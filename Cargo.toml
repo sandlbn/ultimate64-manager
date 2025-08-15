@@ -1,5 +1,5 @@
 [package]
-name = "ultimate64-browser"
+name = "ultimate64-manager"
 version = "0.1.0"
 edition = "2021"
 
@@ -22,5 +22,5 @@ image = "0.24"
 winapi = { version = "0.3", features = ["winuser"] }
 
 [[bin]]
-name = "ultimate64-browser"
+name = "ultimate64-manager"
 path = "src/main.rs"

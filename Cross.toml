@@ -1,0 +1,4 @@
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"
+dockerfile = ".cross/Dockerfile.x86_64-unknown-linux-gnu"
+
