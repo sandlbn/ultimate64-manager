@@ -25,7 +25,6 @@ pub enum MusicPlayerMessage {
     PlayFile(PathBuf, Option<u8>),
     PlaybackCompleted(Result<(), String>),
     UpdatePlaybackTime,
-    SetVolume(f32),
     SetSongNumber(u8),
     RefreshPlaylist,
 }
@@ -58,7 +57,6 @@ pub struct MusicPlayer {
     shuffle_enabled: bool,
     repeat_enabled: bool,
     current_directory: PathBuf,
-    volume: f32,
     current_song_number: u8,
     playback_duration: Duration,
     shuffle_order: Vec<usize>,
@@ -74,7 +72,6 @@ impl MusicPlayer {
             shuffle_enabled: false,
             repeat_enabled: false,
             current_directory: home_dir,
-            volume: 0.7,
             current_song_number: 1,
             playback_duration: Duration::from_secs(0),
             shuffle_order: Vec::new(),
