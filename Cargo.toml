@@ -45,7 +45,7 @@ lto = true
 [package.metadata.bundle]
 name = "Ultimate64 Manager"
 identifier = "com.ultimate64.manager"
-icon = ["app_icon.png"]
+icon = ["icons/icon.icns"]
 version = "0.2.0"
 copyright = "Copyright 2026"
 category = "Utility"
