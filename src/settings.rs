@@ -33,7 +33,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             connection: ConnectionSettings {
-                host: String::from("192.168.1.64"),
+                host: String::new(), // Empty by default - user must configure
                 password: None,
             },
             default_paths: DefaultPaths {
@@ -51,34 +51,40 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+    fn config_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
         let config_dir = dirs::config_dir()
             .ok_or("Could not determine config directory")?
-            .join("ultimate64-browser");
+            .join("ultimate64-manager");
 
         fs::create_dir_all(&config_dir)?;
+        Ok(config_dir.join("settings.json"))
+    }
 
-        let config_file = config_dir.join("settings.json");
+    pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let config_file = Self::config_path()?;
+
+        log::debug!("Loading settings from: {:?}", config_file);
 
         if config_file.exists() {
-            let contents = fs::read_to_string(config_file)?;
-            Ok(serde_json::from_str(&contents)?)
+            let contents = fs::read_to_string(&config_file)?;
+            let settings: AppSettings = serde_json::from_str(&contents)?;
+            log::info!("Settings loaded successfully");
+            Ok(settings)
         } else {
+            log::info!("No settings file found, using defaults");
             Ok(Self::default())
         }
     }
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let config_dir = dirs::config_dir()
-            .ok_or("Could not determine config directory")?
-            .join("ultimate64-browser");
+        let config_file = Self::config_path()?;
 
-        fs::create_dir_all(&config_dir)?;
+        log::debug!("Saving settings to: {:?}", config_file);
 
-        let config_file = config_dir.join("settings.json");
         let contents = serde_json::to_string_pretty(self)?;
-        fs::write(config_file, contents)?;
+        fs::write(&config_file, contents)?;
 
+        log::info!("Settings saved successfully");
         Ok(())
     }
 }

@@ -1,7 +1,10 @@
 use iced::{
-    widget::{button, column, pick_list, row, scrollable, text, Column, Row},
     Command, Element, Length,
+    widget::{
+        Column, Space, button, checkbox, column, container, pick_list, row, scrollable, text,
+    },
 };
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,6 +15,9 @@ pub enum FileBrowserMessage {
     SelectDirectory,
     DirectorySelected(PathBuf),
     FileSelected(PathBuf),
+    ToggleFileCheck(PathBuf, bool),
+    SelectAll,
+    SelectNone,
     MountDisk(PathBuf, String, MountMode),
     MountCompleted(Result<(), String>),
     LoadAndRun(PathBuf),
@@ -19,6 +25,7 @@ pub enum FileBrowserMessage {
     RefreshFiles,
     NavigateUp,
     DriveSelected(DriveOption),
+    NavigateToPath(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +34,7 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub extension: Option<String>,
+    pub size: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,7 +69,9 @@ pub struct FileBrowser {
     current_directory: PathBuf,
     files: Vec<FileEntry>,
     selected_file: Option<PathBuf>,
+    checked_files: HashSet<PathBuf>,
     selected_drive: DriveOption,
+    status_message: Option<String>,
 }
 
 impl FileBrowser {
@@ -71,7 +81,9 @@ impl FileBrowser {
             current_directory: home_dir.clone(),
             files: Vec::new(),
             selected_file: None,
-            selected_drive: DriveOption::A, // Default to Drive A
+            checked_files: HashSet::new(),
+            selected_drive: DriveOption::A,
+            status_message: None,
         };
         browser.load_directory(&home_dir);
         browser
@@ -83,55 +95,69 @@ impl FileBrowser {
         connection: Option<Arc<Mutex<Rest>>>,
     ) -> Command<FileBrowserMessage> {
         match message {
-            FileBrowserMessage::SelectDirectory => {
-                // Open native directory picker
-                Command::perform(
-                    async {
-                        rfd::AsyncFileDialog::new()
-                            .pick_folder()
-                            .await
-                            .map(|handle| handle.path().to_path_buf())
-                    },
-                    |result| {
-                        if let Some(path) = result {
-                            FileBrowserMessage::DirectorySelected(path)
-                        } else {
-                            FileBrowserMessage::RefreshFiles
-                        }
-                    },
-                )
-            }
+            FileBrowserMessage::SelectDirectory => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                |result| {
+                    if let Some(path) = result {
+                        FileBrowserMessage::DirectorySelected(path)
+                    } else {
+                        FileBrowserMessage::RefreshFiles
+                    }
+                },
+            ),
             FileBrowserMessage::DirectorySelected(path) => {
                 self.load_directory(&path);
                 self.current_directory = path;
+                self.checked_files.clear();
+                self.status_message = None;
                 Command::none()
             }
             FileBrowserMessage::FileSelected(path) => {
                 if path.is_dir() {
                     self.load_directory(&path);
                     self.current_directory = path;
+                    self.checked_files.clear();
                 } else {
                     self.selected_file = Some(path);
                 }
                 Command::none()
             }
+            FileBrowserMessage::NavigateToPath(path) => {
+                if path.is_dir() {
+                    self.load_directory(&path);
+                    self.current_directory = path;
+                    self.checked_files.clear();
+                }
+                Command::none()
+            }
             FileBrowserMessage::MountDisk(path, drive, mode) => {
                 if let Some(conn) = connection {
+                    self.status_message = Some(format!(
+                        "Mounting {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
                     Command::perform(
                         mount_disk_async(conn, path, drive, mode),
                         FileBrowserMessage::MountCompleted,
                     )
                 } else {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
                     Command::none()
                 }
             }
             FileBrowserMessage::MountCompleted(result) => {
                 match result {
                     Ok(_) => {
+                        self.status_message = Some("Disk mounted successfully!".to_string());
                         log::info!("Disk mounted successfully");
-                        // Return a command to refresh the main status
                     }
                     Err(e) => {
+                        self.status_message = Some(format!("Mount failed: {}", e));
                         log::error!("Mount failed: {}", e);
                     }
                 }
@@ -139,22 +165,34 @@ impl FileBrowser {
             }
             FileBrowserMessage::LoadAndRun(path) => {
                 if let Some(conn) = connection {
+                    self.status_message = Some(format!(
+                        "Loading {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
                     Command::perform(
                         load_and_run_async(conn, path),
                         FileBrowserMessage::LoadCompleted,
                     )
                 } else {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
                     Command::none()
                 }
             }
             FileBrowserMessage::LoadCompleted(result) => {
-                if let Err(e) = result {
-                    log::error!("Load failed: {}", e);
+                match result {
+                    Ok(_) => {
+                        self.status_message = Some("Loaded successfully!".to_string());
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Load failed: {}", e));
+                        log::error!("Load failed: {}", e);
+                    }
                 }
                 Command::none()
             }
             FileBrowserMessage::RefreshFiles => {
                 self.load_directory(&self.current_directory.clone());
+                self.status_message = None;
                 Command::none()
             }
             FileBrowserMessage::NavigateUp => {
@@ -169,131 +207,249 @@ impl FileBrowser {
                 self.selected_drive = drive;
                 Command::none()
             }
+            FileBrowserMessage::ToggleFileCheck(path, checked) => {
+                if checked {
+                    self.checked_files.insert(path);
+                } else {
+                    self.checked_files.remove(&path);
+                }
+                Command::none()
+            }
+            FileBrowserMessage::SelectAll => {
+                for file in &self.files {
+                    if !file.is_dir {
+                        self.checked_files.insert(file.path.clone());
+                    }
+                }
+                Command::none()
+            }
+            FileBrowserMessage::SelectNone => {
+                self.checked_files.clear();
+                Command::none()
+            }
         }
     }
 
-    pub fn view(&self) -> Element<'_, FileBrowserMessage> {
-        let header = row![
-            text(format!("Current: {}", self.current_directory.display())).size(16),
-            button(text("Browse Folder")).on_press(FileBrowserMessage::SelectDirectory),
-            button(text("Go Up")).on_press(FileBrowserMessage::NavigateUp),
-            button(text("Refresh")).on_press(FileBrowserMessage::RefreshFiles),
-        ]
-        .spacing(10)
-        .padding(5);
+    pub fn get_selected_file(&self) -> Option<&PathBuf> {
+        self.selected_file.as_ref()
+    }
 
-        // Drive selection section
-        let drive_selection = row![
-            text("Mount to:").size(14),
+    pub fn get_checked_files(&self) -> Vec<PathBuf> {
+        self.checked_files.iter().cloned().collect()
+    }
+
+    pub fn clear_checked(&mut self) {
+        self.checked_files.clear();
+    }
+
+    pub fn get_current_directory(&self) -> &PathBuf {
+        &self.current_directory
+    }
+
+    pub fn view(&self) -> Element<'_, FileBrowserMessage> {
+        // Current path display (truncated if too long)
+        let path_str = self.current_directory.to_string_lossy();
+        let display_path = if path_str.len() > 40 {
+            format!("...{}", &path_str[path_str.len() - 37..])
+        } else {
+            path_str.to_string()
+        };
+
+        // Navigation buttons
+        let nav_buttons = row![
+            button(text("Up").size(11))
+                .on_press(FileBrowserMessage::NavigateUp)
+                .padding([4, 8]),
+            button(text("Browse").size(11))
+                .on_press(FileBrowserMessage::SelectDirectory)
+                .padding([4, 8]),
+        ]
+        .spacing(5);
+
+        // Path display
+        let path_display = text(display_path).size(11);
+
+        // Drive selection and selection controls
+        let controls_row = row![
+            text("Mount:").size(10),
             pick_list(
                 DriveOption::get_all(),
                 Some(self.selected_drive.clone()),
                 FileBrowserMessage::DriveSelected,
             )
-            .placeholder("Select drive...")
-            .width(Length::Fixed(120.0)),
+            .placeholder("Drive")
+            .text_size(11)
+            .width(Length::Fixed(95.0)),
+            Space::with_width(10),
+            button(text("All").size(9))
+                .on_press(FileBrowserMessage::SelectAll)
+                .padding([2, 6]),
+            button(text("None").size(9))
+                .on_press(FileBrowserMessage::SelectNone)
+                .padding([2, 6]),
+            Space::with_width(Length::Fill),
+            text(format!("{} files", self.files.len())).size(10),
         ]
-        .spacing(10)
-        .padding(5)
+        .spacing(5)
         .align_items(iced::Alignment::Center);
 
+        // Checked count
+        let checked_count = self.checked_files.len();
+        let selection_info = if checked_count > 0 {
+            text(format!("{} selected", checked_count)).size(10)
+        } else {
+            text("").size(10)
+        };
+
+        // File list
         let file_list: Vec<Element<'_, FileBrowserMessage>> = self
             .files
             .iter()
-            .map(|entry| {
-                let type_indicator = if entry.is_dir {
-                    "[DIR]"
-                } else {
-                    match entry.extension.as_deref() {
-                        Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => "[DSK]",
-                        Some("prg") => "[PRG]",
-                        Some("crt") => "[CRT]",
-                        Some("sid") => "[SID]",
-                        Some("mod") => "[MOD]",
-                        Some("tap") => "[TAP]",
-                        Some("t64") => "[T64]",
-                        _ => "[FILE]",
-                    }
-                };
-
-                let file_button = button(text(format!("{} {}", type_indicator, entry.name)))
-                    .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
-                    .width(Length::Fill);
-
-                let mut actions = Row::new().spacing(5);
-
-                // Add action buttons based on file type
-                if !entry.is_dir {
-                    match entry.extension.as_deref() {
-                        Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => {
-                            // Show which drive will be used in the button text
-                            let drive_letter = match self.selected_drive {
-                                DriveOption::A => "A",
-                                DriveOption::B => "B",
-                            };
-                            
-                            actions = actions
-                                .push(
-                                    button(text(format!("Mount {} RW", drive_letter)))
-                                        .on_press(FileBrowserMessage::MountDisk(
-                                            entry.path.clone(),
-                                            self.selected_drive.to_drive_string(),
-                                            MountMode::ReadWrite,
-                                        )),
-                                )
-                                .push(
-                                    button(text(format!("Mount {} RO", drive_letter)))
-                                        .on_press(FileBrowserMessage::MountDisk(
-                                            entry.path.clone(),
-                                            self.selected_drive.to_drive_string(),
-                                            MountMode::ReadOnly,
-                                        )),
-                                );
-                        }
-                        Some("prg") | Some("crt") => {
-                            actions = actions.push(
-                                button(text("Load & Run"))
-                                    .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone())),
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-
-                row![file_button, actions]
-                    .spacing(10)
-                    .padding(2)
-                    .into()
-            })
+            .map(|entry| self.view_file_entry(entry))
             .collect();
 
-        let scrollable_list = scrollable(
-            Column::with_children(file_list)
-                .spacing(2)
-                .padding(5),
-        )
-        .height(Length::Fill);
+        let scrollable_list =
+            scrollable(Column::with_children(file_list).spacing(0).padding(0)).height(Length::Fill);
+
+        // Status message
+        let status = if let Some(msg) = &self.status_message {
+            text(msg).size(10)
+        } else {
+            text("").size(10)
+        };
 
         column![
-            header,
-            drive_selection,
-            text(format!("Files ({} items)", self.files.len())).size(14),
-            scrollable_list
+            path_display,
+            nav_buttons,
+            controls_row,
+            selection_info,
+            scrollable_list,
+            status,
         ]
-        .spacing(10)
+        .spacing(3)
+        .padding(5)
         .into()
+    }
+
+    fn view_file_entry(&self, entry: &FileEntry) -> Element<'_, FileBrowserMessage> {
+        let is_checked = self.checked_files.contains(&entry.path);
+
+        // File type label
+        let type_label = if entry.is_dir {
+            ""
+        } else {
+            match entry.extension.as_deref() {
+                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => "DSK",
+                Some("prg") => "PRG",
+                Some("crt") => "CRT",
+                Some("sid") => "SID",
+                Some("mod") => "MOD",
+                Some("tap") | Some("t64") => "TAP",
+                _ => "",
+            }
+        };
+
+        // Truncate long filenames
+        let max_name_len = 32;
+        let display_name = if entry.name.len() > max_name_len {
+            format!("{}...", &entry.name[..max_name_len - 3])
+        } else {
+            entry.name.clone()
+        };
+
+        // Action button based on file type
+        let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
+            // Directory - click to enter
+            button(text("Open").size(10))
+                .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
+                .padding([2, 8])
+                .into()
+        } else {
+            match entry.extension.as_deref() {
+                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => {
+                    let drive = match self.selected_drive {
+                        DriveOption::A => "A",
+                        DriveOption::B => "B",
+                    };
+                    row![
+                        button(text(format!("{}:RW", drive)).size(10))
+                            .on_press(FileBrowserMessage::MountDisk(
+                                entry.path.clone(),
+                                self.selected_drive.to_drive_string(),
+                                MountMode::ReadWrite,
+                            ))
+                            .padding([2, 5]),
+                        button(text(format!("{}:RO", drive)).size(10))
+                            .on_press(FileBrowserMessage::MountDisk(
+                                entry.path.clone(),
+                                self.selected_drive.to_drive_string(),
+                                MountMode::ReadOnly,
+                            ))
+                            .padding([2, 5]),
+                    ]
+                    .spacing(2)
+                    .into()
+                }
+                Some("prg") | Some("crt") => button(text("Run").size(10))
+                    .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone()))
+                    .padding([2, 10])
+                    .into(),
+                _ => Space::with_width(0).into(),
+            }
+        };
+
+        // Build the row: [checkbox] [name...] [type] [action]
+        let checkbox_element: Element<'_, FileBrowserMessage> = if entry.is_dir {
+            container(Space::with_width(24)).into()
+        } else {
+            let path_clone = entry.path.clone();
+            checkbox("", is_checked)
+                .on_toggle(move |checked| {
+                    FileBrowserMessage::ToggleFileCheck(path_clone.clone(), checked)
+                })
+                .size(16)
+                .into()
+        };
+
+        let file_row = row![
+            // Checkbox (only for files, not dirs)
+            checkbox_element,
+            // Clickable filename (truncated)
+            button(text(&display_name).size(11))
+                .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
+                .padding([4, 6])
+                .width(Length::Fill),
+            // Type label
+            text(type_label).size(9).width(Length::Fixed(28.0)),
+            // Action button
+            action_button,
+        ]
+        .spacing(4)
+        .align_items(iced::Alignment::Center)
+        .padding([1, 2]);
+
+        file_row.into()
     }
 
     fn load_directory(&mut self, path: &Path) {
         self.files.clear();
-        
+
         if let Ok(entries) = std::fs::read_dir(path) {
             let mut files: Vec<FileEntry> = entries
                 .filter_map(|entry| {
                     entry.ok().and_then(|e| {
                         let path = e.path();
                         let name = e.file_name().to_string_lossy().to_string();
+
+                        // Skip hidden files on Unix
+                        if name.starts_with('.') {
+                            return None;
+                        }
+
                         let is_dir = path.is_dir();
+                        let metadata = e.metadata().ok();
+                        let size = metadata.as_ref().map(|m| m.len());
+
                         let extension = if !is_dir {
                             path.extension()
                                 .and_then(|ext| ext.to_str())
@@ -302,17 +458,29 @@ impl FileBrowser {
                             None
                         };
 
-                        // Filter to show only relevant files
-                        if is_dir || matches!(
-                            extension.as_deref(),
-                            Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") |
-                            Some("prg") | Some("crt") | Some("sid") | Some("mod") | Some("tap") | Some("t64")
-                        ) {
+                        // Filter: show directories and relevant file types
+                        if is_dir
+                            || matches!(
+                                extension.as_deref(),
+                                Some("d64")
+                                    | Some("d71")
+                                    | Some("d81")
+                                    | Some("g64")
+                                    | Some("g71")
+                                    | Some("prg")
+                                    | Some("crt")
+                                    | Some("sid")
+                                    | Some("mod")
+                                    | Some("tap")
+                                    | Some("t64")
+                            )
+                        {
                             Some(FileEntry {
                                 path,
                                 name,
                                 is_dir,
                                 extension,
+                                size,
                             })
                         } else {
                             None
@@ -321,17 +489,17 @@ impl FileBrowser {
                 })
                 .collect();
 
-            // Sort directories first, then files
-            files.sort_by(|a, b| {
-                match (a.is_dir, b.is_dir) {
-                    (true, false) => std::cmp::Ordering::Less,
-                    (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                }
+            // Sort: directories first, then alphabetically
+            files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             });
 
             self.files = files;
         }
+
+        log::debug!("Loaded {} items from {}", self.files.len(), path.display());
     }
 }
 
@@ -341,28 +509,59 @@ async fn mount_disk_async(
     drive: String,
     mode: MountMode,
 ) -> Result<(), String> {
-    let conn = connection.lock().await;
-    
-    // Mount the disk
-    conn.mount_disk_image(&path, drive.clone(), mode, false)
-        .map_err(|e| e.to_string())?;
-    
-    // If successful, log it
-    log::info!("Successfully mounted {} to drive {}", path.display(), drive.to_uppercase());
-    
-    Ok(())
+    log::info!(
+        "Mounting {} to drive {} ({:?})",
+        path.display(),
+        drive,
+        mode
+    );
+
+    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = connection.blocking_lock();
+        conn.mount_disk_image(&path, drive.clone(), mode, false)
+            .map_err(|e| {
+                log::error!("Mount error: {}", e);
+                e.to_string()
+            })
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?;
+
+    if result.is_ok() {
+        log::info!("Mount successful");
+    }
+    result
 }
 
-async fn load_and_run_async(
-    connection: Arc<Mutex<Rest>>,
-    path: PathBuf,
-) -> Result<(), String> {
-    let conn = connection.lock().await;
-    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
-    
-    match path.extension().and_then(|s| s.to_str()) {
-        Some("crt") => conn.run_crt(&data).map_err(|e| e.to_string()),
-        Some("prg") => conn.run_prg(&data).map_err(|e| e.to_string()),
-        _ => Err("Unsupported file type".to_string()),
-    }
+async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Result<(), String> {
+    log::info!("Loading and running: {}", path.display());
+
+    let data = std::fs::read(&path).map_err(|e| {
+        log::error!("Failed to read file: {}", e);
+        e.to_string()
+    })?;
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+
+    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
+    tokio::task::spawn_blocking(move || {
+        let conn = connection.blocking_lock();
+        match ext.as_deref() {
+            Some("crt") => {
+                log::info!("Running as CRT cartridge");
+                conn.run_crt(&data).map_err(|e| e.to_string())
+            }
+            Some("prg") => {
+                log::info!("Running as PRG");
+                conn.run_prg(&data).map_err(|e| e.to_string())
+            }
+            _ => Err("Unsupported file type".to_string()),
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }

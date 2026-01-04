@@ -1,6 +1,6 @@
 use iced::{
-    widget::{button, column, row, scrollable, text, Column},
     Command, Element, Length,
+    widget::{Column, button, column, row, scrollable, text},
 };
 use rand::seq::SliceRandom;
 use std::path::{Path, PathBuf};
@@ -41,7 +41,7 @@ pub struct MusicFile {
     pub path: PathBuf,
     pub name: String,
     pub file_type: MusicFileType,
-    pub song_count: Option<u8>, // For SID files with multiple songs
+    pub song_count: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,7 +107,6 @@ impl MusicPlayer {
             }
             MusicPlayerMessage::Pause => {
                 self.playback_state = PlaybackState::Paused;
-                // Note: Ultimate64 doesn't support pause, so we just stop
                 Command::none()
             }
             MusicPlayerMessage::Stop => {
@@ -164,6 +163,7 @@ impl MusicPlayer {
             }
             MusicPlayerMessage::FileSelected(index) => {
                 self.current_index = Some(index);
+                self.current_song_number = 1;
                 if self.playback_state == PlaybackState::Playing {
                     self.update(MusicPlayerMessage::Play, connection)
                 } else {
@@ -183,14 +183,6 @@ impl MusicPlayer {
             MusicPlayerMessage::PlaybackCompleted(result) => {
                 if let Err(e) = result {
                     log::error!("Playback failed: {}", e);
-                }
-                // Auto-advance to next track if repeat is disabled
-                if !self.repeat_enabled && self.playback_state == PlaybackState::Playing {
-                    self.next_track();
-                    return self.update(MusicPlayerMessage::Play, connection);
-                } else if self.repeat_enabled && self.playback_state == PlaybackState::Playing {
-                    // Repeat current track
-                    return self.update(MusicPlayerMessage::Play, connection);
                 }
                 Command::none()
             }
@@ -216,6 +208,7 @@ impl MusicPlayer {
     }
 
     pub fn view(&self) -> Element<'_, MusicPlayerMessage> {
+        // Transport controls
         let controls = row![
             button(text(if self.playback_state == PlaybackState::Playing {
                 "Pause"
@@ -226,41 +219,63 @@ impl MusicPlayer {
                 MusicPlayerMessage::Pause
             } else {
                 MusicPlayerMessage::Play
-            }),
-            button(text("Stop")).on_press(MusicPlayerMessage::Stop),
-            button(text("Previous")).on_press(MusicPlayerMessage::Previous),
-            button(text("Next")).on_press(MusicPlayerMessage::Next),
+            })
+            .padding([8, 12]),
+            button(text("Stop"))
+                .on_press(MusicPlayerMessage::Stop)
+                .padding([8, 12]),
+            button(text("Prev"))
+                .on_press(MusicPlayerMessage::Previous)
+                .padding([8, 12]),
+            button(text("Next"))
+                .on_press(MusicPlayerMessage::Next)
+                .padding([8, 12]),
+        ]
+        .spacing(5);
+
+        // Mode toggles
+        let mode_controls = row![
             button(text(if self.shuffle_enabled {
                 "Shuffle: ON"
             } else {
                 "Shuffle: OFF"
             }))
-            .on_press(MusicPlayerMessage::ToggleShuffle),
+            .on_press(MusicPlayerMessage::ToggleShuffle)
+            .padding([6, 10]),
             button(text(if self.repeat_enabled {
                 "Repeat: ON"
             } else {
                 "Repeat: OFF"
             }))
-            .on_press(MusicPlayerMessage::ToggleRepeat),
+            .on_press(MusicPlayerMessage::ToggleRepeat)
+            .padding([6, 10]),
         ]
-        .spacing(10);
+        .spacing(5);
 
-        let current_track = if let Some(index) = self.current_index {
+        // Now playing
+        let now_playing = if let Some(index) = self.current_index {
             if let Some(file) = self.playlist.get(index) {
-                text(format!("Now Playing: {}", file.name)).size(18)
+                let icon = match file.file_type {
+                    MusicFileType::Sid => "[SID]",
+                    MusicFileType::Mod => "[MOD]",
+                };
+                text(format!("{} Now Playing: {}", icon, file.name)).size(16)
             } else {
-                text("No track selected").size(18)
+                text("No track selected").size(16)
             }
         } else {
-            text("No track selected").size(18)
+            text("No track selected").size(16)
         };
 
+        // Time display
         let time_display = text(format!(
-            "Time: {}:{:02}",
+            "{}:{:02}",
             self.playback_duration.as_secs() / 60,
             self.playback_duration.as_secs() % 60
-        ));
+        ))
+        .size(14);
 
+        // Song selector for SID files with multiple songs
         let song_selector: Element<'_, MusicPlayerMessage> = if self
             .current_index
             .and_then(|i| self.playlist.get(i))
@@ -271,83 +286,103 @@ impl MusicPlayer {
                 .song_count
                 .unwrap();
             row![
-                text("Song #:"),
-                button(text("-")).on_press(MusicPlayerMessage::SetSongNumber(
-                    self.current_song_number.saturating_sub(1).max(1)
-                )),
-                text(format!("{}/{}", self.current_song_number, max_songs)),
-                button(text("+")).on_press(MusicPlayerMessage::SetSongNumber(
-                    (self.current_song_number + 1).min(max_songs)
-                )),
+                text("Song:").size(12),
+                button(text("-").size(12))
+                    .on_press(MusicPlayerMessage::SetSongNumber(
+                        self.current_song_number.saturating_sub(1).max(1)
+                    ))
+                    .padding([4, 8]),
+                text(format!("{}/{}", self.current_song_number, max_songs)).size(12),
+                button(text("+").size(12))
+                    .on_press(MusicPlayerMessage::SetSongNumber(
+                        (self.current_song_number + 1).min(max_songs)
+                    ))
+                    .padding([4, 8]),
             ]
             .spacing(5)
+            .align_items(iced::Alignment::Center)
             .into()
         } else {
             row![].into()
         };
 
+        // Playlist header
         let playlist_header = row![
-            text(format!("Playlist ({} files)", self.playlist.len())).size(16),
-            button(text("Browse Folder")).on_press(MusicPlayerMessage::SelectDirectory),
-            button(text("Refresh")).on_press(MusicPlayerMessage::RefreshPlaylist),
+            text(format!("Playlist ({} files)", self.playlist.len())).size(14),
+            button(text("Browse").size(12))
+                .on_press(MusicPlayerMessage::SelectDirectory)
+                .padding([4, 8]),
+            button(text("Refresh").size(12))
+                .on_press(MusicPlayerMessage::RefreshPlaylist)
+                .padding([4, 8]),
         ]
-        .spacing(10);
+        .spacing(10)
+        .align_items(iced::Alignment::Center);
 
+        // Playlist items
         let playlist_items: Vec<Element<'_, MusicPlayerMessage>> = self
             .playlist
             .iter()
             .enumerate()
             .map(|(index, file)| {
-                let type_indicator = match file.file_type {
+                let icon = match file.file_type {
                     MusicFileType::Sid => "[SID]",
                     MusicFileType::Mod => "[MOD]",
                 };
 
                 let is_current = Some(index) == self.current_index;
-                let playing_indicator = if is_current {
-                    if self.playback_state == PlaybackState::Playing {
-                        "> "
-                    } else {
-                        "* "
+                let prefix = if is_current {
+                    match self.playback_state {
+                        PlaybackState::Playing => ">",
+                        PlaybackState::Paused => "=",
+                        PlaybackState::Stopped => "*",
                     }
                 } else {
-                    "  "
+                    " "
                 };
 
-                let track_button = button(text(format!(
-                    "{}{} {}",
-                    playing_indicator, type_indicator, file.name
-                )))
-                .on_press(MusicPlayerMessage::FileSelected(index))
-                .width(Length::Fill);
-
-                row![track_button].into()
+                button(text(format!("{} {} {}", prefix, icon, file.name)).size(12))
+                    .on_press(MusicPlayerMessage::FileSelected(index))
+                    .width(Length::Fill)
+                    .padding([4, 8])
+                    .into()
             })
             .collect();
 
         let playlist_scroll =
             scrollable(Column::with_children(playlist_items).spacing(2).padding(5))
-                .height(Length::FillPortion(3));
+                .height(Length::Fill);
+
+        // Current directory
+        let dir_display =
+            text(format!("Dir: {}", self.current_directory.to_string_lossy())).size(11);
 
         column![
-            current_track,
-            controls,
+            text("MUSIC PLAYER").size(20),
+            iced::widget::horizontal_rule(1),
+            iced::widget::Space::with_height(10),
+            now_playing,
             time_display,
+            iced::widget::Space::with_height(10),
+            controls,
+            mode_controls,
             song_selector,
+            iced::widget::Space::with_height(15),
             playlist_header,
+            dir_display,
             playlist_scroll,
         ]
-        .spacing(15)
-        .padding(20)
+        .spacing(8)
+        .padding(15)
         .into()
     }
 
     fn load_music_files(&mut self, directory: &Path) {
         self.playlist.clear();
 
-        // Use WalkDir to recursively scan all subdirectories
         let walker = WalkDir::new(directory)
             .follow_links(true)
+            .max_depth(5) // Limit recursion depth
             .into_iter()
             .filter_map(|entry| entry.ok());
 
@@ -356,17 +391,14 @@ impl MusicPlayer {
         for entry in walker {
             let path = entry.path();
 
-            // Skip directories
             if path.is_dir() {
                 continue;
             }
 
-            // Get file extension and check if it's a music file
             if let Some(extension) = path.extension() {
                 if let Some(ext_str) = extension.to_str() {
                     let ext_lower = ext_str.to_lowercase();
 
-                    // Get relative path for display
                     let display_name = if let Ok(relative) = path.strip_prefix(directory) {
                         relative.to_string_lossy().to_string()
                     } else {
@@ -382,7 +414,7 @@ impl MusicPlayer {
                                 path: path.to_path_buf(),
                                 name: display_name,
                                 file_type: MusicFileType::Sid,
-                                song_count: Some(1), // Would need to parse SID header for actual count
+                                song_count: Some(1), // TODO: Parse SID header
                             });
                         }
                         "mod" | "s3m" | "xm" | "it" => {
@@ -399,11 +431,10 @@ impl MusicPlayer {
             }
         }
 
-        // Sort files by path/name
         files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
         log::info!(
-            "Found {} music files in {} (including subdirectories)",
+            "Found {} music files in {}",
             files.len(),
             directory.display()
         );
@@ -421,7 +452,6 @@ impl MusicPlayer {
         }
 
         if self.shuffle_enabled && !self.shuffle_order.is_empty() {
-            // Find current position in shuffle order and move to next
             if let Some(current) = self.current_index {
                 if let Some(pos) = self.shuffle_order.iter().position(|&x| x == current) {
                     let next_pos = (pos + 1) % self.shuffle_order.len();
@@ -440,7 +470,7 @@ impl MusicPlayer {
             );
         }
 
-        self.current_song_number = 1; // Reset to first song
+        self.current_song_number = 1;
     }
 
     fn previous_track(&mut self) {
@@ -477,7 +507,7 @@ impl MusicPlayer {
             );
         }
 
-        self.current_song_number = 1; // Reset to first song
+        self.current_song_number = 1;
     }
 
     fn generate_shuffle_order(&mut self) {
@@ -492,12 +522,25 @@ async fn play_music_file(
     path: PathBuf,
     song_number: Option<u8>,
 ) -> Result<(), String> {
-    let conn = connection.lock().await;
-    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    log::info!("Playing: {} (song: {:?})", path.display(), song_number);
 
-    match path.extension().and_then(|s| s.to_str()) {
-        Some("sid") => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
-        Some("mod") => conn.mod_play(&data).map_err(|e| e.to_string()),
-        _ => Err("Unsupported music file type".to_string()),
-    }
+    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase());
+
+    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
+    tokio::task::spawn_blocking(move || {
+        let conn = connection.blocking_lock();
+        match ext.as_deref() {
+            Some("sid") => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
+            Some("mod") | Some("s3m") | Some("xm") | Some("it") => {
+                conn.mod_play(&data).map_err(|e| e.to_string())
+            }
+            _ => Err("Unsupported music file type".to_string()),
+        }
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }
