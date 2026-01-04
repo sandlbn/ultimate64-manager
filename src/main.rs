@@ -1,13 +1,17 @@
+// Remove the windows_subsystem attribute during development to see console output
+// Uncomment for release builds:
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use iced::{
-    executor, widget::{
-        button, column, container, horizontal_space, pick_list, row,
-        text, text_input, scrollable, horizontal_rule,
-        Column, Space,
-    }, Application, Command, Element, Length, Settings, Theme,
+    Application, Command, Element, Length, Settings, Theme, executor,
+    widget::{
+        Column, Space, button, column, container, horizontal_rule, horizontal_space, pick_list,
+        row, scrollable, text, text_input,
+    },
 };
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::{Rest, vicstream};
@@ -15,48 +19,126 @@ use url::{Host, Url};
 
 mod file_browser;
 mod music_player;
+mod remote_browser;
 mod settings;
 mod templates;
 
 use file_browser::{FileBrowser, FileBrowserMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage};
+use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
 use templates::{DiskTemplate, TemplateManager};
 
 pub fn main() -> iced::Result {
-    // Initialize logger with debug level for troubleshooting
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    
-    log::info!("Starting Ultimate64 Manager");
-    Ultimate64Browser::run(Settings::default())
+    // Initialize logger - show info level by default, debug if RUST_LOG is set
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
+
+    log::info!("===========================================");
+    log::info!("Starting Ultimate64 Manager v0.1.0");
+    log::info!("===========================================");
+
+    // Print some diagnostic info
+    log::info!("Platform: {}", std::env::consts::OS);
+    log::info!("Arch: {}", std::env::consts::ARCH);
+
+    // Load window icon
+    let icon = load_window_icon();
+
+    Ultimate64Browser::run(Settings {
+        window: iced::window::Settings {
+            size: iced::Size::new(1200.0, 800.0),
+            min_size: Some(iced::Size::new(800.0, 600.0)),
+            icon: icon,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
+fn load_window_icon() -> Option<iced::window::Icon> {
+    const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
+
+    if let Ok(img) = image::load_from_memory(ICON_BYTES) {
+        let img = img.resize_exact(32, 32, image::imageops::FilterType::Lanczos3);
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        if let Ok(icon) = iced::window::icon::from_rgba(rgba.into_raw(), width, height) {
+            log::info!("Using embedded icon (32x32)");
+            return Some(icon);
+        }
+    }
+
+    log::warn!("Failed to load embedded icon, using fallback");
+
+    // Fallback: create a simple colored icon programmatically
+    let size = 32u32;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let border = x < 2 || x >= size - 2 || y < 2 || y >= size - 2;
+            if border {
+                pixels.extend_from_slice(&[134, 122, 222, 255]); // C64 light blue
+            } else {
+                pixels.extend_from_slice(&[64, 50, 133, 255]); // C64 blue
+            }
+        }
+    }
+    iced::window::icon::from_rgba(pixels, size, size).ok()
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    // Navigation
     TabSelected(Tab),
-    FileBrowser(FileBrowserMessage),
+
+    // File browsers (dual pane)
+    LeftBrowser(FileBrowserMessage),
+    RemoteBrowser(RemoteBrowserMessage),
+    ActivePaneChanged(Pane),
+
+    // Copy operations
+    CopyLocalToRemote, // Copy selected local file to Ultimate64
+    CopyRemoteToLocal, // Copy selected remote file to local
+    CopyComplete(Result<String, String>),
+
+    // Music player
     MusicPlayer(MusicPlayerMessage),
-    ConnectionChanged(ConnectionSettings),
+
+    // Connection
     HostInputChanged(String),
     PasswordInputChanged(String),
     ConnectPressed,
     DisconnectPressed,
+    RefreshStatus,
+    RefreshAfterConnect,
+    StatusUpdated(Result<StatusInfo, String>),
+
+    // Templates
     TemplateSelected(DiskTemplate),
     ExecuteTemplate,
-    RefreshStatus,
-    StatusUpdated(Result<StatusInfo, String>),
+
+    // Errors
     ShowError(String),
-    DismissError,
-    // Video viewer messages
+    ShowInfo(String),
+    DismissMessage,
+
+    // Video
     StartVideoStream,
     StopVideoStream,
     TakeScreenshot,
     ScreenshotTaken(Result<String, String>),
     VideoFrameUpdate,
+
     // Machine control
     ResetMachine,
+    RebootMachine,
+    PauseMachine,
+    ResumeMachine,
     PoweroffMachine,
     MachineCommandCompleted(Result<String, String>),
+
     // Command prompt
     CommandInputChanged(String),
     SendCommand,
@@ -64,7 +146,7 @@ pub enum Message {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    DiskBrowser,
+    DualPaneBrowser,
     MusicPlayer,
     VideoViewer,
     Settings,
@@ -73,7 +155,7 @@ pub enum Tab {
 impl std::fmt::Display for Tab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Tab::DiskBrowser => write!(f, "Disk Browser"),
+            Tab::DualPaneBrowser => write!(f, "File Browser"),
             Tab::MusicPlayer => write!(f, "Music Player"),
             Tab::VideoViewer => write!(f, "Video Viewer"),
             Tab::Settings => write!(f, "Settings"),
@@ -81,31 +163,54 @@ impl std::fmt::Display for Tab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone)]
 pub struct StatusInfo {
     pub connected: bool,
     pub device_info: Option<String>,
-    pub mounted_disks: Vec<(String, String)>, // (drive, filename)
+    pub mounted_disks: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum UserMessage {
+    Error(String),
+    Info(String),
 }
 
 pub struct Ultimate64Browser {
     active_tab: Tab,
-    file_browser: FileBrowser,
+
+    // Dual-pane file browsers
+    left_browser: FileBrowser,
+    remote_browser: RemoteBrowser,
+    active_pane: Pane,
+
     music_player: MusicPlayer,
     settings: AppSettings,
     template_manager: TemplateManager,
     selected_template: Option<DiskTemplate>,
     connection: Option<Arc<TokioMutex<Rest>>>,
+    host_url: Option<String>, // Store host URL for direct HTTP requests
     status: StatusInfo,
-    error_message: Option<String>,
-    // Input fields for settings
+
+    // User messages (errors and info)
+    user_message: Option<UserMessage>,
+
+    // Input fields
     host_input: String,
     password_input: String,
-    // Video streaming - improved with proper thread management
+
+    // Video streaming
     video_streaming: bool,
     video_frame: Arc<Mutex<Option<Vec<u8>>>>,
     video_stream_handle: Option<thread::JoinHandle<()>>,
     video_stop_signal: Arc<AtomicBool>,
+
     // Command prompt
     command_input: String,
     command_history: Vec<String>,
@@ -118,14 +223,29 @@ impl Application for Ultimate64Browser {
     type Flags = ();
 
     fn new(_flags: ()) -> (Self, Command<Message>) {
-        let settings = AppSettings::load().unwrap_or_default();
+        log::info!("Initializing application...");
+
+        let settings = match AppSettings::load() {
+            Ok(s) => {
+                log::info!("Loaded settings from config file");
+                s
+            }
+            Err(e) => {
+                log::warn!("Could not load settings: {}. Using defaults.", e);
+                AppSettings::default()
+            }
+        };
+
         let mut app = Self {
-            active_tab: Tab::DiskBrowser,
-            file_browser: FileBrowser::new(),
+            active_tab: Tab::DualPaneBrowser,
+            left_browser: FileBrowser::new(),
+            remote_browser: RemoteBrowser::new(),
+            active_pane: Pane::Left,
             music_player: MusicPlayer::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
             settings: settings.clone(),
+            host_url: None,
             template_manager: TemplateManager::new(),
             selected_template: None,
             connection: None,
@@ -134,7 +254,7 @@ impl Application for Ultimate64Browser {
                 device_info: None,
                 mounted_disks: Vec::new(),
             },
-            error_message: None,
+            user_message: None,
             video_streaming: false,
             video_frame: Arc::new(Mutex::new(None)),
             video_stream_handle: None,
@@ -143,39 +263,56 @@ impl Application for Ultimate64Browser {
             command_history: Vec::new(),
         };
 
-        // Try to establish connection if settings are available
+        // Auto-connect if host is configured
         if !settings.connection.host.is_empty() {
+            log::info!(
+                "Auto-connecting to configured host: {}",
+                settings.connection.host
+            );
             app.establish_connection();
-            // Return a command to refresh status after a brief delay to allow connection to establish
-            return (app, Command::perform(
-                async {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                },
-                |_| Message::RefreshStatus
-            ));
+            return (
+                app,
+                Command::perform(
+                    async {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    },
+                    |_| Message::RefreshStatus,
+                ),
+            );
         }
 
+        log::info!("No host configured, waiting for user input");
         (app, Command::none())
     }
 
     fn title(&self) -> String {
-        String::from("Ultimate64 Manager")
+        let connection_status = if self.status.connected {
+            format!(" - Connected to {}", self.settings.connection.host)
+        } else {
+            " - Disconnected".to_string()
+        };
+        format!("Ultimate64 Manager{}", connection_status)
+    }
+
+    fn theme(&self) -> Theme {
+        Theme::Light
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
         match message {
             Message::TabSelected(tab) => {
+                log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
                 Command::none()
             }
-            Message::FileBrowser(msg) => {
-                // Check if it's a mount completion message
+
+            Message::LeftBrowser(msg) => {
                 let should_refresh = matches!(msg, FileBrowserMessage::MountCompleted(Ok(_)));
-                
-                let cmd = self.file_browser.update(msg, self.connection.clone())
-                    .map(Message::FileBrowser);
-                
-                // If mount was successful, also refresh status
+                let cmd = self
+                    .left_browser
+                    .update(msg, self.connection.clone())
+                    .map(Message::LeftBrowser);
+
                 if should_refresh {
                     Command::batch(vec![
                         cmd,
@@ -183,26 +320,240 @@ impl Application for Ultimate64Browser {
                             async {
                                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                             },
-                            |_| Message::RefreshStatus
+                            |_| Message::RefreshStatus,
                         ),
                     ])
                 } else {
                     cmd
                 }
             }
-            Message::MusicPlayer(msg) => {
-                self.music_player.update(msg, self.connection.clone())
-                    .map(Message::MusicPlayer)
+
+            Message::RemoteBrowser(msg) => self
+                .remote_browser
+                .update(msg, self.connection.clone())
+                .map(Message::RemoteBrowser),
+
+            Message::ActivePaneChanged(pane) => {
+                self.active_pane = pane;
+                Command::none()
             }
+
+            Message::CopyLocalToRemote => {
+                // Copy checked local files to Ultimate64
+                let files_to_copy = self.left_browser.get_checked_files();
+
+                if files_to_copy.is_empty() {
+                    self.user_message = Some(UserMessage::Error(
+                        "No files selected. Use checkboxes to select files.".to_string(),
+                    ));
+                    return Command::none();
+                }
+
+                // Filter out directories
+                let files_to_copy: Vec<PathBuf> =
+                    files_to_copy.into_iter().filter(|p| !p.is_dir()).collect();
+
+                if files_to_copy.is_empty() {
+                    self.user_message = Some(UserMessage::Error(
+                        "No files selected (directories cannot be copied).".to_string(),
+                    ));
+                    return Command::none();
+                }
+
+                if let Some(host) = &self.host_url {
+                    let host = host
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .to_string();
+                    let remote_dest = self.remote_browser.get_current_path().to_string();
+                    let file_count = files_to_copy.len();
+
+                    self.user_message = Some(UserMessage::Info(format!(
+                        "Uploading {} file(s) via FTP...",
+                        file_count
+                    )));
+
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                use std::io::Cursor;
+                                use std::path::PathBuf;
+                                use std::time::Duration;
+                                use suppaftp::FtpStream;
+
+                                let addr = format!("{}:21", host);
+                                let mut ftp = FtpStream::connect(&addr)
+                                    .map_err(|e| format!("FTP connect failed: {}", e))?;
+
+                                ftp.get_ref()
+                                    .set_write_timeout(Some(Duration::from_secs(120)))
+                                    .ok();
+
+                                ftp.login("anonymous", "anonymous")
+                                    .or_else(|_| ftp.login("admin", "admin"))
+                                    .map_err(|e| format!("FTP login failed: {}", e))?;
+
+                                ftp.transfer_type(suppaftp::types::FileType::Binary)
+                                    .map_err(|e| format!("Set binary mode failed: {}", e))?;
+
+                                ftp.cwd(&remote_dest)
+                                    .map_err(|e| format!("Cannot access {}: {}", remote_dest, e))?;
+
+                                let mut uploaded = 0;
+                                for local_path in &files_to_copy {
+                                    let local_path: &PathBuf = local_path;
+                                    let data =
+                                        std::fs::read(local_path.as_path()).map_err(|e| {
+                                            format!("Cannot read {}: {}", local_path.display(), e)
+                                        })?;
+
+                                    let filename = local_path
+                                        .file_name()
+                                        .and_then(|n: &std::ffi::OsStr| n.to_str())
+                                        .unwrap_or("file")
+                                        .to_string();
+
+                                    let mut cursor = Cursor::new(data);
+                                    ftp.put_file(&filename, &mut cursor).map_err(|e| {
+                                        format!("FTP upload {} failed: {}", filename, e)
+                                    })?;
+
+                                    uploaded += 1;
+                                }
+
+                                let _ = ftp.quit();
+
+                                Ok(format!("Uploaded {} file(s)", uploaded))
+                            })
+                            .await
+                            .map_err(|e| e.to_string())?
+                        },
+                        Message::CopyComplete,
+                    );
+                } else {
+                    self.user_message = Some(UserMessage::Error(
+                        "Not connected to Ultimate64".to_string(),
+                    ));
+                }
+                Command::none()
+            }
+
+            Message::CopyRemoteToLocal => {
+                // Copy selected remote file to local directory
+                if let Some(remote_path) = self.remote_browser.get_selected_file() {
+                    if let Some(host) = &self.host_url {
+                        let host = host
+                            .trim_start_matches("http://")
+                            .trim_start_matches("https://")
+                            .to_string();
+                        let remote_path = remote_path.to_string();
+                        let local_dest = self.left_browser.get_current_directory().clone();
+
+                        self.user_message =
+                            Some(UserMessage::Info("Downloading file via FTP...".to_string()));
+
+                        return Command::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    use std::io::Read;
+                                    use std::time::Duration;
+                                    use suppaftp::FtpStream;
+
+                                    let addr = format!("{}:21", host);
+                                    let mut ftp = FtpStream::connect(&addr)
+                                        .map_err(|e| format!("FTP connect failed: {}", e))?;
+
+                                    ftp.get_ref()
+                                        .set_read_timeout(Some(Duration::from_secs(60)))
+                                        .ok();
+
+                                    ftp.login("anonymous", "anonymous")
+                                        .or_else(|_| ftp.login("admin", "admin"))
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+
+                                    ftp.transfer_type(suppaftp::types::FileType::Binary)
+                                        .map_err(|e| format!("Set binary mode failed: {}", e))?;
+
+                                    let mut reader = ftp
+                                        .retr_as_stream(&remote_path)
+                                        .map_err(|e| format!("FTP download failed: {}", e))?;
+
+                                    let mut data = Vec::new();
+                                    reader
+                                        .read_to_end(&mut data)
+                                        .map_err(|e| format!("Read error: {}", e))?;
+
+                                    ftp.finalize_retr_stream(reader)
+                                        .map_err(|e| format!("Transfer finalize error: {}", e))?;
+
+                                    let _ = ftp.quit();
+
+                                    let filename = remote_path.rsplit('/').next().unwrap_or("file");
+                                    let local_path = local_dest.join(filename);
+
+                                    std::fs::write(&local_path, &data)
+                                        .map_err(|e| format!("Write error: {}", e))?;
+
+                                    Ok(format!("Downloaded: {} ({} bytes)", filename, data.len()))
+                                })
+                                .await
+                                .map_err(|e| e.to_string())?
+                            },
+                            Message::CopyComplete,
+                        );
+                    } else {
+                        self.user_message = Some(UserMessage::Error(
+                            "Not connected to Ultimate64".to_string(),
+                        ));
+                    }
+                } else {
+                    self.user_message = Some(UserMessage::Error(
+                        "No file selected in remote pane".to_string(),
+                    ));
+                }
+                Command::none()
+            }
+
+            Message::CopyComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.user_message = Some(UserMessage::Info(msg));
+                        // Clear checked files after successful copy
+                        self.left_browser.clear_checked();
+                        // Refresh both browsers
+                        return Command::batch(vec![
+                            self.left_browser
+                                .update(FileBrowserMessage::RefreshFiles, self.connection.clone())
+                                .map(Message::LeftBrowser),
+                            self.remote_browser
+                                .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
+                                .map(Message::RemoteBrowser),
+                        ]);
+                    }
+                    Err(e) => {
+                        self.user_message = Some(UserMessage::Error(e));
+                    }
+                }
+                Command::none()
+            }
+
+            Message::MusicPlayer(msg) => self
+                .music_player
+                .update(msg, self.connection.clone())
+                .map(Message::MusicPlayer),
+
             Message::HostInputChanged(value) => {
                 self.host_input = value;
                 Command::none()
             }
+
             Message::PasswordInputChanged(value) => {
                 self.password_input = value;
                 Command::none()
             }
+
             Message::ConnectPressed => {
+                log::info!("Connect button pressed");
                 let conn_settings = ConnectionSettings {
                     host: self.host_input.clone(),
                     password: if self.password_input.is_empty() {
@@ -212,87 +563,33 @@ impl Application for Ultimate64Browser {
                     },
                 };
                 self.settings.connection = conn_settings;
-                self.settings.save().ok();
+                if let Err(e) = self.settings.save() {
+                    log::warn!("Could not save settings: {}", e);
+                }
                 self.establish_connection();
-                // Automatically refresh status after connecting
+                // Trigger status refresh and remote browser refresh after a short delay
                 Command::perform(
                     async {
-                        // Small delay to ensure connection is established
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     },
-                    |_| Message::RefreshStatus
+                    |_| Message::RefreshAfterConnect,
                 )
             }
+
             Message::DisconnectPressed => {
+                log::info!("Disconnecting...");
                 self.connection = None;
+                self.host_url = None;
                 self.status.connected = false;
                 self.status.device_info = None;
                 self.status.mounted_disks.clear();
-                log::info!("Disconnected from Ultimate64");
+                self.remote_browser.set_host(None);
+                self.user_message = Some(UserMessage::Info(
+                    "Disconnected from Ultimate64".to_string(),
+                ));
                 Command::none()
             }
-            Message::CommandInputChanged(input) => {
-                self.command_input = input;
-                Command::none()
-            }
-            Message::SendCommand => {
-                if !self.command_input.is_empty() {
-                    let cmd = self.command_input.clone();
-                    self.command_history.push(cmd.clone());
-                    self.command_input.clear();
-                    
-                    if let Some(conn) = &self.connection {
-                        let conn = conn.clone();
-                        Command::perform(
-                            async move {
-                                let conn = conn.lock().await;
-                                conn.type_text(&format!("{}\n", cmd))
-                                    .map(|_| format!("Sent: {}", cmd))
-                                    .map_err(|e| format!("Failed to send command: {}", e))
-                            },
-                            Message::MachineCommandCompleted,
-                        )
-                    } else {
-                        self.error_message = Some("Not connected to Ultimate64".to_string());
-                        Command::none()
-                    }
-                } else {
-                    Command::none()
-                }
-            }
-            Message::ConnectionChanged(conn) => {
-                self.settings.connection = conn;
-                self.settings.save().ok();
-                self.establish_connection();
-                Command::perform(
-                    async {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    },
-                    |_| Message::RefreshStatus
-                )
-            }
-            Message::TemplateSelected(template) => {
-                self.selected_template = Some(template);
-                Command::none()
-            }
-            Message::ExecuteTemplate => {
-                if let Some(template) = &self.selected_template {
-                    if let Some(conn) = &self.connection {
-                        let conn = conn.clone();
-                        let commands = template.commands.clone();
-                        return Command::perform(
-                            async move {
-                                execute_template_commands(conn, commands).await
-                            },
-                            |result| match result {
-                                Ok(_) => Message::RefreshStatus,
-                                Err(e) => Message::ShowError(e),
-                            },
-                        );
-                    }
-                }
-                Command::none()
-            }
+
             Message::RefreshStatus => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -304,148 +601,309 @@ impl Application for Ultimate64Browser {
                     Command::none()
                 }
             }
+
+            Message::RefreshAfterConnect => {
+                // Refresh both status and remote browser after connection
+                let status_cmd = if let Some(conn) = &self.connection {
+                    let conn = conn.clone();
+                    Command::perform(
+                        async move { fetch_status(conn).await },
+                        Message::StatusUpdated,
+                    )
+                } else {
+                    Command::none()
+                };
+
+                let browser_cmd = self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
+                    .map(Message::RemoteBrowser);
+
+                Command::batch(vec![status_cmd, browser_cmd])
+            }
+
             Message::StatusUpdated(result) => {
                 match result {
                     Ok(status) => {
-                        log::info!("Status updated - Connected: {}, Device: {:?}, Disks: {}", 
-                            status.connected, status.device_info, status.mounted_disks.len());
+                        log::info!(
+                            "Status: Connected={}, Device={:?}, Disks={}",
+                            status.connected,
+                            status.device_info,
+                            status.mounted_disks.len()
+                        );
                         self.status = status;
                     }
                     Err(e) => {
                         log::error!("Status update failed: {}", e);
-                        self.error_message = Some(e);
+                        self.user_message =
+                            Some(UserMessage::Error(format!("Status update failed: {}", e)));
                     }
                 }
                 Command::none()
             }
+
+            Message::TemplateSelected(template) => {
+                self.selected_template = Some(template);
+                Command::none()
+            }
+
+            Message::ExecuteTemplate => {
+                if let Some(template) = &self.selected_template {
+                    if let Some(conn) = &self.connection {
+                        let conn = conn.clone();
+                        let commands = template.commands.clone();
+                        return Command::perform(
+                            async move { execute_template_commands(conn, commands).await },
+                            |result| match result {
+                                Ok(_) => Message::RefreshStatus,
+                                Err(e) => Message::ShowError(e),
+                            },
+                        );
+                    } else {
+                        self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    }
+                }
+                Command::none()
+            }
+
             Message::ShowError(error) => {
-                self.error_message = Some(error);
+                log::error!("Error: {}", error);
+                self.user_message = Some(UserMessage::Error(error));
                 Command::none()
             }
-            Message::DismissError => {
-                self.error_message = None;
+
+            Message::ShowInfo(info) => {
+                log::info!("Info: {}", info);
+                self.user_message = Some(UserMessage::Info(info));
                 Command::none()
             }
+
+            Message::DismissMessage => {
+                self.user_message = None;
+                Command::none()
+            }
+
             Message::StartVideoStream => {
                 if !self.video_streaming {
                     self.start_video_stream();
                 }
                 Command::none()
             }
+
             Message::StopVideoStream => {
                 self.stop_video_stream();
                 Command::none()
             }
+
             Message::TakeScreenshot => {
-                Command::perform(
-                    take_screenshot_async(),
-                    Message::ScreenshotTaken,
-                )
+                Command::perform(take_screenshot_async(), Message::ScreenshotTaken)
             }
+
             Message::ScreenshotTaken(result) => {
                 match result {
                     Ok(path) => {
-                        log::info!("Screenshot saved to: {}", path);
-                        self.error_message = Some(format!("Screenshot saved to: {}", path));
+                        self.user_message =
+                            Some(UserMessage::Info(format!("Screenshot saved: {}", path)));
                     }
                     Err(e) => {
-                        log::error!("Screenshot failed: {}", e);
-                        self.error_message = Some(format!("Screenshot failed: {}", e));
+                        self.user_message =
+                            Some(UserMessage::Error(format!("Screenshot failed: {}", e)));
                     }
                 }
                 Command::none()
             }
-            Message::VideoFrameUpdate => {
-                // Trigger a redraw when we have a new frame
-                Command::none()
-            }
+
+            Message::VideoFrameUpdate => Command::none(),
+
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
                     Command::perform(
                         async move {
-                            let conn = conn.lock().await;
-                            conn.reset()
-                                .map(|_| "Machine reset successfully".to_string())
-                                .map_err(|e| format!("Reset failed: {}", e))
+                            tokio::task::spawn_blocking(move || {
+                                let conn = conn.blocking_lock();
+                                conn.reset()
+                                    .map(|_| "Machine reset successfully".to_string())
+                                    .map_err(|e| format!("Reset failed: {}", e))
+                            })
+                            .await
+                            .map_err(|e| format!("Task error: {}", e))?
                         },
                         Message::MachineCommandCompleted,
                     )
                 } else {
-                    self.error_message = Some("Not connected to Ultimate64".to_string());
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
                     Command::none()
                 }
             }
+
+            Message::RebootMachine => {
+                if let Some(host) = &self.host_url {
+                    let url = format!("{}/v1/machine:reboot", host);
+                    Command::perform(
+                        async move {
+                            let client = reqwest::Client::new();
+                            client
+                                .put(&url)
+                                .send()
+                                .await
+                                .map_err(|e| format!("Reboot failed: {}", e))?;
+                            Ok("Machine rebooting...".to_string())
+                        },
+                        Message::MachineCommandCompleted,
+                    )
+                } else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    Command::none()
+                }
+            }
+
+            Message::PauseMachine => {
+                if let Some(host) = &self.host_url {
+                    let url = format!("{}/v1/machine:pause", host);
+                    Command::perform(
+                        async move {
+                            let client = reqwest::Client::new();
+                            client
+                                .put(&url)
+                                .send()
+                                .await
+                                .map_err(|e| format!("Pause failed: {}", e))?;
+                            Ok("Machine paused".to_string())
+                        },
+                        Message::MachineCommandCompleted,
+                    )
+                } else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    Command::none()
+                }
+            }
+
+            Message::ResumeMachine => {
+                if let Some(host) = &self.host_url {
+                    let url = format!("{}/v1/machine:resume", host);
+                    Command::perform(
+                        async move {
+                            let client = reqwest::Client::new();
+                            client
+                                .put(&url)
+                                .send()
+                                .await
+                                .map_err(|e| format!("Resume failed: {}", e))?;
+                            Ok("Machine resumed".to_string())
+                        },
+                        Message::MachineCommandCompleted,
+                    )
+                } else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    Command::none()
+                }
+            }
+
             Message::PoweroffMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
                     Command::perform(
                         async move {
-                            let conn = conn.lock().await;
-                            conn.poweroff()
-                                .map(|_| "Machine powered off".to_string())
-                                .map_err(|e| format!("Poweroff failed: {}", e))
+                            tokio::task::spawn_blocking(move || {
+                                let conn = conn.blocking_lock();
+                                conn.poweroff()
+                                    .map(|_| "Machine powered off".to_string())
+                                    .map_err(|e| format!("Poweroff failed: {}", e))
+                            })
+                            .await
+                            .map_err(|e| format!("Task error: {}", e))?
                         },
                         Message::MachineCommandCompleted,
                     )
                 } else {
-                    self.error_message = Some("Not connected to Ultimate64".to_string());
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
                     Command::none()
                 }
             }
+
             Message::MachineCommandCompleted(result) => {
                 match result {
                     Ok(msg) => {
-                        log::info!("{}", msg);
-                        // Don't show success as error, maybe add a status message later
+                        self.user_message = Some(UserMessage::Info(msg));
                     }
                     Err(e) => {
-                        self.error_message = Some(e);
+                        self.user_message = Some(UserMessage::Error(e));
                     }
                 }
                 Command::none()
+            }
+
+            Message::CommandInputChanged(input) => {
+                self.command_input = input;
+                Command::none()
+            }
+
+            Message::SendCommand => {
+                if !self.command_input.is_empty() {
+                    let cmd = self.command_input.clone();
+                    self.command_history.push(cmd.clone());
+                    self.command_input.clear();
+
+                    if let Some(conn) = &self.connection {
+                        let conn = conn.clone();
+                        Command::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = conn.blocking_lock();
+                                    conn.type_text(&format!("{}\n", cmd))
+                                        .map(|_| format!("Sent: {}", cmd))
+                                        .map_err(|e| format!("Failed: {}", e))
+                                })
+                                .await
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            Message::MachineCommandCompleted,
+                        )
+                    } else {
+                        self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                        Command::none()
+                    }
+                } else {
+                    Command::none()
+                }
             }
         }
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // Tab bar
+        // Tab bar with retro style
         let tabs = container(
             row![
-                button(text(if self.active_tab == Tab::DiskBrowser { "▼ DISK BROWSER" } else { "DISK BROWSER" }))
-                    .on_press(Message::TabSelected(Tab::DiskBrowser))
-                    .padding([10, 20]),
-                button(text(if self.active_tab == Tab::MusicPlayer { "▼ MUSIC PLAYER" } else { "MUSIC PLAYER" }))
-                    .on_press(Message::TabSelected(Tab::MusicPlayer))
-                    .padding([10, 20]),
-                button(text(if self.active_tab == Tab::VideoViewer { "▼ VIDEO VIEWER" } else { "VIDEO VIEWER" }))
-                    .on_press(Message::TabSelected(Tab::VideoViewer))
-                    .padding([10, 20]),
-                button(text(if self.active_tab == Tab::Settings { "▼ SETTINGS" } else { "SETTINGS" }))
-                    .on_press(Message::TabSelected(Tab::Settings))
-                    .padding([10, 20]),
+                self.tab_button("FILE BROWSER", Tab::DualPaneBrowser),
+                self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
+                self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
+                self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
         )
         .padding(5);
 
-        let status_bar = container(self.view_status_bar())
-            .padding(10)
-            .width(Length::Fill);
+        // Connection status bar at top
+        let connection_bar = self.view_connection_bar();
 
-        let content = container(
-            match self.active_tab {
-                Tab::DiskBrowser => self.view_disk_browser(),
-                Tab::MusicPlayer => self.view_music_player(),
-                Tab::VideoViewer => self.view_video_viewer(),
-                Tab::Settings => self.view_settings(),
-            }
-        )
-        .padding(20)
+        // Main content area
+        let content = container(match self.active_tab {
+            Tab::DualPaneBrowser => self.view_dual_pane_browser(),
+            Tab::MusicPlayer => self.view_music_player(),
+            Tab::VideoViewer => self.view_video_viewer(),
+            Tab::Settings => self.view_settings(),
+        })
+        .padding(10)
         .width(Length::Fill)
         .height(Length::Fill);
 
+        // Bottom status/control bar
+        let status_bar = self.view_status_bar();
+
         let main_content = column![
+            connection_bar,
+            horizontal_rule(1),
             tabs,
             horizontal_rule(1),
             content,
@@ -454,85 +912,454 @@ impl Application for Ultimate64Browser {
         ]
         .spacing(0);
 
-        // Show error overlay if there's an error
-        if let Some(error) = &self.error_message {
-            let error_box = container(
-                column![
-                    text("ERROR").size(24),
-                    text(error).size(14),
-                    Space::with_height(10),
-                    button(text("DISMISS"))
-                        .on_press(Message::DismissError)
-                        .padding(10),
-                ]
-                .spacing(10)
-                .padding(30),
-            )
-            .max_width(400)
-            .center_x()
-            .center_y();
-
-            container(column![main_content, error_box])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        } else {
-            container(main_content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        }
+        container(main_content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 }
 
 impl Ultimate64Browser {
+    fn tab_button(&self, label: &str, tab: Tab) -> Element<'_, Message> {
+        let is_active = self.active_tab == tab;
+        button(text(label).size(14))
+            .on_press(Message::TabSelected(tab))
+            .padding([8, 16])
+            .style(if is_active {
+                iced::theme::Button::Primary
+            } else {
+                iced::theme::Button::Secondary
+            })
+            .into()
+    }
+
+    fn view_connection_bar(&self) -> Element<'_, Message> {
+        let status_indicator = if self.status.connected {
+            text("* CONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
+                0.2, 0.8, 0.2,
+            )))
+        } else {
+            text("  DISCONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
+                0.8, 0.2, 0.2,
+            )))
+        };
+
+        let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(12);
+
+        let mounted_text = if !self.status.mounted_disks.is_empty() {
+            let disks: Vec<String> = self
+                .status
+                .mounted_disks
+                .iter()
+                .map(|(drive, name)| format!("{}:{}", drive.to_uppercase(), name))
+                .collect();
+            text(disks.join(" | ")).size(12)
+        } else {
+            text("No disks mounted").size(12)
+        };
+
+        container(
+            row![
+                status_indicator,
+                text(" | ").size(12),
+                device_text,
+                text(" | ").size(12),
+                mounted_text,
+                horizontal_space(),
+                button(text("Refresh").size(12))
+                    .on_press(Message::RefreshStatus)
+                    .padding([4, 8]),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+        )
+        .padding([5, 10])
+        .into()
+    }
+
+    fn view_dual_pane_browser(&self) -> Element<'_, Message> {
+        // Left pane - Local files
+        let left_header = row![
+            text("LOCAL").size(12).width(Length::Fill),
+            if self.active_pane == Pane::Left {
+                text("[ACTIVE]").size(10)
+            } else {
+                text("").size(10)
+            }
+        ]
+        .padding(5)
+        .align_items(iced::Alignment::Center);
+
+        let left_pane = container(column![
+            left_header,
+            horizontal_rule(1),
+            self.left_browser.view().map(Message::LeftBrowser),
+        ])
+        .width(Length::FillPortion(1))
+        .height(Length::Fill)
+        .padding(if self.active_pane == Pane::Left { 2 } else { 0 });
+
+        // Copy buttons in center
+        let copy_buttons = container(
+            column![
+                button(text(">>").size(14))
+                    .on_press(Message::CopyLocalToRemote)
+                    .padding([8, 12]),
+                Space::with_height(10),
+                button(text("<<").size(14))
+                    .on_press(Message::CopyRemoteToLocal)
+                    .padding([8, 12]),
+            ]
+            .align_items(iced::Alignment::Center),
+        )
+        .padding([20, 5])
+        .center_y();
+
+        // Right pane - Ultimate64 files
+        let connection_indicator = if self.status.connected { "*" } else { "" };
+        let right_header = row![
+            text(format!("ULTIMATE64 {}", connection_indicator))
+                .size(12)
+                .width(Length::Fill),
+            button(text("Refresh").size(10))
+                .on_press(Message::RemoteBrowser(RemoteBrowserMessage::RefreshFiles))
+                .padding([2, 6]),
+        ]
+        .padding(5)
+        .align_items(iced::Alignment::Center);
+
+        let right_pane = container(column![
+            right_header,
+            horizontal_rule(1),
+            self.remote_browser.view().map(Message::RemoteBrowser),
+        ])
+        .width(Length::FillPortion(1))
+        .height(Length::Fill)
+        .padding(if self.active_pane == Pane::Right {
+            2
+        } else {
+            0
+        });
+
+        // Template section at bottom
+        let template_section = container(
+            row![
+                text("Quick Actions:").size(12),
+                pick_list(
+                    self.template_manager.get_templates(),
+                    self.selected_template.clone(),
+                    Message::TemplateSelected,
+                )
+                .placeholder("Select template...")
+                .width(Length::Fixed(200.0)),
+                button(text("Execute").size(12))
+                    .on_press(Message::ExecuteTemplate)
+                    .padding([4, 12]),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+        )
+        .padding(10);
+
+        column![
+            row![left_pane, copy_buttons, right_pane].height(Length::Fill),
+            horizontal_rule(1),
+            template_section,
+        ]
+        .into()
+    }
+
+    fn view_music_player(&self) -> Element<'_, Message> {
+        self.music_player.view().map(Message::MusicPlayer)
+    }
+
+    fn view_video_viewer(&self) -> Element<'_, Message> {
+        let controls = row![
+            if self.video_streaming {
+                button(text("STOP"))
+                    .on_press(Message::StopVideoStream)
+                    .padding([8, 16])
+            } else {
+                button(text("START"))
+                    .on_press(Message::StartVideoStream)
+                    .padding([8, 16])
+            },
+            button(text("Screenshot"))
+                .on_press(Message::TakeScreenshot)
+                .padding([8, 16]),
+        ]
+        .spacing(10);
+
+        let video_display: Element<'_, Message> = if self.video_streaming {
+            if let Ok(frame_guard) = self.video_frame.lock() {
+                if let Some(frame_data) = &*frame_guard {
+                    container(
+                        column![
+                            text("STREAMING").size(16),
+                            text(format!("{} bytes", frame_data.len())).size(12),
+                            text("384x272 @ 50Hz").size(12),
+                        ]
+                        .spacing(5)
+                        .align_items(iced::Alignment::Center),
+                    )
+                    .padding(40)
+                    .into()
+                } else {
+                    container(text("Waiting for frames...").size(14))
+                        .padding(40)
+                        .into()
+                }
+            } else {
+                text("Frame buffer error").into()
+            }
+        } else {
+            container(
+                column![
+                    text("VIDEO STREAM INACTIVE").size(16),
+                    Space::with_height(10),
+                    text("UDP Multicast: 239.0.1.64:11000").size(12),
+                ]
+                .align_items(iced::Alignment::Center),
+            )
+            .padding(40)
+            .into()
+        };
+
+        // Command prompt section
+        let command_history_items: Vec<Element<'_, Message>> = self
+            .command_history
+            .iter()
+            .rev()
+            .take(10)
+            .map(|cmd| text(format!("> {}", cmd)).size(11).into())
+            .collect();
+
+        let command_section = column![
+            text("COMMAND PROMPT").size(14),
+            row![
+                text("C64> ").size(14),
+                text_input("Enter BASIC command...", &self.command_input)
+                    .on_input(Message::CommandInputChanged)
+                    .on_submit(Message::SendCommand)
+                    .width(Length::Fill),
+                button(text("Send").size(12))
+                    .on_press(Message::SendCommand)
+                    .padding([4, 12]),
+            ]
+            .spacing(5)
+            .align_items(iced::Alignment::Center),
+            // Command history
+            scrollable(Column::with_children(command_history_items).spacing(2),)
+                .height(Length::Fixed(100.0)),
+        ]
+        .spacing(10)
+        .padding(10);
+
+        column![
+            text("VIC VIDEO STREAM").size(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            controls,
+            video_display,
+            horizontal_rule(1),
+            command_section,
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    fn view_settings(&self) -> Element<'_, Message> {
+        let connection_section = column![
+            text("CONNECTION SETTINGS").size(18),
+            Space::with_height(10),
+            text("Ultimate64 IP Address:").size(14),
+            text_input("192.168.1.64", &self.host_input)
+                .on_input(Message::HostInputChanged)
+                .padding(10)
+                .width(Length::Fixed(300.0)),
+            Space::with_height(10),
+            text("Password (optional):").size(14),
+            text_input("Enter password...", &self.password_input)
+                .on_input(Message::PasswordInputChanged)
+                .padding(10)
+                .width(Length::Fixed(300.0)),
+            Space::with_height(15),
+            row![
+                button(text("Connect"))
+                    .on_press(Message::ConnectPressed)
+                    .padding([10, 20]),
+                button(text("Disconnect"))
+                    .on_press(Message::DisconnectPressed)
+                    .padding([10, 20]),
+                button(text("Test Connection"))
+                    .on_press(Message::RefreshStatus)
+                    .padding([10, 20]),
+            ]
+            .spacing(10),
+        ];
+
+        let status_section = column![
+            Space::with_height(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            text("CONNECTION STATUS").size(18),
+            Space::with_height(10),
+            if self.status.connected {
+                text(format!("✓ Connected to {}", self.settings.connection.host)).style(
+                    iced::theme::Text::Color(iced::Color::from_rgb(0.2, 0.8, 0.2)),
+                )
+            } else {
+                text("✗ Not connected").style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.8, 0.2, 0.2,
+                )))
+            },
+            if let Some(info) = &self.status.device_info {
+                text(format!("Device: {}", info)).size(14)
+            } else {
+                text("").size(14)
+            },
+        ];
+
+        let debug_section = column![
+            Space::with_height(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            text("DEBUG INFO").size(18),
+            text(format!("Platform: {}", std::env::consts::OS)).size(12),
+            text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
+        ];
+
+        container(
+            column![connection_section, status_section, debug_section]
+                .spacing(5)
+                .padding(20),
+        )
+        .into()
+    }
+
+    fn view_status_bar(&self) -> Element<'_, Message> {
+        let video_status = if self.video_streaming {
+            "STREAMING"
+        } else {
+            "IDLE"
+        };
+
+        // Show user message if present, otherwise show video status
+        let status_text: Element<'_, Message> = if let Some(msg) = &self.user_message {
+            let (prefix, message, is_error) = match msg {
+                UserMessage::Error(e) => ("ERROR: ", e.as_str(), true),
+                UserMessage::Info(i) => ("", i.as_str(), false),
+            };
+            let color = if is_error {
+                iced::Color::from_rgb(0.8, 0.0, 0.0)
+            } else {
+                iced::Color::from_rgb(0.0, 0.5, 0.0)
+            };
+            row![
+                text(format!("{}{}", prefix, message))
+                    .size(12)
+                    .style(iced::theme::Text::Color(color)),
+                button(text("X").size(10))
+                    .on_press(Message::DismissMessage)
+                    .padding([2, 6]),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center)
+            .into()
+        } else {
+            text(video_status).size(12).into()
+        };
+
+        container(
+            row![
+                status_text,
+                horizontal_space(),
+                button(text("PAUSE").size(11))
+                    .on_press(Message::PauseMachine)
+                    .padding([4, 8]),
+                button(text("RESUME").size(11))
+                    .on_press(Message::ResumeMachine)
+                    .padding([4, 8]),
+                text("|").size(12),
+                button(text("RESET").size(11))
+                    .on_press(Message::ResetMachine)
+                    .padding([4, 8]),
+                button(text("REBOOT").size(11))
+                    .on_press(Message::RebootMachine)
+                    .padding([4, 8]),
+                button(text("POWER OFF").size(11))
+                    .on_press(Message::PoweroffMachine)
+                    .padding([4, 8]),
+            ]
+            .spacing(6)
+            .align_items(iced::Alignment::Center),
+        )
+        .padding([8, 15])
+        .into()
+    }
+
     fn establish_connection(&mut self) {
-        // Clear old connection first
         self.connection = None;
+        self.host_url = None;
         self.status.connected = false;
         self.status.device_info = None;
         self.status.mounted_disks.clear();
-        
+
         if self.settings.connection.host.is_empty() {
-            self.error_message = Some("Host IP cannot be empty".to_string());
+            log::error!("Host IP is empty");
+            self.user_message = Some(UserMessage::Error("Host IP cannot be empty".to_string()));
             return;
         }
 
-        // Parse the host - try as IP address first
-        let host = if let Ok(ip_addr) = self.settings.connection.host.parse::<std::net::Ipv4Addr>() {
+        log::info!(
+            "Attempting to connect to: {}",
+            self.settings.connection.host
+        );
+
+        // Parse host
+        let host = if let Ok(ip_addr) = self.settings.connection.host.parse::<std::net::Ipv4Addr>()
+        {
+            log::debug!("Parsed as IPv4: {}", ip_addr);
             Host::Ipv4(ip_addr)
         } else if let Ok(ip_addr) = self.settings.connection.host.parse::<std::net::Ipv6Addr>() {
+            log::debug!("Parsed as IPv6: {}", ip_addr);
             Host::Ipv6(ip_addr)
         } else {
-            // Try as domain name
             match Host::parse(&self.settings.connection.host) {
-                Ok(h) => h,
+                Ok(h) => {
+                    log::debug!("Parsed as domain: {:?}", h);
+                    h
+                }
                 Err(e) => {
-                    log::error!("Invalid host: {}", e);
-                    self.error_message = Some(format!("Invalid host address: {}", e));
-                    self.status.connected = false;
-                    self.connection = None;
+                    log::error!(
+                        "Failed to parse host '{}': {}",
+                        self.settings.connection.host,
+                        e
+                    );
+                    self.user_message = Some(UserMessage::Error(format!("Invalid host: {}", e)));
                     return;
                 }
             }
         };
 
-        log::info!("Attempting to connect to {:?} with password: {}", 
-            host, 
-            self.settings.connection.password.is_some());
-        
+        log::info!("Creating REST connection...");
         match Rest::new(&host, self.settings.connection.password.clone()) {
             Ok(rest) => {
-                log::info!("Connection established successfully");
+                log::info!("Connection successful!");
                 self.connection = Some(Arc::new(TokioMutex::new(rest)));
+                // Build proper HTTP URL
+                let http_url = format!("http://{}", self.settings.connection.host);
+                self.host_url = Some(http_url.clone());
                 self.status.connected = true;
-                log::info!("Connected successfully to Ultimate64!");
+                self.remote_browser.set_host(Some(http_url));
+                self.user_message = Some(UserMessage::Info(format!(
+                    "Connected to {}",
+                    self.settings.connection.host
+                )));
             }
             Err(e) => {
                 log::error!("Connection failed: {}", e);
-                self.error_message = Some(format!("Connection failed: {}", e));
-                self.status.connected = false;
-                self.connection = None;
+                self.user_message = Some(UserMessage::Error(format!("Connection failed: {}", e)));
             }
         }
     }
@@ -543,71 +1370,54 @@ impl Ultimate64Browser {
         }
 
         log::info!("Starting video stream...");
-        
-        // Reset the stop signal
         self.video_stop_signal.store(false, Ordering::Relaxed);
-        
+
         let frame_buffer = self.video_frame.clone();
         let stop_signal = self.video_stop_signal.clone();
         self.video_streaming = true;
 
-        // Start background thread to capture VIC frames with proper shutdown
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
             let url = Url::parse("udp://239.0.1.64:11000").unwrap();
-            
+
             match vicstream::get_socket(&url) {
                 Ok(socket) => {
-                    // Set socket to non-blocking mode for responsive shutdown
                     if let Err(e) = socket.set_nonblocking(true) {
-                        log::error!("Failed to set socket to non-blocking: {:?}", e);
+                        log::error!("Failed to set non-blocking: {:?}", e);
                         return;
                     }
 
-                    log::info!("Video stream socket created and set to non-blocking");
-
                     loop {
-                        // Check if we should stop
                         if stop_signal.load(Ordering::Relaxed) {
-                            log::info!("Video stream thread received stop signal");
                             break;
                         }
 
                         match vicstream::capture_frame(socket.try_clone().unwrap()) {
                             Ok(data) => {
-                                // Store the raw frame data
                                 if let Ok(mut frame) = frame_buffer.lock() {
                                     *frame = Some(data);
-                                } else {
-                                    log::warn!("Failed to lock frame buffer");
                                 }
                             }
                             Err(e) => {
-                                // Handle would-block errors (expected with non-blocking socket)
                                 if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
                                     if io_error.kind() == std::io::ErrorKind::WouldBlock {
-                                        // No data available, sleep briefly and continue
                                         thread::sleep(std::time::Duration::from_millis(10));
                                         continue;
                                     }
                                 }
-                                
-                                log::error!("Frame capture error: {:?}", e);
                                 thread::sleep(std::time::Duration::from_millis(50));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    log::error!("Failed to create UDP socket: {:?}", e);
+                    log::error!("Failed to create socket: {:?}", e);
                 }
             }
-            
-            log::info!("Video stream thread terminated gracefully");
+            log::info!("Video stream thread stopped");
         });
 
         self.video_stream_handle = Some(handle);
-        log::info!("Video stream started successfully");
     }
 
     fn stop_video_stream(&mut self) {
@@ -616,367 +1426,44 @@ impl Ultimate64Browser {
         }
 
         log::info!("Stopping video stream...");
-        
-        // Signal the thread to stop
         self.video_stop_signal.store(true, Ordering::Relaxed);
-        
-        // Wait for the thread to finish (with timeout)
+
         if let Some(handle) = self.video_stream_handle.take() {
-            // Create a separate thread to handle the join with timeout
-            let join_handle = thread::spawn(move || {
-                handle.join()
-            });
-            
-            // Give the thread up to 2 seconds to shut down gracefully
-            let timeout = std::time::Duration::from_secs(2);
-            let start = std::time::Instant::now();
-            let mut joined = false;
-            
-            while start.elapsed() < timeout {
-                if join_handle.is_finished() {
-                    match join_handle.join() {
-                        Ok(Ok(())) => {
-                            log::info!("Video stream thread joined successfully");
-                            joined = true;
-                        },
-                        Ok(Err(e)) => {
-                            log::warn!("Video stream thread panicked: {:?}", e);
-                            joined = true;
-                        },
-                        Err(_) => {
-                            log::warn!("Failed to join video stream thread");
-                            joined = true;
-                        }
-                    }
-                    break;
-                }
-                thread::sleep(std::time::Duration::from_millis(10));
-            }
-            
-            if !joined {
-                log::warn!("Video stream thread did not shut down within timeout - continuing anyway");
-            }
+            let _ = handle.join();
         }
-        
+
         self.video_streaming = false;
-        
-        // Clear the frame buffer
         if let Ok(mut frame) = self.video_frame.lock() {
             *frame = None;
         }
-        
-        log::info!("Video stream stopped");
-    }
-
-    fn view_video_viewer(&self) -> Element<'_, Message> {
-        // Control buttons
-        let controls = row![
-            if self.video_streaming {
-                button(text("■ STOP STREAM"))
-                    .on_press(Message::StopVideoStream)
-                    .padding(10)
-            } else {
-                button(text("▶ START STREAM"))
-                    .on_press(Message::StartVideoStream)
-                    .padding(10)
-            },
-            button(text("📷 SCREENSHOT"))
-                .on_press(Message::TakeScreenshot)
-                .padding(10),
-        ]
-        .spacing(10);
-
-        let video_display: Element<'_, Message> = if self.video_streaming {
-            if let Ok(frame_guard) = self.video_frame.lock() {
-                if let Some(frame_data) = &*frame_guard {
-                    container(
-                        column![
-                            text("STREAMING ACTIVE").size(16),
-                            text(format!("{} bytes received", frame_data.len())),
-                            text("384x272 @ 50Hz"),
-                            text("UDP: 239.0.1.64:11000"),
-                        ]
-                        .spacing(5)
-                        .align_items(iced::Alignment::Center),
-                    )
-                    .padding(20)
-                    .width(Length::Fill)
-                    .into()
-                } else {
-                    container(
-                        column![
-                            text("STREAMING ACTIVE").size(16),
-                            text("Waiting for video frames..."),
-                            text("UDP: 239.0.1.64:11000"),
-                        ]
-                        .spacing(5)
-                        .align_items(iced::Alignment::Center),
-                    )
-                    .padding(20)
-                    .width(Length::Fill)
-                    .into()
-                }
-            } else {
-                text("Error accessing frame buffer").into()
-            }
-        } else {
-            container(
-                column![
-                    text("VIDEO STREAM INACTIVE").size(16),
-                    Space::with_height(10),
-                    text("UDP MULTICAST"),
-                    text("239.0.1.64:11000"),
-                    Space::with_height(10),
-                    text("Click START STREAM to begin"),
-                ]
-                .spacing(5)
-                .align_items(iced::Alignment::Center),
-            )
-            .padding(40)
-            .width(Length::Fill)
-            .into()
-        };
-
-        // Command history display
-        let history_display: Element<'_, Message> = if !self.command_history.is_empty() {
-            let history_text: Vec<Element<'_, Message>> = self.command_history
-                .iter()
-                .rev()
-                .take(10)
-                .map(|cmd| {
-                    text(format!("> {}", cmd))
-                        .size(11)
-                        .into()
-                })
-                .collect();
-            
-            container(
-                scrollable(
-                    Column::with_children(history_text)
-                        .spacing(2)
-                        .padding(10),
-                )
-                .height(Length::Fixed(150.0)),
-            )
-            .width(Length::Fill)
-            .into()
-        } else {
-            container(
-                text("Command history will appear here")
-                    .size(11),
-            )
-            .padding(10)
-            .height(Length::Fixed(150.0))
-            .width(Length::Fill)
-            .into()
-        };
-
-        // Command prompt
-        let command_prompt = container(
-            row![
-                text("C64>"),
-                text_input("Enter BASIC command...", &self.command_input)
-                    .on_input(Message::CommandInputChanged)
-                    .on_submit(Message::SendCommand),
-                button(text("SEND"))
-                    .on_press(Message::SendCommand)
-                    .padding(5),
-            ]
-            .spacing(10)
-            .align_items(iced::Alignment::Center),
-        )
-        .padding(10)
-        .width(Length::Fill);
-
-        column![
-            text("VIC VIDEO STREAM").size(20),
-            horizontal_rule(1),
-            Space::with_height(10),
-            controls,
-            Space::with_height(10),
-            video_display,
-            Space::with_height(10),
-            text("COMMAND HISTORY").size(14),
-            history_display,
-            Space::with_height(10),
-            text("COMMAND PROMPT").size(14),
-            command_prompt,
-        ]
-        .spacing(10)
-        .into()
-    }
-
-    fn view_disk_browser(&self) -> Element<'_, Message> {
-        let browser = self.file_browser.view().map(Message::FileBrowser);
-
-        let template_section = column![
-            text("Quick Actions").size(18),
-            row![
-                pick_list(
-                    self.template_manager.get_templates(),
-                    self.selected_template.clone(),
-                    Message::TemplateSelected,
-                )
-                .placeholder("Select template...")
-                .width(Length::FillPortion(2)),
-                button(text("Execute"))
-                    .on_press(Message::ExecuteTemplate)
-                    .padding(10),
-            ]
-            .spacing(10),
-        ]
-        .spacing(10);
-
-        column![browser, template_section]
-            .spacing(20)
-            .padding(10)
-            .into()
-    }
-
-    fn view_music_player(&self) -> Element<'_, Message> {
-        self.music_player.view().map(Message::MusicPlayer)
-    }
-
-    fn view_settings(&self) -> Element<'_, Message> {
-        let host_input = text_input("192.168.1.64", &self.host_input)
-            .on_input(Message::HostInputChanged)
-            .padding(10);
-        
-        let password_input = text_input("Optional password", &self.password_input)
-            .on_input(Message::PasswordInputChanged)
-            .padding(10);
-
-        let connect_button = button(text("Connect"))
-            .on_press(Message::ConnectPressed)
-            .padding(10);
-        
-        let disconnect_button = button(text("Disconnect"))
-            .on_press(Message::DisconnectPressed)
-            .padding(10);
-
-        let test_button = button(text("Test Connection"))
-            .on_press(Message::RefreshStatus)
-            .padding(10);
-
-        column![
-            text("Connection Settings").size(24),
-            text("Ultimate64 Host IP:"),
-            host_input,
-            text("Password (optional - will be visible):"),
-            password_input,
-            row![
-                connect_button,
-                disconnect_button,
-                test_button,
-            ].spacing(10),
-            text(""),
-            text("Connection Status:"),
-            if self.status.connected {
-                text(format!("[OK] Connected to {}", self.settings.connection.host))
-            } else {
-                text("[--] Not connected")
-            },
-            if let Some(info) = &self.status.device_info {
-                text(format!("Device: {}", info))
-            } else {
-                text("")
-            },
-        ]
-        .spacing(10)
-        .padding(20)
-        .into()
-    }
-
-    fn view_status_bar(&self) -> Element<'_, Message> {
-        let connection_indicator = text(if self.status.connected { 
-            "● CONNECTED" 
-        } else { 
-            "○ DISCONNECTED" 
-        });
-
-        let device_info = text(
-            self.status.device_info.as_deref().unwrap_or("NO DEVICE")
-        );
-
-        let mounted_info = text(if !self.status.mounted_disks.is_empty() {
-            let disks: Vec<String> = self.status.mounted_disks
-                .iter()
-                .map(|(drive, name)| format!("[{}] {}", drive.to_uppercase(), name))
-                .collect();
-            disks.join(" ")
-        } else {
-            "NO DISKS".to_string()
-        });
-
-        let video_status = text(if self.video_streaming {
-            "📹 STREAMING"
-        } else {
-            "📹 IDLE"
-        });
-
-        row![
-            connection_indicator,
-            text(" | "),
-            device_info,
-            text(" | "),
-            mounted_info,
-            text(" | "),
-            video_status,
-            horizontal_space(),
-            button(text("RESET"))
-                .on_press(Message::ResetMachine)
-                .padding(5),
-            button(text("POWER"))
-                .on_press(Message::PoweroffMachine)
-                .padding(5),
-            button(text("REFRESH"))
-                .on_press(Message::RefreshStatus)
-                .padding(5),
-        ]
-        .spacing(10)
-        .align_items(iced::Alignment::Center)
-        .into()
     }
 }
 
-// Implement Drop to ensure proper cleanup
 impl Drop for Ultimate64Browser {
     fn drop(&mut self) {
-        log::info!("Ultimate64Browser is being dropped, cleaning up...");
-        
-        // Ensure video stream is stopped when the app is dropped
         if self.video_streaming {
-            log::info!("Stopping video stream during cleanup...");
             self.stop_video_stream();
         }
-        
-        log::info!("Ultimate64Browser cleanup completed");
     }
 }
 
 async fn take_screenshot_async() -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    
-    log::info!("Taking screenshot...");
-    
-    // Create URL for VIC stream
+
     let url = Url::parse("udp://239.0.1.64:11000").map_err(|e| e.to_string())?;
-    
-    // Generate filename with timestamp
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?
         .as_secs();
-    
+
     let filename = format!("screenshot_{}.png", timestamp);
     let path = std::env::current_dir()
         .map_err(|e| e.to_string())?
         .join(&filename);
-    
-    // Take screenshot using the vicstream module
-    vicstream::take_snapshot(&url, Some(&path), Some(2))
-        .map_err(|e| e.to_string())?;
-    
+
+    vicstream::take_snapshot(&url, Some(&path), Some(2)).map_err(|e| e.to_string())?;
+
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -984,85 +1471,75 @@ async fn execute_template_commands(
     connection: Arc<TokioMutex<Rest>>,
     commands: Vec<String>,
 ) -> Result<(), String> {
-    let conn = connection.lock().await;
-    
-    log::info!("Executing template with {} commands", commands.len());
-    
     for command in commands {
-        log::info!("Executing command: {}", command);
-        
-        // Parse and execute template commands
+        log::info!("Executing: {}", command);
+        let conn = connection.clone();
+
         if command.starts_with("RESET") {
-            log::info!("Sending reset command...");
-            conn.reset().map_err(|e| {
-                log::error!("Reset failed: {}", e);
-                format!("Reset failed: {}", e)
-            })?;
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.reset().map_err(|e| format!("Reset failed: {}", e))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         } else if let Some(text) = command.strip_prefix("TYPE ") {
-            log::info!("Typing text: {}", text);
-            conn.type_text(text).map_err(|e| {
-                log::error!("Type text failed: {}", e);
-                format!("Type text failed: {}", e)
-            })?;
+            let text = text.to_string();
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.type_text(&text)
+                    .map_err(|e| format!("Type failed: {}", e))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else if command.starts_with("LOAD") {
-            log::info!("Sending load command...");
-            // Use the same format as the CLI example: load "*",8,1
-            conn.type_text("load\"*\",8,1\n").map_err(|e| {
-                log::error!("Load command failed: {}", e);
-                format!("Load command failed: {}", e)
-            })?;
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.type_text("load\"*\",8,1\n")
+                    .map_err(|e| format!("Load failed: {}", e))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else if command.starts_with("RUN") {
-            log::info!("Sending run command...");
-            conn.type_text("run\n").map_err(|e| {
-                log::error!("Run command failed: {}", e);
-                format!("Run command failed: {}", e)
-            })?;
-        } else {
-            log::warn!("Unknown command: {}", command);
+            tokio::task::spawn_blocking(move || {
+                let conn = conn.blocking_lock();
+                conn.type_text("run\n")
+                    .map_err(|e| format!("Run failed: {}", e))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
         }
     }
-    
-    log::info!("Template execution completed successfully");
+
     Ok(())
 }
 
 async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, String> {
-    let conn = connection.lock().await;
-    
-    log::info!("Fetching device status...");
-    
-    let device_info = match conn.info() {
-        Ok(info) => {
-            log::info!("Got device info: {} ({})", info.product, info.firmware_version);
-            Some(format!("{} ({})", info.product, info.firmware_version))
-        }
-        Err(e) => {
-            log::error!("Failed to get device info: {}", e);
-            return Err(format!("Failed to get device info: {}", e));
-        }
-    };
-    
-    let mounted_disks = match conn.drive_list() {
-        Ok(drives) => {
-            log::info!("Got drive list with {} drives", drives.len());
-            drives.into_iter()
-                .filter_map(|(name, drive)| {
-                    drive.image_file.map(|file| (name, file))
-                })
-                .collect()
-        }
-        Err(e) => {
-            log::warn!("Failed to get drive list: {}", e);
-            Vec::new()
-        }
-    };
+    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
+    tokio::task::spawn_blocking(move || {
+        let conn = connection.blocking_lock();
 
-    Ok(StatusInfo {
-        connected: true,
-        device_info,
-        mounted_disks,
+        let device_info = match conn.info() {
+            Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),
+            Err(e) => return Err(format!("Failed to get device info: {}", e)),
+        };
+
+        let mounted_disks = match conn.drive_list() {
+            Ok(drives) => drives
+                .into_iter()
+                .filter_map(|(name, drive)| drive.image_file.map(|file| (name, file)))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        Ok(StatusInfo {
+            connected: true,
+            device_info,
+            mounted_disks,
+        })
     })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))?
 }

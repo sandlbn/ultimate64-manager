@@ -24,14 +24,16 @@ impl TemplateManager {
             templates: Vec::new(),
         };
         manager.load_default_templates();
-        manager.load_custom_templates().ok();
+        if let Err(e) = manager.load_custom_templates() {
+            log::warn!("Could not load custom templates: {}", e);
+        }
         manager
     }
 
     fn load_default_templates(&mut self) {
         self.templates = vec![
             DiskTemplate {
-                name: "Load and Run First".to_string(),
+                name: "Load & Run First".to_string(),
                 description: "Reset, load first program, and run".to_string(),
                 commands: vec![
                     "RESET".to_string(),
@@ -40,7 +42,7 @@ impl TemplateManager {
                 ],
             },
             DiskTemplate {
-                name: "Load Directory".to_string(),
+                name: "List Directory".to_string(),
                 description: "Load and list disk directory".to_string(),
                 commands: vec![
                     "RESET".to_string(),
@@ -49,8 +51,8 @@ impl TemplateManager {
                 ],
             },
             DiskTemplate {
-                name: "Fast Load (JiffyDOS)".to_string(),
-                description: "Use JiffyDOS fast load if available".to_string(),
+                name: "JiffyDOS Fast Load".to_string(),
+                description: "Use JiffyDOS fast load".to_string(),
                 commands: vec![
                     "RESET".to_string(),
                     "TYPE @8\n".to_string(),
@@ -58,25 +60,12 @@ impl TemplateManager {
                 ],
             },
             DiskTemplate {
-                name: "Load Specific File".to_string(),
-                description: "Load a specific file by name".to_string(),
-                commands: vec![
-                    "RESET".to_string(),
-                    "TYPE load\"filename\",8,1\n".to_string(),
-                    "TYPE run\n".to_string(),
-                ],
+                name: "Reset Only".to_string(),
+                description: "Just reset the machine".to_string(),
+                commands: vec!["RESET".to_string()],
             },
             DiskTemplate {
-                name: "Simple Load".to_string(),
-                description: "Simple load without device specification".to_string(),
-                commands: vec![
-                    "RESET".to_string(),
-                    "TYPE load\n".to_string(),
-                    "TYPE run\n".to_string(),
-                ],
-            },
-            DiskTemplate {
-                name: "Run Only".to_string(),
+                name: "Run".to_string(),
                 description: "Just run an already loaded program".to_string(),
                 commands: vec!["TYPE run\n".to_string()],
             },
@@ -100,6 +89,7 @@ impl TemplateManager {
             if path.extension().and_then(|s| s.to_str()) == Some("json") {
                 let contents = fs::read_to_string(&path)?;
                 if let Ok(template) = serde_json::from_str::<DiskTemplate>(&contents) {
+                    log::info!("Loaded custom template: {}", template.name);
                     self.templates.push(template);
                 }
             }
