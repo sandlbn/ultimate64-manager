@@ -1,6 +1,6 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
