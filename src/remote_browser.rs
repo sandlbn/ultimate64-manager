@@ -19,6 +19,12 @@ pub enum RemoteBrowserMessage {
     DownloadComplete(Result<(String, Vec<u8>), String>),
     UploadFile(PathBuf, String), // local path, remote destination
     UploadComplete(Result<String, String>),
+    // Runners - execute files on Ultimate64
+    RunPrg(String),
+    RunCrt(String),
+    PlaySid(String),
+    PlayMod(String),
+    RunnerComplete(Result<String, String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +201,74 @@ impl RemoteBrowser {
                 }
                 Command::none()
             }
+
+            RemoteBrowserMessage::RunPrg(path) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Running PRG...".to_string());
+                    let host = host.clone();
+                    Command::perform(
+                        run_remote_file(host, path, "run_prg"),
+                        RemoteBrowserMessage::RunnerComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::RunCrt(path) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Running CRT...".to_string());
+                    let host = host.clone();
+                    Command::perform(
+                        run_remote_file(host, path, "run_crt"),
+                        RemoteBrowserMessage::RunnerComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::PlaySid(path) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Playing SID...".to_string());
+                    let host = host.clone();
+                    Command::perform(
+                        run_remote_file(host, path, "sidplay"),
+                        RemoteBrowserMessage::RunnerComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::PlayMod(path) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Playing MOD...".to_string());
+                    let host = host.clone();
+                    Command::perform(
+                        run_remote_file(host, path, "modplay"),
+                        RemoteBrowserMessage::RunnerComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::RunnerComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -253,41 +327,77 @@ impl RemoteBrowser {
                 .map(|entry| {
                     let is_selected = self.selected_file.as_ref() == Some(&entry.path);
 
-                    // Icon based on type
-                    let icon = if entry.is_dir {
-                        "DIR"
+                    // File type label
+                    let type_label = if entry.is_dir {
+                        ""
                     } else {
                         get_file_icon(&entry.name)
                     };
 
-                    // Format size
-                    let size_str = if entry.is_dir {
-                        String::new()
+                    // Truncate long filenames
+                    let max_name_len = 28;
+                    let display_name = if entry.name.len() > max_name_len {
+                        format!("{}...", &entry.name[..max_name_len - 3])
                     } else {
-                        format_size(entry.size)
+                        entry.name.clone()
                     };
 
-                    let name_text = text(format!("{:<3} {}", icon, entry.name)).size(11);
-                    let size_text = text(size_str).size(10);
+                    // Action button based on file type
+                    let ext = entry.name.to_lowercase();
+                    let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
+                        button(text("Open").size(10))
+                            .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
+                            .padding([2, 8])
+                            .into()
+                    } else if ext.ends_with(".prg") {
+                        button(text("Run").size(10))
+                            .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
+                            .padding([2, 8])
+                            .into()
+                    } else if ext.ends_with(".crt") {
+                        button(text("Run").size(10))
+                            .on_press(RemoteBrowserMessage::RunCrt(entry.path.clone()))
+                            .padding([2, 8])
+                            .into()
+                    } else if ext.ends_with(".sid") {
+                        button(text("Play").size(10))
+                            .on_press(RemoteBrowserMessage::PlaySid(entry.path.clone()))
+                            .padding([2, 8])
+                            .into()
+                    } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m")
+                    {
+                        button(text("Play").size(10))
+                            .on_press(RemoteBrowserMessage::PlayMod(entry.path.clone()))
+                            .padding([2, 8])
+                            .into()
+                    } else {
+                        iced::widget::Space::with_width(0).into()
+                    };
 
-                    let row_content = row![name_text, iced::widget::horizontal_space(), size_text]
-                        .spacing(5)
-                        .align_items(iced::Alignment::Center);
-
-                    let btn = button(row_content)
-                        .width(Length::Fill)
-                        .padding([4, 8])
-                        .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()));
+                    let file_row = row![
+                        // Clickable filename
+                        button(text(&display_name).size(11))
+                            .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
+                            .padding([4, 6])
+                            .width(Length::Fill),
+                        // Type label
+                        text(type_label).size(9).width(Length::Fixed(28.0)),
+                        // Action button
+                        action_button,
+                    ]
+                    .spacing(4)
+                    .align_items(iced::Alignment::Center)
+                    .padding([1, 2]);
 
                     if is_selected {
-                        column![btn].width(Length::Fill).into()
+                        column![file_row].width(Length::Fill).into()
                     } else {
-                        btn.into()
+                        file_row.into()
                     }
                 })
                 .collect();
 
-            scrollable(Column::with_children(items).spacing(2).width(Length::Fill))
+            scrollable(Column::with_children(items).spacing(0).width(Length::Fill))
                 .height(Length::Fill)
                 .into()
         };
@@ -335,17 +445,6 @@ fn get_file_icon(name: &str) -> &'static str {
         "TXT"
     } else {
         ""
-    }
-}
-
-// Format file size
-fn format_size(size: u64) -> String {
-    if size < 1024 {
-        format!("{}B", size)
-    } else if size < 1024 * 1024 {
-        format!("{}K", size / 1024)
-    } else {
-        format!("{:.1}M", size as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -622,4 +721,36 @@ async fn upload_file_ftp(
     .map_err(|e| format!("Task error: {}", e))?;
 
     result
+}
+
+// Run a file on Ultimate64 using REST API runners
+async fn run_remote_file(
+    host: String,
+    file_path: String,
+    runner: &'static str,
+) -> Result<String, String> {
+    log::info!("Running {} with runner: {}", file_path, runner);
+
+    let url = format!("http://{}:80/v1/runners:{}", host, runner);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(&url)
+        .query(&[("file", file_path.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    if response.status().is_success() {
+        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
+        match runner {
+            "run_prg" => Ok(format!("Running: {}", filename)),
+            "run_crt" => Ok(format!("Started: {}", filename)),
+            "sidplay" => Ok(format!("Playing SID: {}", filename)),
+            "modplay" => Ok(format!("Playing MOD: {}", filename)),
+            _ => Ok(format!("Executed: {}", filename)),
+        }
+    } else {
+        Err(format!("Runner failed: HTTP {}", response.status()))
+    }
 }
