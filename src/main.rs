@@ -1,12 +1,12 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
     widget::{
         Space, button, column, container, horizontal_rule, horizontal_space, pick_list, row, text,
-        text_input,
+        text_input, tooltip,
     },
 };
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use url::Host;
+
 mod file_browser;
 mod music_player;
 mod remote_browser;
@@ -276,7 +277,17 @@ impl Application for Ultimate64Browser {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Light
+        // Custom dark theme with lighter blue (like the reference screenshot)
+        Theme::custom(
+            "Ultimate64 Dark".to_string(),
+            iced::theme::Palette {
+                background: iced::Color::from_rgb(0.15, 0.15, 0.18), // Dark background
+                text: iced::Color::from_rgb(0.9, 0.9, 0.9),          // Light text
+                primary: iced::Color::from_rgb(0.45, 0.52, 0.85),    // Lighter blue
+                success: iced::Color::from_rgb(0.3, 0.7, 0.3),       // Green
+                danger: iced::Color::from_rgb(0.8, 0.3, 0.3),        // Red
+            },
+        )
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -678,6 +689,54 @@ impl Application for Ultimate64Browser {
                         }
                     }
                 }
+
+                // Handle keyboard command - intercept before passing to streaming
+                if let StreamingMessage::SendCommand = msg {
+                    let command = self.video_streaming.command_input.clone();
+                    if !command.is_empty() {
+                        if let Some(conn) = &self.connection {
+                            let conn = conn.clone();
+                            let cmd = command.clone();
+                            // Add to history with prompt
+                            self.video_streaming
+                                .command_history
+                                .push(format!("> {}", command));
+                            self.video_streaming.command_input.clear();
+
+                            return Command::perform(
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+                                        // Add newline to execute the command
+                                        conn.type_text(&format!("{}\n", cmd))
+                                            .map(|_| format!("Sent: {}", cmd))
+                                            .map_err(|e| format!("Failed to send: {}", e))
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+                                },
+                                |result| match result {
+                                    Ok(msg) => {
+                                        Message::Streaming(StreamingMessage::CommandSent(Ok(msg)))
+                                    }
+                                    Err(e) => {
+                                        Message::Streaming(StreamingMessage::CommandSent(Err(e)))
+                                    }
+                                },
+                            );
+                        } else {
+                            self.video_streaming
+                                .command_history
+                                .push("> ".to_string() + &command);
+                            self.video_streaming
+                                .command_history
+                                .push("Error: Not connected to Ultimate64".to_string());
+                            self.video_streaming.command_input.clear();
+                        }
+                    }
+                    return Command::none();
+                }
+
                 self.video_streaming.update(msg).map(Message::Streaming)
             }
 
@@ -937,13 +996,23 @@ impl Ultimate64Browser {
         // Copy buttons in center
         let copy_buttons = container(
             column![
-                button(text(">>").size(14))
-                    .on_press(Message::CopyLocalToRemote)
-                    .padding([8, 12]),
+                tooltip(
+                    button(text(">>").size(14))
+                        .on_press(Message::CopyLocalToRemote)
+                        .padding([8, 12]),
+                    "Upload to Ultimate64",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
                 Space::with_height(10),
-                button(text("<<").size(14))
-                    .on_press(Message::CopyRemoteToLocal)
-                    .padding([8, 12]),
+                tooltip(
+                    button(text("<<").size(14))
+                        .on_press(Message::CopyRemoteToLocal)
+                        .padding([8, 12]),
+                    "Download from Ultimate64",
+                    tooltip::Position::Left,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .align_items(iced::Alignment::Center),
         )
