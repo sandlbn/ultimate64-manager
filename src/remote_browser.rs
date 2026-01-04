@@ -1,6 +1,6 @@
 use iced::{
     Command, Element, Length,
-    widget::{Column, button, column, row, scrollable, text},
+    widget::{Column, button, column, horizontal_rule, row, scrollable, text, tooltip},
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -282,26 +282,51 @@ impl RemoteBrowser {
 
         // Navigation buttons
         let nav_buttons = row![
-            button(text("Up").size(11))
-                .on_press(RemoteBrowserMessage::NavigateUp)
-                .padding([4, 8]),
+            tooltip(
+                button(text("Up").size(11))
+                    .on_press(RemoteBrowserMessage::NavigateUp)
+                    .padding([4, 8]),
+                "Go to parent folder",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
         ]
         .spacing(5);
 
         // Quick navigation to common paths
         let quick_nav = row![
-            button(text("/").size(10))
-                .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
-                .padding([2, 6]),
-            button(text("Usb0").size(10))
-                .on_press(RemoteBrowserMessage::NavigateToPath("/Usb0".to_string()))
-                .padding([2, 6]),
-            button(text("Usb1").size(10))
-                .on_press(RemoteBrowserMessage::NavigateToPath("/Usb1".to_string()))
-                .padding([2, 6]),
-            button(text("SD").size(10))
-                .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
-                .padding([2, 6]),
+            tooltip(
+                button(text("/").size(10))
+                    .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
+                    .padding([2, 6]),
+                "Root directory",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(text("Usb0").size(10))
+                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb0".to_string()))
+                    .padding([2, 6]),
+                "USB Drive 0",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(text("Usb1").size(10))
+                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb1".to_string()))
+                    .padding([2, 6]),
+                "USB Drive 1",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(text("SD").size(10))
+                    .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
+                    .padding([2, 6]),
+                "SD Card",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
         ]
         .spacing(3);
 
@@ -321,85 +346,118 @@ impl RemoteBrowser {
                 text("Empty directory").size(12).into()
             }
         } else {
-            let items: Vec<Element<'_, RemoteBrowserMessage>> = self
-                .files
-                .iter()
-                .map(|entry| {
-                    let is_selected = self.selected_file.as_ref() == Some(&entry.path);
+            let mut items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
 
-                    // File type label
-                    let type_label = if entry.is_dir {
-                        ""
-                    } else {
-                        get_file_icon(&entry.name)
-                    };
+            for (i, entry) in self.files.iter().enumerate() {
+                if i > 0 {
+                    // Add divider between rows
+                    items.push(horizontal_rule(1).into());
+                }
 
-                    // Truncate long filenames
-                    let max_name_len = 28;
-                    let display_name = if entry.name.len() > max_name_len {
-                        format!("{}...", &entry.name[..max_name_len - 3])
-                    } else {
-                        entry.name.clone()
-                    };
+                let is_selected = self.selected_file.as_ref() == Some(&entry.path);
 
-                    // Action button based on file type
-                    let ext = entry.name.to_lowercase();
-                    let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
+                // File type label
+                let type_label = if entry.is_dir {
+                    ""
+                } else {
+                    get_file_icon(&entry.name)
+                };
+
+                // Truncate long filenames
+                let max_name_len = 28;
+                let display_name = if entry.name.len() > max_name_len {
+                    format!("{}...", &entry.name[..max_name_len - 3])
+                } else {
+                    entry.name.clone()
+                };
+
+                // Action button based on file type
+                let ext = entry.name.to_lowercase();
+                let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
+                    tooltip(
                         button(text("Open").size(10))
                             .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
-                            .padding([2, 8])
-                            .into()
-                    } else if ext.ends_with(".prg") {
+                            .padding([2, 8]),
+                        "Open folder",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else if ext.ends_with(".prg") {
+                    tooltip(
                         button(text("Run").size(10))
                             .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
-                            .padding([2, 8])
-                            .into()
-                    } else if ext.ends_with(".crt") {
+                            .padding([2, 8]),
+                        "Load and run PRG file",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else if ext.ends_with(".crt") {
+                    tooltip(
                         button(text("Run").size(10))
                             .on_press(RemoteBrowserMessage::RunCrt(entry.path.clone()))
-                            .padding([2, 8])
-                            .into()
-                    } else if ext.ends_with(".sid") {
+                            .padding([2, 8]),
+                        "Load cartridge image",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else if ext.ends_with(".sid") {
+                    tooltip(
                         button(text("Play").size(10))
                             .on_press(RemoteBrowserMessage::PlaySid(entry.path.clone()))
-                            .padding([2, 8])
-                            .into()
-                    } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m")
-                    {
+                            .padding([2, 8]),
+                        "Play SID music",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m") {
+                    tooltip(
                         button(text("Play").size(10))
                             .on_press(RemoteBrowserMessage::PlayMod(entry.path.clone()))
-                            .padding([2, 8])
-                            .into()
-                    } else {
-                        iced::widget::Space::with_width(0).into()
-                    };
+                            .padding([2, 8]),
+                        "Play MOD/tracker music",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else {
+                    iced::widget::Space::with_width(0).into()
+                };
 
-                    let file_row = row![
-                        // Clickable filename
-                        button(text(&display_name).size(11))
-                            .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
-                            .padding([4, 6])
-                            .width(Length::Fill),
-                        // Type label
-                        text(type_label).size(9).width(Length::Fixed(28.0)),
-                        // Action button
-                        action_button,
-                    ]
-                    .spacing(4)
-                    .align_items(iced::Alignment::Center)
-                    .padding([1, 2]);
+                let file_row = row![
+                    // Clickable filename
+                    button(text(&display_name).size(11))
+                        .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
+                        .padding([4, 6])
+                        .width(Length::Fill)
+                        .style(iced::theme::Button::Text),
+                    // Type label
+                    text(type_label).size(9).width(Length::Fixed(28.0)),
+                    // Action button
+                    action_button,
+                ]
+                .spacing(4)
+                .align_items(iced::Alignment::Center)
+                .padding([2, 4]);
 
-                    if is_selected {
-                        column![file_row].width(Length::Fill).into()
-                    } else {
-                        file_row.into()
-                    }
-                })
-                .collect();
+                if is_selected {
+                    items.push(column![file_row].width(Length::Fill).into());
+                } else {
+                    items.push(file_row.into());
+                }
+            }
 
-            scrollable(Column::with_children(items).spacing(0).width(Length::Fill))
-                .height(Length::Fill)
-                .into()
+            scrollable(
+                Column::with_children(items)
+                    .spacing(0)
+                    .width(Length::Fill)
+                    .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
+            )
+            .height(Length::Fill)
+            .into()
         };
 
         column![nav_buttons, quick_nav, path_display, status, file_list,]

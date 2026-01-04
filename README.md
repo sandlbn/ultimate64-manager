@@ -35,6 +35,12 @@ cargo build --release
 cargo bundle --release
 ```
 
+## Streaming under Windows 
+
+```bash
+New-NetFirewallRule -DisplayName "C64 Stream" -Direction Inbound -Protocol UDP -LocalPort 11000,11001 -RemoteAddress {U64_Adress} -Action Allow
+```
+
 ## Quick Start
 
 1. Launch the application

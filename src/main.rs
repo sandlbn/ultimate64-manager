@@ -1,32 +1,32 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
-    Application, Command, Element, Length, Settings, Theme, executor,
+    Application, Command, Element, Length, Settings, Subscription, Theme, executor,
     widget::{
-        Column, Space, button, column, container, horizontal_rule, horizontal_space, pick_list,
-        row, scrollable, text, text_input,
+        Space, button, column, container, horizontal_rule, horizontal_space, pick_list, row, text,
+        text_input, tooltip,
     },
 };
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
-use ultimate64::{Rest, vicstream};
-use url::{Host, Url};
+use ultimate64::Rest;
+use url::Host;
 
 mod file_browser;
 mod music_player;
 mod remote_browser;
 mod settings;
+mod streaming;
 mod templates;
 
 use file_browser::{FileBrowser, FileBrowserMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
+use streaming::{StreamingMessage, VideoStreaming};
 use templates::{DiskTemplate, TemplateManager};
 
 pub fn main() -> iced::Result {
@@ -58,6 +58,8 @@ pub fn main() -> iced::Result {
 }
 
 fn load_window_icon() -> Option<iced::window::Icon> {
+    // Embedded icon - icon.png MUST exist in icons/ folder at compile time
+    // If you don't have icons/icon.png, compilation will fail
     const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
 
     if let Ok(img) = image::load_from_memory(ICON_BYTES) {
@@ -124,12 +126,8 @@ pub enum Message {
     ShowInfo(String),
     DismissMessage,
 
-    // Video
-    StartVideoStream,
-    StopVideoStream,
-    TakeScreenshot,
-    ScreenshotTaken(Result<String, String>),
-    VideoFrameUpdate,
+    // Video/Streaming
+    Streaming(StreamingMessage),
 
     // Machine control
     ResetMachine,
@@ -138,10 +136,6 @@ pub enum Message {
     ResumeMachine,
     PoweroffMachine,
     MachineCommandCompleted(Result<String, String>),
-
-    // Command prompt
-    CommandInputChanged(String),
-    SendCommand,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,14 +200,7 @@ pub struct Ultimate64Browser {
     password_input: String,
 
     // Video streaming
-    video_streaming: bool,
-    video_frame: Arc<Mutex<Option<Vec<u8>>>>,
-    video_stream_handle: Option<thread::JoinHandle<()>>,
-    video_stop_signal: Arc<AtomicBool>,
-
-    // Command prompt
-    command_input: String,
-    command_history: Vec<String>,
+    video_streaming: VideoStreaming,
 }
 
 impl Application for Ultimate64Browser {
@@ -255,12 +242,7 @@ impl Application for Ultimate64Browser {
                 mounted_disks: Vec::new(),
             },
             user_message: None,
-            video_streaming: false,
-            video_frame: Arc::new(Mutex::new(None)),
-            video_stream_handle: None,
-            video_stop_signal: Arc::new(AtomicBool::new(false)),
-            command_input: String::new(),
-            command_history: Vec::new(),
+            video_streaming: VideoStreaming::new(),
         };
 
         // Auto-connect if host is configured
@@ -295,7 +277,17 @@ impl Application for Ultimate64Browser {
     }
 
     fn theme(&self) -> Theme {
-        Theme::Light
+        // Custom dark theme with lighter blue (like the reference screenshot)
+        Theme::custom(
+            "Ultimate64 Dark".to_string(),
+            iced::theme::Palette {
+                background: iced::Color::from_rgb(0.15, 0.15, 0.18), // Dark background
+                text: iced::Color::from_rgb(0.9, 0.9, 0.9),          // Light text
+                primary: iced::Color::from_rgb(0.45, 0.52, 0.85),    // Lighter blue
+                success: iced::Color::from_rgb(0.3, 0.7, 0.3),       // Green
+                danger: iced::Color::from_rgb(0.8, 0.3, 0.3),        // Red
+            },
+        )
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -683,37 +675,70 @@ impl Application for Ultimate64Browser {
                 Command::none()
             }
 
-            Message::StartVideoStream => {
-                if !self.video_streaming {
-                    self.start_video_stream();
-                }
-                Command::none()
-            }
-
-            Message::StopVideoStream => {
-                self.stop_video_stream();
-                Command::none()
-            }
-
-            Message::TakeScreenshot => {
-                Command::perform(take_screenshot_async(), Message::ScreenshotTaken)
-            }
-
-            Message::ScreenshotTaken(result) => {
-                match result {
-                    Ok(path) => {
-                        self.user_message =
-                            Some(UserMessage::Info(format!("Screenshot saved: {}", path)));
-                    }
-                    Err(e) => {
-                        self.user_message =
-                            Some(UserMessage::Error(format!("Screenshot failed: {}", e)));
+            Message::Streaming(msg) => {
+                // Handle screenshot result for user message
+                if let StreamingMessage::ScreenshotComplete(ref result) = msg {
+                    match result {
+                        Ok(path) => {
+                            self.user_message =
+                                Some(UserMessage::Info(format!("Screenshot saved: {}", path)));
+                        }
+                        Err(e) => {
+                            self.user_message =
+                                Some(UserMessage::Error(format!("Screenshot failed: {}", e)));
+                        }
                     }
                 }
-                Command::none()
-            }
 
-            Message::VideoFrameUpdate => Command::none(),
+                // Handle keyboard command - intercept before passing to streaming
+                if let StreamingMessage::SendCommand = msg {
+                    let command = self.video_streaming.command_input.clone();
+                    if !command.is_empty() {
+                        if let Some(conn) = &self.connection {
+                            let conn = conn.clone();
+                            let cmd = command.clone();
+                            // Add to history with prompt
+                            self.video_streaming
+                                .command_history
+                                .push(format!("> {}", command));
+                            self.video_streaming.command_input.clear();
+
+                            return Command::perform(
+                                async move {
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+                                        // Add newline to execute the command
+                                        conn.type_text(&format!("{}\n", cmd))
+                                            .map(|_| format!("Sent: {}", cmd))
+                                            .map_err(|e| format!("Failed to send: {}", e))
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+                                },
+                                |result| match result {
+                                    Ok(msg) => {
+                                        Message::Streaming(StreamingMessage::CommandSent(Ok(msg)))
+                                    }
+                                    Err(e) => {
+                                        Message::Streaming(StreamingMessage::CommandSent(Err(e)))
+                                    }
+                                },
+                            );
+                        } else {
+                            self.video_streaming
+                                .command_history
+                                .push("> ".to_string() + &command);
+                            self.video_streaming
+                                .command_history
+                                .push("Error: Not connected to Ultimate64".to_string());
+                            self.video_streaming.command_input.clear();
+                        }
+                    }
+                    return Command::none();
+                }
+
+                self.video_streaming.update(msg).map(Message::Streaming)
+            }
 
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
@@ -833,41 +858,6 @@ impl Application for Ultimate64Browser {
                 }
                 Command::none()
             }
-
-            Message::CommandInputChanged(input) => {
-                self.command_input = input;
-                Command::none()
-            }
-
-            Message::SendCommand => {
-                if !self.command_input.is_empty() {
-                    let cmd = self.command_input.clone();
-                    self.command_history.push(cmd.clone());
-                    self.command_input.clear();
-
-                    if let Some(conn) = &self.connection {
-                        let conn = conn.clone();
-                        Command::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    let conn = conn.blocking_lock();
-                                    conn.type_text(&format!("{}\n", cmd))
-                                        .map(|_| format!("Sent: {}", cmd))
-                                        .map_err(|e| format!("Failed: {}", e))
-                                })
-                                .await
-                                .map_err(|e| format!("Task error: {}", e))?
-                            },
-                            Message::MachineCommandCompleted,
-                        )
-                    } else {
-                        self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                        Command::none()
-                    }
-                } else {
-                    Command::none()
-                }
-            }
         }
     }
 
@@ -891,7 +881,7 @@ impl Application for Ultimate64Browser {
         let content = container(match self.active_tab {
             Tab::DualPaneBrowser => self.view_dual_pane_browser(),
             Tab::MusicPlayer => self.view_music_player(),
-            Tab::VideoViewer => self.view_video_viewer(),
+            Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)
@@ -916,6 +906,10 @@ impl Application for Ultimate64Browser {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        self.video_streaming.subscription().map(Message::Streaming)
     }
 }
 
@@ -1002,13 +996,23 @@ impl Ultimate64Browser {
         // Copy buttons in center
         let copy_buttons = container(
             column![
-                button(text(">>").size(14))
-                    .on_press(Message::CopyLocalToRemote)
-                    .padding([8, 12]),
+                tooltip(
+                    button(text(">>").size(14))
+                        .on_press(Message::CopyLocalToRemote)
+                        .padding([8, 12]),
+                    "Upload to Ultimate64",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
                 Space::with_height(10),
-                button(text("<<").size(14))
-                    .on_press(Message::CopyRemoteToLocal)
-                    .padding([8, 12]),
+                tooltip(
+                    button(text("<<").size(14))
+                        .on_press(Message::CopyRemoteToLocal)
+                        .padding([8, 12]),
+                    "Download from Ultimate64",
+                    tooltip::Position::Left,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .align_items(iced::Alignment::Center),
         )
@@ -1071,101 +1075,6 @@ impl Ultimate64Browser {
 
     fn view_music_player(&self) -> Element<'_, Message> {
         self.music_player.view().map(Message::MusicPlayer)
-    }
-
-    fn view_video_viewer(&self) -> Element<'_, Message> {
-        let controls = row![
-            if self.video_streaming {
-                button(text("STOP"))
-                    .on_press(Message::StopVideoStream)
-                    .padding([8, 16])
-            } else {
-                button(text("START"))
-                    .on_press(Message::StartVideoStream)
-                    .padding([8, 16])
-            },
-            button(text("Screenshot"))
-                .on_press(Message::TakeScreenshot)
-                .padding([8, 16]),
-        ]
-        .spacing(10);
-
-        let video_display: Element<'_, Message> = if self.video_streaming {
-            if let Ok(frame_guard) = self.video_frame.lock() {
-                if let Some(frame_data) = &*frame_guard {
-                    container(
-                        column![
-                            text("STREAMING").size(16),
-                            text(format!("{} bytes", frame_data.len())).size(12),
-                            text("384x272 @ 50Hz").size(12),
-                        ]
-                        .spacing(5)
-                        .align_items(iced::Alignment::Center),
-                    )
-                    .padding(40)
-                    .into()
-                } else {
-                    container(text("Waiting for frames...").size(14))
-                        .padding(40)
-                        .into()
-                }
-            } else {
-                text("Frame buffer error").into()
-            }
-        } else {
-            container(
-                column![
-                    text("VIDEO STREAM INACTIVE").size(16),
-                    Space::with_height(10),
-                    text("UDP Multicast: 239.0.1.64:11000").size(12),
-                ]
-                .align_items(iced::Alignment::Center),
-            )
-            .padding(40)
-            .into()
-        };
-
-        // Command prompt section
-        let command_history_items: Vec<Element<'_, Message>> = self
-            .command_history
-            .iter()
-            .rev()
-            .take(10)
-            .map(|cmd| text(format!("> {}", cmd)).size(11).into())
-            .collect();
-
-        let command_section = column![
-            text("COMMAND PROMPT").size(14),
-            row![
-                text("C64> ").size(14),
-                text_input("Enter BASIC command...", &self.command_input)
-                    .on_input(Message::CommandInputChanged)
-                    .on_submit(Message::SendCommand)
-                    .width(Length::Fill),
-                button(text("Send").size(12))
-                    .on_press(Message::SendCommand)
-                    .padding([4, 12]),
-            ]
-            .spacing(5)
-            .align_items(iced::Alignment::Center),
-            // Command history
-            scrollable(Column::with_children(command_history_items).spacing(2),)
-                .height(Length::Fixed(100.0)),
-        ]
-        .spacing(10)
-        .padding(10);
-
-        column![
-            text("VIC VIDEO STREAM").size(20),
-            horizontal_rule(1),
-            Space::with_height(10),
-            controls,
-            video_display,
-            horizontal_rule(1),
-            command_section,
-        ]
-        .spacing(10)
-        .into()
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
@@ -1238,7 +1147,7 @@ impl Ultimate64Browser {
     }
 
     fn view_status_bar(&self) -> Element<'_, Message> {
-        let video_status = if self.video_streaming {
+        let video_status = if self.video_streaming.is_streaming {
             "STREAMING"
         } else {
             "IDLE"
@@ -1363,108 +1272,6 @@ impl Ultimate64Browser {
             }
         }
     }
-
-    fn start_video_stream(&mut self) {
-        if self.video_streaming {
-            return;
-        }
-
-        log::info!("Starting video stream...");
-        self.video_stop_signal.store(false, Ordering::Relaxed);
-
-        let frame_buffer = self.video_frame.clone();
-        let stop_signal = self.video_stop_signal.clone();
-        self.video_streaming = true;
-
-        let handle = thread::spawn(move || {
-            log::info!("Video stream thread started");
-            let url = Url::parse("udp://239.0.1.64:11000").unwrap();
-
-            match vicstream::get_socket(&url) {
-                Ok(socket) => {
-                    if let Err(e) = socket.set_nonblocking(true) {
-                        log::error!("Failed to set non-blocking: {:?}", e);
-                        return;
-                    }
-
-                    loop {
-                        if stop_signal.load(Ordering::Relaxed) {
-                            break;
-                        }
-
-                        match vicstream::capture_frame(socket.try_clone().unwrap()) {
-                            Ok(data) => {
-                                if let Ok(mut frame) = frame_buffer.lock() {
-                                    *frame = Some(data);
-                                }
-                            }
-                            Err(e) => {
-                                if let Some(io_error) = e.downcast_ref::<std::io::Error>() {
-                                    if io_error.kind() == std::io::ErrorKind::WouldBlock {
-                                        thread::sleep(std::time::Duration::from_millis(10));
-                                        continue;
-                                    }
-                                }
-                                thread::sleep(std::time::Duration::from_millis(50));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to create socket: {:?}", e);
-                }
-            }
-            log::info!("Video stream thread stopped");
-        });
-
-        self.video_stream_handle = Some(handle);
-    }
-
-    fn stop_video_stream(&mut self) {
-        if !self.video_streaming {
-            return;
-        }
-
-        log::info!("Stopping video stream...");
-        self.video_stop_signal.store(true, Ordering::Relaxed);
-
-        if let Some(handle) = self.video_stream_handle.take() {
-            let _ = handle.join();
-        }
-
-        self.video_streaming = false;
-        if let Ok(mut frame) = self.video_frame.lock() {
-            *frame = None;
-        }
-    }
-}
-
-impl Drop for Ultimate64Browser {
-    fn drop(&mut self) {
-        if self.video_streaming {
-            self.stop_video_stream();
-        }
-    }
-}
-
-async fn take_screenshot_async() -> Result<String, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let url = Url::parse("udp://239.0.1.64:11000").map_err(|e| e.to_string())?;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-
-    let filename = format!("screenshot_{}.png", timestamp);
-    let path = std::env::current_dir()
-        .map_err(|e| e.to_string())?
-        .join(&filename);
-
-    vicstream::take_snapshot(&url, Some(&path), Some(2)).map_err(|e| e.to_string())?;
-
-    Ok(path.to_string_lossy().to_string())
 }
 
 async fn execute_template_commands(

@@ -1,6 +1,6 @@
 [package]
 name = "ultimate64-manager"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Ultimate64 Manager - Control your Ultimate64/Ultimate-II+"
 authors = ["Marcin Spoczynski"]
@@ -23,6 +23,7 @@ url = "2.5"
 image = { version = "0.24", features = ["ico", "png"] }
 reqwest = { version = "0.11", features = ["blocking", "multipart", "json"] }
 suppaftp = "6.0"
+cpal = "0.15"
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]
