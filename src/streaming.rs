@@ -14,9 +14,22 @@ use std::time::Duration;
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
-const FRAME_SIZE: usize = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes
+// const FRAME_SIZE: usize = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes
 
-// C64 color palette (RGB values)
+// Ultimate64 video packet header (12 bytes)
+// struct {
+//     uint16_t seq;           // 0-1
+//     uint16_t frame;         // 2-3
+//     uint16_t line;          // 4-5 (MSB = frame sync flag)
+//     uint16_t pixelsInLine;  // 6-7
+//     uint8_t linesInPacket;  // 8
+//     uint8_t bpp;            // 9
+//     uint16_t encoding;      // 10-11
+//     char payload[768];      // 12+
+// }
+const HEADER_SIZE: usize = 12;
+
+// C64 color palette (RGB values) - from u64view
 const C64_PALETTE: [[u8; 3]; 16] = [
     [0x00, 0x00, 0x00], // 0: Black
     [0xFF, 0xFF, 0xFF], // 1: White
@@ -74,7 +87,6 @@ pub struct VideoStreaming {
     pub command_history: Vec<String>,
     pub stream_mode: StreamMode,
     pub listen_port: String,
-    pub status_message: Option<String>,
     pub packets_received: Arc<Mutex<u64>>,
 }
 
@@ -96,7 +108,6 @@ impl VideoStreaming {
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
             listen_port: "11000".to_string(),
-            status_message: None,
             packets_received: Arc::new(Mutex::new(0)),
         }
     }
@@ -112,13 +123,11 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Decode raw frame to RGBA for display
+                // Frame buffer now contains RGBA data directly - just copy to image buffer
                 if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(raw_data) = &*frame_guard {
-                        if let Some(rgba_data) = decode_vic_frame(raw_data) {
-                            if let Ok(mut img_guard) = self.image_buffer.lock() {
-                                *img_guard = Some(rgba_data);
-                            }
+                    if let Some(rgba_data) = &*frame_guard {
+                        if let Ok(mut img_guard) = self.image_buffer.lock() {
+                            *img_guard = Some(rgba_data.clone());
                         }
                     }
                 }
@@ -412,9 +421,28 @@ impl VideoStreaming {
             }
 
             // Buffer for receiving packets
-            let mut recv_buf = [0u8; 65536];
-            // Buffer for assembling frames
-            let mut frame_data: Vec<u8> = Vec::with_capacity(FRAME_SIZE * 2);
+            let mut recv_buf = [0u8; 1024];
+
+            // RGBA frame buffer (384 * 272 * 4 bytes)
+            let rgba_size = (VIC_WIDTH * VIC_HEIGHT * 4) as usize;
+            let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
+            let mut first_packet = true;
+
+            // Build color lookup table (2 pixels packed per byte -> 8 bytes RGBA output)
+            // Low nibble = LEFT pixel (x*2), High nibble = RIGHT pixel (x*2+1)
+            let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
+            for i in 0..256 {
+                let hi = (i >> 4) & 0x0F; // High nibble = RIGHT pixel
+                let lo = i & 0x0F; // Low nibble = LEFT pixel
+                let c_hi = &C64_PALETTE[hi];
+                let c_lo = &C64_PALETTE[lo];
+                color_lut.push([
+                    c_lo[0], c_lo[1], c_lo[2],
+                    255, // LEFT pixel (low nibble) - first in memory
+                    c_hi[0], c_hi[1], c_hi[2],
+                    255, // RIGHT pixel (high nibble) - second in memory
+                ]);
+            }
 
             loop {
                 if stop_signal.load(Ordering::Relaxed) {
@@ -423,29 +451,77 @@ impl VideoStreaming {
 
                 match socket.recv_from(&mut recv_buf) {
                     Ok((size, _addr)) => {
+                        if size < HEADER_SIZE {
+                            continue;
+                        }
+
                         // Count packets
                         if let Ok(mut p) = packets_counter.lock() {
                             *p += 1;
                         }
 
-                        // Append received data to frame buffer
-                        frame_data.extend_from_slice(&recv_buf[..size]);
+                        // Parse header
+                        let line_raw = u16::from_le_bytes([recv_buf[4], recv_buf[5]]);
+                        let pixels_in_line =
+                            u16::from_le_bytes([recv_buf[6], recv_buf[7]]) as usize;
+                        let lines_in_packet = recv_buf[8] as usize;
 
-                        // Check if we have a complete frame (104448 bytes)
-                        while frame_data.len() >= FRAME_SIZE {
-                            let frame: Vec<u8> = frame_data.drain(..FRAME_SIZE).collect();
-                            if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(frame);
+                        // Log first packet info
+                        if first_packet {
+                            first_packet = false;
+                            log::info!(
+                                "First packet: pixels_in_line={}, lines_in_packet={}, payload_size={}",
+                                pixels_in_line,
+                                lines_in_packet,
+                                size - HEADER_SIZE
+                            );
+                        }
+
+                        let line_num = (line_raw & 0x7FFF) as usize; // Strip MSB (sync flag)
+                        let is_frame_end = (line_raw & 0x8000) != 0;
+
+                        let payload = &recv_buf[HEADER_SIZE..size];
+                        let bytes_per_line = pixels_in_line / 2; // 2 pixels per byte = 192 bytes/line
+
+                        // Process each line in the packet
+                        for l in 0..lines_in_packet {
+                            let y = line_num + l;
+                            if y >= VIC_HEIGHT as usize {
+                                continue;
+                            }
+
+                            let payload_offset = l * bytes_per_line;
+
+                            // Write pixels to RGBA buffer using VIC_WIDTH stride
+                            let row_offset = y * (VIC_WIDTH as usize) * 4;
+
+                            for x in 0..bytes_per_line {
+                                if payload_offset + x >= payload.len() {
+                                    break;
+                                }
+                                let packed_byte = payload[payload_offset + x] as usize;
+                                let colors = &color_lut[packed_byte];
+
+                                // Each packed byte = 2 pixels
+                                let pixel_x = x * 2;
+                                if pixel_x + 1 < VIC_WIDTH as usize {
+                                    let offset = row_offset + pixel_x * 4;
+                                    if offset + 7 < rgba_frame.len() {
+                                        rgba_frame[offset..offset + 8].copy_from_slice(colors);
+                                    }
+                                }
                             }
                         }
 
-                        // Prevent buffer from growing too large
-                        if frame_data.len() > FRAME_SIZE * 4 {
-                            frame_data.clear();
+                        // On frame end, copy to shared buffer
+                        if is_frame_end {
+                            if let Ok(mut fb) = frame_buffer.lock() {
+                                *fb = Some(rgba_frame.clone());
+                            }
                         }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
+                        thread::sleep(Duration::from_millis(2));
                     }
                     Err(e) => {
                         log::debug!("Socket recv error: {}", e);
@@ -497,7 +573,8 @@ impl Drop for VideoStreaming {
     }
 }
 
-// Decode VIC stream frame to RGBA
+// Decode VIC stream frame to RGBA (used for raw frame data, not packet-based data)
+#[allow(dead_code)]
 fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
     let expected_indexed = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes (1 byte/pixel)
     let expected_rgb = expected_indexed * 3; // 313344 bytes (3 bytes/pixel)
@@ -569,8 +646,8 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
         .map_err(|e| e.to_string())?
         .join(&filename);
 
-    // Capture a single frame
-    let frame_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    // Capture a complete frame using proper packet parsing
+    let rgba_data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
         let socket = match mode {
             StreamMode::Unicast => UdpSocket::bind(format!("0.0.0.0:{}", port))
                 .map_err(|e| format!("Failed to bind socket: {}", e))?,
@@ -589,15 +666,81 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| format!("Failed to set timeout: {}", e))?;
 
-        let mut recv_buf = [0u8; 65536];
-        let mut frame_data: Vec<u8> = Vec::with_capacity(FRAME_SIZE);
+        let mut recv_buf = [0u8; 1024];
+        let rgba_size = (VIC_WIDTH * VIC_HEIGHT * 4) as usize;
+        let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
 
-        // Collect enough data for one frame
+        // Build color lookup table (low nibble = LEFT, high nibble = RIGHT)
+        let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
+        for i in 0..256 {
+            let hi = (i >> 4) & 0x0F;
+            let lo = i & 0x0F;
+            let c_hi = &C64_PALETTE[hi];
+            let c_lo = &C64_PALETTE[lo];
+            color_lut.push([
+                c_lo[0], c_lo[1], c_lo[2], 255, // LEFT pixel (low nibble)
+                c_hi[0], c_hi[1], c_hi[2], 255, // RIGHT pixel (high nibble)
+            ]);
+        }
+
+        // Wait for a complete frame (until we see frame end flag)
         let start = std::time::Instant::now();
-        while frame_data.len() < FRAME_SIZE && start.elapsed() < Duration::from_secs(5) {
+        let mut got_frame = false;
+
+        while !got_frame && start.elapsed() < Duration::from_secs(5) {
             match socket.recv_from(&mut recv_buf) {
                 Ok((size, _)) => {
-                    frame_data.extend_from_slice(&recv_buf[..size]);
+                    if size < HEADER_SIZE {
+                        continue;
+                    }
+
+                    // Parse header
+                    let line_raw = u16::from_le_bytes([recv_buf[4], recv_buf[5]]);
+                    let pixels_in_line = u16::from_le_bytes([recv_buf[6], recv_buf[7]]) as usize;
+                    let lines_in_packet = recv_buf[8] as usize;
+
+                    let line_num = (line_raw & 0x7FFF) as usize;
+                    let is_frame_end = (line_raw & 0x8000) != 0;
+
+                    let payload = &recv_buf[HEADER_SIZE..size];
+                    let half_pixels = pixels_in_line / 2;
+
+                    // Process lines
+                    for l in 0..lines_in_packet {
+                        let y = line_num + l;
+                        if y >= VIC_HEIGHT as usize {
+                            continue;
+                        }
+
+                        let line_start = l * half_pixels;
+                        let line_end = line_start + half_pixels;
+
+                        if line_end > payload.len() {
+                            break;
+                        }
+
+                        let row_offset = y * (VIC_WIDTH as usize) * 4;
+
+                        for x in 0..half_pixels {
+                            if line_start + x >= payload.len() {
+                                break;
+                            }
+                            let packed_byte = payload[line_start + x] as usize;
+                            let colors = &color_lut[packed_byte];
+
+                            let pixel_x = x * 2;
+                            if pixel_x + 1 < VIC_WIDTH as usize {
+                                let offset = row_offset + pixel_x * 4;
+                                if offset + 7 < rgba_frame.len() {
+                                    rgba_frame[offset..offset + 8].copy_from_slice(colors);
+                                }
+                            }
+                        }
+                    }
+
+                    if is_frame_end {
+                        got_frame = true;
+                    }
                 }
                 Err(e) => {
                     return Err(format!("Failed to receive data: {}", e));
@@ -605,22 +748,14 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
             }
         }
 
-        if frame_data.len() < FRAME_SIZE {
-            return Err(format!(
-                "Incomplete frame: {} bytes (need {})",
-                frame_data.len(),
-                FRAME_SIZE
-            ));
+        if !got_frame {
+            return Err("Timeout waiting for frame".to_string());
         }
 
-        Ok(frame_data[..FRAME_SIZE].to_vec())
+        Ok(rgba_frame)
     })
     .await
     .map_err(|e| format!("Task error: {}", e))??;
-
-    // Convert to RGBA and save as PNG
-    let rgba_data =
-        decode_vic_frame(&frame_data).ok_or_else(|| "Failed to decode frame".to_string())?;
 
     // Create image and save
     let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
