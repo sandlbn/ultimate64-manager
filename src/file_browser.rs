@@ -34,6 +34,7 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub extension: Option<String>,
+    #[allow(dead_code)]
     pub size: Option<u64>,
 }
 
@@ -229,7 +230,7 @@ impl FileBrowser {
             }
         }
     }
-
+    #[allow(dead_code)]
     pub fn get_selected_file(&self) -> Option<&PathBuf> {
         self.selected_file.as_ref()
     }
