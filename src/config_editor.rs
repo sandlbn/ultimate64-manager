@@ -202,29 +202,7 @@ impl ConfigEditor {
                             category
                         ));
                         self.error_message = None;
-
-                        // Fetch details for ALL items (not just integers) since strings might be enums with "values"
-                        if let Some(host) = host_url {
-                            let commands: Vec<Command<ConfigEditorMessage>> = self
-                                .current_items
-                                .values()
-                                .filter(|item| item.details.is_none())
-                                .take(50)
-                                .map(|item| {
-                                    let host = host.clone();
-                                    let cat = item.category.clone();
-                                    let name = item.name.clone();
-                                    Command::perform(
-                                        fetch_item_details(host, cat, name),
-                                        ConfigEditorMessage::ItemDetailsLoaded,
-                                    )
-                                })
-                                .collect();
-
-                            if !commands.is_empty() {
-                                return Command::batch(commands);
-                            }
-                        }
+                        // All details are now fetched in one request using wildcard API
                     }
                     Err(e) => {
                         log::error!("Failed to load category items: {}", e);
@@ -977,14 +955,14 @@ async fn fetch_category_items(
 ) -> Result<(String, Vec<ConfigOption>), String> {
     log::info!("Fetching config items for category: {}", category);
 
-    // GET /v1/configs/<category> returns items with their current values
+    // Use wildcard to get ALL items with FULL details in one request: /v1/configs/<category>/*
     let encoded_category = urlencoding::encode(&category);
-    let url = format!("{}/v1/configs/{}", host, encoded_category);
+    let url = format!("{}/v1/configs/{}/*", host, encoded_category);
 
     log::info!("Request URL: {}", url);
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
@@ -1002,49 +980,83 @@ async fn fetch_category_items(
         .text()
         .await
         .map_err(|e| format!("Read error: {}", e))?;
-    log::info!("Category items response for '{}': {}", category, text);
+    log::info!("Category items response length: {} bytes", text.len());
+    log::debug!("Category items response for '{}': {}", category, text);
 
     let json: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("JSON parse error: {}", e))?;
 
     let mut items = Vec::new();
 
-    // Response format: { "Category Name": { "Item1": value1, "Item2": value2, ... }, "errors": [] }
+    // Response format with wildcard:
+    // { "Category Name": { "Item1": { "current": ..., "values": [...], "default": ... }, ... }, "errors": [] }
     if let Some(obj) = json.as_object() {
         for (cat_name, cat_value) in obj {
             if cat_name == "errors" {
                 continue;
             }
 
-            log::info!(
-                "Processing category '{}' with value type: {}",
-                cat_name,
-                if cat_value.is_object() {
-                    "object"
-                } else if cat_value.is_array() {
-                    "array"
-                } else {
-                    "other"
-                }
-            );
-
             if let Some(cat_obj) = cat_value.as_object() {
                 for (item_name, item_value) in cat_obj {
-                    let option_type = determine_option_type(item_value);
-                    log::debug!(
-                        "Item '{}' = {:?} (type: {:?})",
-                        item_name,
-                        item_value,
-                        option_type
-                    );
+                    if let Some(item_obj) = item_value.as_object() {
+                        // Parse full item details
+                        let current = item_obj
+                            .get("current")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
 
-                    items.push(ConfigOption {
-                        category: cat_name.clone(),
-                        name: item_name.clone(),
-                        current_value: item_value.clone(),
-                        details: None,
-                        option_type,
-                    });
+                        // Check for "options" or "values" (API uses "values" for enums)
+                        let options = item_obj
+                            .get("options")
+                            .or_else(|| item_obj.get("values"))
+                            .and_then(|v| {
+                                v.as_array().map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                        .collect()
+                                })
+                            });
+
+                        let details = ConfigItemDetails {
+                            current: current.clone(),
+                            min: item_obj.get("min").and_then(|v| v.as_i64()),
+                            max: item_obj.get("max").and_then(|v| v.as_i64()),
+                            format: item_obj
+                                .get("format")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            default: item_obj.get("default").cloned(),
+                            options,
+                        };
+
+                        // Determine option type from details
+                        let option_type = if details.options.is_some()
+                            && !details.options.as_ref().unwrap().is_empty()
+                        {
+                            ConfigOptionType::Enum
+                        } else if details.min.is_some() || details.max.is_some() {
+                            ConfigOptionType::Integer
+                        } else {
+                            determine_option_type(&current)
+                        };
+
+                        log::debug!(
+                            "Item '{}': type={:?}, options={:?}, min={:?}, max={:?}",
+                            item_name,
+                            option_type,
+                            details.options.as_ref().map(|o| o.len()),
+                            details.min,
+                            details.max
+                        );
+
+                        items.push(ConfigOption {
+                            category: cat_name.clone(),
+                            name: item_name.clone(),
+                            current_value: current,
+                            details: Some(details),
+                            option_type,
+                        });
+                    }
                 }
             }
         }
@@ -1052,7 +1064,11 @@ async fn fetch_category_items(
 
     items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
-    log::info!("Loaded {} items for category '{}'", items.len(), category);
+    log::info!(
+        "Loaded {} items for category '{}' (with full details)",
+        items.len(),
+        category
+    );
     Ok((category, items))
 }
 
