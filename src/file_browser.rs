@@ -21,6 +21,8 @@ pub enum FileBrowserMessage {
     SelectNone,
     MountDisk(PathBuf, String, MountMode),
     MountCompleted(Result<(), String>),
+    RunDisk(PathBuf, String), // Mount, reset, load and run
+    RunDiskCompleted(Result<(), String>),
     LoadAndRun(PathBuf),
     LoadCompleted(Result<(), String>),
     RefreshFiles,
@@ -161,6 +163,34 @@ impl FileBrowser {
                     Err(e) => {
                         self.status_message = Some(format!("Mount failed: {}", e));
                         log::error!("Mount failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+            FileBrowserMessage::RunDisk(path, drive) => {
+                if let Some(conn) = connection {
+                    self.status_message = Some(format!(
+                        "Running {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    Command::perform(
+                        run_disk_async(conn, path, drive),
+                        FileBrowserMessage::RunDiskCompleted,
+                    )
+                } else {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    Command::none()
+                }
+            }
+            FileBrowserMessage::RunDiskCompleted(result) => {
+                match result {
+                    Ok(_) => {
+                        self.status_message = Some("Disk loaded and running!".to_string());
+                        log::info!("Disk run successful");
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Run failed: {}", e));
+                        log::error!("Run failed: {}", e);
                     }
                 }
                 Command::none()
@@ -416,6 +446,18 @@ impl FileBrowser {
                     };
                     row![
                         tooltip(
+                            button(text("Run").size(10))
+                                .on_press(FileBrowserMessage::RunDisk(
+                                    entry.path.clone(),
+                                    self.selected_drive.to_drive_string(),
+                                ))
+                                .padding([2, 5]),
+                            text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
+                                .size(11),
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
                             button(text(format!("{}:RW", drive)).size(10))
                                 .on_press(FileBrowserMessage::MountDisk(
                                     entry.path.clone(),
@@ -591,6 +633,50 @@ async fn mount_disk_async(
         log::info!("Mount successful");
     }
     result
+}
+
+async fn run_disk_async(
+    connection: Arc<Mutex<Rest>>,
+    path: PathBuf,
+    drive: String,
+) -> Result<(), String> {
+    log::info!("Running disk {} on drive {}", path.display(), drive);
+
+    // Determine device number based on drive
+    let device_num = if drive == "a" { "8" } else { "9" };
+
+    tokio::task::spawn_blocking(move || {
+        let conn = connection.blocking_lock();
+
+        // 1. Mount the disk image (read-only is fine for running)
+        conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
+            .map_err(|e| format!("Mount failed: {}", e))?;
+
+        // Small delay to ensure mount completes
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // 2. Reset the machine
+        conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
+
+        // Wait for C64 to boot up
+        std::thread::sleep(std::time::Duration::from_secs(3));
+
+        // 3. Type LOAD"*",8,1 (or 9) and RUN
+        let load_cmd = format!("load \"*\",{},1\n", device_num);
+        conn.type_text(&load_cmd)
+            .map_err(|e| format!("Type LOAD failed: {}", e))?;
+
+        // Wait for program to load
+        std::thread::sleep(std::time::Duration::from_secs(5));
+
+        // 4. Type RUN
+        conn.type_text("run\n")
+            .map_err(|e| format!("Type RUN failed: {}", e))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
 }
 
 async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Result<(), String> {
