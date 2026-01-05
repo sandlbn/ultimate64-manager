@@ -2,7 +2,7 @@
 
 A cross-platform desktop application for managing Ultimate64 and Ultimate-II+ devices. Built with Rust and Iced.
 
-![Ultimate64 Manager](screenshot.png)
+![Ultimate64 Manager](screenshot.gif)
 
 ## Features
 
