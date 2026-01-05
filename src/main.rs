@@ -909,7 +909,10 @@ impl Application for Ultimate64Browser {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        self.video_streaming.subscription().map(Message::Streaming)
+        Subscription::batch([
+            self.video_streaming.subscription().map(Message::Streaming),
+            self.music_player.subscription().map(Message::MusicPlayer),
+        ])
     }
 }
 
@@ -1114,11 +1117,11 @@ impl Ultimate64Browser {
             text("CONNECTION STATUS").size(18),
             Space::with_height(10),
             if self.status.connected {
-                text(format!("✓ Connected to {}", self.settings.connection.host)).style(
+                text(format!("Connected to {}", self.settings.connection.host)).style(
                     iced::theme::Text::Color(iced::Color::from_rgb(0.2, 0.8, 0.2)),
                 )
             } else {
-                text("✗ Not connected").style(iced::theme::Text::Color(iced::Color::from_rgb(
+                text("Not connected").style(iced::theme::Text::Color(iced::Color::from_rgb(
                     0.8, 0.2, 0.2,
                 )))
             },

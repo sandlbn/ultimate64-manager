@@ -1,32 +1,89 @@
 use iced::{
-    Command, Element, Length,
-    widget::{Column, button, column, row, scrollable, text},
+    Command, Element, Length, Subscription,
+    widget::{
+        Column, Space, button, column, container, horizontal_rule, progress_bar, row, scrollable,
+        text, text_input, vertical_rule,
+    },
 };
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use ultimate64::Rest;
-use walkdir::WalkDir;
+
+// MD5 hash size
+const MD5_HASH_SIZE: usize = 16;
+const DEFAULT_SONG_DURATION: u32 = 180; // 3 minutes default
+
+/// SID file header information
+#[derive(Debug, Clone, Default)]
+pub struct SidInfo {
+    pub title: String,
+    pub author: String,
+    #[allow(dead_code)]
+    pub released: String,
+    pub songs: u8,
+    #[allow(dead_code)]
+    pub start_song: u8,
+}
 
 #[derive(Debug, Clone)]
 pub enum MusicPlayerMessage {
+    // Playback controls
     Play,
     Pause,
     Stop,
-    Next,
-    Previous,
+    NextSubsong,     // Next subsong within current file
+    PreviousSubsong, // Previous subsong within current file
+    NextFile,        // Next file in playlist
+    PreviousFile,    // Previous file in playlist
     ToggleShuffle,
     ToggleRepeat,
+
+    // File browser
     SelectDirectory,
     DirectorySelected(PathBuf),
-    FileSelected(usize),
+    NavigateToDirectory(PathBuf),
+    NavigateUp,
+    RefreshBrowser,
+    BrowserItemClicked(usize), // Click on browser item (double-click plays)
+
+    // Playlist management
+    AddToPlaylist(usize),      // Add from browser by index
+    AddAndPlay(usize),         // Add and immediately play
+    RemoveFromPlaylist(usize), // Remove from playlist by index
+    ClearPlaylist,
+    PlaylistItemSelected(usize),    // Select item in playlist
+    PlaylistItemDoubleClick(usize), // Play item immediately
+    MovePlaylistItemUp(usize),
+    MovePlaylistItemDown(usize),
+
+    // Playlist save/load
+    SavePlaylist,
+    LoadPlaylist,
+    PlaylistSaved(Result<String, String>),
+    PlaylistLoaded(Result<Vec<PlaylistEntry>, String>),
+    PlaylistNameChanged(String),
+
+    // Song length database
+    DownloadSongLengths,
+    SongLengthsDownloaded(Result<String, String>),
+    LoadSongLengthsFromFile,
+    SongLengthsLoaded(Result<HashMap<[u8; MD5_HASH_SIZE], Vec<u32>>, String>),
+    SongLengthProgress(String),
+
+    // Playback
     PlayFile(PathBuf, Option<u8>),
     PlaybackCompleted(Result<(), String>),
-    UpdatePlaybackTime,
     SetSongNumber(u8),
-    RefreshPlaylist,
+
+    // Timer
+    TimerTick,
+    SongEnded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -36,46 +93,163 @@ pub enum PlaybackState {
     Paused,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaylistEntry {
+    pub path: PathBuf,
+    pub name: String, // Display name (from SID header or filename)
+    pub file_type: MusicFileType,
+    pub duration: Option<u32>, // Duration in seconds
+    pub subsong: u8,
+    pub max_subsongs: u8, // Total subsongs in this file
+    #[serde(skip)]
+    pub md5_hash: Option<[u8; MD5_HASH_SIZE]>,
+}
+
 #[derive(Debug, Clone)]
-pub struct MusicFile {
+pub struct BrowserEntry {
     pub path: PathBuf,
     pub name: String,
-    pub file_type: MusicFileType,
-    pub song_count: Option<u8>,
+    pub entry_type: BrowserEntryType,
+    pub subsongs: u8, // Number of subsongs (1 for non-SID or single-song SID)
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum BrowserEntryType {
+    Directory,
+    MusicFile(MusicFileType),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MusicFileType {
     Sid,
     Mod,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedPlaylist {
+    pub name: String,
+    pub entries: Vec<PlaylistEntry>,
+}
+
 pub struct MusicPlayer {
-    playlist: Vec<MusicFile>,
-    current_index: Option<usize>,
+    // Browser (left pane)
+    browser_directory: PathBuf,
+    browser_entries: Vec<BrowserEntry>,
+    browser_selected: Option<usize>, // For double-click detection
+
+    // Playlist (right pane)
+    playlist: Vec<PlaylistEntry>,
+    playlist_selected: Option<usize>,
+    current_playing: Option<usize>,
+    playlist_name: String,
+
+    // Playback state
     playback_state: PlaybackState,
     shuffle_enabled: bool,
     repeat_enabled: bool,
-    current_directory: PathBuf,
-    current_song_number: u8,
-    playback_duration: Duration,
+    current_subsong: u8,
+    max_subsongs: u8,
     shuffle_order: Vec<usize>,
+
+    // Timer
+    elapsed_seconds: u32,
+    current_song_duration: u32,
+
+    // Song length database
+    song_lengths: HashMap<[u8; MD5_HASH_SIZE], Vec<u32>>,
+    song_lengths_loaded: bool,
+    song_lengths_status: String,
+
+    // Status
+    status_message: String,
 }
 
 impl MusicPlayer {
     pub fn new() -> Self {
         let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
-        Self {
+
+        let mut player = Self {
+            browser_directory: home_dir.clone(),
+            browser_entries: Vec::new(),
+            browser_selected: None,
+
             playlist: Vec::new(),
-            current_index: None,
+            playlist_selected: None,
+            current_playing: None,
+            playlist_name: "My Playlist".to_string(),
+
             playback_state: PlaybackState::Stopped,
             shuffle_enabled: false,
             repeat_enabled: false,
-            current_directory: home_dir,
-            current_song_number: 1,
-            playback_duration: Duration::from_secs(0),
+            current_subsong: 1,
+            max_subsongs: 1,
             shuffle_order: Vec::new(),
+
+            elapsed_seconds: 0,
+            current_song_duration: DEFAULT_SONG_DURATION,
+
+            song_lengths: HashMap::new(),
+            song_lengths_loaded: false,
+            song_lengths_status: "Song lengths not loaded".to_string(),
+
+            status_message: "Ready".to_string(),
+        };
+
+        player.load_browser_entries(&home_dir);
+
+        // Try to auto-load song lengths database from config directory
+        if let Some(config_dir) = dirs::config_dir() {
+            let db_path = config_dir
+                .join("ultimate64-manager")
+                .join("Songlengths.md5");
+            if db_path.exists() {
+                log::info!("Found song lengths database at {:?}", db_path);
+                if let Ok(content) = fs::read_to_string(&db_path) {
+                    let mut db: HashMap<[u8; MD5_HASH_SIZE], Vec<u32>> = HashMap::new();
+                    let mut count = 0;
+
+                    for line in content.lines() {
+                        let line = line.trim();
+                        // Skip empty lines, comments, and section headers like [Database]
+                        if line.is_empty()
+                            || line.starts_with(';')
+                            || line.starts_with('#')
+                            || line.starts_with('[')
+                        {
+                            continue;
+                        }
+                        if let Some(eq_pos) = line.find('=') {
+                            let md5_str = &line[..eq_pos];
+                            let lengths_str = &line[eq_pos + 1..];
+                            if md5_str.len() != 32 {
+                                continue;
+                            }
+                            if let Some(hash) = hex_to_md5(md5_str) {
+                                let mut lengths = Vec::new();
+                                for token in lengths_str.split_whitespace() {
+                                    if let Some(duration) = parse_time_string(token) {
+                                        lengths.push(duration + 1);
+                                    }
+                                }
+                                if !lengths.is_empty() {
+                                    db.insert(hash, lengths);
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if count > 0 {
+                        player.song_lengths = db;
+                        player.song_lengths_loaded = true;
+                        player.song_lengths_status = format!("{} entries", count);
+                        log::info!("Auto-loaded {} song length entries", count);
+                    }
+                }
+            }
         }
+
+        player
     }
 
     pub fn update(
@@ -84,52 +258,162 @@ impl MusicPlayer {
         connection: Option<Arc<Mutex<Rest>>>,
     ) -> Command<MusicPlayerMessage> {
         match message {
+            // === Playback Controls ===
             MusicPlayerMessage::Play => {
-                if let Some(index) = self.current_index {
-                    if let Some(file) = self.playlist.get(index) {
+                if let Some(idx) = self.current_playing {
+                    if let Some(entry) = self.playlist.get(idx) {
                         self.playback_state = PlaybackState::Playing;
+                        self.max_subsongs = entry.max_subsongs;
+
+                        // Get duration from song length database or use default
+                        self.current_song_duration = self.get_song_duration(entry);
+
+                        let now_playing = if entry.name.is_empty() {
+                            entry
+                                .path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        } else {
+                            entry.name.clone()
+                        };
+                        self.status_message = format!("Playing: {}", now_playing);
+
                         if let Some(conn) = connection {
+                            let path = entry.path.clone();
+                            let subsong = self.current_subsong;
+                            let file_type = entry.file_type.clone();
                             return Command::perform(
-                                play_music_file(
-                                    conn,
-                                    file.path.clone(),
-                                    Some(self.current_song_number),
-                                ),
+                                play_music_file(conn, path, Some(subsong), file_type),
                                 MusicPlayerMessage::PlaybackCompleted,
                             );
                         }
                     }
                 } else if !self.playlist.is_empty() {
-                    self.current_index = Some(0);
+                    self.current_playing = Some(0);
+                    self.current_subsong = 1;
+                    self.elapsed_seconds = 0;
                     return self.update(MusicPlayerMessage::Play, connection);
                 }
                 Command::none()
             }
+
             MusicPlayerMessage::Pause => {
                 self.playback_state = PlaybackState::Paused;
+                self.status_message = "Paused".to_string();
                 Command::none()
             }
+
             MusicPlayerMessage::Stop => {
                 self.playback_state = PlaybackState::Stopped;
-                self.playback_duration = Duration::from_secs(0);
+                self.elapsed_seconds = 0;
+                self.current_subsong = 1;
+                self.status_message = "Stopped".to_string();
+
+                // Reset the Commodore to stop SID playback
+                if let Some(conn) = connection {
+                    return Command::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                let conn = conn.blocking_lock();
+                                conn.reset().map_err(|e| e.to_string())
+                            })
+                            .await
+                            .map_err(|e| format!("Task error: {}", e))?
+                        },
+                        |result| {
+                            if let Err(e) = result {
+                                log::error!("Reset failed: {}", e);
+                            }
+                            MusicPlayerMessage::PlaybackCompleted(Ok(()))
+                        },
+                    );
+                }
                 Command::none()
             }
-            MusicPlayerMessage::Next => {
+
+            MusicPlayerMessage::NextSubsong => {
+                // Go to next subsong within current file
+                if self.current_subsong < self.max_subsongs {
+                    self.current_subsong += 1;
+                    self.elapsed_seconds = 0;
+
+                    // Update duration for this subsong from database
+                    if let Some(idx) = self.current_playing {
+                        if let Some(entry) = self.playlist.get(idx) {
+                            if let Some(hash) = &entry.md5_hash {
+                                if let Some(lengths) = self.song_lengths.get(hash) {
+                                    // subsong is 1-based, array is 0-based
+                                    let subsong_idx =
+                                        (self.current_subsong as usize).saturating_sub(1);
+                                    if subsong_idx < lengths.len() {
+                                        self.current_song_duration = lengths[subsong_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if self.playback_state == PlaybackState::Playing {
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::PreviousSubsong => {
+                // Go to previous subsong within current file
+                if self.current_subsong > 1 {
+                    self.current_subsong -= 1;
+                    self.elapsed_seconds = 0;
+
+                    // Update duration for this subsong from database
+                    if let Some(idx) = self.current_playing {
+                        if let Some(entry) = self.playlist.get(idx) {
+                            if let Some(hash) = &entry.md5_hash {
+                                if let Some(lengths) = self.song_lengths.get(hash) {
+                                    // subsong is 1-based, array is 0-based
+                                    let subsong_idx =
+                                        (self.current_subsong as usize).saturating_sub(1);
+                                    if subsong_idx < lengths.len() {
+                                        self.current_song_duration = lengths[subsong_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if self.playback_state == PlaybackState::Playing {
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::NextFile => {
                 self.next_track();
-                if self.playback_state == PlaybackState::Playing {
-                    self.update(MusicPlayerMessage::Play, connection)
-                } else {
-                    Command::none()
+                if self.current_playing.is_some() {
+                    self.elapsed_seconds = 0;
+                    self.current_subsong = 1;
+                    if self.playback_state == PlaybackState::Playing {
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
                 }
+                Command::none()
             }
-            MusicPlayerMessage::Previous => {
+
+            MusicPlayerMessage::PreviousFile => {
                 self.previous_track();
-                if self.playback_state == PlaybackState::Playing {
-                    self.update(MusicPlayerMessage::Play, connection)
-                } else {
-                    Command::none()
+                if self.current_playing.is_some() {
+                    self.elapsed_seconds = 0;
+                    self.current_subsong = 1;
+                    if self.playback_state == PlaybackState::Playing {
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
                 }
+                Command::none()
             }
+
             MusicPlayerMessage::ToggleShuffle => {
                 self.shuffle_enabled = !self.shuffle_enabled;
                 if self.shuffle_enabled {
@@ -137,10 +421,13 @@ impl MusicPlayer {
                 }
                 Command::none()
             }
+
             MusicPlayerMessage::ToggleRepeat => {
                 self.repeat_enabled = !self.repeat_enabled;
                 Command::none()
             }
+
+            // === File Browser ===
             MusicPlayerMessage::SelectDirectory => Command::perform(
                 async {
                     rfd::AsyncFileDialog::new()
@@ -152,350 +439,1095 @@ impl MusicPlayer {
                     if let Some(path) = result {
                         MusicPlayerMessage::DirectorySelected(path)
                     } else {
-                        MusicPlayerMessage::RefreshPlaylist
+                        MusicPlayerMessage::RefreshBrowser
                     }
                 },
             ),
+
             MusicPlayerMessage::DirectorySelected(path) => {
-                self.current_directory = path.clone();
-                self.load_music_files(&path);
+                self.browser_directory = path.clone();
+                self.browser_selected = None;
+                self.load_browser_entries(&path);
                 Command::none()
             }
-            MusicPlayerMessage::FileSelected(index) => {
-                self.current_index = Some(index);
-                self.current_song_number = 1;
-                if self.playback_state == PlaybackState::Playing {
-                    self.update(MusicPlayerMessage::Play, connection)
-                } else {
-                    Command::none()
-                }
+
+            MusicPlayerMessage::NavigateToDirectory(path) => {
+                self.browser_directory = path.clone();
+                self.browser_selected = None;
+                self.load_browser_entries(&path);
+                Command::none()
             }
+
+            MusicPlayerMessage::NavigateUp => {
+                if let Some(parent) = self.browser_directory.parent() {
+                    let parent = parent.to_path_buf();
+                    self.browser_directory = parent.clone();
+                    self.browser_selected = None;
+                    self.load_browser_entries(&parent);
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::RefreshBrowser => {
+                self.browser_selected = None;
+                self.load_browser_entries(&self.browser_directory.clone());
+                Command::none()
+            }
+
+            MusicPlayerMessage::BrowserItemClicked(index) => {
+                // Double-click detection: if same item clicked again, play it
+                if let Some(browser_entry) = self.browser_entries.get(index) {
+                    match &browser_entry.entry_type {
+                        BrowserEntryType::Directory => {
+                            // Navigate into directory
+                            let path = browser_entry.path.clone();
+                            return self
+                                .update(MusicPlayerMessage::NavigateToDirectory(path), connection);
+                        }
+                        BrowserEntryType::MusicFile(_) => {
+                            // Check if this is a double-click (same item selected)
+                            if self.browser_selected == Some(index) {
+                                // Double-click - add and play
+                                return self
+                                    .update(MusicPlayerMessage::AddAndPlay(index), connection);
+                            } else {
+                                // First click - just select
+                                self.browser_selected = Some(index);
+                            }
+                        }
+                    }
+                }
+                Command::none()
+            }
+
+            // === Playlist Management ===
+            MusicPlayerMessage::AddToPlaylist(index) => {
+                if let Some(browser_entry) = self.browser_entries.get(index) {
+                    if let BrowserEntryType::MusicFile(ref ft) = browser_entry.entry_type {
+                        let entry = self.create_playlist_entry(browser_entry, ft.clone());
+                        let name = entry.name.clone();
+                        self.playlist.push(entry);
+                        self.status_message = format!("Added: {}", name);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::AddAndPlay(index) => {
+                if let Some(browser_entry) = self.browser_entries.get(index) {
+                    if let BrowserEntryType::MusicFile(ref ft) = browser_entry.entry_type {
+                        let entry = self.create_playlist_entry(browser_entry, ft.clone());
+                        let name = entry.name.clone();
+                        self.playlist.push(entry);
+
+                        // Set to play the newly added track
+                        let new_idx = self.playlist.len() - 1;
+                        self.current_playing = Some(new_idx);
+                        self.elapsed_seconds = 0;
+                        self.current_subsong = 1;
+                        self.playback_state = PlaybackState::Playing;
+                        self.status_message = format!("Playing: {}", name);
+
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::RemoveFromPlaylist(index) => {
+                if index < self.playlist.len() {
+                    let removed = self.playlist.remove(index);
+                    self.status_message = format!("Removed: {}", removed.name);
+
+                    // Adjust current_playing if needed
+                    if let Some(current) = self.current_playing {
+                        if index < current {
+                            self.current_playing = Some(current - 1);
+                        } else if index == current {
+                            self.current_playing = None;
+                            self.playback_state = PlaybackState::Stopped;
+                        }
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::ClearPlaylist => {
+                self.playlist.clear();
+                self.current_playing = None;
+                self.playlist_selected = None;
+                self.playback_state = PlaybackState::Stopped;
+                self.status_message = "Playlist cleared".to_string();
+                Command::none()
+            }
+
+            MusicPlayerMessage::PlaylistItemSelected(index) => {
+                self.playlist_selected = Some(index);
+                Command::none()
+            }
+
+            MusicPlayerMessage::PlaylistItemDoubleClick(index) => {
+                self.current_playing = Some(index);
+                self.elapsed_seconds = 0;
+                self.current_subsong = 1;
+                self.playback_state = PlaybackState::Playing;
+                self.update(MusicPlayerMessage::Play, connection)
+            }
+
+            MusicPlayerMessage::MovePlaylistItemUp(index) => {
+                if index > 0 && index < self.playlist.len() {
+                    self.playlist.swap(index, index - 1);
+                    self.playlist_selected = Some(index - 1);
+
+                    // Adjust current_playing
+                    if let Some(current) = self.current_playing {
+                        if current == index {
+                            self.current_playing = Some(index - 1);
+                        } else if current == index - 1 {
+                            self.current_playing = Some(index);
+                        }
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::MovePlaylistItemDown(index) => {
+                if index + 1 < self.playlist.len() {
+                    self.playlist.swap(index, index + 1);
+                    self.playlist_selected = Some(index + 1);
+
+                    // Adjust current_playing
+                    if let Some(current) = self.current_playing {
+                        if current == index {
+                            self.current_playing = Some(index + 1);
+                        } else if current == index + 1 {
+                            self.current_playing = Some(index);
+                        }
+                    }
+                }
+                Command::none()
+            }
+
+            // === Playlist Save/Load ===
+            MusicPlayerMessage::PlaylistNameChanged(name) => {
+                self.playlist_name = name;
+                Command::none()
+            }
+
+            MusicPlayerMessage::SavePlaylist => {
+                let playlist = SavedPlaylist {
+                    name: self.playlist_name.clone(),
+                    entries: self.playlist.clone(),
+                };
+
+                Command::perform(
+                    save_playlist_async(playlist),
+                    MusicPlayerMessage::PlaylistSaved,
+                )
+            }
+
+            MusicPlayerMessage::LoadPlaylist => {
+                Command::perform(load_playlist_async(), MusicPlayerMessage::PlaylistLoaded)
+            }
+
+            MusicPlayerMessage::PlaylistSaved(result) => {
+                match result {
+                    Ok(path) => {
+                        self.status_message = format!("Playlist saved: {}", path);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Save failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::PlaylistLoaded(result) => {
+                match result {
+                    Ok(entries) => {
+                        self.playlist = entries;
+                        self.current_playing = None;
+                        self.playlist_selected = None;
+
+                        // Re-calculate MD5 hashes and look up durations and subsong counts
+                        for entry in &mut self.playlist {
+                            if entry.file_type == MusicFileType::Sid {
+                                if let Ok(data) = fs::read(&entry.path) {
+                                    let hash = compute_md5(&data);
+                                    entry.md5_hash = Some(hash);
+
+                                    // Song length database is authoritative
+                                    if let Some(lengths) = self.song_lengths.get(&hash) {
+                                        // Update subsong count from database
+                                        if lengths.len() > entry.max_subsongs as usize
+                                            && lengths.len() <= 256
+                                        {
+                                            entry.max_subsongs = lengths.len() as u8;
+                                        }
+                                        // Update duration for subsong 1
+                                        if !lengths.is_empty() {
+                                            entry.duration = Some(lengths[0]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        self.status_message =
+                            format!("Loaded playlist with {} entries", self.playlist.len());
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Load failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+
+            // === Song Length Database ===
+            MusicPlayerMessage::DownloadSongLengths => {
+                self.song_lengths_status = "Downloading song lengths database...".to_string();
+                Command::perform(
+                    download_song_lengths_async(),
+                    MusicPlayerMessage::SongLengthsDownloaded,
+                )
+            }
+
+            MusicPlayerMessage::SongLengthsDownloaded(result) => {
+                match result {
+                    Ok(path) => {
+                        self.song_lengths_status = format!("Downloaded to: {}", path);
+                        // Now load the file
+                        return Command::perform(
+                            parse_song_lengths_async(PathBuf::from(path)),
+                            MusicPlayerMessage::SongLengthsLoaded,
+                        );
+                    }
+                    Err(e) => {
+                        self.song_lengths_status = format!("Download failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::LoadSongLengthsFromFile => {
+                self.song_lengths_status = "Select song lengths file...".to_string();
+                Command::perform(
+                    async {
+                        if let Some(handle) = rfd::AsyncFileDialog::new()
+                            .add_filter("MD5 Files", &["md5", "txt"])
+                            .pick_file()
+                            .await
+                        {
+                            let path = handle.path().to_path_buf();
+                            parse_song_lengths_async(path).await
+                        } else {
+                            Err("No file selected".to_string())
+                        }
+                    },
+                    MusicPlayerMessage::SongLengthsLoaded,
+                )
+            }
+
+            MusicPlayerMessage::SongLengthsLoaded(result) => {
+                match result {
+                    Ok(db) => {
+                        let count = db.len();
+                        self.song_lengths = db;
+                        self.song_lengths_loaded = true;
+                        self.song_lengths_status = format!("{} entries", count);
+
+                        // Update existing playlist entries with subsong counts and durations
+                        let mut updated = 0;
+                        for entry in &mut self.playlist {
+                            if let Some(hash) = &entry.md5_hash {
+                                if let Some(lengths) = self.song_lengths.get(hash) {
+                                    // Database subsong count is authoritative
+                                    if lengths.len() > entry.max_subsongs as usize
+                                        && lengths.len() <= 256
+                                    {
+                                        entry.max_subsongs = lengths.len() as u8;
+                                        updated += 1;
+                                    }
+                                    // Update duration for subsong 1
+                                    if !lengths.is_empty() {
+                                        entry.duration = Some(lengths[0]);
+                                    }
+                                }
+                            }
+                        }
+
+                        if updated > 0 {
+                            log::info!(
+                                "Updated {} playlist entries with database subsong counts",
+                                updated
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.song_lengths_status = format!("Load failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::SongLengthProgress(msg) => {
+                self.song_lengths_status = msg;
+                Command::none()
+            }
+
+            // === Playback ===
             MusicPlayerMessage::PlayFile(path, song_num) => {
                 if let Some(conn) = connection {
                     Command::perform(
-                        play_music_file(conn, path, song_num),
+                        play_music_file(conn, path, song_num, MusicFileType::Sid),
                         MusicPlayerMessage::PlaybackCompleted,
                     )
                 } else {
                     Command::none()
                 }
             }
+
             MusicPlayerMessage::PlaybackCompleted(result) => {
                 if let Err(e) = result {
+                    self.status_message = format!("Playback error: {}", e);
                     log::error!("Playback failed: {}", e);
                 }
                 Command::none()
             }
-            MusicPlayerMessage::UpdatePlaybackTime => {
-                if self.playback_state == PlaybackState::Playing {
-                    self.playback_duration += Duration::from_secs(1);
+
+            MusicPlayerMessage::SetSongNumber(num) => {
+                if num >= 1 && num <= self.max_subsongs {
+                    self.current_subsong = num;
+                    self.elapsed_seconds = 0;
+
+                    // Update duration for this subsong
+                    if let Some(idx) = self.current_playing {
+                        if let Some(entry) = self.playlist.get(idx) {
+                            if let Some(hash) = &entry.md5_hash {
+                                if let Some(lengths) = self.song_lengths.get(hash) {
+                                    let subsong_idx = (num as usize).saturating_sub(1);
+                                    if subsong_idx < lengths.len() {
+                                        self.current_song_duration = lengths[subsong_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if self.playback_state == PlaybackState::Playing {
+                        return self.update(MusicPlayerMessage::Play, connection);
+                    }
                 }
                 Command::none()
             }
-            MusicPlayerMessage::SetSongNumber(num) => {
-                self.current_song_number = num;
+
+            // === Timer ===
+            MusicPlayerMessage::TimerTick => {
                 if self.playback_state == PlaybackState::Playing {
+                    self.elapsed_seconds += 1;
+
+                    // Check if song should end
+                    if self.elapsed_seconds >= self.current_song_duration {
+                        return self.update(MusicPlayerMessage::SongEnded, connection);
+                    }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::SongEnded => {
+                // Check if there are more subsongs
+                if self.current_subsong < self.max_subsongs {
+                    self.current_subsong += 1;
+                    self.elapsed_seconds = 0;
+
+                    // Update duration for next subsong
+                    if let Some(idx) = self.current_playing {
+                        if let Some(entry) = self.playlist.get(idx) {
+                            if let Some(hash) = &entry.md5_hash {
+                                if let Some(lengths) = self.song_lengths.get(hash) {
+                                    let subsong_idx =
+                                        (self.current_subsong as usize).saturating_sub(1);
+                                    if subsong_idx < lengths.len() {
+                                        self.current_song_duration = lengths[subsong_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    return self.update(MusicPlayerMessage::Play, connection);
+                }
+
+                // Move to next track
+                self.next_track();
+
+                if self.current_playing.is_some() {
+                    self.elapsed_seconds = 0;
+                    self.current_subsong = 1;
                     self.update(MusicPlayerMessage::Play, connection)
                 } else {
-                    Command::none()
+                    // End of playlist
+                    if self.repeat_enabled && !self.playlist.is_empty() {
+                        self.current_playing = Some(0);
+                        self.elapsed_seconds = 0;
+                        self.current_subsong = 1;
+                        self.update(MusicPlayerMessage::Play, connection)
+                    } else {
+                        self.playback_state = PlaybackState::Stopped;
+                        self.status_message = "Playlist ended".to_string();
+                        Command::none()
+                    }
                 }
-            }
-            MusicPlayerMessage::RefreshPlaylist => {
-                self.load_music_files(&self.current_directory.clone());
-                Command::none()
             }
         }
     }
 
     pub fn view(&self) -> Element<'_, MusicPlayerMessage> {
-        // Transport controls
-        let controls = row![
-            button(text(if self.playback_state == PlaybackState::Playing {
-                "Pause"
+        // === TOP: Now playing info ===
+        let now_playing_text = if let Some(idx) = self.current_playing {
+            if let Some(entry) = self.playlist.get(idx) {
+                let icon = match entry.file_type {
+                    MusicFileType::Sid => "[SID]",
+                    MusicFileType::Mod => "[MOD]",
+                };
+                let name = if entry.name.is_empty() {
+                    entry
+                        .path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                } else {
+                    entry.name.clone()
+                };
+                format!("{} {}", icon, name)
             } else {
-                "Play"
-            }))
+                "No track selected".to_string()
+            }
+        } else {
+            "No track selected".to_string()
+        };
+
+        let now_playing = text(&now_playing_text).size(14);
+
+        // Time display
+        let remaining = self
+            .current_song_duration
+            .saturating_sub(self.elapsed_seconds);
+        let time_display = text(format!(
+            "{}:{:02} / {}:{:02} (-{}:{:02})",
+            self.elapsed_seconds / 60,
+            self.elapsed_seconds % 60,
+            self.current_song_duration / 60,
+            self.current_song_duration % 60,
+            remaining / 60,
+            remaining % 60
+        ))
+        .size(12);
+
+        // Transport buttons - separate file and subsong navigation
+        let transport = row![
+            // File navigation
+            button(text("|<").size(12))
+                .on_press(MusicPlayerMessage::PreviousFile)
+                .padding([4, 8]),
+            // Subsong navigation
+            button(text("<<").size(12))
+                .on_press(MusicPlayerMessage::PreviousSubsong)
+                .padding([4, 6]),
+            button(
+                text(if self.playback_state == PlaybackState::Playing {
+                    "Pause"
+                } else {
+                    "Play"
+                })
+                .size(12)
+            )
             .on_press(if self.playback_state == PlaybackState::Playing {
                 MusicPlayerMessage::Pause
             } else {
                 MusicPlayerMessage::Play
             })
-            .padding([8, 12]),
-            button(text("Stop"))
+            .padding([4, 12]),
+            button(text("Stop").size(12))
                 .on_press(MusicPlayerMessage::Stop)
-                .padding([8, 12]),
-            button(text("Prev"))
-                .on_press(MusicPlayerMessage::Previous)
-                .padding([8, 12]),
-            button(text("Next"))
-                .on_press(MusicPlayerMessage::Next)
-                .padding([8, 12]),
-        ]
-        .spacing(5);
-
-        // Mode toggles
-        let mode_controls = row![
-            button(text(if self.shuffle_enabled {
-                "Shuffle: ON"
-            } else {
-                "Shuffle: OFF"
-            }))
-            .on_press(MusicPlayerMessage::ToggleShuffle)
-            .padding([6, 10]),
-            button(text(if self.repeat_enabled {
-                "Repeat: ON"
-            } else {
-                "Repeat: OFF"
-            }))
-            .on_press(MusicPlayerMessage::ToggleRepeat)
-            .padding([6, 10]),
-        ]
-        .spacing(5);
-
-        // Now playing
-        let now_playing = if let Some(index) = self.current_index {
-            if let Some(file) = self.playlist.get(index) {
-                let icon = match file.file_type {
-                    MusicFileType::Sid => "[SID]",
-                    MusicFileType::Mod => "[MOD]",
-                };
-                text(format!("{} Now Playing: {}", icon, file.name)).size(16)
-            } else {
-                text("No track selected").size(16)
-            }
-        } else {
-            text("No track selected").size(16)
-        };
-
-        // Time display
-        let time_display = text(format!(
-            "{}:{:02}",
-            self.playback_duration.as_secs() / 60,
-            self.playback_duration.as_secs() % 60
-        ))
-        .size(14);
-
-        // Song selector for SID files with multiple songs
-        let song_selector: Element<'_, MusicPlayerMessage> = if self
-            .current_index
-            .and_then(|i| self.playlist.get(i))
-            .and_then(|f| f.song_count)
-            .is_some()
-        {
-            let max_songs = self.playlist[self.current_index.unwrap()]
-                .song_count
-                .unwrap();
-            row![
-                text("Song:").size(12),
-                button(text("-").size(12))
-                    .on_press(MusicPlayerMessage::SetSongNumber(
-                        self.current_song_number.saturating_sub(1).max(1)
-                    ))
-                    .padding([4, 8]),
-                text(format!("{}/{}", self.current_song_number, max_songs)).size(12),
-                button(text("+").size(12))
-                    .on_press(MusicPlayerMessage::SetSongNumber(
-                        (self.current_song_number + 1).min(max_songs)
-                    ))
-                    .padding([4, 8]),
-            ]
-            .spacing(5)
-            .align_items(iced::Alignment::Center)
-            .into()
-        } else {
-            row![].into()
-        };
-
-        // Playlist header
-        let playlist_header = row![
-            text(format!("Playlist ({} files)", self.playlist.len())).size(14),
-            button(text("Browse").size(12))
-                .on_press(MusicPlayerMessage::SelectDirectory)
                 .padding([4, 8]),
-            button(text("Refresh").size(12))
-                .on_press(MusicPlayerMessage::RefreshPlaylist)
+            // Subsong navigation
+            button(text(">>").size(12))
+                .on_press(MusicPlayerMessage::NextSubsong)
+                .padding([4, 6]),
+            // File navigation
+            button(text(">|").size(12))
+                .on_press(MusicPlayerMessage::NextFile)
                 .padding([4, 8]),
+            // Subsong indicator
+            text(format!(
+                "Tune {}/{}",
+                self.current_subsong, self.max_subsongs
+            ))
+            .size(11),
         ]
-        .spacing(10)
+        .spacing(5)
         .align_items(iced::Alignment::Center);
 
-        // Playlist items
-        let playlist_items: Vec<Element<'_, MusicPlayerMessage>> = self
-            .playlist
-            .iter()
-            .enumerate()
-            .map(|(index, file)| {
-                let icon = match file.file_type {
-                    MusicFileType::Sid => "[SID]",
-                    MusicFileType::Mod => "[MOD]",
-                };
-
-                let is_current = Some(index) == self.current_index;
-                let prefix = if is_current {
-                    match self.playback_state {
-                        PlaybackState::Playing => ">",
-                        PlaybackState::Paused => "=",
-                        PlaybackState::Stopped => "*",
-                    }
+        // Mode toggles
+        let modes = row![
+            button(
+                text(if self.shuffle_enabled {
+                    "Shuffle: ON"
                 } else {
-                    " "
-                };
+                    "Shuffle"
+                })
+                .size(10)
+            )
+            .on_press(MusicPlayerMessage::ToggleShuffle)
+            .padding([3, 6])
+            .style(if self.shuffle_enabled {
+                iced::theme::Button::Primary
+            } else {
+                iced::theme::Button::Secondary
+            }),
+            button(
+                text(if self.repeat_enabled {
+                    "Repeat: ON"
+                } else {
+                    "Repeat"
+                })
+                .size(10)
+            )
+            .on_press(MusicPlayerMessage::ToggleRepeat)
+            .padding([3, 6])
+            .style(if self.repeat_enabled {
+                iced::theme::Button::Primary
+            } else {
+                iced::theme::Button::Secondary
+            }),
+        ]
+        .spacing(5);
 
-                button(text(format!("{} {} {}", prefix, icon, file.name)).size(12))
-                    .on_press(MusicPlayerMessage::FileSelected(index))
-                    .width(Length::Fill)
-                    .padding([4, 8])
-                    .into()
-            })
-            .collect();
-
-        let playlist_scroll =
-            scrollable(Column::with_children(playlist_items).spacing(2).padding(5))
-                .height(Length::Fill);
-
-        // Current directory
-        let dir_display =
-            text(format!("Dir: {}", self.current_directory.to_string_lossy())).size(11);
-
-        column![
-            text("MUSIC PLAYER").size(20),
-            iced::widget::horizontal_rule(1),
-            iced::widget::Space::with_height(10),
-            now_playing,
-            time_display,
-            iced::widget::Space::with_height(10),
-            controls,
-            mode_controls,
-            song_selector,
-            iced::widget::Space::with_height(15),
-            playlist_header,
-            dir_display,
-            playlist_scroll,
+        let top_bar = column![
+            row![now_playing, Space::with_width(Length::Fill), time_display]
+                .align_items(iced::Alignment::Center),
+            row![transport, Space::with_width(20), modes].align_items(iced::Alignment::Center),
+            // Progress bar
+            container(
+                progress_bar(
+                    0.0..=self.current_song_duration as f32,
+                    self.elapsed_seconds as f32
+                )
+                .height(8)
+            )
+            .width(Length::Fill)
+            .padding([5, 0]),
         ]
         .spacing(8)
-        .padding(15)
+        .padding(10);
+
+        // === LEFT PANE: File Browser ===
+        let dir_display = truncate_path(&self.browser_directory, 40);
+
+        // Count music files
+        let music_file_count = self
+            .browser_entries
+            .iter()
+            .filter(|e| matches!(e.entry_type, BrowserEntryType::MusicFile(_)))
+            .count();
+
+        let browser_header = container(
+            column![
+                text("LOCAL FILES").size(12),
+                row![
+                    button(text("Browse").size(10))
+                        .on_press(MusicPlayerMessage::SelectDirectory)
+                        .padding([3, 8]),
+                    button(text("Up").size(10))
+                        .on_press(MusicPlayerMessage::NavigateUp)
+                        .padding([3, 8]),
+                    button(text("Refresh").size(10))
+                        .on_press(MusicPlayerMessage::RefreshBrowser)
+                        .padding([3, 8]),
+                ]
+                .spacing(5),
+                text(&dir_display).size(10),
+                text(format!("{} music files", music_file_count)).size(10),
+            ]
+            .spacing(5),
+        )
+        .padding(10);
+
+        let browser_list: Element<'_, MusicPlayerMessage> = if self.browser_entries.is_empty() {
+            container(text("Empty directory").size(11))
+                .padding(10)
+                .into()
+        } else {
+            let items: Vec<Element<'_, MusicPlayerMessage>> = self
+                .browser_entries
+                .iter()
+                .enumerate()
+                .map(|(idx, entry)| {
+                    let is_selected = self.browser_selected == Some(idx);
+
+                    match &entry.entry_type {
+                        BrowserEntryType::Directory => {
+                            // Directory entry - click to navigate
+                            row![
+                                button(text(format!("[DIR] {}", entry.name)).size(11))
+                                    .on_press(MusicPlayerMessage::BrowserItemClicked(idx))
+                                    .padding([6, 8])
+                                    .width(Length::Fill)
+                                    .style(iced::theme::Button::Text),
+                            ]
+                            .into()
+                        }
+                        BrowserEntryType::MusicFile(ft) => {
+                            // Music file entry - show add and play buttons
+                            let icon = match ft {
+                                MusicFileType::Sid => "[SID]",
+                                MusicFileType::Mod => "[MOD]",
+                            };
+
+                            // Show subsong count for multi-subsong files
+                            let subsong_info = if entry.subsongs > 1 {
+                                format!(" ({})", entry.subsongs)
+                            } else {
+                                String::new()
+                            };
+
+                            let display = truncate_string(&entry.name, 28);
+
+                            row![
+                                button(
+                                    text(format!("{}{} {}", icon, subsong_info, display)).size(11)
+                                )
+                                .on_press(MusicPlayerMessage::BrowserItemClicked(idx))
+                                .padding([6, 8])
+                                .width(Length::Fill)
+                                .style(if is_selected {
+                                    iced::theme::Button::Primary
+                                } else {
+                                    iced::theme::Button::Text
+                                }),
+                                button(text(">").size(10))
+                                    .on_press(MusicPlayerMessage::AddAndPlay(idx))
+                                    .padding([4, 8]),
+                                button(text("+").size(10))
+                                    .on_press(MusicPlayerMessage::AddToPlaylist(idx))
+                                    .padding([4, 8]),
+                            ]
+                            .spacing(4)
+                            .align_items(iced::Alignment::Center)
+                            .into()
+                        }
+                    }
+                })
+                .collect();
+
+            scrollable(
+                Column::with_children(items)
+                    .spacing(2)
+                    .padding([5, 15, 5, 5]), // Extra right padding for scrollbar
+            )
+            .height(Length::Fill)
+            .into()
+        };
+
+        let browser_pane = container(
+            column![browser_header, horizontal_rule(1), browser_list]
+                .spacing(0)
+                .height(Length::Fill),
+        )
+        .width(Length::FillPortion(1));
+
+        // === RIGHT PANE: Playlist ===
+        let playlist_header = container(
+            column![
+                text("PLAYLIST").size(12),
+                row![
+                    text_input("Playlist name", &self.playlist_name)
+                        .on_input(MusicPlayerMessage::PlaylistNameChanged)
+                        .size(10)
+                        .width(Length::Fixed(120.0)),
+                    button(text("Save").size(10))
+                        .on_press(MusicPlayerMessage::SavePlaylist)
+                        .padding([3, 6]),
+                    button(text("Load").size(10))
+                        .on_press(MusicPlayerMessage::LoadPlaylist)
+                        .padding([3, 6]),
+                    button(text("Clear").size(10))
+                        .on_press(MusicPlayerMessage::ClearPlaylist)
+                        .padding([3, 6]),
+                ]
+                .spacing(5),
+                text(format!(
+                    "{} tracks | Total: {}",
+                    self.playlist.len(),
+                    format_total_duration(&self.playlist)
+                ))
+                .size(10),
+            ]
+            .spacing(5),
+        )
+        .padding(10);
+
+        let playlist_list: Element<'_, MusicPlayerMessage> = if self.playlist.is_empty() {
+            container(text("Playlist is empty\nDouble-click files to add and play").size(11))
+                .padding(10)
+                .into()
+        } else {
+            let items: Vec<Element<'_, MusicPlayerMessage>> = self
+                .playlist
+                .iter()
+                .enumerate()
+                .map(|(idx, entry)| {
+                    let is_selected = self.playlist_selected == Some(idx);
+                    let is_playing = self.current_playing == Some(idx);
+
+                    let prefix = if is_playing {
+                        match self.playback_state {
+                            PlaybackState::Playing => ">",
+                            PlaybackState::Paused => "=",
+                            PlaybackState::Stopped => "*",
+                        }
+                    } else {
+                        " "
+                    };
+
+                    let icon = match entry.file_type {
+                        MusicFileType::Sid => "S",
+                        MusicFileType::Mod => "M",
+                    };
+
+                    // Show subsong count for multi-subsong files
+                    let subsong_info = if entry.max_subsongs > 1 {
+                        format!("x{}", entry.max_subsongs)
+                    } else {
+                        String::new()
+                    };
+
+                    let duration_str = if let Some(dur) = entry.duration {
+                        format!("{}:{:02}", dur / 60, dur % 60)
+                    } else {
+                        "3:00".to_string()
+                    };
+
+                    // Show parsed name or filename
+                    let display_name = if entry.name.is_empty() {
+                        entry
+                            .path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "Unknown".to_string())
+                    } else {
+                        entry.name.clone()
+                    };
+                    let name = truncate_string(&display_name, 25);
+
+                    row![
+                        button(
+                            text(format!(
+                                "{} [{}{}] {} ({})",
+                                prefix, icon, subsong_info, name, duration_str
+                            ))
+                            .size(10)
+                        )
+                        .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .style(if is_selected || is_playing {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Text
+                        }),
+                        button(text("^").size(9))
+                            .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
+                            .padding([4, 6]),
+                        button(text("v").size(9))
+                            .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
+                            .padding([4, 6]),
+                        button(text("X").size(9))
+                            .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
+                            .padding([4, 6]),
+                    ]
+                    .spacing(2)
+                    .align_items(iced::Alignment::Center)
+                    .into()
+                })
+                .collect();
+
+            scrollable(
+                Column::with_children(items)
+                    .spacing(2)
+                    .padding([5, 15, 5, 5]), // Extra right padding for scrollbar
+            )
+            .height(Length::Fill)
+            .into()
+        };
+
+        // Play selected button
+        let playlist_controls = container(if let Some(selected) = self.playlist_selected {
+            row![
+                button(text("Play Selected").size(10))
+                    .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
+                    .padding([4, 10]),
+            ]
+        } else {
+            row![]
+        })
+        .padding([5, 10]);
+
+        let playlist_pane = container(
+            column![
+                playlist_header,
+                horizontal_rule(1),
+                playlist_list,
+                playlist_controls,
+            ]
+            .spacing(0)
+            .height(Length::Fill),
+        )
+        .width(Length::FillPortion(1));
+
+        // === BOTTOM: Song Length Database Controls ===
+        let db_status = if self.song_lengths_loaded {
+            format!("{} entries", self.song_lengths.len())
+        } else {
+            self.song_lengths_status.clone()
+        };
+
+        let db_controls = container(
+            row![
+                text("Song Lengths:").size(10),
+                button(text("Download HVSC").size(10))
+                    .on_press(MusicPlayerMessage::DownloadSongLengths)
+                    .padding([3, 8]),
+                button(text("Load File").size(10))
+                    .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
+                    .padding([3, 8]),
+                text(&db_status).size(10),
+                Space::with_width(Length::Fill),
+                text(&self.status_message).size(10),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+        )
+        .padding([5, 10]);
+
+        // === Main Layout ===
+        let main_content = row![browser_pane, vertical_rule(1), playlist_pane].height(Length::Fill);
+
+        column![
+            text("MUSIC PLAYER").size(16),
+            horizontal_rule(1),
+            top_bar,
+            horizontal_rule(1),
+            main_content,
+            horizontal_rule(1),
+            db_controls,
+        ]
+        .spacing(5)
+        .padding(10)
         .into()
     }
 
-    fn load_music_files(&mut self, directory: &Path) {
-        self.playlist.clear();
+    pub fn subscription(&self) -> Subscription<MusicPlayerMessage> {
+        if self.playback_state == PlaybackState::Playing {
+            iced::time::every(Duration::from_secs(1)).map(|_| MusicPlayerMessage::TimerTick)
+        } else {
+            Subscription::none()
+        }
+    }
 
-        let walker = WalkDir::new(directory)
-            .follow_links(true)
-            .max_depth(5) // Limit recursion depth
-            .into_iter()
-            .filter_map(|entry| entry.ok());
+    // Helper methods
 
-        let mut files: Vec<MusicFile> = Vec::new();
+    fn create_playlist_entry(
+        &self,
+        browser_entry: &BrowserEntry,
+        file_type: MusicFileType,
+    ) -> PlaylistEntry {
+        let mut entry = PlaylistEntry {
+            path: browser_entry.path.clone(),
+            name: String::new(),
+            file_type,
+            duration: None,
+            subsong: 1,
+            max_subsongs: browser_entry.subsongs, // Start with SID header count
+            md5_hash: None,
+        };
 
-        for entry in walker {
-            let path = entry.path();
-
-            if path.is_dir() {
-                continue;
-            }
-
-            if let Some(extension) = path.extension() {
-                if let Some(ext_str) = extension.to_str() {
-                    let ext_lower = ext_str.to_lowercase();
-
-                    let display_name = if let Ok(relative) = path.strip_prefix(directory) {
-                        relative.to_string_lossy().to_string()
+        // Parse SID header only when adding to playlist (lazy loading)
+        if entry.file_type == MusicFileType::Sid {
+            if let Ok(data) = fs::read(&entry.path) {
+                // Parse SID header for display name
+                if let Some(info) = parse_sid_header(&data) {
+                    entry.name = if info.title.is_empty() {
+                        browser_entry.name.clone()
+                    } else if info.author.is_empty() {
+                        info.title
                     } else {
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string()
+                        format!("{} - {}", info.author, info.title)
                     };
+                    // Use SID header subsong count as baseline
+                    entry.max_subsongs = info.songs;
+                } else {
+                    entry.name = browser_entry.name.clone();
+                }
 
-                    match ext_lower.as_str() {
-                        "sid" => {
-                            files.push(MusicFile {
-                                path: path.to_path_buf(),
-                                name: display_name,
-                                file_type: MusicFileType::Sid,
-                                song_count: Some(1), // TODO: Parse SID header
+                // Calculate MD5 and look up in song length database
+                let hash = compute_md5(&data);
+                entry.md5_hash = Some(hash);
+
+                // Song length database is authoritative for subsong count and durations
+                if let Some(lengths) = self.song_lengths.get(&hash) {
+                    // Database subsong count is more reliable than SID header
+                    if lengths.len() > entry.max_subsongs as usize && lengths.len() <= 256 {
+                        entry.max_subsongs = lengths.len() as u8;
+                    }
+                    // Get duration for first subsong (subsong 1 = index 0)
+                    if !lengths.is_empty() {
+                        entry.duration = Some(lengths[0]);
+                    }
+                }
+            } else {
+                entry.name = browser_entry.name.clone();
+            }
+        } else {
+            entry.name = browser_entry.name.clone();
+        }
+
+        entry
+    }
+
+    fn load_browser_entries(&mut self, directory: &Path) {
+        self.browser_entries.clear();
+
+        // Read directory entries
+        if let Ok(entries) = fs::read_dir(directory) {
+            let mut dirs: Vec<BrowserEntry> = Vec::new();
+            let mut files: Vec<BrowserEntry> = Vec::new();
+
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                // Skip hidden files/directories
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                if path.is_dir() {
+                    dirs.push(BrowserEntry {
+                        path,
+                        name,
+                        entry_type: BrowserEntryType::Directory,
+                        subsongs: 1,
+                    });
+                } else if let Some(extension) = path.extension() {
+                    if let Some(ext_str) = extension.to_str() {
+                        let ext_lower = ext_str.to_lowercase();
+                        let file_type = match ext_lower.as_str() {
+                            "sid" => Some(MusicFileType::Sid),
+                            "mod" | "s3m" | "xm" | "it" => Some(MusicFileType::Mod),
+                            _ => None,
+                        };
+
+                        if let Some(ft) = file_type {
+                            // Parse SID file to get subsong count
+                            let subsongs = if ft == MusicFileType::Sid {
+                                parse_sid_subsong_count(&path)
+                            } else {
+                                1
+                            };
+
+                            files.push(BrowserEntry {
+                                path,
+                                name,
+                                entry_type: BrowserEntryType::MusicFile(ft),
+                                subsongs,
                             });
                         }
-                        "mod" | "s3m" | "xm" | "it" => {
-                            files.push(MusicFile {
-                                path: path.to_path_buf(),
-                                name: display_name,
-                                file_type: MusicFileType::Mod,
-                                song_count: None,
-                            });
-                        }
-                        _ => {}
                     }
                 }
             }
-        }
 
-        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            // Sort directories and files alphabetically
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+            // Directories first, then files
+            self.browser_entries.extend(dirs);
+            self.browser_entries.extend(files);
+        }
 
         log::info!(
-            "Found {} music files in {}",
-            files.len(),
+            "Loaded {} entries from {}",
+            self.browser_entries.len(),
             directory.display()
         );
-
-        self.playlist = files;
-
-        if self.shuffle_enabled {
-            self.generate_shuffle_order();
-        }
     }
 
     fn next_track(&mut self) {
         if self.playlist.is_empty() {
+            self.current_playing = None;
             return;
         }
 
         if self.shuffle_enabled && !self.shuffle_order.is_empty() {
-            if let Some(current) = self.current_index {
+            if let Some(current) = self.current_playing {
                 if let Some(pos) = self.shuffle_order.iter().position(|&x| x == current) {
-                    let next_pos = (pos + 1) % self.shuffle_order.len();
-                    self.current_index = Some(self.shuffle_order[next_pos]);
+                    let next_pos = pos + 1;
+                    if next_pos < self.shuffle_order.len() {
+                        self.current_playing = Some(self.shuffle_order[next_pos]);
+                    } else {
+                        self.current_playing = None;
+                    }
                 } else {
-                    self.current_index = Some(self.shuffle_order[0]);
+                    self.current_playing = Some(self.shuffle_order[0]);
                 }
             } else {
-                self.current_index = Some(self.shuffle_order[0]);
+                self.current_playing = Some(self.shuffle_order[0]);
             }
         } else {
-            self.current_index = Some(
-                self.current_index
-                    .map(|i| (i + 1) % self.playlist.len())
-                    .unwrap_or(0),
-            );
+            self.current_playing = self
+                .current_playing
+                .map(|i| {
+                    let next = i + 1;
+                    if next < self.playlist.len() {
+                        Some(next)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(Some(0));
         }
-
-        self.current_song_number = 1;
     }
 
     fn previous_track(&mut self) {
         if self.playlist.is_empty() {
+            self.current_playing = None;
             return;
         }
 
         if self.shuffle_enabled && !self.shuffle_order.is_empty() {
-            if let Some(current) = self.current_index {
+            if let Some(current) = self.current_playing {
                 if let Some(pos) = self.shuffle_order.iter().position(|&x| x == current) {
                     let prev_pos = if pos == 0 {
                         self.shuffle_order.len() - 1
                     } else {
                         pos - 1
                     };
-                    self.current_index = Some(self.shuffle_order[prev_pos]);
+                    self.current_playing = Some(self.shuffle_order[prev_pos]);
                 } else {
-                    self.current_index = Some(self.shuffle_order[0]);
+                    self.current_playing = Some(self.shuffle_order[0]);
                 }
             } else {
-                self.current_index = Some(self.shuffle_order[0]);
+                self.current_playing = Some(self.shuffle_order[0]);
             }
         } else {
-            self.current_index = Some(
-                self.current_index
+            self.current_playing = Some(
+                self.current_playing
                     .map(|i| {
                         if i == 0 {
                             self.playlist.len() - 1
@@ -506,8 +1538,6 @@ impl MusicPlayer {
                     .unwrap_or(0),
             );
         }
-
-        self.current_song_number = 1;
     }
 
     fn generate_shuffle_order(&mut self) {
@@ -515,32 +1545,345 @@ impl MusicPlayer {
         let mut rng = rand::thread_rng();
         self.shuffle_order.shuffle(&mut rng);
     }
+
+    fn get_song_duration(&self, entry: &PlaylistEntry) -> u32 {
+        // Try to look up in song length database by current subsong
+        // Note: subsong is 1-based, array is 0-based
+        if let Some(hash) = &entry.md5_hash {
+            if let Some(lengths) = self.song_lengths.get(hash) {
+                let subsong_idx = (self.current_subsong as usize).saturating_sub(1);
+                if subsong_idx < lengths.len() {
+                    return lengths[subsong_idx];
+                }
+            }
+        }
+
+        // Fall back to stored duration (for subsong 1)
+        if self.current_subsong == 1 {
+            if let Some(dur) = entry.duration {
+                return dur;
+            }
+        }
+
+        // Default duration
+        DEFAULT_SONG_DURATION
+    }
 }
+
+// === SID Header Parsing ===
+
+/// Quick parse to get just subsong count (for browser display)
+fn parse_sid_subsong_count(path: &Path) -> u8 {
+    // Only read first 16 bytes needed for subsong count
+    if let Ok(file) = fs::File::open(path) {
+        use std::io::Read;
+        let mut buffer = [0u8; 16];
+        let mut reader = std::io::BufReader::new(file);
+        if reader.read_exact(&mut buffer).is_ok() {
+            // Check PSID or RSID magic
+            if &buffer[0..4] == b"PSID" || &buffer[0..4] == b"RSID" {
+                // Subsong count at offset 0x0E (big-endian)
+                let songs = ((buffer[14] as u16) << 8) | (buffer[15] as u16);
+                return if songs > 0 { songs as u8 } else { 1 };
+            }
+        }
+    }
+    1 // Default to 1 subsong
+}
+
+fn parse_sid_header(data: &[u8]) -> Option<SidInfo> {
+    if data.len() < 0x76 {
+        return None;
+    }
+
+    let magic = &data[0..4];
+    if magic != b"PSID" && magic != b"RSID" {
+        return None;
+    }
+
+    let songs = u16::from_be_bytes([data[0x0E], data[0x0F]]) as u8;
+    let start_song = u16::from_be_bytes([data[0x10], data[0x11]]) as u8;
+    let title = read_sid_string(&data[0x16..0x36]);
+    let author = read_sid_string(&data[0x36..0x56]);
+    let released = read_sid_string(&data[0x56..0x76]);
+
+    Some(SidInfo {
+        title,
+        author,
+        released,
+        songs: songs.max(1),
+        start_song: start_song.max(1),
+    })
+}
+
+fn read_sid_string(data: &[u8]) -> String {
+    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
+    data[..end]
+        .iter()
+        .filter_map(|&b| {
+            if b >= 32 && b < 127 {
+                Some(b as char)
+            } else {
+                None
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+// === Async Functions ===
 
 async fn play_music_file(
     connection: Arc<Mutex<Rest>>,
     path: PathBuf,
     song_number: Option<u8>,
+    file_type: MusicFileType,
 ) -> Result<(), String> {
     log::info!("Playing: {} (song: {:?})", path.display(), song_number);
 
-    let data = std::fs::read(&path).map_err(|e| e.to_string())?;
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
+    let data = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
     tokio::task::spawn_blocking(move || {
         let conn = connection.blocking_lock();
-        match ext.as_deref() {
-            Some("sid") => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
-            Some("mod") | Some("s3m") | Some("xm") | Some("it") => {
-                conn.mod_play(&data).map_err(|e| e.to_string())
-            }
-            _ => Err("Unsupported music file type".to_string()),
+        match file_type {
+            MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
+            MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),
         }
     })
     .await
     .map_err(|e| format!("Task join error: {}", e))?
+}
+
+async fn download_song_lengths_async() -> Result<String, String> {
+    let urls = [
+        "https://hvsc.perv.dk/HVSC/C64Music/DOCUMENTS/Songlengths.md5",
+        "http://hvsc.brona.dk/HVSC/C64Music/DOCUMENTS/Songlengths.md5",
+    ];
+
+    let config_dir = dirs::config_dir()
+        .ok_or("Cannot determine config directory")?
+        .join("ultimate64-manager");
+
+    tokio::fs::create_dir_all(&config_dir)
+        .await
+        .map_err(|e| format!("Cannot create config dir: {}", e))?;
+
+    let dest_path = config_dir.join("Songlengths.md5");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    for url in urls {
+        log::info!("Trying to download from: {}", url);
+
+        match client.get(url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .map_err(|e| format!("Download error: {}", e))?;
+
+                    tokio::fs::write(&dest_path, &bytes)
+                        .await
+                        .map_err(|e| format!("Write error: {}", e))?;
+
+                    return Ok(dest_path.to_string_lossy().to_string());
+                }
+            }
+            Err(e) => {
+                log::warn!("Failed to download from {}: {}", url, e);
+                continue;
+            }
+        }
+    }
+
+    Err("All download attempts failed".to_string())
+}
+
+async fn parse_song_lengths_async(
+    path: PathBuf,
+) -> Result<HashMap<[u8; MD5_HASH_SIZE], Vec<u32>>, String> {
+    // Song length database format:
+    // Each line: MD5HASH=duration1 duration2 duration3 ...
+    // Where each duration corresponds to a subsong (subsong 1 = index 0, etc.)
+    // The number of durations = number of subsongs in the file
+    // This is more authoritative than the SID header subsong count
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Cannot read file: {}", e))?;
+
+    let mut db: HashMap<[u8; MD5_HASH_SIZE], Vec<u32>> = HashMap::new();
+    let mut count = 0;
+
+    for line in content.lines() {
+        let line = line.trim();
+
+        // Skip empty lines, comments, and section headers like [Database]
+        if line.is_empty()
+            || line.starts_with(';')
+            || line.starts_with('#')
+            || line.starts_with('[')
+        {
+            continue;
+        }
+
+        if let Some(eq_pos) = line.find('=') {
+            let md5_str = &line[..eq_pos];
+            let lengths_str = &line[eq_pos + 1..];
+
+            if md5_str.len() != 32 {
+                continue;
+            }
+
+            if let Some(hash) = hex_to_md5(md5_str) {
+                let mut lengths = Vec::new();
+
+                for token in lengths_str.split_whitespace() {
+                    if let Some(duration) = parse_time_string(token) {
+                        lengths.push(duration + 1);
+                    }
+                }
+
+                if !lengths.is_empty() {
+                    db.insert(hash, lengths);
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    log::info!(
+        "Parsed {} song length entries from {}",
+        count,
+        path.display()
+    );
+
+    Ok(db)
+}
+
+async fn save_playlist_async(playlist: SavedPlaylist) -> Result<String, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("Playlist", &["json"])
+        .set_file_name(&format!("{}.json", playlist.name))
+        .save_file()
+        .await
+        .ok_or("Save cancelled")?;
+
+    let path = handle.path().to_path_buf();
+
+    let json = serde_json::to_string_pretty(&playlist)
+        .map_err(|e| format!("Serialization error: {}", e))?;
+
+    tokio::fs::write(&path, json)
+        .await
+        .map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+async fn load_playlist_async() -> Result<Vec<PlaylistEntry>, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("Playlist", &["json"])
+        .pick_file()
+        .await
+        .ok_or("Load cancelled")?;
+
+    let path = handle.path().to_path_buf();
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let playlist: SavedPlaylist =
+        serde_json::from_str(&content).map_err(|e| format!("Parse error: {}", e))?;
+
+    Ok(playlist.entries)
+}
+
+// === Helper Functions ===
+
+fn compute_md5(data: &[u8]) -> [u8; MD5_HASH_SIZE] {
+    let digest = md5::compute(data);
+    digest.0
+}
+
+fn hex_to_md5(hex_str: &str) -> Option<[u8; MD5_HASH_SIZE]> {
+    if hex_str.len() != 32 {
+        return None;
+    }
+
+    let mut result = [0u8; MD5_HASH_SIZE];
+
+    for (i, byte) in result.iter_mut().enumerate() {
+        let hex_byte = &hex_str[i * 2..i * 2 + 2];
+        *byte = u8::from_str_radix(hex_byte, 16).ok()?;
+    }
+
+    Some(result)
+}
+
+fn parse_time_string(s: &str) -> Option<u32> {
+    // Handle formats: "M:SS", "M:SS.mmm", "H:MM:SS", "H:MM:SS.mmm", or just seconds
+    // Strip any milliseconds (after the decimal point)
+    let s = s.split('.').next().unwrap_or(s);
+
+    let parts: Vec<&str> = s.split(':').collect();
+
+    match parts.len() {
+        1 => parts[0].parse().ok(),
+        2 => {
+            let minutes: u32 = parts[0].parse().ok()?;
+            let seconds: u32 = parts[1].parse().ok()?;
+            Some(minutes * 60 + seconds)
+        }
+        3 => {
+            let hours: u32 = parts[0].parse().ok()?;
+            let minutes: u32 = parts[1].parse().ok()?;
+            let seconds: u32 = parts[2].parse().ok()?;
+            Some(hours * 3600 + minutes * 60 + seconds)
+        }
+        _ => None,
+    }
+}
+
+fn truncate_string(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn truncate_path(path: &Path, max_len: usize) -> String {
+    let s = path.to_string_lossy();
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
+    }
+}
+
+fn format_total_duration(entries: &[PlaylistEntry]) -> String {
+    let total_seconds: u32 = entries
+        .iter()
+        .map(|e| e.duration.unwrap_or(DEFAULT_SONG_DURATION))
+        .sum();
+
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{}h {}m {}s", hours, minutes, seconds)
+    } else {
+        format!("{}m {}s", minutes, seconds)
+    }
 }
