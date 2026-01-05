@@ -196,110 +196,11 @@ impl VideoStreaming {
     }
 
     pub fn view(&self) -> Element<'_, StreamingMessage> {
-        // Mode selection
-        let mode_row = row![
-            text("Mode:").size(12),
-            tooltip(
-                button(text("Unicast").size(11))
-                    .on_press(StreamingMessage::StreamModeChanged(StreamMode::Unicast))
-                    .padding([4, 8])
-                    .style(if self.stream_mode == StreamMode::Unicast {
-                        iced::theme::Button::Primary
-                    } else {
-                        iced::theme::Button::Secondary
-                    }),
-                "Direct IP connection (works over WiFi)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-            tooltip(
-                button(text("Multicast").size(11))
-                    .on_press(StreamingMessage::StreamModeChanged(StreamMode::Multicast))
-                    .padding([4, 8])
-                    .style(if self.stream_mode == StreamMode::Multicast {
-                        iced::theme::Button::Primary
-                    } else {
-                        iced::theme::Button::Secondary
-                    }),
-                "Multicast 239.0.1.64 (requires wired LAN)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-            text("Port:").size(12),
-            tooltip(
-                text_input("11000", &self.listen_port)
-                    .on_input(StreamingMessage::PortChanged)
-                    .width(Length::Fixed(60.0))
-                    .size(12),
-                "Video port (audio uses port+1)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-        ]
-        .spacing(8)
-        .align_items(iced::Alignment::Center);
-
-        let controls = row![
-            if self.is_streaming {
-                tooltip(
-                    button(text("STOP"))
-                        .on_press(StreamingMessage::StopStream)
-                        .padding([8, 16]),
-                    "Stop video stream",
-                    tooltip::Position::Bottom,
-                )
-                .style(iced::theme::Container::Box)
-            } else {
-                tooltip(
-                    button(text("START"))
-                        .on_press(StreamingMessage::StartStream)
-                        .padding([8, 16]),
-                    "Start video stream",
-                    tooltip::Position::Bottom,
-                )
-                .style(iced::theme::Container::Box)
-            },
-            tooltip(
-                button(text("Screenshot"))
-                    .on_press(StreamingMessage::TakeScreenshot)
-                    .padding([8, 16]),
-                "Capture single frame to PNG",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-            tooltip(
-                checkbox("Audio", self.audio_enabled)
-                    .on_toggle(StreamingMessage::AudioToggled)
-                    .size(16)
-                    .text_size(12),
-                "Enable audio streaming (port+1)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-        ]
-        .spacing(10)
-        .align_items(iced::Alignment::Center);
-
-        // Status info
+        // Video packets info
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
-        let status_info = if self.is_streaming {
-            format!(
-                "Video: {} pkts | Audio: {} pkts | Mode: {}",
-                video_packets, audio_packets, self.stream_mode
-            )
-        } else {
-            match self.stream_mode {
-                StreamMode::Unicast => format!(
-                    "Unicast mode: Configure Ultimate64 to send to YOUR_MAC_IP:{}",
-                    self.listen_port
-                ),
-                StreamMode::Multicast => {
-                    "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
-                }
-            }
-        };
 
+        // === LEFT SIDE: Video display ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
             // Try to display the decoded RGBA image
             if let Ok(img_guard) = self.image_buffer.lock() {
@@ -373,6 +274,16 @@ impl VideoStreaming {
                 text("Frame buffer error").into()
             }
         } else {
+            let status_info = match self.stream_mode {
+                StreamMode::Unicast => format!(
+                    "Unicast mode: Configure Ultimate64 to send to YOUR_IP:{}",
+                    self.listen_port
+                ),
+                StreamMode::Multicast => {
+                    "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
+                }
+            };
+
             container(
                 column![
                     text("VIDEO STREAM INACTIVE").size(16),
@@ -383,9 +294,109 @@ impl VideoStreaming {
                 ]
                 .align_items(iced::Alignment::Center),
             )
-            .padding(40)
+            .width(Length::Fixed((VIC_WIDTH * 2) as f32))
+            .height(Length::Fixed((VIC_HEIGHT * 2) as f32))
+            .center_x()
+            .center_y()
             .into()
         };
+
+        // === RIGHT SIDE: Controls panel ===
+
+        // Mode selection
+        let mode_section = column![
+            text("Stream Mode").size(12),
+            row![
+                tooltip(
+                    button(text("Unicast").size(11))
+                        .on_press(StreamingMessage::StreamModeChanged(StreamMode::Unicast))
+                        .padding([4, 8])
+                        .style(if self.stream_mode == StreamMode::Unicast {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Direct IP connection (works over WiFi)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Multicast").size(11))
+                        .on_press(StreamingMessage::StreamModeChanged(StreamMode::Multicast))
+                        .padding([4, 8])
+                        .style(if self.stream_mode == StreamMode::Multicast {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Multicast 239.0.1.64 (requires wired LAN)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(5),
+            Space::with_height(5),
+            row![
+                text("Port:").size(11),
+                tooltip(
+                    text_input("11000", &self.listen_port)
+                        .on_input(StreamingMessage::PortChanged)
+                        .width(Length::Fixed(70.0))
+                        .size(11),
+                    "Video port (audio uses port+1)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(5)
+            .align_items(iced::Alignment::Center),
+        ]
+        .spacing(5);
+
+        // Stream controls
+        let stream_controls = column![
+            text("Stream Control").size(12),
+            row![
+                if self.is_streaming {
+                    tooltip(
+                        button(text("STOP").size(11))
+                            .on_press(StreamingMessage::StopStream)
+                            .padding([6, 14]),
+                        "Stop video stream",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box)
+                } else {
+                    tooltip(
+                        button(text("START").size(11))
+                            .on_press(StreamingMessage::StartStream)
+                            .padding([6, 14]),
+                        "Start video stream",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box)
+                },
+                tooltip(
+                    button(text("Screenshot").size(11))
+                        .on_press(StreamingMessage::TakeScreenshot)
+                        .padding([6, 10]),
+                    "Capture single frame to PNG",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(5),
+            tooltip(
+                checkbox("Audio", self.audio_enabled)
+                    .on_toggle(StreamingMessage::AudioToggled)
+                    .size(16)
+                    .text_size(11),
+                "Enable audio streaming (port+1)",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+        ]
+        .spacing(5);
 
         // Command prompt section
         let command_history_items: Vec<Element<'_, StreamingMessage>> = self
@@ -393,41 +404,61 @@ impl VideoStreaming {
             .iter()
             .rev()
             .take(10)
-            .map(|cmd| text(format!("> {}", cmd)).size(11).into())
+            .map(|cmd| text(cmd).size(10).into())
             .collect();
 
         let command_section = column![
-            text("COMMAND PROMPT").size(14),
+            text("COMMAND PROMPT").size(12),
             row![
-                text("C64> ").size(14),
+                text("C64>").size(11),
                 text_input("Enter BASIC command...", &self.command_input)
                     .on_input(StreamingMessage::CommandInputChanged)
                     .on_submit(StreamingMessage::SendCommand)
-                    .width(Length::Fill),
-                button(text("Send").size(12))
-                    .on_press(StreamingMessage::SendCommand)
-                    .padding([4, 12]),
+                    .width(Length::Fill)
+                    .size(11),
             ]
             .spacing(5)
             .align_items(iced::Alignment::Center),
-            // Command history
-            scrollable(Column::with_children(command_history_items).spacing(2),)
-                .height(Length::Fixed(100.0)),
+            button(text("Send").size(11))
+                .on_press(StreamingMessage::SendCommand)
+                .padding([4, 12])
+                .width(Length::Fill),
+            scrollable(Column::with_children(command_history_items).spacing(2))
+                .height(Length::Fill),
+        ]
+        .spacing(5);
+
+        // Right panel with all controls
+        let right_panel = container(
+            column![
+                mode_section,
+                iced::widget::horizontal_rule(1),
+                stream_controls,
+                iced::widget::horizontal_rule(1),
+                command_section,
+            ]
+            .spacing(10)
+            .padding(10)
+            .width(Length::Fixed(220.0)),
+        )
+        .height(Length::Fill);
+
+        // Main layout: video on left, controls on right
+        let main_content = row![
+            container(video_display).width(Length::Fill).center_x(),
+            iced::widget::vertical_rule(1),
+            right_panel,
         ]
         .spacing(10)
-        .padding(10);
+        .height(Length::Fill);
 
         column![
             text("VIC VIDEO STREAM").size(20),
             iced::widget::horizontal_rule(1),
-            mode_row,
-            Space::with_height(5),
-            controls,
-            video_display,
-            iced::widget::horizontal_rule(1),
-            command_section,
+            main_content,
         ]
         .spacing(10)
+        .height(Length::Fill)
         .into()
     }
 
