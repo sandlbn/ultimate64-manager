@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::Rest;
 
+use crate::api;
+
 #[derive(Debug, Clone)]
 pub enum RemoteBrowserMessage {
     RefreshFiles,
@@ -25,6 +27,10 @@ pub enum RemoteBrowserMessage {
     PlaySid(String),
     PlayMod(String),
     RunnerComplete(Result<String, String>),
+    // Disk mounting
+    MountDisk(String, String, String), // path, drive (a/b), mode (readwrite/readonly/unlinked)
+    MountComplete(Result<String, String>),
+    RunDisk(String, String), // path, drive - mount and reset
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +49,8 @@ pub struct RemoteBrowser {
     pub status_message: Option<String>,
     pub is_loading: bool,
     pub is_connected: bool,
-    pub host_address: Option<String>, // Store host IP for FTP
+    pub host_address: Option<String>,
+    pub password: Option<String>,
 }
 
 impl Default for RemoteBrowser {
@@ -56,6 +63,7 @@ impl Default for RemoteBrowser {
             is_loading: false,
             is_connected: false,
             host_address: None,
+            password: None,
         }
     }
 }
@@ -65,13 +73,14 @@ impl RemoteBrowser {
         Self::default()
     }
 
-    pub fn set_host(&mut self, host: Option<String>) {
+    pub fn set_host(&mut self, host: Option<String>, password: Option<String>) {
         // Strip http:// prefix if present, we just need the IP
         self.host_address = host.map(|h| {
             h.trim_start_matches("http://")
                 .trim_start_matches("https://")
                 .to_string()
         });
+        self.password = password;
         self.is_connected = self.host_address.is_some();
         if self.host_address.is_none() {
             self.files.clear();
@@ -91,8 +100,9 @@ impl RemoteBrowser {
                     self.status_message = Some("Loading...".to_string());
                     let path = self.current_path.clone();
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        fetch_files_ftp(host, path),
+                        fetch_files_ftp(host, path, password),
                         RemoteBrowserMessage::FilesLoaded,
                     )
                 } else {
@@ -153,8 +163,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Downloading...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        download_file_ftp(host, remote_path),
+                        download_file_ftp(host, remote_path, password),
                         RemoteBrowserMessage::DownloadComplete,
                     )
                 } else {
@@ -179,8 +190,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Uploading...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        upload_file_ftp(host, local_path, remote_dest),
+                        upload_file_ftp(host, local_path, remote_dest, password),
                         RemoteBrowserMessage::UploadComplete,
                     )
                 } else {
@@ -206,8 +218,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Running PRG...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        run_remote_file(host, path, "run_prg"),
+                        async move { api::run_prg(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
@@ -220,8 +233,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Running CRT...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        run_remote_file(host, path, "run_crt"),
+                        async move { api::run_crt(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
@@ -234,8 +248,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Playing SID...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        run_remote_file(host, path, "sidplay"),
+                        async move { api::sidplay(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
@@ -248,8 +263,9 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     self.status_message = Some("Playing MOD...".to_string());
                     let host = host.clone();
+                    let password = self.password.clone();
                     Command::perform(
-                        run_remote_file(host, path, "modplay"),
+                        async move { api::modplay(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
@@ -268,6 +284,50 @@ impl RemoteBrowser {
                     }
                 }
                 Command::none()
+            }
+
+            RemoteBrowserMessage::MountDisk(path, drive, mode) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message =
+                        Some(format!("Mounting to drive {}...", drive.to_uppercase()));
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    Command::perform(
+                        async move { api::mount_disk(&host, &path, &drive, &mode, password).await },
+                        RemoteBrowserMessage::MountComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::MountComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Mount failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            RemoteBrowserMessage::RunDisk(path, drive) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message =
+                        Some(format!("Running disk on drive {}...", drive.to_uppercase()));
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    Command::perform(
+                        async move { api::run_disk(&host, &path, &drive, password).await },
+                        RemoteBrowserMessage::MountComplete, // Reuse MountComplete for result
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
             }
         }
     }
@@ -423,6 +483,64 @@ impl RemoteBrowser {
                     )
                     .style(iced::theme::Container::Box)
                     .into()
+                } else if ext.ends_with(".d64")
+                    || ext.ends_with(".g64")
+                    || ext.ends_with(".d71")
+                    || ext.ends_with(".g71")
+                    || ext.ends_with(".d81")
+                {
+                    // Disk image - show run and mount buttons
+                    row![
+                        tooltip(
+                            button(text("Run").size(9))
+                                .on_press(RemoteBrowserMessage::RunDisk(
+                                    entry.path.clone(),
+                                    "a".to_string(),
+                                ))
+                                .padding([2, 6]),
+                            "Mount, reset & LOAD\"*\",8,1",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
+                            button(text("A:RW").size(9))
+                                .on_press(RemoteBrowserMessage::MountDisk(
+                                    entry.path.clone(),
+                                    "a".to_string(),
+                                    "readwrite".to_string(),
+                                ))
+                                .padding([2, 4]),
+                            "Mount to Drive A (Read/Write)",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
+                            button(text("A:RO").size(9))
+                                .on_press(RemoteBrowserMessage::MountDisk(
+                                    entry.path.clone(),
+                                    "a".to_string(),
+                                    "readonly".to_string(),
+                                ))
+                                .padding([2, 4]),
+                            "Mount to Drive A (Read Only)",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
+                            button(text("B:RW").size(9))
+                                .on_press(RemoteBrowserMessage::MountDisk(
+                                    entry.path.clone(),
+                                    "b".to_string(),
+                                    "readwrite".to_string(),
+                                ))
+                                .padding([2, 4]),
+                            "Mount to Drive B (Read/Write)",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box),
+                    ]
+                    .spacing(2)
+                    .into()
                 } else {
                     iced::widget::Space::with_width(0).into()
                 };
@@ -486,6 +604,7 @@ fn get_file_icon(name: &str) -> &'static str {
     } else if lower.ends_with(".d64")
         || lower.ends_with(".g64")
         || lower.ends_with(".d71")
+        || lower.ends_with(".g71")
         || lower.ends_with(".d81")
     {
         "DSK"
@@ -507,7 +626,11 @@ fn get_file_icon(name: &str) -> &'static str {
 }
 
 // Fetch files via FTP
-async fn fetch_files_ftp(host: String, path: String) -> Result<Vec<RemoteFileEntry>, String> {
+async fn fetch_files_ftp(
+    host: String,
+    path: String,
+    password: Option<String>,
+) -> Result<Vec<RemoteFileEntry>, String> {
     log::info!("FTP: Listing {} on {}", path, host);
 
     let result = tokio::task::spawn_blocking(move || {
@@ -527,11 +650,19 @@ async fn fetch_files_ftp(host: String, path: String) -> Result<Vec<RemoteFileEnt
             .set_write_timeout(Some(Duration::from_secs(10)))
             .ok();
 
-        // Login anonymously (Ultimate64 typically allows this)
-        ftp.login("anonymous", "anonymous")
-            .or_else(|_| ftp.login("admin", "admin"))
-            .or_else(|_| ftp.login("root", ""))
-            .map_err(|e| format!("FTP login failed: {}", e))?;
+        // Login with password or anonymous
+        if let Some(ref pwd) = password {
+            if !pwd.is_empty() {
+                ftp.login("admin", pwd)
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+        } else {
+            ftp.login("anonymous", "anonymous")
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        }
 
         // Change to directory
         let ftp_path = if path.is_empty() || path == "/" {
@@ -667,7 +798,11 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
 }
 
 // Download file via FTP
-async fn download_file_ftp(host: String, remote_path: String) -> Result<(String, Vec<u8>), String> {
+async fn download_file_ftp(
+    host: String,
+    remote_path: String,
+    password: Option<String>,
+) -> Result<(String, Vec<u8>), String> {
     log::info!("FTP: Downloading {}", remote_path);
 
     let result = tokio::task::spawn_blocking(move || {
@@ -683,9 +818,19 @@ async fn download_file_ftp(host: String, remote_path: String) -> Result<(String,
             .set_read_timeout(Some(Duration::from_secs(60)))
             .ok();
 
-        ftp.login("anonymous", "anonymous")
-            .or_else(|_| ftp.login("admin", "admin"))
-            .map_err(|e| format!("FTP login failed: {}", e))?;
+        // Login with password or anonymous
+        if let Some(ref pwd) = password {
+            if !pwd.is_empty() {
+                ftp.login("admin", pwd)
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+        } else {
+            ftp.login("anonymous", "anonymous")
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        }
 
         // Set binary transfer mode
         ftp.transfer_type(suppaftp::types::FileType::Binary)
@@ -723,6 +868,7 @@ async fn upload_file_ftp(
     host: String,
     local_path: PathBuf,
     remote_dest: String,
+    password: Option<String>,
 ) -> Result<String, String> {
     log::info!("FTP: Uploading {} to {}", local_path.display(), remote_dest);
 
@@ -748,9 +894,19 @@ async fn upload_file_ftp(
             .set_write_timeout(Some(Duration::from_secs(120)))
             .ok();
 
-        ftp.login("anonymous", "anonymous")
-            .or_else(|_| ftp.login("admin", "admin"))
-            .map_err(|e| format!("FTP login failed: {}", e))?;
+        // Login with password or anonymous
+        if let Some(ref pwd) = password {
+            if !pwd.is_empty() {
+                ftp.login("admin", pwd)
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+        } else {
+            ftp.login("anonymous", "anonymous")
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        }
 
         // Set binary transfer mode
         ftp.transfer_type(suppaftp::types::FileType::Binary)
@@ -779,36 +935,4 @@ async fn upload_file_ftp(
     .map_err(|e| format!("Task error: {}", e))?;
 
     result
-}
-
-// Run a file on Ultimate64 using REST API runners
-async fn run_remote_file(
-    host: String,
-    file_path: String,
-    runner: &'static str,
-) -> Result<String, String> {
-    log::info!("Running {} with runner: {}", file_path, runner);
-
-    let url = format!("http://{}:80/v1/runners:{}", host, runner);
-
-    let client = reqwest::Client::new();
-    let response = client
-        .put(&url)
-        .query(&[("file", file_path.as_str())])
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if response.status().is_success() {
-        let filename = file_path.rsplit('/').next().unwrap_or(&file_path);
-        match runner {
-            "run_prg" => Ok(format!("Running: {}", filename)),
-            "run_crt" => Ok(format!("Started: {}", filename)),
-            "sidplay" => Ok(format!("Playing SID: {}", filename)),
-            "modplay" => Ok(format!("Playing MOD: {}", filename)),
-            _ => Ok(format!("Executed: {}", filename)),
-        }
-    } else {
-        Err(format!("Runner failed: HTTP {}", response.status()))
-    }
 }
