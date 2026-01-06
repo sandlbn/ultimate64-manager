@@ -1,6 +1,6 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
@@ -15,6 +15,7 @@ use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use url::Host;
 
+mod api;
 mod config_editor;
 mod file_browser;
 mod music_player;
@@ -375,6 +376,7 @@ impl Application for Ultimate64Browser {
                         .to_string();
                     let remote_dest = self.remote_browser.get_current_path().to_string();
                     let file_count = files_to_copy.len();
+                    let password = self.settings.connection.password.clone();
 
                     self.user_message = Some(UserMessage::Info(format!(
                         "Uploading {} file(s) via FTP...",
@@ -397,9 +399,19 @@ impl Application for Ultimate64Browser {
                                     .set_write_timeout(Some(Duration::from_secs(120)))
                                     .ok();
 
-                                ftp.login("anonymous", "anonymous")
-                                    .or_else(|_| ftp.login("admin", "admin"))
-                                    .map_err(|e| format!("FTP login failed: {}", e))?;
+                                // Login with configured password or anonymous
+                                if let Some(ref pwd) = password {
+                                    if !pwd.is_empty() {
+                                        ftp.login("admin", pwd)
+                                            .map_err(|e| format!("FTP login failed: {}", e))?;
+                                    } else {
+                                        ftp.login("anonymous", "anonymous")
+                                            .map_err(|e| format!("FTP login failed: {}", e))?;
+                                    }
+                                } else {
+                                    ftp.login("anonymous", "anonymous")
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                }
 
                                 ftp.transfer_type(suppaftp::types::FileType::Binary)
                                     .map_err(|e| format!("Set binary mode failed: {}", e))?;
@@ -456,6 +468,7 @@ impl Application for Ultimate64Browser {
                             .to_string();
                         let remote_path = remote_path.to_string();
                         let local_dest = self.left_browser.get_current_directory().clone();
+                        let password = self.settings.connection.password.clone();
 
                         self.user_message =
                             Some(UserMessage::Info("Downloading file via FTP...".to_string()));
@@ -475,9 +488,19 @@ impl Application for Ultimate64Browser {
                                         .set_read_timeout(Some(Duration::from_secs(60)))
                                         .ok();
 
-                                    ftp.login("anonymous", "anonymous")
-                                        .or_else(|_| ftp.login("admin", "admin"))
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                    // Login with configured password or anonymous
+                                    if let Some(ref pwd) = password {
+                                        if !pwd.is_empty() {
+                                            ftp.login("admin", pwd)
+                                                .map_err(|e| format!("FTP login failed: {}", e))?;
+                                        } else {
+                                            ftp.login("anonymous", "anonymous")
+                                                .map_err(|e| format!("FTP login failed: {}", e))?;
+                                        }
+                                    } else {
+                                        ftp.login("anonymous", "anonymous")
+                                            .map_err(|e| format!("FTP login failed: {}", e))?;
+                                    }
 
                                     ftp.transfer_type(suppaftp::types::FileType::Binary)
                                         .map_err(|e| format!("Set binary mode failed: {}", e))?;
@@ -656,7 +679,7 @@ impl Application for Ultimate64Browser {
                 self.status.connected = false;
                 self.status.device_info = None;
                 self.status.mounted_disks.clear();
-                self.remote_browser.set_host(None);
+                self.remote_browser.set_host(None, None);
                 self.user_message = Some(UserMessage::Info(
                     "Disconnected from Ultimate64".to_string(),
                 ));
@@ -1454,7 +1477,8 @@ impl Ultimate64Browser {
                 let http_url = format!("http://{}", self.settings.connection.host);
                 self.host_url = Some(http_url.clone());
                 // Don't set connected = true here - let StatusUpdated verify the connection
-                self.remote_browser.set_host(Some(http_url));
+                self.remote_browser
+                    .set_host(Some(http_url), self.settings.connection.password.clone());
                 self.user_message = Some(UserMessage::Info(format!(
                     "Connecting to {}...",
                     self.settings.connection.host
