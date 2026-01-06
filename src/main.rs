@@ -1,6 +1,6 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
@@ -25,7 +25,7 @@ mod templates;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
-use music_player::{MusicPlayer, MusicPlayerMessage};
+use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
 use streaming::{StreamingMessage, VideoStreaming};
@@ -539,10 +539,70 @@ impl Application for Ultimate64Browser {
                 Command::none()
             }
 
-            Message::MusicPlayer(msg) => self
-                .music_player
-                .update(msg, self.connection.clone())
-                .map(Message::MusicPlayer),
+            Message::MusicPlayer(msg) => {
+                // Check if we need to pause or resume the machine
+                let was_paused = self.music_player.playback_state == PlaybackState::Paused;
+
+                // Intercept Pause - also pause the machine
+                if let MusicPlayerMessage::Pause = &msg {
+                    let cmd = self
+                        .music_player
+                        .update(msg, self.connection.clone())
+                        .map(Message::MusicPlayer);
+
+                    // Also send PauseMachine command
+                    if let Some(host) = &self.host_url {
+                        let url = format!("{}/v1/machine:pause", host);
+                        let pause_cmd = Command::perform(
+                            async move {
+                                let client = reqwest::Client::new();
+                                client
+                                    .put(&url)
+                                    .send()
+                                    .await
+                                    .map_err(|e| format!("Pause failed: {}", e))?;
+                                Ok("Machine paused".to_string())
+                            },
+                            Message::MachineCommandCompleted,
+                        );
+                        return Command::batch([cmd, pause_cmd]);
+                    }
+                    return cmd;
+                }
+
+                // Intercept Play when resuming from pause - also resume the machine
+                if let MusicPlayerMessage::Play = &msg {
+                    if was_paused {
+                        let cmd = self
+                            .music_player
+                            .update(msg, self.connection.clone())
+                            .map(Message::MusicPlayer);
+
+                        // Also send ResumeMachine command
+                        if let Some(host) = &self.host_url {
+                            let url = format!("{}/v1/machine:resume", host);
+                            let resume_cmd = Command::perform(
+                                async move {
+                                    let client = reqwest::Client::new();
+                                    client
+                                        .put(&url)
+                                        .send()
+                                        .await
+                                        .map_err(|e| format!("Resume failed: {}", e))?;
+                                    Ok("Machine resumed".to_string())
+                                },
+                                Message::MachineCommandCompleted,
+                            );
+                            return Command::batch([cmd, resume_cmd]);
+                        }
+                        return cmd;
+                    }
+                }
+
+                self.music_player
+                    .update(msg, self.connection.clone())
+                    .map(Message::MusicPlayer)
+            }
 
             Message::ConfigEditor(msg) => self
                 .config_editor

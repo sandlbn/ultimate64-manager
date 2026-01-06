@@ -144,7 +144,7 @@ pub struct MusicPlayer {
     playlist_name: String,
 
     // Playback state
-    playback_state: PlaybackState,
+    pub playback_state: PlaybackState,
     shuffle_enabled: bool,
     repeat_enabled: bool,
     current_subsong: u8,
@@ -260,8 +260,32 @@ impl MusicPlayer {
         match message {
             // === Playback Controls ===
             MusicPlayerMessage::Play => {
+                // If paused, just update state (main.rs will call resume API)
+                if self.playback_state == PlaybackState::Paused {
+                    if let Some(idx) = self.current_playing {
+                        if let Some(entry) = self.playlist.get(idx) {
+                            self.playback_state = PlaybackState::Playing;
+
+                            let now_playing = if entry.name.is_empty() {
+                                entry
+                                    .path
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| "Unknown".to_string())
+                            } else {
+                                entry.name.clone()
+                            };
+                            self.status_message = format!("Playing: {}", now_playing);
+
+                            return Command::none();
+                        }
+                    }
+                }
+
+                // Normal play - start playing a file
                 if let Some(idx) = self.current_playing {
                     if let Some(entry) = self.playlist.get(idx) {
+                        self.elapsed_seconds = 0;
                         self.playback_state = PlaybackState::Playing;
                         self.max_subsongs = entry.max_subsongs;
 
@@ -301,6 +325,7 @@ impl MusicPlayer {
             MusicPlayerMessage::Pause => {
                 self.playback_state = PlaybackState::Paused;
                 self.status_message = "Paused".to_string();
+                // Note: main.rs intercepts this and calls the machine pause API
                 Command::none()
             }
 
