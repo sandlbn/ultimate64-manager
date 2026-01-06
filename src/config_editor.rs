@@ -121,6 +121,7 @@ impl ConfigEditor {
         message: ConfigEditorMessage,
         _connection: Option<Arc<Mutex<Rest>>>,
         host_url: Option<String>,
+        password: Option<String>,
     ) -> Command<ConfigEditorMessage> {
         match message {
             ConfigEditorMessage::LoadCategories => {
@@ -129,7 +130,7 @@ impl ConfigEditor {
                     self.status_message = Some("Loading categories...".to_string());
                     self.error_message = None;
                     Command::perform(
-                        fetch_categories(host),
+                        fetch_categories(host, password),
                         ConfigEditorMessage::CategoriesLoaded,
                     )
                 } else {
@@ -173,7 +174,7 @@ impl ConfigEditor {
                     self.status_message = Some(format!("Loading {}...", category));
                     self.error_message = None;
                     Command::perform(
-                        fetch_category_items(host, category),
+                        fetch_category_items(host, category, password),
                         ConfigEditorMessage::CategoryItemsLoaded,
                     )
                 } else {
@@ -217,7 +218,7 @@ impl ConfigEditor {
             ConfigEditorMessage::LoadItemDetails(category, item_name) => {
                 if let Some(host) = host_url {
                     Command::perform(
-                        fetch_item_details(host, category, item_name),
+                        fetch_item_details(host, category, item_name, password),
                         ConfigEditorMessage::ItemDetailsLoaded,
                     )
                 } else {
@@ -305,7 +306,7 @@ impl ConfigEditor {
 
                     let changes = self.pending_changes.clone();
                     Command::perform(
-                        save_batch_changes(host, changes),
+                        save_batch_changes(host, changes, password),
                         ConfigEditorMessage::SaveComplete,
                     )
                 } else {
@@ -339,7 +340,7 @@ impl ConfigEditor {
                     self.is_loading = true;
                     self.status_message = Some("Saving to flash...".to_string());
                     Command::perform(
-                        flash_operation(host, "save_to_flash"),
+                        flash_operation(host, "save_to_flash", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
@@ -353,7 +354,7 @@ impl ConfigEditor {
                     self.is_loading = true;
                     self.status_message = Some("Loading from flash...".to_string());
                     Command::perform(
-                        flash_operation(host, "load_from_flash"),
+                        flash_operation(host, "load_from_flash", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
@@ -367,7 +368,7 @@ impl ConfigEditor {
                     self.is_loading = true;
                     self.status_message = Some("Resetting to defaults...".to_string());
                     Command::perform(
-                        flash_operation(host, "reset_to_default"),
+                        flash_operation(host, "reset_to_default", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
@@ -394,6 +395,7 @@ impl ConfigEditor {
                         ConfigEditorMessage::SelectCategory(category),
                         _connection,
                         host_url,
+                        password,
                     );
                 }
                 Command::none()
@@ -419,6 +421,7 @@ impl ConfigEditor {
                         ConfigEditorMessage::SelectCategory(category),
                         _connection,
                         host_url,
+                        password,
                     );
                 }
                 Command::none()
@@ -870,7 +873,7 @@ fn format_value(value: &serde_json::Value) -> String {
 
 // === Async API functions ===
 
-async fn fetch_categories(host: String) -> Result<Vec<String>, String> {
+async fn fetch_categories(host: String, password: Option<String>) -> Result<Vec<String>, String> {
     log::info!("Fetching config categories from {}/v1/configs", host);
 
     let url = format!("{}/v1/configs", host);
@@ -880,8 +883,16 @@ async fn fetch_categories(host: String) -> Result<Vec<String>, String> {
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+
+    // Add X-password header if password is configured
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            request = request.header("X-password", pwd.as_str());
+        }
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -952,6 +963,7 @@ async fn fetch_categories(host: String) -> Result<Vec<String>, String> {
 async fn fetch_category_items(
     host: String,
     category: String,
+    password: Option<String>,
 ) -> Result<(String, Vec<ConfigOption>), String> {
     log::info!("Fetching config items for category: {}", category);
 
@@ -966,8 +978,15 @@ async fn fetch_category_items(
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            request = request.header("X-password", pwd.as_str());
+        }
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -1076,6 +1095,7 @@ async fn fetch_item_details(
     host: String,
     category: String,
     item_name: String,
+    password: Option<String>,
 ) -> Result<(String, ConfigItemDetails), String> {
     log::debug!("Fetching details for {}/{}", category, item_name);
 
@@ -1089,8 +1109,15 @@ async fn fetch_item_details(
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            request = request.header("X-password", pwd.as_str());
+        }
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;
@@ -1162,6 +1189,7 @@ async fn fetch_item_details(
 async fn save_batch_changes(
     host: String,
     changes: HashMap<String, HashMap<String, serde_json::Value>>,
+    password: Option<String>,
 ) -> Result<String, String> {
     log::info!("Saving batch config changes: {:?}", changes);
 
@@ -1193,9 +1221,15 @@ async fn save_batch_changes(
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let response = client
-        .post(&url)
-        .header("Content-Type", "application/json")
+    let mut request = client.post(&url).header("Content-Type", "application/json");
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            request = request.header("X-password", pwd.as_str());
+        }
+    }
+
+    let response = request
         .json(&serde_json::Value::Object(body))
         .send()
         .await
@@ -1212,7 +1246,11 @@ async fn save_batch_changes(
     }
 }
 
-async fn flash_operation(host: String, operation: &'static str) -> Result<String, String> {
+async fn flash_operation(
+    host: String,
+    operation: &'static str,
+    password: Option<String>,
+) -> Result<String, String> {
     log::info!("Flash operation: {}", operation);
 
     let url = format!("{}/v1/configs:{}", host, operation);
@@ -1222,8 +1260,15 @@ async fn flash_operation(host: String, operation: &'static str) -> Result<String
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))?;
 
-    let response = client
-        .put(&url)
+    let mut request = client.put(&url);
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            request = request.header("X-password", pwd.as_str());
+        }
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|e| format!("Request failed: {}", e))?;

@@ -1,6 +1,6 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
@@ -635,7 +635,12 @@ impl Application for Ultimate64Browser {
 
             Message::ConfigEditor(msg) => self
                 .config_editor
-                .update(msg, self.connection.clone(), self.host_url.clone())
+                .update(
+                    msg,
+                    self.connection.clone(),
+                    self.host_url.clone(),
+                    self.settings.connection.password.clone(),
+                )
                 .map(Message::ConfigEditor),
 
             Message::HostInputChanged(value) => {
