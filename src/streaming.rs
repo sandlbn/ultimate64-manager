@@ -2,8 +2,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::{
     Command, Element, Length, Subscription,
     widget::{
-        Column, Space, button, checkbox, column, container, image as iced_image, row, scrollable,
-        text, text_input, tooltip,
+        Column, Space, button, checkbox, column, container, image as iced_image, mouse_area, row,
+        scrollable, text, text_input, tooltip,
     },
 };
 use std::collections::VecDeque;
@@ -87,6 +87,8 @@ pub enum StreamingMessage {
     StreamModeChanged(StreamMode),
     PortChanged(String),
     AudioToggled(bool),
+    ToggleFullscreen,
+    VideoClicked, // For double-click detection
 }
 
 pub struct VideoStreaming {
@@ -104,6 +106,8 @@ pub struct VideoStreaming {
     pub audio_packets_received: Arc<Mutex<u64>>,
     pub audio_enabled: bool,
     audio_producer: Option<Arc<Mutex<VecDeque<i16>>>>,
+    pub is_fullscreen: bool,
+    last_click_time: Option<std::time::Instant>,
 }
 
 impl Default for VideoStreaming {
@@ -129,6 +133,8 @@ impl VideoStreaming {
             audio_packets_received: Arc::new(Mutex::new(0)),
             audio_enabled: true,
             audio_producer: None,
+            is_fullscreen: false,
+            last_click_time: None,
         }
     }
 
@@ -154,12 +160,29 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::TakeScreenshot => {
-                let port = self.listen_port.parse().unwrap_or(11000);
-                let mode = self.stream_mode;
-                Command::perform(
-                    take_screenshot_async(port, mode),
-                    StreamingMessage::ScreenshotComplete,
-                )
+                // Take screenshot from the existing image buffer (no need to bind new socket)
+                if !self.is_streaming {
+                    return Command::none();
+                }
+
+                // Get current frame from buffer
+                let rgba_data = if let Ok(img_guard) = self.image_buffer.lock() {
+                    img_guard.clone()
+                } else {
+                    None
+                };
+
+                if let Some(data) = rgba_data {
+                    Command::perform(
+                        save_screenshot_to_pictures(data),
+                        StreamingMessage::ScreenshotComplete,
+                    )
+                } else {
+                    Command::perform(
+                        async { Err("No frame available".to_string()) },
+                        StreamingMessage::ScreenshotComplete,
+                    )
+                }
             }
             StreamingMessage::ScreenshotComplete(_result) => {
                 // Handled by main app for user message display
@@ -192,7 +215,91 @@ impl VideoStreaming {
                 self.audio_enabled = enabled;
                 Command::none()
             }
+            StreamingMessage::ToggleFullscreen => {
+                // Note: This is handled by main.rs which changes window mode
+                // If we get here, just return none (main.rs intercepts this message)
+                Command::none()
+            }
+            StreamingMessage::VideoClicked => {
+                // Check for double-click (within 300ms)
+                let now = std::time::Instant::now();
+                if let Some(last_time) = self.last_click_time {
+                    if now.duration_since(last_time).as_millis() < 300 {
+                        // Double-click detected - send toggle fullscreen command
+                        // (main.rs will handle the actual toggle and window mode change)
+                        self.last_click_time = None;
+                        return Command::perform(async {}, |_| StreamingMessage::ToggleFullscreen);
+                    }
+                }
+                self.last_click_time = Some(now);
+                Command::none()
+            }
         }
+    }
+
+    /// Fullscreen view - video fills the entire available space with black letterboxing
+    pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
+        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
+            if let Ok(img_guard) = self.image_buffer.lock() {
+                if let Some(rgba_data) = &*img_guard {
+                    let handle = iced::widget::image::Handle::from_pixels(
+                        VIC_WIDTH,
+                        VIC_HEIGHT,
+                        rgba_data.clone(),
+                    );
+
+                    // Use ContentFit::Contain to maintain aspect ratio with letterboxing
+                    // Wrap in mouse_area for double-click to exit fullscreen
+                    mouse_area(
+                        iced_image(handle)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .content_fit(iced::ContentFit::Contain),
+                    )
+                    .on_press(StreamingMessage::VideoClicked)
+                    .into()
+                } else {
+                    text("Waiting for frames...")
+                        .size(20)
+                        .style(iced::theme::Text::Color(iced::Color::WHITE))
+                        .into()
+                }
+            } else {
+                text("Frame buffer error")
+                    .size(20)
+                    .style(iced::theme::Text::Color(iced::Color::WHITE))
+                    .into()
+            }
+        } else {
+            text("Stream not active - press ESC to exit")
+                .size(20)
+                .style(iced::theme::Text::Color(iced::Color::WHITE))
+                .into()
+        };
+
+        // Exit hint at the top
+        let exit_hint = container(
+            button(text("Exit Fullscreen (ESC or double-click)").size(12))
+                .on_press(StreamingMessage::ToggleFullscreen)
+                .padding([6, 12]),
+        )
+        .width(Length::Fill)
+        .center_x()
+        .padding(10);
+
+        // Black background container with centered video
+        container(column![
+            exit_hint,
+            container(video_content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x()
+                .center_y(),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(iced::theme::Container::Custom(Box::new(BlackBackground)))
+        .into()
     }
 
     pub fn view(&self) -> Element<'_, StreamingMessage> {
@@ -212,14 +319,20 @@ impl VideoStreaming {
                         rgba_data.clone(),
                     );
 
+                    // Wrap image in mouse_area for double-click fullscreen
+                    let video_image = mouse_area(
+                        iced_image(handle)
+                            .width(Length::Fixed((VIC_WIDTH * 2) as f32))
+                            .height(Length::Fixed((VIC_HEIGHT * 2) as f32))
+                            .content_fit(iced::ContentFit::Fill),
+                    )
+                    .on_press(StreamingMessage::VideoClicked);
+
                     container(
                         column![
-                            iced_image(handle)
-                                .width(Length::Fixed((VIC_WIDTH * 2) as f32))
-                                .height(Length::Fixed((VIC_HEIGHT * 2) as f32))
-                                .content_fit(iced::ContentFit::Fill),
+                            video_image,
                             text(format!(
-                                "384x272 | Video: {} | Audio: {}",
+                                "384x272 | Video: {} | Audio: {} | Double-click for fullscreen",
                                 video_packets, audio_packets
                             ))
                             .size(10),
@@ -353,7 +466,16 @@ impl VideoStreaming {
         ]
         .spacing(5);
 
-        // Stream controls
+        // Stream controls - centered
+        let screenshot_button = if self.is_streaming {
+            button(text("Screenshot").size(11))
+                .on_press(StreamingMessage::TakeScreenshot)
+                .padding([6, 10])
+        } else {
+            button(text("Screenshot").size(11)).padding([6, 10])
+            // No on_press - button is disabled
+        };
+
         let stream_controls = column![
             text("Stream Control").size(12),
             row![
@@ -377,15 +499,18 @@ impl VideoStreaming {
                     .style(iced::theme::Container::Box)
                 },
                 tooltip(
-                    button(text("Screenshot").size(11))
-                        .on_press(StreamingMessage::TakeScreenshot)
-                        .padding([6, 10]),
-                    "Capture single frame to PNG",
+                    screenshot_button,
+                    if self.is_streaming {
+                        "Capture frame to Pictures folder"
+                    } else {
+                        "Start streaming first"
+                    },
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
             ]
-            .spacing(5),
+            .spacing(5)
+            .align_items(iced::Alignment::Center),
             tooltip(
                 checkbox("Audio", self.audio_enabled)
                     .on_toggle(StreamingMessage::AudioToggled)
@@ -396,7 +521,8 @@ impl VideoStreaming {
             )
             .style(iced::theme::Container::Box),
         ]
-        .spacing(5);
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
 
         // Command prompt section
         let command_history_items: Vec<Element<'_, StreamingMessage>> = self
@@ -876,6 +1002,21 @@ impl Drop for VideoStreaming {
     }
 }
 
+// Custom style for black background in fullscreen mode
+struct BlackBackground;
+
+impl iced::widget::container::StyleSheet for BlackBackground {
+    type Style = iced::Theme;
+
+    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
+        iced::widget::container::Appearance {
+            background: Some(iced::Background::Color(iced::Color::BLACK)),
+            text_color: Some(iced::Color::WHITE),
+            ..Default::default()
+        }
+    }
+}
+
 // Decode VIC stream frame to RGBA (used for raw frame data, not packet-based data)
 #[allow(dead_code)]
 fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
@@ -936,6 +1077,39 @@ fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Save screenshot from existing RGBA buffer to user's Pictures folder
+pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    // Get user's Pictures folder, fallback to home directory
+    let pictures_dir = dirs::picture_dir()
+        .or_else(|| dirs::home_dir())
+        .ok_or_else(|| "Could not find Pictures or Home directory".to_string())?;
+
+    // Create Ultimate64 subfolder
+    let screenshot_dir = pictures_dir.join("Ultimate64");
+    std::fs::create_dir_all(&screenshot_dir)
+        .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
+
+    let filename = format!("u64_screenshot_{}.png", timestamp);
+    let path = screenshot_dir.join(&filename);
+
+    // Create image and save
+    let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
+        .ok_or_else(|| "Failed to create image from frame data".to_string())?;
+
+    img.save(&path)
+        .map_err(|e| format!("Failed to save PNG: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[allow(dead_code)]
 pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
