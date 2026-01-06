@@ -635,7 +635,12 @@ impl Application for Ultimate64Browser {
 
             Message::ConfigEditor(msg) => self
                 .config_editor
-                .update(msg, self.connection.clone(), self.host_url.clone())
+                .update(
+                    msg,
+                    self.connection.clone(),
+                    self.host_url.clone(),
+                    self.settings.connection.password.clone(),
+                )
                 .map(Message::ConfigEditor),
 
             Message::HostInputChanged(value) => {

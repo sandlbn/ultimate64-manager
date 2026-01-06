@@ -56,7 +56,7 @@ pub struct RemoteBrowser {
 impl Default for RemoteBrowser {
     fn default() -> Self {
         Self {
-            current_path: "/Usb0".to_string(),
+            current_path: "/".to_string(),
             files: Vec::new(),
             selected_file: None,
             status_message: Some("Not connected".to_string()),
