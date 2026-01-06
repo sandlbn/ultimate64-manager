@@ -160,12 +160,29 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::TakeScreenshot => {
-                let port = self.listen_port.parse().unwrap_or(11000);
-                let mode = self.stream_mode;
-                Command::perform(
-                    take_screenshot_async(port, mode),
-                    StreamingMessage::ScreenshotComplete,
-                )
+                // Take screenshot from the existing image buffer (no need to bind new socket)
+                if !self.is_streaming {
+                    return Command::none();
+                }
+
+                // Get current frame from buffer
+                let rgba_data = if let Ok(img_guard) = self.image_buffer.lock() {
+                    img_guard.clone()
+                } else {
+                    None
+                };
+
+                if let Some(data) = rgba_data {
+                    Command::perform(
+                        save_screenshot_to_pictures(data),
+                        StreamingMessage::ScreenshotComplete,
+                    )
+                } else {
+                    Command::perform(
+                        async { Err("No frame available".to_string()) },
+                        StreamingMessage::ScreenshotComplete,
+                    )
+                }
             }
             StreamingMessage::ScreenshotComplete(_result) => {
                 // Handled by main app for user message display
@@ -449,7 +466,16 @@ impl VideoStreaming {
         ]
         .spacing(5);
 
-        // Stream controls with fullscreen button - centered
+        // Stream controls - centered
+        let screenshot_button = if self.is_streaming {
+            button(text("Screenshot").size(11))
+                .on_press(StreamingMessage::TakeScreenshot)
+                .padding([6, 10])
+        } else {
+            button(text("Screenshot").size(11)).padding([6, 10])
+            // No on_press - button is disabled
+        };
+
         let stream_controls = column![
             text("Stream Control").size(12),
             row![
@@ -473,18 +499,12 @@ impl VideoStreaming {
                     .style(iced::theme::Container::Box)
                 },
                 tooltip(
-                    button(text("Screenshot").size(11))
-                        .on_press(StreamingMessage::TakeScreenshot)
-                        .padding([6, 10]),
-                    "Capture single frame to PNG",
-                    tooltip::Position::Bottom,
-                )
-                .style(iced::theme::Container::Box),
-                tooltip(
-                    button(text("Fullscreen").size(11))
-                        .on_press(StreamingMessage::ToggleFullscreen)
-                        .padding([6, 10]),
-                    "Toggle fullscreen (Opt+F / double-click video)",
+                    screenshot_button,
+                    if self.is_streaming {
+                        "Capture frame to Pictures folder"
+                    } else {
+                        "Start streaming first"
+                    },
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
@@ -1057,6 +1077,39 @@ fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Save screenshot from existing RGBA buffer to user's Pictures folder
+pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+
+    // Get user's Pictures folder, fallback to home directory
+    let pictures_dir = dirs::picture_dir()
+        .or_else(|| dirs::home_dir())
+        .ok_or_else(|| "Could not find Pictures or Home directory".to_string())?;
+
+    // Create Ultimate64 subfolder
+    let screenshot_dir = pictures_dir.join("Ultimate64");
+    std::fs::create_dir_all(&screenshot_dir)
+        .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
+
+    let filename = format!("u64_screenshot_{}.png", timestamp);
+    let path = screenshot_dir.join(&filename);
+
+    // Create image and save
+    let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
+        .ok_or_else(|| "Failed to create image from frame data".to_string())?;
+
+    img.save(&path)
+        .map_err(|e| format!("Failed to save PNG: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[allow(dead_code)]
 pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
