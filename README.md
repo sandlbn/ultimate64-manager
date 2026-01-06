@@ -2,6 +2,8 @@
 
 A cross-platform desktop application for managing Ultimate64 and Ultimate-II+ devices. Built with Rust and Iced.
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow.svg)](https://buymeacoffee.com/sandlbn)
+
 ![Ultimate64 Manager](screenshot.gif)
 
 ## Features
@@ -14,6 +16,7 @@ A cross-platform desktop application for managing Ultimate64 and Ultimate-II+ de
 - **Music Player** – Play SID and MOD files (playlist, next/prev, stop)
 - **Streaming Support** – UDP-based VIC video streaming
 - **Video Viewer** – Real-time VIC video stream capture
+- **Configuration Editor** – Edit configuration settings
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 
 ## Building

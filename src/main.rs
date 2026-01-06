@@ -637,12 +637,21 @@ impl Application for Ultimate64Browser {
                             status.device_info,
                             status.mounted_disks.len()
                         );
+                        // Show connected message when first connecting
+                        if !self.status.connected && status.connected {
+                            self.user_message = Some(UserMessage::Info(format!(
+                                "Connected to {}",
+                                self.settings.connection.host
+                            )));
+                        }
                         self.status = status;
                     }
                     Err(e) => {
                         log::error!("Status update failed: {}", e);
+                        self.status.connected = false;
+                        self.status.device_info = None;
                         self.user_message =
-                            Some(UserMessage::Error(format!("Status update failed: {}", e)));
+                            Some(UserMessage::Error(format!("Connection failed: {}", e)));
                     }
                 }
                 Command::none()
@@ -974,6 +983,19 @@ impl Ultimate64Browser {
             text("No disks mounted").size(12)
         };
 
+        // Show Connect button when disconnected, Refresh button when connected
+        let action_button: Element<'_, Message> = if self.status.connected {
+            button(text("Refresh").size(12))
+                .on_press(Message::RefreshStatus)
+                .padding([4, 8])
+                .into()
+        } else {
+            button(text("Connect").size(12))
+                .on_press(Message::ConnectPressed)
+                .padding([4, 8])
+                .into()
+        };
+
         container(
             row![
                 status_indicator,
@@ -982,10 +1004,8 @@ impl Ultimate64Browser {
                 text(" | ").size(12),
                 mounted_text,
                 horizontal_space(),
-                button(text("Refresh").size(12))
-                    .on_press(Message::RefreshStatus)
-                    .padding([4, 8]),
             ]
+            .push(action_button)
             .spacing(10)
             .align_items(iced::Alignment::Center),
         )
@@ -1276,15 +1296,14 @@ impl Ultimate64Browser {
         log::info!("Creating REST connection...");
         match Rest::new(&host, self.settings.connection.password.clone()) {
             Ok(rest) => {
-                log::info!("Connection successful!");
+                log::info!("REST client created, verifying connection...");
                 self.connection = Some(Arc::new(TokioMutex::new(rest)));
                 // Build proper HTTP URL
                 let http_url = format!("http://{}", self.settings.connection.host);
                 self.host_url = Some(http_url.clone());
-                self.status.connected = true;
                 self.remote_browser.set_host(Some(http_url));
                 self.user_message = Some(UserMessage::Info(format!(
-                    "Connected to {}",
+                    "Connecting to {}...",
                     self.settings.connection.host
                 )));
             }
