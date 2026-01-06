@@ -133,6 +133,7 @@ pub enum Message {
 
     // Video/Streaming
     Streaming(StreamingMessage),
+    ExitFullscreen,
 
     // Machine control
     ResetMachine,
@@ -713,6 +714,19 @@ impl Application for Ultimate64Browser {
                     }
                 }
 
+                // Handle fullscreen toggle - change window mode for true fullscreen
+                if let StreamingMessage::ToggleFullscreen = msg {
+                    self.video_streaming.is_fullscreen = !self.video_streaming.is_fullscreen;
+
+                    let mode = if self.video_streaming.is_fullscreen {
+                        iced::window::Mode::Fullscreen
+                    } else {
+                        iced::window::Mode::Windowed
+                    };
+
+                    return iced::window::change_mode(iced::window::Id::MAIN, mode);
+                }
+
                 // Handle keyboard command - intercept before passing to streaming
                 if let StreamingMessage::SendCommand = msg {
                     let command = self.video_streaming.command_input.clone();
@@ -761,6 +775,18 @@ impl Application for Ultimate64Browser {
                 }
 
                 self.video_streaming.update(msg).map(Message::Streaming)
+            }
+
+            Message::ExitFullscreen => {
+                // Only exit fullscreen if currently in fullscreen mode
+                if self.video_streaming.is_fullscreen {
+                    self.video_streaming.is_fullscreen = false;
+                    return iced::window::change_mode(
+                        iced::window::Id::MAIN,
+                        iced::window::Mode::Windowed,
+                    );
+                }
+                Command::none()
             }
 
             Message::ResetMachine => {
@@ -885,6 +911,14 @@ impl Application for Ultimate64Browser {
     }
 
     fn view(&self) -> Element<'_, Message> {
+        // If video is in fullscreen mode, show only the fullscreen view
+        if self.video_streaming.is_fullscreen {
+            return self
+                .video_streaming
+                .view_fullscreen()
+                .map(Message::Streaming);
+        }
+
         // Tab bar with retro style
         let tabs = container(
             row![
@@ -937,9 +971,21 @@ impl Application for Ultimate64Browser {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        use iced::keyboard;
+
+        // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
+        let keyboard_sub = keyboard::on_key_press(|key, modifiers| match key {
+            keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
+            keyboard::Key::Character(c) if c.as_str() == "f" && modifiers.alt() => Some(
+                Message::Streaming(streaming::StreamingMessage::ToggleFullscreen),
+            ),
+            _ => None,
+        });
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
+            keyboard_sub,
         ])
     }
 }
@@ -1301,6 +1347,7 @@ impl Ultimate64Browser {
                 // Build proper HTTP URL
                 let http_url = format!("http://{}", self.settings.connection.host);
                 self.host_url = Some(http_url.clone());
+                // Don't set connected = true here - let StatusUpdated verify the connection
                 self.remote_browser.set_host(Some(http_url));
                 self.user_message = Some(UserMessage::Info(format!(
                     "Connecting to {}...",
