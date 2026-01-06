@@ -7,17 +7,47 @@ A cross-platform desktop application for managing Ultimate64 and Ultimate-II+ de
 ![Ultimate64 Manager](screenshot.gif)
 
 ## Features
-
 - **Dual-Pane File Browser** – Local and remote file browsing side by side
 - **FTP File Transfer** – Upload/download files via FTP with multi-file selection
 - **Remote Directory Browser** – Browse Ultimate64 filesystem without mounting disks
 - **Disk Management** – Mount D64, D71, D81, G64, G71 images to Drive A/B
 - **Run Programs** – Direct load and run for PRG and CRT files
-- **Music Player** – Play SID and MOD files (playlist, next/prev, stop)
-- **Streaming Support** – UDP-based VIC video streaming
-- **Video Viewer** – Real-time VIC video stream capture
-- **Configuration Editor** – Edit configuration settings
+- **Music Player** – Play SID and MOD files with playlist support
+  - Shuffle and repeat modes
+  - Subsong navigation for multi-tune SID files
+  - Song length database support (HVSC Songlengths.md5)
+  - True pause/resume (freezes C64)
+  - Configurable default song duration
+- **Video Streaming** – Real-time VIC video with audio
+  - Fullscreen mode (double-click or Opt+F / Alt+F)
+  - Screenshot capture to Pictures folder
+  - Unicast and Multicast support
+- **Audio Streaming** – SID audio output via UDP
+- **Configuration Editor** – Edit Ultimate64 configuration settings
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Opt+F` / `Alt+F` | Toggle video fullscreen |
+| `ESC` | Exit fullscreen |
+
+## Song Length Database
+
+The music player can use the HVSC Songlengths.md5 database for accurate song durations. 
+You can download it from the Music Player tab or place it manually at:
+
+- **Windows**: `%APPDATA%\ultimate64-manager\Songlengths.md5`
+- **macOS**: `~/Library/Application Support/ultimate64-manager/Songlengths.md5`
+- **Linux**: `~/.config/ultimate64-manager/Songlengths.md5`
+
+## Screenshots
+
+Screenshots are saved to:
+- **Windows**: `Pictures\Ultimate64\`
+- **macOS**: `~/Pictures/Ultimate64/`
+- **Linux**: `~/Pictures/Ultimate64/`
 
 ## Building
 

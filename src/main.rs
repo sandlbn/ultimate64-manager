@@ -25,7 +25,7 @@ mod templates;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
-use music_player::{MusicPlayer, MusicPlayerMessage};
+use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
 use streaming::{StreamingMessage, VideoStreaming};
@@ -142,6 +142,9 @@ pub enum Message {
     ResumeMachine,
     PoweroffMachine,
     MachineCommandCompleted(Result<String, String>),
+
+    // Settings
+    DefaultSongDurationChanged(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,12 +235,15 @@ impl Application for Ultimate64Browser {
             }
         };
 
+        let mut music_player = MusicPlayer::new();
+        music_player.set_default_song_duration(settings.preferences.default_song_duration);
+
         let mut app = Self {
             active_tab: Tab::DualPaneBrowser,
             left_browser: FileBrowser::new(),
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
-            music_player: MusicPlayer::new(),
+            music_player,
             config_editor: ConfigEditor::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
@@ -539,10 +545,70 @@ impl Application for Ultimate64Browser {
                 Command::none()
             }
 
-            Message::MusicPlayer(msg) => self
-                .music_player
-                .update(msg, self.connection.clone())
-                .map(Message::MusicPlayer),
+            Message::MusicPlayer(msg) => {
+                // Check if we need to pause or resume the machine
+                let was_paused = self.music_player.playback_state == PlaybackState::Paused;
+
+                // Intercept Pause - also pause the machine
+                if let MusicPlayerMessage::Pause = &msg {
+                    let cmd = self
+                        .music_player
+                        .update(msg, self.connection.clone())
+                        .map(Message::MusicPlayer);
+
+                    // Also send PauseMachine command
+                    if let Some(host) = &self.host_url {
+                        let url = format!("{}/v1/machine:pause", host);
+                        let pause_cmd = Command::perform(
+                            async move {
+                                let client = reqwest::Client::new();
+                                client
+                                    .put(&url)
+                                    .send()
+                                    .await
+                                    .map_err(|e| format!("Pause failed: {}", e))?;
+                                Ok("Machine paused".to_string())
+                            },
+                            Message::MachineCommandCompleted,
+                        );
+                        return Command::batch([cmd, pause_cmd]);
+                    }
+                    return cmd;
+                }
+
+                // Intercept Play when resuming from pause - also resume the machine
+                if let MusicPlayerMessage::Play = &msg {
+                    if was_paused {
+                        let cmd = self
+                            .music_player
+                            .update(msg, self.connection.clone())
+                            .map(Message::MusicPlayer);
+
+                        // Also send ResumeMachine command
+                        if let Some(host) = &self.host_url {
+                            let url = format!("{}/v1/machine:resume", host);
+                            let resume_cmd = Command::perform(
+                                async move {
+                                    let client = reqwest::Client::new();
+                                    client
+                                        .put(&url)
+                                        .send()
+                                        .await
+                                        .map_err(|e| format!("Resume failed: {}", e))?;
+                                    Ok("Machine resumed".to_string())
+                                },
+                                Message::MachineCommandCompleted,
+                            );
+                            return Command::batch([cmd, resume_cmd]);
+                        }
+                        return cmd;
+                    }
+                }
+
+                self.music_player
+                    .update(msg, self.connection.clone())
+                    .map(Message::MusicPlayer)
+            }
 
             Message::ConfigEditor(msg) => self
                 .config_editor
@@ -907,6 +973,20 @@ impl Application for Ultimate64Browser {
                 }
                 Command::none()
             }
+
+            Message::DefaultSongDurationChanged(value) => {
+                if let Ok(duration) = value.parse::<u32>() {
+                    if duration > 0 && duration <= 3600 {
+                        self.settings.preferences.default_song_duration = duration;
+                        self.music_player.set_default_song_duration(duration);
+                        // Save settings
+                        if let Err(e) = self.settings.save() {
+                            log::error!("Failed to save settings: {}", e);
+                        }
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -1226,10 +1306,36 @@ impl Ultimate64Browser {
             text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
         ];
 
+        let music_section = column![
+            Space::with_height(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            text("MUSIC PLAYER SETTINGS").size(18),
+            Space::with_height(10),
+            row![
+                text("Default song duration (seconds):").size(14),
+                text_input(
+                    "180",
+                    &self.settings.preferences.default_song_duration.to_string()
+                )
+                .on_input(Message::DefaultSongDurationChanged)
+                .padding(8)
+                .width(Length::Fixed(80.0)),
+                text("(used when song length is unknown)").size(11),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+        ];
+
         container(
-            column![connection_section, status_section, debug_section]
-                .spacing(5)
-                .padding(20),
+            column![
+                connection_section,
+                status_section,
+                music_section,
+                debug_section
+            ]
+            .spacing(5)
+            .padding(20),
         )
         .into()
     }

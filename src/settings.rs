@@ -27,6 +27,12 @@ pub struct Preferences {
     pub auto_mount_and_run: bool,
     pub default_mount_mode: String,
     pub show_hidden_files: bool,
+    #[serde(default = "default_song_duration")]
+    pub default_song_duration: u32, // Default duration for songs without known length (in seconds)
+}
+
+fn default_song_duration() -> u32 {
+    180 // 3 minutes default
 }
 
 impl Default for AppSettings {
@@ -45,6 +51,7 @@ impl Default for AppSettings {
                 auto_mount_and_run: false,
                 default_mount_mode: String::from("readwrite"),
                 show_hidden_files: false,
+                default_song_duration: 180, // 3 minutes
             },
         }
     }
