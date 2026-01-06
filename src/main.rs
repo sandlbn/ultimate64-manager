@@ -1,6 +1,6 @@
 // Remove the windows_subsystem attribute during development to see console output
 // Uncomment for release builds:
-// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
@@ -15,6 +15,7 @@ use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use url::Host;
 
+mod config_editor;
 mod file_browser;
 mod music_player;
 mod remote_browser;
@@ -22,6 +23,7 @@ mod settings;
 mod streaming;
 mod templates;
 
+use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
@@ -108,6 +110,9 @@ pub enum Message {
     // Music player
     MusicPlayer(MusicPlayerMessage),
 
+    // Configuration editor
+    ConfigEditor(ConfigEditorMessage),
+
     // Connection
     HostInputChanged(String),
     PasswordInputChanged(String),
@@ -143,6 +148,7 @@ pub enum Tab {
     DualPaneBrowser,
     MusicPlayer,
     VideoViewer,
+    Configuration,
     Settings,
 }
 
@@ -152,6 +158,7 @@ impl std::fmt::Display for Tab {
             Tab::DualPaneBrowser => write!(f, "File Browser"),
             Tab::MusicPlayer => write!(f, "Music Player"),
             Tab::VideoViewer => write!(f, "Video Viewer"),
+            Tab::Configuration => write!(f, "Configuration"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -185,6 +192,7 @@ pub struct Ultimate64Browser {
     active_pane: Pane,
 
     music_player: MusicPlayer,
+    config_editor: ConfigEditor,
     settings: AppSettings,
     template_manager: TemplateManager,
     selected_template: Option<DiskTemplate>,
@@ -229,6 +237,7 @@ impl Application for Ultimate64Browser {
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
             music_player: MusicPlayer::new(),
+            config_editor: ConfigEditor::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
             settings: settings.clone(),
@@ -533,6 +542,11 @@ impl Application for Ultimate64Browser {
                 .music_player
                 .update(msg, self.connection.clone())
                 .map(Message::MusicPlayer),
+
+            Message::ConfigEditor(msg) => self
+                .config_editor
+                .update(msg, self.connection.clone(), self.host_url.clone())
+                .map(Message::ConfigEditor),
 
             Message::HostInputChanged(value) => {
                 self.host_input = value;
@@ -868,6 +882,7 @@ impl Application for Ultimate64Browser {
                 self.tab_button("FILE BROWSER", Tab::DualPaneBrowser),
                 self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
                 self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
+                self.tab_button("CONFIG", Tab::Configuration),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -882,6 +897,10 @@ impl Application for Ultimate64Browser {
             Tab::DualPaneBrowser => self.view_dual_pane_browser(),
             Tab::MusicPlayer => self.view_music_player(),
             Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
+            Tab::Configuration => self
+                .config_editor
+                .view(self.status.connected)
+                .map(Message::ConfigEditor),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)
