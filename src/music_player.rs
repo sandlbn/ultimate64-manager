@@ -154,6 +154,7 @@ pub struct MusicPlayer {
     // Timer
     elapsed_seconds: u32,
     current_song_duration: u32,
+    default_song_duration: u32, // Configurable default for unknown song lengths
 
     // Song length database
     song_lengths: HashMap<[u8; MD5_HASH_SIZE], Vec<u32>>,
@@ -187,6 +188,7 @@ impl MusicPlayer {
 
             elapsed_seconds: 0,
             current_song_duration: DEFAULT_SONG_DURATION,
+            default_song_duration: DEFAULT_SONG_DURATION,
 
             song_lengths: HashMap::new(),
             song_lengths_loaded: false,
@@ -1185,7 +1187,7 @@ impl MusicPlayer {
                 text(format!(
                     "{} tracks | Total: {}",
                     self.playlist.len(),
-                    format_total_duration(&self.playlist)
+                    format_total_duration(&self.playlist, self.default_song_duration)
                 ))
                 .size(10),
             ]
@@ -1571,6 +1573,11 @@ impl MusicPlayer {
         self.shuffle_order.shuffle(&mut rng);
     }
 
+    /// Set the default song duration (called from main.rs with settings value)
+    pub fn set_default_song_duration(&mut self, duration: u32) {
+        self.default_song_duration = duration;
+    }
+
     fn get_song_duration(&self, entry: &PlaylistEntry) -> u32 {
         // Try to look up in song length database by current subsong
         // Note: subsong is 1-based, array is 0-based
@@ -1590,8 +1597,8 @@ impl MusicPlayer {
             }
         }
 
-        // Default duration
-        DEFAULT_SONG_DURATION
+        // Default duration from settings
+        self.default_song_duration
     }
 }
 
@@ -1896,10 +1903,10 @@ fn truncate_path(path: &Path, max_len: usize) -> String {
     }
 }
 
-fn format_total_duration(entries: &[PlaylistEntry]) -> String {
+fn format_total_duration(entries: &[PlaylistEntry], default_duration: u32) -> String {
     let total_seconds: u32 = entries
         .iter()
-        .map(|e| e.duration.unwrap_or(DEFAULT_SONG_DURATION))
+        .map(|e| e.duration.unwrap_or(default_duration))
         .sum();
 
     let hours = total_seconds / 3600;
