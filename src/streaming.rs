@@ -16,15 +16,27 @@ use std::time::Duration;
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
+// const FRAME_SIZE: usize = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes
 
 // Audio constants
 const AUDIO_PORT_OFFSET: u16 = 1; // Audio port = video port + 1
 const AUDIO_SAMPLE_RATE: u32 = 48000;
 const AUDIO_CHANNELS: u16 = 2;
+// const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
 
 // Ultimate64 video packet header (12 bytes)
+// struct {
+//     uint16_t seq;           // 0-1
+//     uint16_t frame;         // 2-3
+//     uint16_t line;          // 4-5 (MSB = frame sync flag)
+//     uint16_t pixelsInLine;  // 6-7
+//     uint8_t linesInPacket;  // 8
+//     uint8_t bpp;            // 9
+//     uint16_t encoding;      // 10-11
+//     char payload[768];      // 12+
+// }
 const HEADER_SIZE: usize = 12;
 
 // C64 color palette (RGB values) - from u64view
@@ -62,6 +74,14 @@ impl std::fmt::Display for StreamMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScaleMode {
+    #[default]
+    Nearest, // Sharp pixels (default)
+    Scale2x,   // EPX/Scale2x smoothing
+    Scanlines, // Sharp pixels + CRT scanline effect
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamingMessage {
     StartStream,
@@ -73,6 +93,7 @@ pub enum StreamingMessage {
     SendCommand,
     CommandSent(Result<String, String>),
     StreamModeChanged(StreamMode),
+    ScaleModeChanged(ScaleMode),
     PortChanged(String),
     AudioToggled(bool),
     ToggleFullscreen,
@@ -81,22 +102,24 @@ pub enum StreamingMessage {
 
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>,
-    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>,
+    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA frame from network
+    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Unscaled frame for screenshots
+    pub scaled_buffer: Option<Vec<u8>>,            // Scaled frame for display
     pub stop_signal: Arc<AtomicBool>,
-    stream_handle: Option<thread::JoinHandle<()>>,
-    audio_stream_handle: Option<thread::JoinHandle<()>>,
-    audio_network_handle: Option<thread::JoinHandle<()>>,
+    stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
+    audio_stream_handle: Option<thread::JoinHandle<()>>, // Audio playback thread
+    audio_network_handle: Option<thread::JoinHandle<()>>, // Audio receive thread
     pub command_input: String,
     pub command_history: Vec<String>,
     pub stream_mode: StreamMode,
+    pub scale_mode: ScaleMode,
     pub listen_port: String,
-    pub packets_received: Arc<Mutex<u64>>,
-    pub audio_packets_received: Arc<Mutex<u64>>,
+    pub packets_received: Arc<Mutex<u64>>, // Video packet counter
+    pub audio_packets_received: Arc<Mutex<u64>>, // Audio packet counter
     pub audio_enabled: bool,
-    audio_buffer: Option<Arc<Mutex<VecDeque<f32>>>>,
+    audio_buffer: Option<Arc<Mutex<VecDeque<f32>>>>, // Shared audio sample buffer (f32 for cross-platform)
     pub is_fullscreen: bool,
-    last_click_time: Option<std::time::Instant>,
+    last_click_time: Option<std::time::Instant>, // For double-click detection
 }
 
 impl Default for VideoStreaming {
@@ -111,6 +134,7 @@ impl VideoStreaming {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
             image_buffer: Arc::new(Mutex::new(None)),
+            scaled_buffer: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
             audio_stream_handle: None,
@@ -118,6 +142,7 @@ impl VideoStreaming {
             command_input: String::new(),
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
+            scale_mode: ScaleMode::Nearest,
             listen_port: "11000".to_string(),
             packets_received: Arc::new(Mutex::new(0)),
             audio_packets_received: Arc::new(Mutex::new(0)),
@@ -139,9 +164,20 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Frame buffer now contains RGBA data directly - just copy to image buffer
+                // Frame buffer contains RGBA data - apply scaling based on mode
                 if let Ok(frame_guard) = self.frame_buffer.lock() {
                     if let Some(rgba_data) = &*frame_guard {
+                        // Apply scaling (Nearest = no processing, just clone)
+                        let scaled = match self.scale_mode {
+                            ScaleMode::Nearest => rgba_data.clone(),
+                            ScaleMode::Scale2x => scale2x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
+                            ScaleMode::Scanlines => {
+                                apply_scanlines(rgba_data, VIC_WIDTH, VIC_HEIGHT)
+                            }
+                        };
+                        self.scaled_buffer = Some(scaled);
+
+                        // Also update image_buffer for screenshots (unscaled)
                         if let Ok(mut img_guard) = self.image_buffer.lock() {
                             *img_guard = Some(rgba_data.clone());
                         }
@@ -197,6 +233,10 @@ impl VideoStreaming {
                 self.stream_mode = mode;
                 Command::none()
             }
+            StreamingMessage::ScaleModeChanged(mode) => {
+                self.scale_mode = mode;
+                Command::none()
+            }
             StreamingMessage::PortChanged(port) => {
                 self.listen_port = port;
                 Command::none()
@@ -227,31 +267,35 @@ impl VideoStreaming {
 
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
-        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
-            if let Ok(img_guard) = self.image_buffer.lock() {
-                if let Some(rgba_data) = &*img_guard {
-                    let handle = iced::widget::image::Handle::from_pixels(
-                        VIC_WIDTH,
-                        VIC_HEIGHT,
-                        rgba_data.clone(),
-                    );
+        // Image dimensions based on scale mode
+        let (img_width, img_height) = match self.scale_mode {
+            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
+            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+        };
 
-                    mouse_area(
-                        iced_image(handle)
-                            .width(Length::Fill)
-                            .height(Length::Fill)
-                            .content_fit(iced::ContentFit::Contain),
-                    )
-                    .on_press(StreamingMessage::VideoClicked)
-                    .into()
-                } else {
-                    text("Waiting for frames...")
-                        .size(20)
-                        .style(iced::theme::Text::Color(iced::Color::WHITE))
-                        .into()
-                }
+        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
+            // Use scaled buffer if available and not in Nearest mode
+            let frame_data = if self.scale_mode != ScaleMode::Nearest {
+                self.scaled_buffer.clone()
             } else {
-                text("Frame buffer error")
+                self.image_buffer.lock().ok().and_then(|g| g.clone())
+            };
+
+            if let Some(rgba_data) = frame_data {
+                let handle =
+                    iced::widget::image::Handle::from_pixels(img_width, img_height, rgba_data);
+
+                mouse_area(
+                    iced_image(handle)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain),
+                )
+                .on_press(StreamingMessage::VideoClicked)
+                .into()
+            } else {
+                text("Waiting for frames...")
                     .size(20)
                     .style(iced::theme::Text::Color(iced::Color::WHITE))
                     .into()
@@ -293,84 +337,103 @@ impl VideoStreaming {
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
+        // Calculate display dimensions based on scale mode
+        let (display_width, display_height) = match self.scale_mode {
+            ScaleMode::Nearest => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2), // Scale2x outputs 2x size
+            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2), // Scanlines outputs 2x size
+        };
+
+        // Image dimensions for the handle
+        let (img_width, img_height) = match self.scale_mode {
+            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
+            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+        };
+
         // === LEFT SIDE: Video display ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Try to display the decoded RGBA image
-            if let Ok(img_guard) = self.image_buffer.lock() {
-                if let Some(rgba_data) = &*img_guard {
-                    // Create an image handle from RGBA data
-                    let handle = iced::widget::image::Handle::from_pixels(
-                        VIC_WIDTH,
-                        VIC_HEIGHT,
-                        rgba_data.clone(),
-                    );
-
-                    // Wrap image in mouse_area for double-click fullscreen
-                    let video_image = mouse_area(
-                        iced_image(handle)
-                            .width(Length::Fixed((VIC_WIDTH * 2) as f32))
-                            .height(Length::Fixed((VIC_HEIGHT * 2) as f32))
-                            .content_fit(iced::ContentFit::Fill),
-                    )
-                    .on_press(StreamingMessage::VideoClicked);
-
-                    container(
-                        column![
-                            video_image,
-                            text(format!(
-                                "384x272 | Video: {} | Audio: {} | Double-click for fullscreen",
-                                video_packets, audio_packets
-                            ))
-                            .size(10),
-                        ]
-                        .spacing(5)
-                        .align_items(iced::Alignment::Center),
-                    )
-                    .padding(10)
-                    .into()
-                } else {
-                    // Image not decoded yet, show raw frame info
-                    if let Ok(frame_guard) = self.frame_buffer.lock() {
-                        if let Some(frame_data) = &*frame_guard {
-                            container(
-                                column![
-                                    text("RECEIVING FRAMES").size(16),
-                                    text(format!("{} bytes", frame_data.len())).size(12),
-                                    text(format!(
-                                        "Video: {} | Audio: {}",
-                                        video_packets, audio_packets
-                                    ))
-                                    .size(12),
-                                ]
-                                .spacing(5)
-                                .align_items(iced::Alignment::Center),
-                            )
-                            .padding(40)
-                            .into()
-                        } else {
-                            container(
-                                column![
-                                    text("Waiting for frames...").size(14),
-                                    text(format!(
-                                        "Video: {} | Audio: {}",
-                                        video_packets, audio_packets
-                                    ))
-                                    .size(12),
-                                ]
-                                .spacing(5)
-                                .align_items(iced::Alignment::Center),
-                            )
-                            .padding(40)
-                            .into()
-                        }
-                    } else {
-                        container(text("Waiting for frames...").size(14))
-                            .padding(40)
-                            .into()
-                    }
-                }
+            // Use scaled buffer if available, otherwise fall back to image buffer
+            let frame_data = if self.scale_mode != ScaleMode::Nearest {
+                self.scaled_buffer.clone()
             } else {
-                text("Frame buffer error").into()
+                self.image_buffer.lock().ok().and_then(|g| g.clone())
+            };
+
+            if let Some(rgba_data) = frame_data {
+                // Create an image handle from RGBA data
+                let handle =
+                    iced::widget::image::Handle::from_pixels(img_width, img_height, rgba_data);
+
+                // Wrap image in mouse_area for double-click fullscreen
+                let video_image = mouse_area(
+                    iced_image(handle)
+                        .width(Length::Fixed(display_width as f32))
+                        .height(Length::Fixed(display_height as f32))
+                        .content_fit(iced::ContentFit::Fill),
+                )
+                .on_press(StreamingMessage::VideoClicked);
+
+                let scale_label = match self.scale_mode {
+                    ScaleMode::Nearest => "Nearest",
+                    ScaleMode::Scale2x => "Scale2x",
+                    ScaleMode::Scanlines => "Scanlines",
+                };
+
+                container(
+                    column![
+                        video_image,
+                        text(format!(
+                            "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
+                            VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
+                        ))
+                        .size(10),
+                    ]
+                    .spacing(5)
+                    .align_items(iced::Alignment::Center),
+                )
+                .padding(10)
+                .into()
+            } else {
+                // Image not decoded yet, show raw frame info
+                if let Ok(frame_guard) = self.frame_buffer.lock() {
+                    if let Some(frame_data) = &*frame_guard {
+                        container(
+                            column![
+                                text("RECEIVING FRAMES").size(16),
+                                text(format!("{} bytes", frame_data.len())).size(12),
+                                text(format!(
+                                    "Video: {} | Audio: {}",
+                                    video_packets, audio_packets
+                                ))
+                                .size(12),
+                            ]
+                            .spacing(5)
+                            .align_items(iced::Alignment::Center),
+                        )
+                        .padding(40)
+                        .into()
+                    } else {
+                        container(
+                            column![
+                                text("Waiting for frames...").size(14),
+                                text(format!(
+                                    "Video: {} | Audio: {}",
+                                    video_packets, audio_packets
+                                ))
+                                .size(12),
+                            ]
+                            .spacing(5)
+                            .align_items(iced::Alignment::Center),
+                        )
+                        .padding(40)
+                        .into()
+                    }
+                } else {
+                    container(text("Waiting for frames...").size(14))
+                        .padding(40)
+                        .into()
+                }
             }
         } else {
             let status_info = match self.stream_mode {
@@ -449,6 +512,54 @@ impl VideoStreaming {
             ]
             .spacing(5)
             .align_items(iced::Alignment::Center),
+        ]
+        .spacing(5);
+
+        // Scale mode selection
+        let scale_section = column![
+            text("Video Scale").size(12),
+            row![
+                tooltip(
+                    button(text("Nearest").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Nearest))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::Nearest {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Sharp pixels (fastest)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Scale2x").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::Scale2x {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Smoothed edges (EPX algorithm)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Scanlines").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::Scanlines {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "CRT scanline effect",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(3),
         ]
         .spacing(5);
 
@@ -544,6 +655,8 @@ impl VideoStreaming {
             column![
                 mode_section,
                 iced::widget::horizontal_rule(1),
+                scale_section,
+                iced::widget::horizontal_rule(1),
                 stream_controls,
                 iced::widget::horizontal_rule(1),
                 command_section,
@@ -575,6 +688,7 @@ impl VideoStreaming {
 
     pub fn subscription(&self) -> Subscription<StreamingMessage> {
         if self.is_streaming {
+            // ~25 fps refresh rate (40ms per frame)
             iced::time::every(Duration::from_millis(40)).map(|_| StreamingMessage::FrameUpdate)
         } else {
             Subscription::none()
@@ -655,8 +769,10 @@ impl VideoStreaming {
                 let c_hi = &C64_PALETTE[hi];
                 let c_lo = &C64_PALETTE[lo];
                 color_lut.push([
-                    c_lo[0], c_lo[1], c_lo[2], 255, // LEFT pixel (low nibble)
-                    c_hi[0], c_hi[1], c_hi[2], 255, // RIGHT pixel (high nibble)
+                    c_lo[0], c_lo[1], c_lo[2],
+                    255, // LEFT pixel (low nibble) - first in memory
+                    c_hi[0], c_hi[1], c_hi[2],
+                    255, // RIGHT pixel (high nibble) - second in memory
                 ]);
             }
 
@@ -693,11 +809,11 @@ impl VideoStreaming {
                             );
                         }
 
-                        let line_num = (line_raw & 0x7FFF) as usize;
+                        let line_num = (line_raw & 0x7FFF) as usize; // Strip MSB (sync flag)
                         let is_frame_end = (line_raw & 0x8000) != 0;
 
                         let payload = &recv_buf[HEADER_SIZE..size];
-                        let bytes_per_line = pixels_in_line / 2;
+                        let bytes_per_line = pixels_in_line / 2; // 2 pixels per byte = 192 bytes/line
 
                         // Process each line in the packet
                         for l in 0..lines_in_packet {
@@ -707,6 +823,8 @@ impl VideoStreaming {
                             }
 
                             let payload_offset = l * bytes_per_line;
+
+                            // Write pixels to RGBA buffer using VIC_WIDTH stride
                             let row_offset = y * (VIC_WIDTH as usize) * 4;
 
                             for x in 0..bytes_per_line {
@@ -716,10 +834,12 @@ impl VideoStreaming {
                                 let packed_byte = payload[payload_offset + x] as usize;
                                 let colors = &color_lut[packed_byte];
 
+                                // Each packed byte = 2 pixels
                                 let pixel_x = x * 2;
                                 if pixel_x + 1 < VIC_WIDTH as usize {
                                     let offset = row_offset + pixel_x * 4;
                                     if offset + 7 < rgba_frame.len() {
+                                        // Copy 8 bytes (2 RGBA pixels) from lookup table
                                         rgba_frame[offset..offset + 8].copy_from_slice(colors);
                                     }
                                 }
@@ -774,8 +894,8 @@ impl VideoStreaming {
             Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_SIZE * 2)));
         self.audio_buffer = Some(audio_buffer.clone());
 
-        let consumer_buffer = audio_buffer.clone();
-        let producer_buffer = audio_buffer.clone();
+        let consumer_buffer = audio_buffer.clone(); // For audio playback thread
+        let producer_buffer = audio_buffer.clone(); // For network receive thread
         let stop_signal = self.stop_signal.clone();
         let stop_signal_net = self.stop_signal.clone();
         let audio_packets_counter = self.audio_packets_received.clone();
@@ -811,6 +931,7 @@ impl VideoStreaming {
             }
 
             // Try to get a supported config, preferring f32 format
+            // Priority: f32 (Mac/most compatible) > i16 (Windows) > any format
             let supported_config = match device.supported_output_configs() {
                 Ok(configs) => {
                     let configs_vec: Vec<_> = configs.collect();
@@ -1114,6 +1235,8 @@ impl VideoStreaming {
         self.audio_buffer = None;
 
         self.is_streaming = false;
+
+        // Clear frame buffers
         if let Ok(mut frame) = self.frame_buffer.lock() {
             *frame = None;
         }
@@ -1151,9 +1274,9 @@ impl iced::widget::container::StyleSheet for BlackBackground {
 // Decode VIC stream frame to RGBA (used for raw frame data, not packet-based data)
 #[allow(dead_code)]
 fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
-    let expected_indexed = (VIC_WIDTH * VIC_HEIGHT) as usize;
-    let expected_rgb = expected_indexed * 3;
-    let expected_rgba = expected_indexed * 4;
+    let expected_indexed = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes (1 byte/pixel)
+    let expected_rgb = expected_indexed * 3; // 313344 bytes (3 bytes/pixel)
+    let expected_rgba = expected_indexed * 4; // 417792 bytes (4 bytes/pixel)
 
     log::debug!("Decoding frame: {} bytes", raw_data.len());
 
@@ -1185,7 +1308,9 @@ fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
         // Already RGBA
         Some(raw_data.to_vec())
     } else if raw_data.len() >= expected_indexed {
-        // Fallback for unknown format but has enough data - try indexed interpretation
+        // Unknown format but has enough data for indexed mode.
+        // This is a best-effort fallback: interpret first 104448 bytes as
+        // indexed color data (1 byte per pixel, color index 0-15).
         let mut rgba = Vec::with_capacity(expected_rgba);
         for &pixel in raw_data.iter().take(expected_indexed) {
             let idx = (pixel & 0x0F) as usize;
@@ -1371,4 +1496,143 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
         .map_err(|e| format!("Failed to save PNG: {}", e))?;
 
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Scale2x (EPX) algorithm - smooths edges while preserving sharp details
+/// Input: RGBA buffer at original size
+/// Output: RGBA buffer at 2x size
+fn scale2x(input: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    for y in 0..h {
+        for x in 0..w {
+            // Get center pixel P and neighbors A,B,C,D (with edge clamping):
+            //     A
+            //   C P B
+            //     D
+            let p = get_pixel(input, w, h, x, y);
+            let a = get_pixel(input, w, h, x, y.saturating_sub(1)); // Top
+            let b = get_pixel(input, w, h, x.saturating_add(1).min(w - 1), y); // Right
+            let c = get_pixel(input, w, h, x.saturating_sub(1), y); // Left
+            let d = get_pixel(input, w, h, x, y.saturating_add(1).min(h - 1)); // Bottom
+
+            // Scale2x rules:
+            // If A==C and A!=B and C!=D -> output[0] = A, else P
+            // If A==B and A!=C and B!=D -> output[1] = B, else P
+            // If C==D and A!=C and B!=D -> output[2] = C, else P
+            // If B==D and A!=B and C!=D -> output[3] = D, else P
+
+            let p0 = if colors_equal(&a, &c) && !colors_equal(&a, &b) && !colors_equal(&c, &d) {
+                a
+            } else {
+                p
+            };
+            let p1 = if colors_equal(&a, &b) && !colors_equal(&a, &c) && !colors_equal(&b, &d) {
+                b
+            } else {
+                p
+            };
+            let p2 = if colors_equal(&c, &d) && !colors_equal(&a, &c) && !colors_equal(&b, &d) {
+                c
+            } else {
+                p
+            };
+            let p3 = if colors_equal(&b, &d) && !colors_equal(&a, &b) && !colors_equal(&c, &d) {
+                d
+            } else {
+                p
+            };
+
+            // Write 2x2 output pixels:
+            // p0 | p1   (top-left | top-right)
+            // ---+---
+            // p2 | p3   (bottom-left | bottom-right)
+            let out_x = x * 2;
+            let out_y = y * 2;
+            set_pixel(&mut output, out_w, out_x, out_y, &p0); // top-left
+            set_pixel(&mut output, out_w, out_x + 1, out_y, &p1); // top-right
+            set_pixel(&mut output, out_w, out_x, out_y + 1, &p2); // bottom-left
+            set_pixel(&mut output, out_w, out_x + 1, out_y + 1, &p3); // bottom-right
+        }
+    }
+
+    output
+}
+
+/// Apply CRT-style scanlines effect
+/// Input: RGBA buffer at original size
+/// Output: RGBA buffer at 2x size with darkened even lines
+fn apply_scanlines(input: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    // Scanline intensity (0.0 = black lines, 1.0 = no effect)
+    let scanline_brightness: f32 = 0.55;
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = get_pixel(input, w, h, x, y);
+
+            // Create darkened version for scanlines
+            let dark_pixel = [
+                (pixel[0] as f32 * scanline_brightness) as u8,
+                (pixel[1] as f32 * scanline_brightness) as u8,
+                (pixel[2] as f32 * scanline_brightness) as u8,
+                pixel[3],
+            ];
+
+            // Write 2x2 output: top row normal, bottom row darkened
+            let out_x = x * 2;
+            let out_y = y * 2;
+
+            // Top row - full brightness (duplicated horizontally)
+            set_pixel(&mut output, out_w, out_x, out_y, &pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y, &pixel);
+
+            // Bottom row - darkened (scanline effect)
+            set_pixel(&mut output, out_w, out_x, out_y + 1, &dark_pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y + 1, &dark_pixel);
+        }
+    }
+
+    output
+}
+
+/// Get pixel from RGBA buffer with bounds checking
+#[inline]
+fn get_pixel(data: &[u8], width: usize, height: usize, x: usize, y: usize) -> [u8; 4] {
+    if x >= width || y >= height {
+        return [0, 0, 0, 255];
+    }
+    let idx = (y * width + x) * 4;
+    if idx + 3 < data.len() {
+        [data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]
+    } else {
+        [0, 0, 0, 255]
+    }
+}
+
+/// Set pixel in RGBA buffer
+#[inline]
+fn set_pixel(data: &mut [u8], width: usize, x: usize, y: usize, pixel: &[u8; 4]) {
+    let idx = (y * width + x) * 4;
+    if idx + 3 < data.len() {
+        data[idx] = pixel[0];
+        data[idx + 1] = pixel[1];
+        data[idx + 2] = pixel[2];
+        data[idx + 3] = pixel[3];
+    }
+}
+
+/// Compare two pixels for equality (RGB only, ignore alpha)
+#[inline]
+fn colors_equal(a: &[u8; 4], b: &[u8; 4]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
 }
