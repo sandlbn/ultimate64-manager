@@ -707,7 +707,7 @@ impl ConfigEditor {
                 text(format!("Default: {}", format_value(default)))
                     .size(10)
                     .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.5, 0.5, 0.5,
+                        0.1, 0.1, 0.1,
                     )))
             } else {
                 text("").size(10)
