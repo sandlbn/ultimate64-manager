@@ -55,6 +55,7 @@ pub enum MusicPlayerMessage {
     // Playlist management
     AddToPlaylist(usize),      // Add from browser by index
     AddAndPlay(usize),         // Add and immediately play
+    AddAllToPlaylist,          // Add all music files from current directory
     RemoveFromPlaylist(usize), // Remove from playlist by index
     ClearPlaylist,
     PlaylistItemSelected(usize),    // Select item in playlist
@@ -557,6 +558,35 @@ impl MusicPlayer {
 
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
+                }
+                Command::none()
+            }
+
+            MusicPlayerMessage::AddAllToPlaylist => {
+                let mut added_count = 0;
+                // Collect all music files from browser
+                let music_entries: Vec<_> = self
+                    .browser_entries
+                    .iter()
+                    .filter_map(|entry| {
+                        if let BrowserEntryType::MusicFile(ref ft) = entry.entry_type {
+                            Some((entry.clone(), ft.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                for (browser_entry, ft) in music_entries {
+                    let entry = self.create_playlist_entry(&browser_entry, ft);
+                    self.playlist.push(entry);
+                    added_count += 1;
+                }
+
+                if added_count > 0 {
+                    self.status_message = format!("Added {} files to playlist", added_count);
+                } else {
+                    self.status_message = "No music files in current directory".to_string();
                 }
                 Command::none()
             }
@@ -1071,6 +1101,9 @@ impl MusicPlayer {
                         .padding([3, 8]),
                     button(text("Refresh").size(10))
                         .on_press(MusicPlayerMessage::RefreshBrowser)
+                        .padding([3, 8]),
+                    button(text("Add All").size(10))
+                        .on_press(MusicPlayerMessage::AddAllToPlaylist)
                         .padding([3, 8]),
                 ]
                 .spacing(5),
