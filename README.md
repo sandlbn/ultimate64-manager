@@ -1,6 +1,6 @@
 # Ultimate64 Manager
 
-A cross-platform desktop application for managing Ultimate64 and Ultimate-II+ devices. Built with Rust and Iced.
+A cross-platform desktop application for managing Commodore 64 Ultimate, Ultimate 64 Elite and Ultimate-II+ devices. Browse files, stream content, play SID music, mount disk images, and configure device settings.
 
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow.svg)](https://buymeacoffee.com/sandlbn)
 
