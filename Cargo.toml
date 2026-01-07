@@ -35,6 +35,20 @@ winapi = { version = "0.3", features = ["winuser"] }
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"
 
+# AppImage configuration (cargo appimage)
+[package.metadata.appimage]
+assets = ["icons/icon.png"]
+auto_link = true
+auto_link_exclude_list = [
+    "libc.so*",
+    "libdl.so*",
+    "libpthread.so*",
+    "libm.so*",
+    "libgcc_s.so*",
+    "librt.so*",
+    "ld-linux*.so*",
+]
+
 [[bin]]
 name = "ultimate64-manager"
 path = "src/main.rs"

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Ultimate64 Manager
+Exec=ultimate64-manager
+Icon=ultimate64-manager
+Type=Application
+Categories=Utility;
+Comment=Control your Ultimate64/Ultimate-II+
+Terminal=false
