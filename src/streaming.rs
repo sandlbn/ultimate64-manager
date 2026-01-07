@@ -16,27 +16,15 @@ use std::time::Duration;
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
-// const FRAME_SIZE: usize = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes
 
 // Audio constants
 const AUDIO_PORT_OFFSET: u16 = 1; // Audio port = video port + 1
 const AUDIO_SAMPLE_RATE: u32 = 48000;
 const AUDIO_CHANNELS: u16 = 2;
-// const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
 
 // Ultimate64 video packet header (12 bytes)
-// struct {
-//     uint16_t seq;           // 0-1
-//     uint16_t frame;         // 2-3
-//     uint16_t line;          // 4-5 (MSB = frame sync flag)
-//     uint16_t pixelsInLine;  // 6-7
-//     uint8_t linesInPacket;  // 8
-//     uint8_t bpp;            // 9
-//     uint16_t encoding;      // 10-11
-//     char payload[768];      // 12+
-// }
 const HEADER_SIZE: usize = 12;
 
 // C64 color palette (RGB values) - from u64view
@@ -98,6 +86,7 @@ pub struct VideoStreaming {
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>,
     audio_stream_handle: Option<thread::JoinHandle<()>>,
+    audio_network_handle: Option<thread::JoinHandle<()>>,
     pub command_input: String,
     pub command_history: Vec<String>,
     pub stream_mode: StreamMode,
@@ -105,7 +94,7 @@ pub struct VideoStreaming {
     pub packets_received: Arc<Mutex<u64>>,
     pub audio_packets_received: Arc<Mutex<u64>>,
     pub audio_enabled: bool,
-    audio_producer: Option<Arc<Mutex<VecDeque<i16>>>>,
+    audio_buffer: Option<Arc<Mutex<VecDeque<f32>>>>,
     pub is_fullscreen: bool,
     last_click_time: Option<std::time::Instant>,
 }
@@ -125,6 +114,7 @@ impl VideoStreaming {
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
             audio_stream_handle: None,
+            audio_network_handle: None,
             command_input: String::new(),
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
@@ -132,7 +122,7 @@ impl VideoStreaming {
             packets_received: Arc::new(Mutex::new(0)),
             audio_packets_received: Arc::new(Mutex::new(0)),
             audio_enabled: true,
-            audio_producer: None,
+            audio_buffer: None,
             is_fullscreen: false,
             last_click_time: None,
         }
@@ -160,7 +150,7 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::TakeScreenshot => {
-                // Take screenshot from the existing image buffer (no need to bind new socket)
+                // Take screenshot from the existing image buffer
                 if !self.is_streaming {
                     return Command::none();
                 }
@@ -217,7 +207,6 @@ impl VideoStreaming {
             }
             StreamingMessage::ToggleFullscreen => {
                 // Note: This is handled by main.rs which changes window mode
-                // If we get here, just return none (main.rs intercepts this message)
                 Command::none()
             }
             StreamingMessage::VideoClicked => {
@@ -225,8 +214,7 @@ impl VideoStreaming {
                 let now = std::time::Instant::now();
                 if let Some(last_time) = self.last_click_time {
                     if now.duration_since(last_time).as_millis() < 300 {
-                        // Double-click detected - send toggle fullscreen command
-                        // (main.rs will handle the actual toggle and window mode change)
+                        // Double-click detected
                         self.last_click_time = None;
                         return Command::perform(async {}, |_| StreamingMessage::ToggleFullscreen);
                     }
@@ -248,8 +236,6 @@ impl VideoStreaming {
                         rgba_data.clone(),
                     );
 
-                    // Use ContentFit::Contain to maintain aspect ratio with letterboxing
-                    // Wrap in mouse_area for double-click to exit fullscreen
                     mouse_area(
                         iced_image(handle)
                             .width(Length::Fill)
@@ -466,14 +452,13 @@ impl VideoStreaming {
         ]
         .spacing(5);
 
-        // Stream controls - centered
+        // Stream controls
         let screenshot_button = if self.is_streaming {
             button(text("Screenshot").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
                 .padding([6, 10])
         } else {
             button(text("Screenshot").size(11)).padding([6, 10])
-            // No on_press - button is disabled
         };
 
         let stream_controls = column![
@@ -621,39 +606,32 @@ impl VideoStreaming {
             log::info!("Video stream thread started");
 
             let socket = match mode {
-                StreamMode::Unicast => {
-                    // Bind to all interfaces on the specified port
-                    match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
-                        Ok(s) => {
-                            log::info!("Unicast socket bound to 0.0.0.0:{}", port);
-                            s
-                        }
-                        Err(e) => {
-                            log::error!("Failed to bind unicast socket: {}", e);
+                StreamMode::Unicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+                    Ok(s) => {
+                        log::info!("Unicast socket bound to 0.0.0.0:{}", port);
+                        s
+                    }
+                    Err(e) => {
+                        log::error!("Failed to bind unicast socket: {}", e);
+                        return;
+                    }
+                },
+                StreamMode::Multicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+                    Ok(s) => {
+                        let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
+                        let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                        if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
+                            log::error!("Failed to join multicast group: {}", e);
                             return;
                         }
+                        log::info!("Multicast socket joined 239.0.1.64:{}", port);
+                        s
                     }
-                }
-                StreamMode::Multicast => {
-                    // Create multicast socket
-                    match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
-                        Ok(s) => {
-                            // Join multicast group
-                            let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
-                            let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
-                            if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
-                                log::error!("Failed to join multicast group: {}", e);
-                                return;
-                            }
-                            log::info!("Multicast socket joined 239.0.1.64:{}", port);
-                            s
-                        }
-                        Err(e) => {
-                            log::error!("Failed to bind multicast socket: {}", e);
-                            return;
-                        }
+                    Err(e) => {
+                        log::error!("Failed to bind multicast socket: {}", e);
+                        return;
                     }
-                }
+                },
             };
 
             if let Err(e) = socket.set_nonblocking(true) {
@@ -670,18 +648,15 @@ impl VideoStreaming {
             let mut first_packet = true;
 
             // Build color lookup table (2 pixels packed per byte -> 8 bytes RGBA output)
-            // Low nibble = LEFT pixel (x*2), High nibble = RIGHT pixel (x*2+1)
             let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
             for i in 0..256 {
-                let hi = (i >> 4) & 0x0F; // High nibble = RIGHT pixel
-                let lo = i & 0x0F; // Low nibble = LEFT pixel
+                let hi = (i >> 4) & 0x0F;
+                let lo = i & 0x0F;
                 let c_hi = &C64_PALETTE[hi];
                 let c_lo = &C64_PALETTE[lo];
                 color_lut.push([
-                    c_lo[0], c_lo[1], c_lo[2],
-                    255, // LEFT pixel (low nibble) - first in memory
-                    c_hi[0], c_hi[1], c_hi[2],
-                    255, // RIGHT pixel (high nibble) - second in memory
+                    c_lo[0], c_lo[1], c_lo[2], 255, // LEFT pixel (low nibble)
+                    c_hi[0], c_hi[1], c_hi[2], 255, // RIGHT pixel (high nibble)
                 ]);
             }
 
@@ -711,18 +686,18 @@ impl VideoStreaming {
                         if first_packet {
                             first_packet = false;
                             log::info!(
-                                "First packet: pixels_in_line={}, lines_in_packet={}, payload_size={}",
+                                "First video packet: pixels_in_line={}, lines_in_packet={}, payload_size={}",
                                 pixels_in_line,
                                 lines_in_packet,
                                 size - HEADER_SIZE
                             );
                         }
 
-                        let line_num = (line_raw & 0x7FFF) as usize; // Strip MSB (sync flag)
+                        let line_num = (line_raw & 0x7FFF) as usize;
                         let is_frame_end = (line_raw & 0x8000) != 0;
 
                         let payload = &recv_buf[HEADER_SIZE..size];
-                        let bytes_per_line = pixels_in_line / 2; // 2 pixels per byte = 192 bytes/line
+                        let bytes_per_line = pixels_in_line / 2;
 
                         // Process each line in the packet
                         for l in 0..lines_in_packet {
@@ -732,8 +707,6 @@ impl VideoStreaming {
                             }
 
                             let payload_offset = l * bytes_per_line;
-
-                            // Write pixels to RGBA buffer using VIC_WIDTH stride
                             let row_offset = y * (VIC_WIDTH as usize) * 4;
 
                             for x in 0..bytes_per_line {
@@ -743,7 +716,6 @@ impl VideoStreaming {
                                 let packed_byte = payload[payload_offset + x] as usize;
                                 let colors = &color_lut[packed_byte];
 
-                                // Each packed byte = 2 pixels
                                 let pixel_x = x * 2;
                                 if pixel_x + 1 < VIC_WIDTH as usize {
                                     let offset = row_offset + pixel_x * 4;
@@ -797,13 +769,15 @@ impl VideoStreaming {
             *p = 0;
         }
 
-        // Create shared audio buffer
-        let audio_buffer: Arc<Mutex<VecDeque<i16>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_SIZE)));
-        self.audio_producer = Some(audio_buffer.clone());
+        // Create shared audio buffer using f32 for better Mac compatibility
+        let audio_buffer: Arc<Mutex<VecDeque<f32>>> =
+            Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_SIZE * 2)));
+        self.audio_buffer = Some(audio_buffer.clone());
 
         let consumer_buffer = audio_buffer.clone();
+        let producer_buffer = audio_buffer.clone();
         let stop_signal = self.stop_signal.clone();
+        let stop_signal_net = self.stop_signal.clone();
         let audio_packets_counter = self.audio_packets_received.clone();
 
         // Start audio output thread using cpal
@@ -811,6 +785,8 @@ impl VideoStreaming {
             log::info!("Audio playback thread started");
 
             let host = cpal::default_host();
+            log::info!("Audio host: {}", host.id().name());
+
             let device = match host.default_output_device() {
                 Some(d) => d,
                 None => {
@@ -819,33 +795,170 @@ impl VideoStreaming {
                 }
             };
 
-            log::info!("Using audio device: {}", device.name().unwrap_or_default());
+            let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+            log::info!("Using audio device: {}", device_name);
 
-            let config = cpal::StreamConfig {
-                channels: AUDIO_CHANNELS,
-                sample_rate: cpal::SampleRate(AUDIO_SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Fixed(512),
+            // Log supported configs for debugging
+            match device.supported_output_configs() {
+                Ok(configs) => {
+                    for config in configs {
+                        log::debug!("Supported output config: {:?}", config);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Could not query supported configs: {}", e);
+                }
+            }
+
+            // Try to get a supported config, preferring f32 format
+            let supported_config = match device.supported_output_configs() {
+                Ok(configs) => {
+                    let configs_vec: Vec<_> = configs.collect();
+
+                    // First try: f32 with matching channels and sample rate
+                    configs_vec
+                        .iter()
+                        .find(|c| {
+                            c.channels() == AUDIO_CHANNELS
+                                && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
+                                && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                                && c.sample_format() == cpal::SampleFormat::F32
+                        })
+                        .or_else(|| {
+                            // Second try: i16 with matching channels and sample rate
+                            configs_vec.iter().find(|c| {
+                                c.channels() == AUDIO_CHANNELS
+                                    && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
+                                    && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                                    && c.sample_format() == cpal::SampleFormat::I16
+                            })
+                        })
+                        .or_else(|| {
+                            // Third try: any format with matching channels and sample rate
+                            configs_vec.iter().find(|c| {
+                                c.channels() == AUDIO_CHANNELS
+                                    && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
+                                    && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                            })
+                        })
+                        .cloned()
+                        .map(|c| c.with_sample_rate(cpal::SampleRate(AUDIO_SAMPLE_RATE)))
+                }
+                Err(e) => {
+                    log::error!("Failed to get supported configs: {}", e);
+                    None
+                }
             };
 
-            let consumer = consumer_buffer;
-            let stream = match device.build_output_stream(
-                &config,
-                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                    // Fill output buffer from shared buffer
-                    if let Ok(mut buf) = consumer.lock() {
-                        for sample in data.iter_mut() {
-                            *sample = buf.pop_front().unwrap_or(0);
+            let (stream_config, sample_format) = match supported_config {
+                Some(ref c) => {
+                    log::info!("Using supported config: {:?}", c);
+                    (c.config(), c.sample_format())
+                }
+                None => {
+                    log::warn!("No matching config found, trying default f32 config");
+                    (
+                        cpal::StreamConfig {
+                            channels: AUDIO_CHANNELS,
+                            sample_rate: cpal::SampleRate(AUDIO_SAMPLE_RATE),
+                            buffer_size: cpal::BufferSize::Default,
+                        },
+                        cpal::SampleFormat::F32,
+                    )
+                }
+            };
+
+            log::info!(
+                "Audio stream config: {} channels, {} Hz, format: {:?}, buffer: {:?}",
+                stream_config.channels,
+                stream_config.sample_rate.0,
+                sample_format,
+                stream_config.buffer_size
+            );
+
+            // Build stream based on the supported sample format
+            let stream: cpal::Stream = match sample_format {
+                cpal::SampleFormat::F32 => {
+                    let consumer = consumer_buffer;
+                    match device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                            if let Ok(mut buf) = consumer.lock() {
+                                for sample in data.iter_mut() {
+                                    *sample = buf.pop_front().unwrap_or(0.0);
+                                }
+                            } else {
+                                for sample in data.iter_mut() {
+                                    *sample = 0.0;
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("Failed to build f32 audio stream: {}", e);
+                            return;
                         }
                     }
-                },
-                |err| {
-                    log::error!("Audio stream error: {}", err);
-                },
-                None,
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to build audio stream: {}", e);
+                }
+                cpal::SampleFormat::I16 => {
+                    let consumer = consumer_buffer;
+                    match device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                            if let Ok(mut buf) = consumer.lock() {
+                                for sample in data.iter_mut() {
+                                    // Convert f32 back to i16
+                                    let f = buf.pop_front().unwrap_or(0.0);
+                                    *sample = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                }
+                            } else {
+                                for sample in data.iter_mut() {
+                                    *sample = 0;
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("Failed to build i16 audio stream: {}", e);
+                            return;
+                        }
+                    }
+                }
+                cpal::SampleFormat::U16 => {
+                    let consumer = consumer_buffer;
+                    match device.build_output_stream(
+                        &stream_config,
+                        move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
+                            if let Ok(mut buf) = consumer.lock() {
+                                for sample in data.iter_mut() {
+                                    // Convert f32 (-1.0 to 1.0) to u16 (0 to 65535)
+                                    let f = buf.pop_front().unwrap_or(0.0);
+                                    *sample = ((f + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                }
+                            } else {
+                                for sample in data.iter_mut() {
+                                    *sample = 32768; // Silence for unsigned
+                                }
+                            }
+                        },
+                        |err| log::error!("Audio stream error: {}", err),
+                        None,
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::error!("Failed to build u16 audio stream: {}", e);
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    log::error!("Unsupported sample format: {:?}", sample_format);
                     return;
                 }
             };
@@ -855,21 +968,19 @@ impl VideoStreaming {
                 return;
             }
 
-            log::info!("Audio playback started");
+            log::info!("Audio playback started successfully");
 
             // Keep thread alive while streaming
             while !stop_signal.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(100));
             }
 
+            // Stream will be dropped here, stopping playback
+            drop(stream);
             log::info!("Audio playback thread stopped");
         });
 
         // Start audio network receiver thread
-        let producer_buffer = audio_buffer;
-        let stop_signal_net = self.stop_signal.clone();
-        let audio_packets_counter_clone = audio_packets_counter;
-
         let network_handle = thread::spawn(move || {
             log::info!("Audio network thread started on port {}", port);
 
@@ -908,6 +1019,7 @@ impl VideoStreaming {
             }
 
             let mut recv_buf = [0u8; 2048];
+            let mut first_packet = true;
 
             loop {
                 if stop_signal_net.load(Ordering::Relaxed) {
@@ -916,25 +1028,38 @@ impl VideoStreaming {
 
                 match socket.recv_from(&mut recv_buf) {
                     Ok((size, _addr)) => {
-                        if size < AUDIO_HEADER_SIZE {
+                        if size <= AUDIO_HEADER_SIZE {
                             continue;
                         }
 
                         // Count packets
-                        if let Ok(mut p) = audio_packets_counter_clone.lock() {
+                        if let Ok(mut p) = audio_packets_counter.lock() {
                             *p += 1;
                         }
 
-                        // Skip 2-byte sequence header, rest is i16 samples
+                        // Log first packet for debugging
+                        if first_packet {
+                            first_packet = false;
+                            log::info!(
+                                "First audio packet: {} bytes (payload: {} bytes, {} samples)",
+                                size,
+                                size - AUDIO_HEADER_SIZE,
+                                (size - AUDIO_HEADER_SIZE) / 2
+                            );
+                        }
+
+                        // Skip 2-byte sequence header, rest is i16 samples (little-endian)
                         let audio_data = &recv_buf[AUDIO_HEADER_SIZE..size];
 
-                        // Convert bytes to i16 samples (little-endian) and push to buffer
+                        // Convert bytes to f32 samples (i16 -> f32 normalized to -1.0..1.0)
                         if let Ok(mut buf) = producer_buffer.lock() {
                             for chunk in audio_data.chunks_exact(2) {
-                                let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-                                // Keep buffer size limited
-                                if buf.len() < AUDIO_BUFFER_SIZE {
-                                    buf.push_back(sample);
+                                let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+                                let sample_f32 = sample_i16 as f32 / 32768.0;
+
+                                // Keep buffer size limited to prevent memory growth
+                                if buf.len() < AUDIO_BUFFER_SIZE * 2 {
+                                    buf.push_back(sample_f32);
                                 }
                             }
                         }
@@ -958,9 +1083,8 @@ impl VideoStreaming {
             log::info!("Audio network thread stopped");
         });
 
-        // We'll just track the audio playback handle (network thread will stop via stop_signal)
         self.audio_stream_handle = Some(audio_handle);
-        let _ = network_handle; // Network thread detaches
+        self.audio_network_handle = Some(network_handle);
     }
 
     fn stop_stream(&mut self) {
@@ -976,13 +1100,18 @@ impl VideoStreaming {
             let _ = handle.join();
         }
 
-        // Stop audio thread
+        // Stop audio playback thread
         if let Some(handle) = self.audio_stream_handle.take() {
             let _ = handle.join();
         }
 
-        // Clear audio producer
-        self.audio_producer = None;
+        // Stop audio network thread
+        if let Some(handle) = self.audio_network_handle.take() {
+            let _ = handle.join();
+        }
+
+        // Clear audio buffer
+        self.audio_buffer = None;
 
         self.is_streaming = false;
         if let Ok(mut frame) = self.frame_buffer.lock() {
@@ -991,6 +1120,8 @@ impl VideoStreaming {
         if let Ok(mut img) = self.image_buffer.lock() {
             *img = None;
         }
+
+        log::info!("All streams stopped");
     }
 }
 
@@ -1020,9 +1151,9 @@ impl iced::widget::container::StyleSheet for BlackBackground {
 // Decode VIC stream frame to RGBA (used for raw frame data, not packet-based data)
 #[allow(dead_code)]
 fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
-    let expected_indexed = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes (1 byte/pixel)
-    let expected_rgb = expected_indexed * 3; // 313344 bytes (3 bytes/pixel)
-    let expected_rgba = expected_indexed * 4; // 417792 bytes (4 bytes/pixel)
+    let expected_indexed = (VIC_WIDTH * VIC_HEIGHT) as usize;
+    let expected_rgb = expected_indexed * 3;
+    let expected_rgba = expected_indexed * 4;
 
     log::debug!("Decoding frame: {} bytes", raw_data.len());
 
@@ -1054,7 +1185,7 @@ fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
         // Already RGBA
         Some(raw_data.to_vec())
     } else if raw_data.len() >= expected_indexed {
-        // Unknown format but has enough data - try indexed interpretation
+        // Fallback for unknown format but has enough data - try indexed interpretation
         let mut rgba = Vec::with_capacity(expected_rgba);
         for &pixel in raw_data.iter().take(expected_indexed) {
             let idx = (pixel & 0x0F) as usize;
@@ -1088,7 +1219,7 @@ pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, S
 
     // Get user's Pictures folder, fallback to home directory
     let pictures_dir = dirs::picture_dir()
-        .or_else(|| dirs::home_dir())
+        .or_else(dirs::home_dir)
         .ok_or_else(|| "Could not find Pictures or Home directory".to_string())?;
 
     // Create Ultimate64 subfolder
@@ -1147,7 +1278,7 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
         let rgba_size = (VIC_WIDTH * VIC_HEIGHT * 4) as usize;
         let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
 
-        // Build color lookup table (low nibble = LEFT, high nibble = RIGHT)
+        // Build color lookup table
         let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
         for i in 0..256 {
             let hi = (i >> 4) & 0x0F;
@@ -1160,7 +1291,7 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
             ]);
         }
 
-        // Wait for a complete frame (until we see frame end flag)
+        // Wait for a complete frame
         let start = std::time::Instant::now();
         let mut got_frame = false;
 
@@ -1171,7 +1302,6 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
                         continue;
                     }
 
-                    // Parse header
                     let line_raw = u16::from_le_bytes([recv_buf[4], recv_buf[5]]);
                     let pixels_in_line = u16::from_le_bytes([recv_buf[6], recv_buf[7]]) as usize;
                     let lines_in_packet = recv_buf[8] as usize;
@@ -1182,7 +1312,6 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
                     let payload = &recv_buf[HEADER_SIZE..size];
                     let half_pixels = pixels_in_line / 2;
 
-                    // Process lines
                     for l in 0..lines_in_packet {
                         let y = line_num + l;
                         if y >= VIC_HEIGHT as usize {
