@@ -1,6 +1,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::{
     Command, Element, Length, Subscription,
+    event::{self, Event},
+    keyboard::{self, Key, Modifiers},
     widget::{
         Column, Space, button, checkbox, column, container, image as iced_image, mouse_area, row,
         scrollable, text, text_input, tooltip,
@@ -12,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::Mutex as TokioMutex;
+use ultimate64::Rest;
+use ultimate64::petscii::Petscii;
 
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
@@ -98,6 +103,11 @@ pub enum StreamingMessage {
     AudioToggled(bool),
     ToggleFullscreen,
     VideoClicked, // For double-click detection
+    // Keyboard control messages
+    ToggleKeyboard(bool),        // Enable/disable keyboard capture
+    KeyPressed(Key, Modifiers),  // Key press event with modifiers
+    KeyReleased(Key),            // Key release event
+    KeySent(Result<(), String>), // Result of sending key to C64
 }
 
 pub struct VideoStreaming {
@@ -120,6 +130,9 @@ pub struct VideoStreaming {
     audio_buffer: Option<Arc<Mutex<VecDeque<f32>>>>, // Shared audio sample buffer (f32 for cross-platform)
     pub is_fullscreen: bool,
     last_click_time: Option<std::time::Instant>, // For double-click detection
+    // Keyboard control
+    pub keyboard_enabled: bool, // Whether keyboard capture is active
+    last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
 }
 
 impl Default for VideoStreaming {
@@ -150,10 +163,16 @@ impl VideoStreaming {
             audio_buffer: None,
             is_fullscreen: false,
             last_click_time: None,
+            keyboard_enabled: false,
+            last_key_time: None,
         }
     }
 
-    pub fn update(&mut self, message: StreamingMessage) -> Command<StreamingMessage> {
+    pub fn update(
+        &mut self,
+        message: StreamingMessage,
+        connection: Option<Arc<TokioMutex<Rest>>>,
+    ) -> Command<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {
                 self.start_stream();
@@ -246,7 +265,6 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::ToggleFullscreen => {
-                // Note: This is handled by main.rs which changes window mode
                 Command::none()
             }
             StreamingMessage::VideoClicked => {
@@ -260,6 +278,206 @@ impl VideoStreaming {
                     }
                 }
                 self.last_click_time = Some(now);
+                Command::none()
+            }
+
+            // ==================== Keyboard Control Messages ====================
+            StreamingMessage::ToggleKeyboard(enabled) => {
+                self.keyboard_enabled = enabled;
+                log::info!(
+                    "Keyboard capture: {}",
+                    if enabled { "ENABLED" } else { "DISABLED" }
+                );
+                Command::none()
+            }
+
+            StreamingMessage::KeyPressed(key, modifiers) => {
+                if !self.keyboard_enabled || !self.is_streaming {
+                    return Command::none();
+                }
+
+                // Rate limit: minimum 30ms between key sends to avoid flooding API
+                const MIN_KEY_INTERVAL_MS: u64 = 30;
+                let now = std::time::Instant::now();
+                if let Some(last) = self.last_key_time {
+                    if now.duration_since(last).as_millis() < MIN_KEY_INTERVAL_MS as u128 {
+                        // Too fast, skip this key event
+                        return Command::none();
+                    }
+                }
+                self.last_key_time = Some(now);
+
+                // Convert key to PETSCII
+                let petscii: Option<u8> = match &key {
+                    Key::Character(c) => {
+                        let is_shift = modifiers.shift();
+
+                        // Handle shifted characters - US keyboard layout
+                        let code = if is_shift {
+                            match c.as_str() {
+                                "'" => Some(34),   // Shift+' = "
+                                ";" => Some(58),   // Shift+; = :
+                                "," => Some(60),   // Shift+, = <
+                                "." => Some(62),   // Shift+. = >
+                                "/" => Some(63),   // Shift+/ = ?
+                                "1" => Some(33),   // Shift+1 = !
+                                "2" => Some(64),   // Shift+2 = @
+                                "3" => Some(35),   // Shift+3 = #
+                                "4" => Some(36),   // Shift+4 = $
+                                "5" => Some(37),   // Shift+5 = %
+                                "6" => Some(94),   // Shift+6 = ^ (up arrow on C64)
+                                "7" => Some(38),   // Shift+7 = &
+                                "8" => Some(42),   // Shift+8 = *
+                                "9" => Some(40),   // Shift+9 = (
+                                "0" => Some(41),   // Shift+0 = )
+                                "-" => Some(95),   // Shift+- = _ (underscore)
+                                "=" => Some(43),   // Shift+= = +
+                                "[" => Some(123),  // Shift+[ = { (not on C64, but try)
+                                "]" => Some(125),  // Shift+] = } (not on C64, but try)
+                                "\\" => Some(124), // Shift+\ = |
+                                "`" => Some(126),  // Shift+` = ~
+                                _ => None,         // Fall through to normal handling
+                            }
+                        } else {
+                            None // Not shifted, use normal handling
+                        };
+
+                        // If shift mapping found, use it; otherwise try normal mapping
+                        code.or_else(|| {
+                            // Try explicit mapping for direct characters
+                            match c.as_str() {
+                                "\"" => Some(34), // Double quote (if OS sends it directly)
+                                ":" => Some(58),  // Colon
+                                ";" => Some(59),  // Semicolon
+                                "<" => Some(60),  // Less than
+                                ">" => Some(62),  // Greater than
+                                "=" => Some(61),  // Equals
+                                "+" => Some(43),  // Plus
+                                "-" => Some(45),  // Minus
+                                "*" => Some(42),  // Asterisk
+                                "/" => Some(47),  // Slash
+                                "?" => Some(63),  // Question mark
+                                "@" => Some(64),  // At sign
+                                "!" => Some(33),  // Exclamation
+                                "#" => Some(35),  // Hash
+                                "$" => Some(36),  // Dollar
+                                "%" => Some(37),  // Percent
+                                "&" => Some(38),  // Ampersand
+                                "'" => Some(39),  // Single quote
+                                "(" => Some(40),  // Open paren
+                                ")" => Some(41),  // Close paren
+                                "," => Some(44),  // Comma
+                                "." => Some(46),  // Period
+                                "[" => Some(91),  // Open bracket
+                                "]" => Some(93),  // Close bracket
+                                "^" => Some(94),  // Caret
+                                "_" => Some(164), // Underscore
+                                " " => Some(32),  // Space
+                                _ => {
+                                    // Fall back to Petscii::from_str_lossy for letters/numbers
+                                    let petscii_bytes = Petscii::from_str_lossy(c);
+                                    if petscii_bytes.len() > 0 {
+                                        let code = petscii_bytes[0];
+                                        // 0x7F is the "unknown character" replacement
+                                        if code != 0x7F {
+                                            Some(code)
+                                        } else {
+                                            log::debug!("KEYBOARD: Unknown char '{}' -> 0x7F", c);
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                }
+                            }
+                        })
+                    }
+                    Key::Named(named) => {
+                        // Special keys need manual PETSCII mapping
+                        use iced::keyboard::key::Named;
+                        match named {
+                            Named::Enter => Some(13),      // RETURN
+                            Named::Space => Some(32),      // SPACE
+                            Named::Backspace => Some(20),  // DEL (C64 delete)
+                            Named::Delete => Some(20),     // DEL
+                            Named::Home => Some(19),       // HOME
+                            Named::End => Some(147),       // CLR (Shift+HOME)
+                            Named::Escape => Some(3),      // RUN/STOP
+                            Named::ArrowUp => Some(145),   // CRSR UP
+                            Named::ArrowDown => Some(17),  // CRSR DOWN
+                            Named::ArrowLeft => Some(157), // CRSR LEFT
+                            Named::ArrowRight => Some(29), // CRSR RIGHT
+                            Named::F1 => Some(133),        // F1
+                            Named::F2 => Some(137),        // F2
+                            Named::F3 => Some(134),        // F3
+                            Named::F4 => Some(138),        // F4
+                            Named::F5 => Some(135),        // F5
+                            Named::F6 => Some(139),        // F6
+                            Named::F7 => Some(136),        // F7
+                            Named::F8 => Some(140),        // F8
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some(code) = petscii {
+                    log::debug!("KEYBOARD: {:?} -> PETSCII {} (0x{:02X})", key, code, code);
+
+                    if let Some(conn) = connection {
+                        return Command::perform(
+                            async move {
+                                // Use timeout to prevent hangs
+                                let result = tokio::time::timeout(
+                                    std::time::Duration::from_millis(500),
+                                    tokio::task::spawn_blocking(move || {
+                                        let c = conn.blocking_lock();
+
+                                        // Match type_text behavior from ultimate64 library:
+                                        // 1. Clear LSTX ($C5) and NDX ($C6) - last key and buffer count
+                                        c.write_mem(0x00C5, &[0, 0])
+                                            .map_err(|e| format!("Clear failed: {}", e))?;
+
+                                        // 2. Write PETSCII code to keyboard buffer at $0277
+                                        c.write_mem(0x0277, &[code])
+                                            .map_err(|e| format!("Buffer write failed: {}", e))?;
+
+                                        // 3. Set buffer count to 1 at $C6 to trigger processing
+                                        c.write_mem(0x00C6, &[1])
+                                            .map_err(|e| format!("Count write failed: {}", e))?;
+
+                                        Ok(())
+                                    }),
+                                )
+                                .await;
+
+                                match result {
+                                    Ok(Ok(r)) => r,
+                                    Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                    Err(_) => Err("Keyboard write timed out".to_string()),
+                                }
+                            },
+                            StreamingMessage::KeySent,
+                        );
+                    } else {
+                        log::warn!("KEYBOARD: No connection available!");
+                    }
+                } else {
+                    log::trace!("KEYBOARD: Key {:?} not mapped", key);
+                }
+                Command::none()
+            }
+
+            StreamingMessage::KeyReleased(_key) => {
+                // For keyboard buffer approach, we don't need to do anything on release
+                // The character was already sent to the buffer on key press
+                Command::none()
+            }
+
+            StreamingMessage::KeySent(result) => {
+                if let Err(e) = result {
+                    log::error!("Failed to send key to C64: {}", e);
+                }
                 Command::none()
             }
         }
@@ -307,11 +525,31 @@ impl VideoStreaming {
                 .into()
         };
 
-        // Exit hint at the top
+        // Exit hint at the top with keyboard toggle
+        let keyboard_btn = button(
+            text(if self.keyboard_enabled {
+                "⌨ Enabled"
+            } else {
+                "⌨ Disabled"
+            })
+            .size(12),
+        )
+        .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
+        .padding([6, 12])
+        .style(if self.keyboard_enabled {
+            iced::theme::Button::Primary
+        } else {
+            iced::theme::Button::Secondary
+        });
+
         let exit_hint = container(
-            button(text("Exit Fullscreen (ESC or double-click)").size(12))
-                .on_press(StreamingMessage::ToggleFullscreen)
-                .padding([6, 12]),
+            row![
+                button(text("Exit Fullscreen (ESC or double-click)").size(12))
+                    .on_press(StreamingMessage::ToggleFullscreen)
+                    .padding([6, 12]),
+                keyboard_btn,
+            ]
+            .spacing(10),
         )
         .width(Length::Fill)
         .center_x()
@@ -563,13 +801,44 @@ impl VideoStreaming {
         ]
         .spacing(5);
 
-        // Stream controls
+        // Stream controls with keyboard toggle
         let screenshot_button = if self.is_streaming {
             button(text("Screenshot").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
                 .padding([6, 10])
         } else {
             button(text("Screenshot").size(11)).padding([6, 10])
+        };
+
+        // Keyboard toggle button
+        let keyboard_button = if self.is_streaming {
+            tooltip(
+                button(
+                    text(if self.keyboard_enabled {
+                        "⌨ Enabled"
+                    } else {
+                        "⌨ Disabled"
+                    })
+                    .size(11),
+                )
+                .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
+                .padding([6, 10])
+                .style(if self.keyboard_enabled {
+                    iced::theme::Button::Primary
+                } else {
+                    iced::theme::Button::Secondary
+                }),
+                "Enable keyboard input to C64 (type in video window)",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box)
+        } else {
+            tooltip(
+                button(text("⌨ Disabled").size(11)).padding([6, 10]),
+                "Start streaming first",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box)
         };
 
         let stream_controls = column![
@@ -607,15 +876,20 @@ impl VideoStreaming {
             ]
             .spacing(5)
             .align_items(iced::Alignment::Center),
-            tooltip(
-                checkbox("Audio", self.audio_enabled)
-                    .on_toggle(StreamingMessage::AudioToggled)
-                    .size(16)
-                    .text_size(11),
-                "Enable audio streaming (port+1)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
+            row![
+                tooltip(
+                    checkbox("Audio", self.audio_enabled)
+                        .on_toggle(StreamingMessage::AudioToggled)
+                        .size(16)
+                        .text_size(11),
+                    "Enable audio streaming (port+1)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                keyboard_button,
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
         ]
         .spacing(5)
         .align_items(iced::Alignment::Center);
@@ -687,11 +961,32 @@ impl VideoStreaming {
     }
 
     pub fn subscription(&self) -> Subscription<StreamingMessage> {
+        let mut subscriptions = Vec::new();
+
+        // Frame update subscription (~25 fps)
         if self.is_streaming {
-            // ~25 fps refresh rate (40ms per frame)
-            iced::time::every(Duration::from_millis(40)).map(|_| StreamingMessage::FrameUpdate)
-        } else {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(40)).map(|_| StreamingMessage::FrameUpdate),
+            );
+        }
+
+        // Keyboard events subscription - only when enabled and streaming
+        if self.keyboard_enabled && self.is_streaming {
+            subscriptions.push(event::listen_with(|event, _status| match event {
+                Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Some(StreamingMessage::KeyPressed(key, modifiers))
+                }
+                Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) => {
+                    Some(StreamingMessage::KeyReleased(key))
+                }
+                _ => None,
+            }));
+        }
+
+        if subscriptions.is_empty() {
             Subscription::none()
+        } else {
+            Subscription::batch(subscriptions)
         }
     }
 
@@ -1215,6 +1510,7 @@ impl VideoStreaming {
 
         log::info!("Stopping video and audio streams...");
         self.stop_signal.store(true, Ordering::Relaxed);
+        self.keyboard_enabled = false;
 
         // Stop video thread
         if let Some(handle) = self.stream_handle.take() {
