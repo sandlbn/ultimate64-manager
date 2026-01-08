@@ -18,7 +18,6 @@ use url::Host;
 mod api;
 mod config_editor;
 mod file_browser;
-mod keyboard_map;
 mod music_player;
 mod remote_browser;
 mod settings;
