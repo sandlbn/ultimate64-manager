@@ -320,8 +320,9 @@ impl RemoteBrowser {
                         Some(format!("Running disk on drive {}...", drive.to_uppercase()));
                     let host = host.clone();
                     let password = self.password.clone();
+                    let conn = _connection.clone();
                     Command::perform(
-                        async move { api::run_disk(&host, &path, &drive, password).await },
+                        async move { api::run_disk(&host, &path, &drive, password, conn).await },
                         RemoteBrowserMessage::MountComplete, // Reuse MountComplete for result
                     )
                 } else {
