@@ -478,7 +478,7 @@ impl VideoStreaming {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "Direct IP connection (works over WiFi)",
+                    "Direct UDP connection (requires Ethernet, WiFi not supported)",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),

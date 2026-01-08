@@ -78,14 +78,65 @@ cargo build --release
 # macOS bundle
 cargo bundle --release
 ```
+ 
+# Enabling Video & Audio Streaming
 
-## Streaming under Windows
-The following command adds a Windows Firewall inbound rule required for VIC streaming.
-Make sure to replace {U64_Address} with the IP address of your Ultimate64 device.
+## Prerequisites
 
-```powershell
-New-NetFirewallRule -DisplayName "C64 Stream" -Direction Inbound -Protocol UDP -LocalPort 11000,11001 -RemoteAddress {U64_Address} -Action Allow
-```
+- Ultimate64 and your computer connected via Ethernet (WiFi is not supported for streaming)
+- Note your computer's IP address (e.g., `192.168.1.100`)
+
+## Step 1: Configure Stream Destination
+
+You can configure the stream destination either on the Ultimate64 directly or through the app.
+
+### Option A: Using Ultimate64 Manager (recommended)
+
+1. Open Ultimate64 Manager and connect to your device
+2. Go to **Configuration Editor** tab
+3. Select **Data Streams** from the categories list
+4. Set **Stream VIC to** to your computer's IP address (e.g., `10.0.0.141:11000`)
+5. Set **Stream Audio to** to the same IP with port 11001 (e.g., `10.0.0.141:11001`)
+6. Click **Apply All** to save settings
+
+### Option B: Using F2 Menu on Ultimate64 / Commodore 64 Ultimate
+
+1. Press **F2** to enter the Configuration Menu
+2. Navigate to **Data Streams** settings
+3. Set the stream destinations to your computer's IP address
+4. Save settings and exit
+
+## Step 2: Start Ultimate64 Manager
+
+1. Launch Ultimate64 Manager
+2. Go to the **Streaming** tab
+3. Select **Unicast** mode (direct IP connection)
+4. Verify port is set to **11000** (default)
+5. Enable **Audio** checkbox if desired (uses port 11001)
+6. Click **START** to begin listening for the stream
+
+## Step 3: Start Streaming on Ultimate64 / Commodore 64 Ultimate
+
+1. Press **F5** to open the Action Menu
+2. Navigate to **Streams**
+3. Select **Start VIC Stream** — enter destination IP if prompted
+4. Select **Start Audio Stream** for audio (optional)
+
+The video should now appear in Ultimate64 Manager.
+
+## Stopping the Stream
+
+- **On Ultimate64**: F5 → Streams → Stop VIC Stream / Stop Audio Stream
+- **In Ultimate64 Manager**: Click **STOP**
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| No video received | Verify IP address, check firewall allows UDP port 11000 |
+| No audio | Ensure audio stream is started separately, check port 11001 |
+| Stream not working over WiFi | Streaming requires Ethernet connection, WiFi is not supported |
+| Windows firewall | Run: `netsh advfirewall firewall add rule name="Ultimate64 Stream" dir=in action=allow protocol=UDP localport=11000-11001` |
 
 ## Quick Start
 
