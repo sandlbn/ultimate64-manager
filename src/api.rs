@@ -1,7 +1,9 @@
 // Ultimate64 REST API client
-// Handles API calls to the Ultimate64 device
 
 use reqwest::Client;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use ultimate64::Rest;
 
 /// Run a PRG file from the Ultimate64 filesystem
 /// PUT /v1/runners:run_prg?file=<path>
@@ -88,7 +90,7 @@ fn runner_description(runner: &str) -> &'static str {
     }
 }
 
-/// Mount a disk image on the Ultimate64
+/// Mount a disk image on the Ultimate64 (for files already on the device)
 /// PUT /v1/drives/<drive>:mount?image=<path>&mode=<mode>
 pub async fn mount_disk(
     host: &str,
@@ -125,54 +127,69 @@ pub async fn mount_disk(
     }
 }
 
-/// Reset the C64 machine
-/// PUT /v1/machine:reset
-pub async fn reset_machine(host: &str, password: Option<String>) -> Result<(), String> {
-    let url = format!("http://{}:80/v1/machine:reset", host);
-    log::info!("API: reset machine");
-
-    let client = Client::new();
-    let mut request = client.put(&url);
-
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            request = request.header("X-password", pwd.as_str());
-        }
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("Reset failed: HTTP {}", response.status()))
-    }
-}
-
-/// Run a disk image: mount, reset, and auto-load
-/// This mounts the disk readonly, resets the machine
+/// Run a disk image with full sequence: mount, reset, LOAD"*",8,1, RUN
+/// Uses Rest connection for type_text (from ultimate64 crate)
 pub async fn run_disk(
     host: &str,
     file_path: &str,
     drive: &str,
     password: Option<String>,
+    connection: Option<Arc<Mutex<Rest>>>,
 ) -> Result<String, String> {
-    // 1. Mount the disk (readonly)
+    let device_num = if drive == "a" { "8" } else { "9" };
+    let filename = file_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(file_path)
+        .to_string();
+
+    log::info!(
+        "API: run_disk {} on drive {} (device {})",
+        filename,
+        drive,
+        device_num
+    );
+
+    // 1. Mount the disk (readonly) via HTTP API
     mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
 
-    // Small delay
-    tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+    // Small delay for mount to complete
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // 2. Reset the machine
-    reset_machine(host, password).await?;
+    // 2. Reset and type commands using Rest connection
+    if let Some(conn) = connection {
+        let device = device_num.to_string();
 
-    let filename = file_path.rsplit('/').next().unwrap_or(file_path);
-    let drive_num = if drive == "a" { 8 } else { 9 };
-    Ok(format!(
-        "Mounted & reset: {} - Type LOAD\"*\",{},1 then RUN",
-        filename, drive_num
-    ))
+        tokio::task::spawn_blocking(move || {
+            let c = conn.blocking_lock();
+
+            // Reset the machine
+            c.reset().map_err(|e| format!("Reset failed: {}", e))?;
+
+            // Wait for C64 to boot up
+            std::thread::sleep(std::time::Duration::from_secs(3));
+
+            // Type LOAD"*",8,1 (or 9)
+            let load_cmd = format!("load\"*\",{},1\n", device);
+            c.type_text(&load_cmd)
+                .map_err(|e| format!("Type LOAD failed: {}", e))?;
+
+            // Wait for program to load
+            std::thread::sleep(std::time::Duration::from_secs(5));
+
+            // Type RUN
+            c.type_text("run\n")
+                .map_err(|e| format!("Type RUN failed: {}", e))?;
+
+            Ok::<String, String>(format!("Running: {}", filename))
+        })
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
+    } else {
+        // No connection available - just mount (reset requires connection or separate HTTP call)
+        Ok(format!(
+            "Mounted: {} (no connection for auto-run)",
+            filename
+        ))
+    }
 }
