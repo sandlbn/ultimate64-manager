@@ -18,6 +18,7 @@ use url::Host;
 mod api;
 mod config_editor;
 mod file_browser;
+mod keyboard_map;
 mod music_player;
 mod remote_browser;
 mod settings;
@@ -292,11 +293,7 @@ impl Application for Ultimate64Browser {
         } else {
             " - Disconnected".to_string()
         };
-        format!(
-            "Ultimate64 Manager v{}{}",
-            APP_VERSION,
-            connection_status
-        )
+        format!("Ultimate64 Manager v{}{}", APP_VERSION, connection_status)
     }
 
     fn theme(&self) -> Theme {
@@ -874,7 +871,9 @@ impl Application for Ultimate64Browser {
                     return Command::none();
                 }
 
-                self.video_streaming.update(msg).map(Message::Streaming)
+                self.video_streaming
+                    .update(msg, self.connection.clone())
+                    .map(Message::Streaming)
             }
 
             Message::ExitFullscreen => {
