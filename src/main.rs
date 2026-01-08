@@ -32,6 +32,8 @@ use settings::{AppSettings, ConnectionSettings};
 use streaming::{StreamingMessage, VideoStreaming};
 use templates::{DiskTemplate, TemplateManager};
 
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub fn main() -> iced::Result {
     // Initialize logger - show info level by default, debug if RUST_LOG is set
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -39,7 +41,7 @@ pub fn main() -> iced::Result {
         .init();
 
     log::info!("===========================================");
-    log::info!("Starting Ultimate64 Manager v0.1.0");
+    log::info!("Starting Ultimate64 Manager v{}", APP_VERSION);
     log::info!("===========================================");
 
     // Print some diagnostic info
@@ -290,7 +292,11 @@ impl Application for Ultimate64Browser {
         } else {
             " - Disconnected".to_string()
         };
-        format!("Ultimate64 Manager{}", connection_status)
+        format!(
+            "Ultimate64 Manager v{}{}",
+            APP_VERSION,
+            connection_status
+        )
     }
 
     fn theme(&self) -> Theme {
