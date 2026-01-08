@@ -25,6 +25,7 @@ A cross-platform desktop application for managing Commodore 64 Ultimate, Ultimat
 - **Audio Streaming** – SID audio output via UDP
 - **Configuration Editor** – Edit Ultimate64 configuration settings
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
+- **Remote keyboard input for BASIC and menus**
 
 ## Keyboard Shortcuts
 
@@ -128,6 +129,13 @@ The video should now appear in Ultimate64 Manager.
 
 - **On Ultimate64**: F5 → Streams → Stop VIC Stream / Stop Audio Stream
 - **In Ultimate64 Manager**: Click **STOP**
+
+## Remote Keyboard
+
+When video streaming is active, click the **⌨ Disabled** button to enable keyboard input. Your keystrokes will be sent directly to the C64.
+
+**Supported:** BASIC programming, menu navigation, text adventures
+**Not supported:** Games requiring held keys (uses keyboard buffer, not CIA matrix)
 
 ## Troubleshooting
 
