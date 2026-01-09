@@ -79,17 +79,23 @@ pub struct FileBrowser {
 }
 
 impl FileBrowser {
-    pub fn new() -> Self {
-        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    /// Create a new FileBrowser with an optional starting directory.
+    /// If start_dir is None or invalid, defaults to the user's home directory.
+    pub fn new(start_dir: Option<PathBuf>) -> Self {
+        // Use provided path if it exists and is a directory, otherwise fall back to home
+        let initial_dir = start_dir
+            .filter(|p| p.exists() && p.is_dir())
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
+
         let mut browser = Self {
-            current_directory: home_dir.clone(),
+            current_directory: initial_dir.clone(),
             files: Vec::new(),
             selected_file: None,
             checked_files: HashSet::new(),
             selected_drive: DriveOption::A,
             status_message: None,
         };
-        browser.load_directory(&home_dir);
+        browser.load_directory(&initial_dir);
         browser
     }
 

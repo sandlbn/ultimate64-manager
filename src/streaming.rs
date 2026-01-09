@@ -264,9 +264,7 @@ impl VideoStreaming {
                 self.audio_enabled = enabled;
                 Command::none()
             }
-            StreamingMessage::ToggleFullscreen => {
-                Command::none()
-            }
+            StreamingMessage::ToggleFullscreen => Command::none(),
             StreamingMessage::VideoClicked => {
                 // Check for double-click (within 300ms)
                 let now = std::time::Instant::now();
