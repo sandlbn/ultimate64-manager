@@ -20,6 +20,12 @@ pub struct DefaultPaths {
     pub disk_images: Option<PathBuf>,
     pub music_files: Option<PathBuf>,
     pub programs: Option<PathBuf>,
+    /// Starting directory for the File Browser tab
+    #[serde(default)]
+    pub file_browser_start_dir: Option<PathBuf>,
+    /// Starting directory for the Music Player tab
+    #[serde(default)]
+    pub music_player_start_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +52,8 @@ impl Default for AppSettings {
                 disk_images: None,
                 music_files: None,
                 programs: None,
+                file_browser_start_dir: None,
+                music_player_start_dir: None,
             },
             preferences: Preferences {
                 auto_mount_and_run: false,

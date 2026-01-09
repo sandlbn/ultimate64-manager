@@ -148,6 +148,14 @@ pub enum Message {
 
     // Settings
     DefaultSongDurationChanged(String),
+
+    // Starting directory settings
+    BrowseFileBrowserStartDir,
+    FileBrowserStartDirSelected(Option<PathBuf>),
+    ClearFileBrowserStartDir,
+    BrowseMusicPlayerStartDir,
+    MusicPlayerStartDirSelected(Option<PathBuf>),
+    ClearMusicPlayerStartDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,12 +246,17 @@ impl Application for Ultimate64Browser {
             }
         };
 
-        let mut music_player = MusicPlayer::new();
+        // Create music player with configured starting directory
+        let mut music_player =
+            MusicPlayer::new(settings.default_paths.music_player_start_dir.clone());
         music_player.set_default_song_duration(settings.preferences.default_song_duration);
+
+        // Create file browser with configured starting directory
+        let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
 
         let mut app = Self {
             active_tab: Tab::DualPaneBrowser,
-            left_browser: FileBrowser::new(),
+            left_browser,
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
             music_player,
@@ -1019,6 +1032,75 @@ impl Application for Ultimate64Browser {
                 }
                 Command::none()
             }
+
+            // Starting directory settings
+            Message::BrowseFileBrowserStartDir => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::FileBrowserStartDirSelected,
+            ),
+
+            Message::FileBrowserStartDirSelected(path) => {
+                if let Some(p) = path {
+                    self.settings.default_paths.file_browser_start_dir = Some(p);
+                    if let Err(e) = self.settings.save() {
+                        log::error!("Failed to save settings: {}", e);
+                    }
+                    self.user_message = Some(UserMessage::Info(
+                        "File Browser start directory set (restart app to apply)".to_string(),
+                    ));
+                }
+                Command::none()
+            }
+
+            Message::ClearFileBrowserStartDir => {
+                self.settings.default_paths.file_browser_start_dir = None;
+                if let Err(e) = self.settings.save() {
+                    log::error!("Failed to save settings: {}", e);
+                }
+                self.user_message = Some(UserMessage::Info(
+                    "File Browser start directory cleared".to_string(),
+                ));
+                Command::none()
+            }
+
+            Message::BrowseMusicPlayerStartDir => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::MusicPlayerStartDirSelected,
+            ),
+
+            Message::MusicPlayerStartDirSelected(path) => {
+                if let Some(p) = path {
+                    self.settings.default_paths.music_player_start_dir = Some(p);
+                    if let Err(e) = self.settings.save() {
+                        log::error!("Failed to save settings: {}", e);
+                    }
+                    self.user_message = Some(UserMessage::Info(
+                        "Music Player start directory set (restart app to apply)".to_string(),
+                    ));
+                }
+                Command::none()
+            }
+
+            Message::ClearMusicPlayerStartDir => {
+                self.settings.default_paths.music_player_start_dir = None;
+                if let Err(e) = self.settings.save() {
+                    log::error!("Failed to save settings: {}", e);
+                }
+                self.user_message = Some(UserMessage::Info(
+                    "Music Player start directory cleared".to_string(),
+                ));
+                Command::none()
+            }
         }
     }
 
@@ -1329,13 +1411,59 @@ impl Ultimate64Browser {
             },
         ];
 
-        let debug_section = column![
+        // Starting directories section
+        let file_browser_start_dir_display = self
+            .settings
+            .default_paths
+            .file_browser_start_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(home directory)".to_string());
+
+        let music_player_start_dir_display = self
+            .settings
+            .default_paths
+            .music_player_start_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(home directory)".to_string());
+
+        let starting_dirs_section = column![
             Space::with_height(20),
             horizontal_rule(1),
             Space::with_height(10),
-            text("DEBUG INFO").size(18),
-            text(format!("Platform: {}", std::env::consts::OS)).size(12),
-            text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
+            text("STARTING DIRECTORIES").size(18),
+            Space::with_height(10),
+            text("File Browser tab starting directory:").size(14),
+            row![
+                text(&file_browser_start_dir_display)
+                    .size(12)
+                    .width(Length::Fixed(400.0)),
+                button(text("Browse").size(11))
+                    .on_press(Message::BrowseFileBrowserStartDir)
+                    .padding([4, 10]),
+                button(text("Clear").size(11))
+                    .on_press(Message::ClearFileBrowserStartDir)
+                    .padding([4, 10]),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+            Space::with_height(10),
+            text("Music Player tab starting directory:").size(14),
+            row![
+                text(&music_player_start_dir_display)
+                    .size(12)
+                    .width(Length::Fixed(400.0)),
+                button(text("Browse").size(11))
+                    .on_press(Message::BrowseMusicPlayerStartDir)
+                    .padding([4, 10]),
+                button(text("Clear").size(11))
+                    .on_press(Message::ClearMusicPlayerStartDir)
+                    .padding([4, 10]),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+            text("(Changes take effect on next application restart)").size(11),
         ];
 
         let music_section = column![
@@ -1359,10 +1487,20 @@ impl Ultimate64Browser {
             .align_items(iced::Alignment::Center),
         ];
 
+        let debug_section = column![
+            Space::with_height(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            text("DEBUG INFO").size(18),
+            text(format!("Platform: {}", std::env::consts::OS)).size(12),
+            text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
+        ];
+
         container(
             column![
                 connection_section,
                 status_section,
+                starting_dirs_section,
                 music_section,
                 debug_section
             ]

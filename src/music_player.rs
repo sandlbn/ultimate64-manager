@@ -167,11 +167,16 @@ pub struct MusicPlayer {
 }
 
 impl MusicPlayer {
-    pub fn new() -> Self {
-        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    /// Create a new MusicPlayer with an optional starting directory.
+    /// If start_dir is None or invalid, defaults to the user's home directory.
+    pub fn new(start_dir: Option<PathBuf>) -> Self {
+        // Use provided path if it exists and is a directory, otherwise fall back to home
+        let initial_dir = start_dir
+            .filter(|p| p.exists() && p.is_dir())
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")));
 
         let mut player = Self {
-            browser_directory: home_dir.clone(),
+            browser_directory: initial_dir.clone(),
             browser_entries: Vec::new(),
             browser_selected: None,
 
@@ -198,7 +203,7 @@ impl MusicPlayer {
             status_message: "Ready".to_string(),
         };
 
-        player.load_browser_entries(&home_dir);
+        player.load_browser_entries(&initial_dir);
 
         // Try to auto-load song lengths database from config directory
         if let Some(config_dir) = dirs::config_dir() {
