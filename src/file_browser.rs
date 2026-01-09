@@ -2,7 +2,7 @@ use iced::{
     Command, Element, Length,
     widget::{
         Column, Space, button, checkbox, column, container, horizontal_rule, pick_list, row,
-        scrollable, text, tooltip,
+        scrollable, text, text_input, tooltip,
     },
 };
 use std::collections::HashSet;
@@ -29,6 +29,7 @@ pub enum FileBrowserMessage {
     NavigateUp,
     DriveSelected(DriveOption),
     NavigateToPath(PathBuf),
+    FilterChanged(String),
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +77,7 @@ pub struct FileBrowser {
     checked_files: HashSet<PathBuf>,
     selected_drive: DriveOption,
     status_message: Option<String>,
+    filter: String,
 }
 
 impl FileBrowser {
@@ -94,6 +96,7 @@ impl FileBrowser {
             checked_files: HashSet::new(),
             selected_drive: DriveOption::A,
             status_message: None,
+            filter: String::new(),
         };
         browser.load_directory(&initial_dir);
         browser
@@ -265,6 +268,10 @@ impl FileBrowser {
                 self.checked_files.clear();
                 Command::none()
             }
+            FileBrowserMessage::FilterChanged(value) => {
+                self.filter = value;
+                Command::none()
+            }
         }
     }
     #[allow(dead_code)]
@@ -293,7 +300,7 @@ impl FileBrowser {
             path_str.to_string()
         };
 
-        // Navigation buttons
+        // Navigation buttons with filter
         let nav_buttons = row![
             tooltip(
                 button(text("Up").size(11))
@@ -311,8 +318,16 @@ impl FileBrowser {
                 tooltip::Position::Bottom,
             )
             .style(iced::theme::Container::Box),
+            Space::with_width(Length::Fill),
+            text("Filter:").size(10),
+            text_input("filter...", &self.filter)
+                .on_input(FileBrowserMessage::FilterChanged)
+                .size(11)
+                .padding(4)
+                .width(Length::Fixed(100.0)),
         ]
-        .spacing(5);
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
 
         // Path display
         let path_display = text(display_path).size(11);
@@ -364,14 +379,24 @@ impl FileBrowser {
             text("").size(10)
         };
 
+        // Filter files based on filter text
+        let filtered_files: Vec<&FileEntry> = self
+            .files
+            .iter()
+            .filter(|f| {
+                self.filter.is_empty()
+                    || f.name.to_lowercase().contains(&self.filter.to_lowercase())
+            })
+            .collect();
+
         // File list with row dividers
         let mut file_list: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
-        for (i, entry) in self.files.iter().enumerate() {
+        for (i, entry) in filtered_files.iter().enumerate() {
             if i > 0 {
                 // Add divider between rows
                 file_list.push(horizontal_rule(1).into());
             }
-            file_list.push(self.view_file_entry(entry));
+            file_list.push(self.view_file_entry(*entry));
         }
 
         let scrollable_list = scrollable(

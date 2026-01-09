@@ -51,6 +51,7 @@ pub enum MusicPlayerMessage {
     NavigateUp,
     RefreshBrowser,
     BrowserItemClicked(usize), // Click on browser item (double-click plays)
+    BrowserFilterChanged(String), // Filter browser entries
 
     // Playlist management
     AddToPlaylist(usize),      // Add from browser by index
@@ -137,6 +138,7 @@ pub struct MusicPlayer {
     browser_directory: PathBuf,
     browser_entries: Vec<BrowserEntry>,
     browser_selected: Option<usize>, // For double-click detection
+    browser_filter: String,
 
     // Playlist (right pane)
     playlist: Vec<PlaylistEntry>,
@@ -179,6 +181,7 @@ impl MusicPlayer {
             browser_directory: initial_dir.clone(),
             browser_entries: Vec::new(),
             browser_selected: None,
+            browser_filter: String::new(),
 
             playlist: Vec::new(),
             playlist_selected: None,
@@ -504,6 +507,11 @@ impl MusicPlayer {
             MusicPlayerMessage::RefreshBrowser => {
                 self.browser_selected = None;
                 self.load_browser_entries(&self.browser_directory.clone());
+                Command::none()
+            }
+
+            MusicPlayerMessage::BrowserFilterChanged(value) => {
+                self.browser_filter = value;
                 Command::none()
             }
 
@@ -1110,8 +1118,16 @@ impl MusicPlayer {
                     button(text("Add All").size(10))
                         .on_press(MusicPlayerMessage::AddAllToPlaylist)
                         .padding([3, 8]),
+                    Space::with_width(Length::Fill),
+                    text("Filter:").size(10),
+                    text_input("filter...", &self.browser_filter)
+                        .on_input(MusicPlayerMessage::BrowserFilterChanged)
+                        .size(10)
+                        .padding(4)
+                        .width(Length::Fixed(100.0)),
                 ]
-                .spacing(5),
+                .spacing(5)
+                .align_items(iced::Alignment::Center),
                 text(&dir_display).size(10),
                 text(format!("{} music files", music_file_count)).size(10),
             ]
@@ -1124,19 +1140,31 @@ impl MusicPlayer {
                 .padding(10)
                 .into()
         } else {
-            let items: Vec<Element<'_, MusicPlayerMessage>> = self
+            // Filter entries based on filter text
+            let filtered_entries: Vec<(usize, &BrowserEntry)> = self
                 .browser_entries
                 .iter()
                 .enumerate()
+                .filter(|(_, entry)| {
+                    self.browser_filter.is_empty()
+                        || entry
+                            .name
+                            .to_lowercase()
+                            .contains(&self.browser_filter.to_lowercase())
+                })
+                .collect();
+
+            let items: Vec<Element<'_, MusicPlayerMessage>> = filtered_entries
+                .iter()
                 .map(|(idx, entry)| {
-                    let is_selected = self.browser_selected == Some(idx);
+                    let is_selected = self.browser_selected == Some(*idx);
 
                     match &entry.entry_type {
                         BrowserEntryType::Directory => {
                             // Directory entry - click to navigate
                             row![
                                 button(text(format!("[DIR] {}", entry.name)).size(11))
-                                    .on_press(MusicPlayerMessage::BrowserItemClicked(idx))
+                                    .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                     .padding([6, 8])
                                     .width(Length::Fill)
                                     .style(iced::theme::Button::Text),
@@ -1163,7 +1191,7 @@ impl MusicPlayer {
                                 button(
                                     text(format!("{}{} {}", icon, subsong_info, display)).size(11)
                                 )
-                                .on_press(MusicPlayerMessage::BrowserItemClicked(idx))
+                                .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                 .padding([6, 8])
                                 .width(Length::Fill)
                                 .style(if is_selected {
@@ -1172,10 +1200,10 @@ impl MusicPlayer {
                                     iced::theme::Button::Text
                                 }),
                                 button(text(">").size(10))
-                                    .on_press(MusicPlayerMessage::AddAndPlay(idx))
+                                    .on_press(MusicPlayerMessage::AddAndPlay(*idx))
                                     .padding([4, 8]),
                                 button(text("+").size(10))
-                                    .on_press(MusicPlayerMessage::AddToPlaylist(idx))
+                                    .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
                                     .padding([4, 8]),
                             ]
                             .spacing(4)
