@@ -25,11 +25,21 @@ pub const VIC_HEIGHT: u32 = 272;
 
 // Audio constants
 const AUDIO_PORT_OFFSET: u16 = 1; // Audio port = video port + 1
-const AUDIO_SAMPLE_RATE: u32 = 48000;
+const AUDIO_SAMPLE_RATE: u32 = 48000; // Output sample rate (what cpal uses)
 const AUDIO_CHANNELS: u16 = 2;
 // const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
+
+
+// Derived from the C64's clock frequencies
+const AUDIO_SAMPLE_RATE_PAL: f64 = 47982.8869047619;
+#[allow(dead_code)]
+const AUDIO_SAMPLE_RATE_NTSC: f64 = 47940.3408482143;
+
+// Jitter buffer settings
+const JITTER_BUFFER_MIN_SAMPLES: usize = 2400; // ~50ms at 48kHz - minimum before playback starts
+const JITTER_BUFFER_TARGET_SAMPLES: usize = 4800; // ~100ms target buffer level
 
 // Ultimate64 video packet header (12 bytes)
 // struct {
@@ -110,6 +120,84 @@ pub enum StreamingMessage {
     KeySent(Result<(), String>), // Result of sending key to C64
 }
 
+/// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
+/// This prevents audio drift that would otherwise cause buffer underrun/overflow
+struct AudioResampler {
+    /// Ratio of input rate to output rate (e.g., 48000/47983 ≈ 1.00035)
+    ratio: f64,
+    /// Fractional position within current input sample pair
+    pos: f64,
+    /// Previous sample for interpolation (left channel)
+    last_left: f32,
+    /// Previous sample for interpolation (right channel)
+    last_right: f32,
+}
+
+impl AudioResampler {
+    fn new(input_rate: f64, output_rate: f64) -> Self {
+        Self {
+            ratio: output_rate / input_rate,
+            pos: 0.0,
+            last_left: 0.0,
+            last_right: 0.0,
+        }
+    }
+
+    /// Process stereo samples and output resampled data
+    /// Input: interleaved stereo samples [L, R, L, R, ...]
+    /// Output: pushed to the provided buffer
+    fn process_stereo(&mut self, input: &[f32], output: &mut VecDeque<f32>) {
+        // Process samples in stereo pairs
+        for chunk in input.chunks_exact(2) {
+            let left = chunk[0];
+            let right = chunk[1];
+
+            // Generate output samples using linear interpolation
+            while self.pos < 1.0 {
+                // Interpolate between last sample and current sample
+                let t = self.pos as f32;
+                let out_left = self.last_left + (left - self.last_left) * t;
+                let out_right = self.last_right + (right - self.last_right) * t;
+
+                output.push_back(out_left);
+                output.push_back(out_right);
+
+                self.pos += self.ratio;
+            }
+
+            self.pos -= 1.0;
+            self.last_left = left;
+            self.last_right = right;
+        }
+    }
+}
+
+/// Audio buffer state for jitter buffer management
+struct AudioBufferState {
+    /// Sample buffer (interleaved stereo f32)
+    samples: VecDeque<f32>,
+    /// Whether initial buffering is complete
+    buffering_complete: bool,
+    /// Last sequence number seen (for gap detection)
+    last_seq: Option<u16>,
+    /// Count of detected packet gaps
+    packet_gaps: u64,
+    /// Count of dropped samples due to overflow
+    samples_dropped: u64,
+}
+
+impl AudioBufferState {
+    fn new() -> Self {
+        Self {
+            samples: VecDeque::with_capacity(AUDIO_BUFFER_SIZE * 2),
+            buffering_complete: false,
+            last_seq: None,
+            packet_gaps: 0,
+            samples_dropped: 0,
+        }
+    }
+}
+
 pub struct VideoStreaming {
     pub is_streaming: bool,
     pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA frame from network
@@ -127,7 +215,7 @@ pub struct VideoStreaming {
     pub packets_received: Arc<Mutex<u64>>, // Video packet counter
     pub audio_packets_received: Arc<Mutex<u64>>, // Audio packet counter
     pub audio_enabled: bool,
-    audio_buffer: Option<Arc<Mutex<VecDeque<f32>>>>, // Shared audio sample buffer (f32 for cross-platform)
+    audio_buffer: Option<Arc<Mutex<AudioBufferState>>>, // Shared audio sample buffer with jitter management
     pub is_fullscreen: bool,
     last_click_time: Option<std::time::Instant>, // For double-click detection
     // Keyboard control
@@ -1192,9 +1280,9 @@ impl VideoStreaming {
             *p = 0;
         }
 
-        // Create shared audio buffer using f32 for better Mac compatibility
-        let audio_buffer: Arc<Mutex<VecDeque<f32>>> =
-            Arc::new(Mutex::new(VecDeque::with_capacity(AUDIO_BUFFER_SIZE * 2)));
+        // Create shared audio buffer with jitter buffer state
+        let audio_buffer: Arc<Mutex<AudioBufferState>> =
+            Arc::new(Mutex::new(AudioBufferState::new()));
         self.audio_buffer = Some(audio_buffer.clone());
 
         let consumer_buffer = audio_buffer.clone(); // For audio playback thread
@@ -1307,9 +1395,35 @@ impl VideoStreaming {
                     match device.build_output_stream(
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            if let Ok(mut buf) = consumer.lock() {
+                            if let Ok(mut state) = consumer.lock() {
+                                // Jitter buffer: wait until we have enough samples before starting playback
+                                if !state.buffering_complete {
+                                    if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
+                                        state.buffering_complete = true;
+                                        log::info!(
+                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            state.samples.len()
+                                        );
+                                    } else {
+                                        // Still buffering, output silence
+                                        for sample in data.iter_mut() {
+                                            *sample = 0.0;
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Normal playback - consume samples from buffer
                                 for sample in data.iter_mut() {
-                                    *sample = buf.pop_front().unwrap_or(0.0);
+                                    *sample = state.samples.pop_front().unwrap_or(0.0);
+                                }
+
+                                // Log warning if buffer is getting low (potential underrun)
+                                if state.samples.len() < JITTER_BUFFER_MIN_SAMPLES / 2 {
+                                    log::trace!(
+                                        "Audio buffer low: {} samples remaining",
+                                        state.samples.len()
+                                    );
                                 }
                             } else {
                                 for sample in data.iter_mut() {
@@ -1332,10 +1446,28 @@ impl VideoStreaming {
                     match device.build_output_stream(
                         &stream_config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            if let Ok(mut buf) = consumer.lock() {
+                            if let Ok(mut state) = consumer.lock() {
+                                // Jitter buffer: wait until we have enough samples before starting playback
+                                if !state.buffering_complete {
+                                    if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
+                                        state.buffering_complete = true;
+                                        log::info!(
+                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            state.samples.len()
+                                        );
+                                    } else {
+                                        // Still buffering, output silence
+                                        for sample in data.iter_mut() {
+                                            *sample = 0;
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Normal playback - consume samples from buffer
                                 for sample in data.iter_mut() {
                                     // Convert f32 back to i16
-                                    let f = buf.pop_front().unwrap_or(0.0);
+                                    let f = state.samples.pop_front().unwrap_or(0.0);
                                     *sample = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
                                 }
                             } else {
@@ -1359,10 +1491,28 @@ impl VideoStreaming {
                     match device.build_output_stream(
                         &stream_config,
                         move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
-                            if let Ok(mut buf) = consumer.lock() {
+                            if let Ok(mut state) = consumer.lock() {
+                                // Jitter buffer: wait until we have enough samples before starting playback
+                                if !state.buffering_complete {
+                                    if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
+                                        state.buffering_complete = true;
+                                        log::info!(
+                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            state.samples.len()
+                                        );
+                                    } else {
+                                        // Still buffering, output silence
+                                        for sample in data.iter_mut() {
+                                            *sample = 32768; // Silence for unsigned
+                                        }
+                                        return;
+                                    }
+                                }
+
+                                // Normal playback - consume samples from buffer
                                 for sample in data.iter_mut() {
                                     // Convert f32 (-1.0 to 1.0) to u16 (0 to 65535)
-                                    let f = buf.pop_front().unwrap_or(0.0);
+                                    let f = state.samples.pop_front().unwrap_or(0.0);
                                     *sample = ((f + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
                                 }
                             } else {
@@ -1445,6 +1595,13 @@ impl VideoStreaming {
             let mut recv_buf = [0u8; 2048];
             let mut first_packet = true;
 
+            // Create resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
+            let mut resampler =
+                AudioResampler::new(AUDIO_SAMPLE_RATE_PAL, AUDIO_SAMPLE_RATE as f64);
+
+            // Temporary buffer for converted samples before resampling
+            let mut temp_samples: Vec<f32> = Vec::with_capacity(1024);
+
             loop {
                 if stop_signal_net.load(Ordering::Relaxed) {
                     break;
@@ -1461,14 +1618,18 @@ impl VideoStreaming {
                             *p += 1;
                         }
 
+                        // Parse sequence number for gap detection
+                        let packet_seq = u16::from_le_bytes([recv_buf[0], recv_buf[1]]);
+
                         // Log first packet for debugging
                         if first_packet {
                             first_packet = false;
                             log::info!(
-                                "First audio packet: {} bytes (payload: {} bytes, {} samples)",
+                                "First audio packet: {} bytes (payload: {} bytes, {} samples), seq={}",
                                 size,
                                 size - AUDIO_HEADER_SIZE,
-                                (size - AUDIO_HEADER_SIZE) / 2
+                                (size - AUDIO_HEADER_SIZE) / 2,
+                                packet_seq
                             );
                         }
 
@@ -1476,15 +1637,56 @@ impl VideoStreaming {
                         let audio_data = &recv_buf[AUDIO_HEADER_SIZE..size];
 
                         // Convert bytes to f32 samples (i16 -> f32 normalized to -1.0..1.0)
-                        if let Ok(mut buf) = producer_buffer.lock() {
-                            for chunk in audio_data.chunks_exact(2) {
-                                let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
-                                let sample_f32 = sample_i16 as f32 / 32768.0;
+                        temp_samples.clear();
+                        for chunk in audio_data.chunks_exact(2) {
+                            let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
+                            let sample_f32 = sample_i16 as f32 / 32768.0;
+                            temp_samples.push(sample_f32);
+                        }
 
-                                // Keep buffer size limited to prevent memory growth
-                                if buf.len() < AUDIO_BUFFER_SIZE * 2 {
-                                    buf.push_back(sample_f32);
+                        // Add resampled audio to buffer with jitter buffer management
+                        if let Ok(mut state) = producer_buffer.lock() {
+                            // Check for packet sequence gaps (packet loss detection)
+                            if let Some(last) = state.last_seq {
+                                let expected = last.wrapping_add(1);
+                                if packet_seq != expected {
+                                    // Calculate gap size (handling wraparound)
+                                    let gap = if packet_seq > expected {
+                                        packet_seq - expected
+                                    } else {
+                                        // Wraparound case
+                                        (0xFFFF - expected) + packet_seq + 1
+                                    };
+                                    state.packet_gaps += 1;
+                                    log::debug!(
+                                        "Audio packet gap: expected seq {}, got {} (gap: {}, total gaps: {})",
+                                        expected,
+                                        packet_seq,
+                                        gap,
+                                        state.packet_gaps
+                                    );
                                 }
+                            }
+                            state.last_seq = Some(packet_seq);
+
+                            // Resample from Ultimate64's ~47983 Hz to 48000 Hz
+                            // This prevents long-term drift that would cause buffer underrun/overflow
+                            resampler.process_stereo(&temp_samples, &mut state.samples);
+
+                            // Buffer overflow protection: drop oldest samples to stay in sync
+                            // This is better than dropping newest because it keeps audio in sync with video
+                            let max_buffer_size = AUDIO_BUFFER_SIZE * 2;
+                            if state.samples.len() > max_buffer_size {
+                                let overflow = state.samples.len() - JITTER_BUFFER_TARGET_SAMPLES;
+                                for _ in 0..overflow {
+                                    state.samples.pop_front();
+                                }
+                                state.samples_dropped += overflow as u64;
+                                log::debug!(
+                                    "Audio buffer overflow: dropped {} oldest samples (total dropped: {})",
+                                    overflow,
+                                    state.samples_dropped
+                                );
                             }
                         }
                     }
@@ -1504,7 +1706,16 @@ impl VideoStreaming {
                 let _ = socket.leave_multicast_v4(&multicast_addr, &interface);
             }
 
-            log::info!("Audio network thread stopped");
+            // Log final statistics
+            if let Ok(state) = producer_buffer.lock() {
+                log::info!(
+                    "Audio network thread stopped (packet gaps: {}, samples dropped: {})",
+                    state.packet_gaps,
+                    state.samples_dropped
+                );
+            } else {
+                log::info!("Audio network thread stopped");
+            }
         });
 
         self.audio_stream_handle = Some(audio_handle);
