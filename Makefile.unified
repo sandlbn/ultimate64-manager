@@ -30,7 +30,7 @@ CARGO_HOME_FALLBACK := $(HOME)/.cargo
 CARGO_HOME_USED     := $(or $(CARGO_HOME),$(CARGO_HOME_FALLBACK))
 SYSROOT             := $(shell $(RUSTC) --print sysroot)
 
-export RUSTFLAGS := \
+export RUSTFLAGS = \
   --remap-path-prefix=$(HOME)=/home/build \
   --remap-path-prefix=$(SYSROOT)=/rust/sysroot \
   --remap-path-prefix=$(CARGO_HOME_USED)=/cargo \
