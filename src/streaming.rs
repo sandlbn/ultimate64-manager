@@ -573,21 +573,14 @@ impl VideoStreaming {
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
-        // Calculate display dimensions based on scale mode
-        let (display_width, display_height) = match self.scale_mode {
-            ScaleMode::Nearest => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2), // Scale2x outputs 2x size
-            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2), // Scanlines outputs 2x size
-        };
-
-        // Image dimensions for the handle
+        // Image dimensions for the handle (based on scale mode processing)
         let (img_width, img_height) = match self.scale_mode {
             ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
             ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
             ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
         };
 
-        // === LEFT SIDE: Video display ===
+        // === LEFT SIDE: Video display (fluid scaling) ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use scaled buffer if available, otherwise fall back to image buffer
             let frame_data = if self.scale_mode != ScaleMode::Nearest {
@@ -602,11 +595,12 @@ impl VideoStreaming {
                     iced::widget::image::Handle::from_pixels(img_width, img_height, rgba_data);
 
                 // Wrap image in mouse_area for double-click fullscreen
+                // Use Length::Fill with ContentFit::Contain for fluid scaling
                 let video_image = mouse_area(
                     iced_image(handle)
-                        .width(Length::Fixed(display_width as f32))
-                        .height(Length::Fixed(display_height as f32))
-                        .content_fit(iced::ContentFit::Fill),
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain),
                 )
                 .on_press(StreamingMessage::VideoClicked);
 
@@ -616,19 +610,22 @@ impl VideoStreaming {
                     ScaleMode::Scanlines => "Scanlines",
                 };
 
-                container(
-                    column![
-                        video_image,
-                        text(format!(
-                            "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
-                            VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
-                        ))
-                        .size(10),
-                    ]
-                    .spacing(5)
-                    .align_items(iced::Alignment::Center),
-                )
-                .padding(10)
+                column![
+                    container(video_image)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x()
+                        .center_y(),
+                    text(format!(
+                        "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
+                        VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
+                    ))
+                    .size(10),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center)
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .into()
             } else {
                 // Image not decoded yet, show raw frame info
@@ -647,7 +644,10 @@ impl VideoStreaming {
                             .spacing(5)
                             .align_items(iced::Alignment::Center),
                         )
-                        .padding(40)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x()
+                        .center_y()
                         .into()
                     } else {
                         container(
@@ -662,12 +662,18 @@ impl VideoStreaming {
                             .spacing(5)
                             .align_items(iced::Alignment::Center),
                         )
-                        .padding(40)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x()
+                        .center_y()
                         .into()
                     }
                 } else {
                     container(text("Waiting for frames...").size(14))
-                        .padding(40)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x()
+                        .center_y()
                         .into()
                 }
             }
@@ -692,8 +698,8 @@ impl VideoStreaming {
                 ]
                 .align_items(iced::Alignment::Center),
             )
-            .width(Length::Fixed((VIC_WIDTH * 2) as f32))
-            .height(Length::Fixed((VIC_HEIGHT * 2) as f32))
+            .width(Length::Fill)
+            .height(Length::Fill)
             .center_x()
             .center_y()
             .into()
@@ -941,7 +947,11 @@ impl VideoStreaming {
 
         // Main layout: video on left, controls on right
         let main_content = row![
-            container(video_display).width(Length::Fill).center_x(),
+            container(video_display)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x()
+                .center_y(),
             iced::widget::vertical_rule(1),
             right_panel,
         ]
