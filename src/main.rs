@@ -355,10 +355,22 @@ impl Application for Ultimate64Browser {
                 }
             }
 
-            Message::RemoteBrowser(msg) => self
-                .remote_browser
-                .update(msg, self.connection.clone())
-                .map(Message::RemoteBrowser),
+            Message::RemoteBrowser(msg) => {
+                // Intercept UploadDirectoryComplete to show result in main status bar
+                if let RemoteBrowserMessage::UploadDirectoryComplete(ref result) = msg {
+                    match result {
+                        Ok(m) => {
+                            self.user_message = Some(UserMessage::Info(m.clone()));
+                        }
+                        Err(e) => {
+                            self.user_message = Some(UserMessage::Error(e.clone()));
+                        }
+                    }
+                }
+                self.remote_browser
+                    .update(msg, self.connection.clone())
+                    .map(Message::RemoteBrowser)
+            }
 
             Message::ActivePaneChanged(pane) => {
                 self.active_pane = pane;
@@ -366,114 +378,165 @@ impl Application for Ultimate64Browser {
             }
 
             Message::CopyLocalToRemote => {
-                // Copy checked local files to Ultimate64
-                let files_to_copy = self.left_browser.get_checked_files();
+                // Copy checked local files and directories to Ultimate64
+                let items_to_copy = self.left_browser.get_checked_files();
 
-                if files_to_copy.is_empty() {
+                if items_to_copy.is_empty() {
                     self.user_message = Some(UserMessage::Error(
                         "No files selected. Use checkboxes to select files.".to_string(),
                     ));
                     return Command::none();
                 }
 
-                // Filter out directories
-                let files_to_copy: Vec<PathBuf> =
-                    files_to_copy.into_iter().filter(|p| !p.is_dir()).collect();
+                // Separate files and directories
+                let files_to_copy: Vec<PathBuf> = items_to_copy
+                    .iter()
+                    .filter(|p| !p.is_dir())
+                    .cloned()
+                    .collect();
+                let dirs_to_copy: Vec<PathBuf> = items_to_copy
+                    .iter()
+                    .filter(|p| p.is_dir())
+                    .cloned()
+                    .collect();
 
-                if files_to_copy.is_empty() {
-                    self.user_message = Some(UserMessage::Error(
-                        "No files selected (directories cannot be copied).".to_string(),
-                    ));
+                if files_to_copy.is_empty() && dirs_to_copy.is_empty() {
+                    self.user_message =
+                        Some(UserMessage::Error("No valid items selected.".to_string()));
                     return Command::none();
                 }
 
-                if let Some(host) = &self.host_url {
-                    let host = host
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
-                        .to_string();
-                    let remote_dest = self.remote_browser.get_current_path().to_string();
-                    let file_count = files_to_copy.len();
-                    let password = self.settings.connection.password.clone();
+                let remote_dest = self.remote_browser.get_current_path().to_string();
 
-                    self.user_message = Some(UserMessage::Info(format!(
-                        "Uploading {} file(s) via FTP...",
-                        file_count
-                    )));
+                // Build commands for each operation
+                let mut commands: Vec<Command<Message>> = Vec::new();
 
-                    return Command::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                use std::io::Cursor;
-                                use std::path::PathBuf;
-                                use std::time::Duration;
-                                use suppaftp::FtpStream;
+                // Handle directories via RemoteBrowser's UploadDirectory
+                for dir_path in dirs_to_copy {
+                    commands.push(
+                        self.remote_browser
+                            .update(
+                                RemoteBrowserMessage::UploadDirectory(
+                                    dir_path,
+                                    remote_dest.clone(),
+                                ),
+                                self.connection.clone(),
+                            )
+                            .map(Message::RemoteBrowser),
+                    );
+                }
 
-                                let addr = format!("{}:21", host);
-                                let mut ftp = FtpStream::connect(&addr)
-                                    .map_err(|e| format!("FTP connect failed: {}", e))?;
+                // Handle files with batch upload
+                if !files_to_copy.is_empty() {
+                    if let Some(host) = &self.host_url {
+                        let host = host
+                            .trim_start_matches("http://")
+                            .trim_start_matches("https://")
+                            .to_string();
+                        let file_count = files_to_copy.len();
+                        let password = self.settings.connection.password.clone();
+                        let remote_dest_clone = remote_dest.clone();
 
-                                ftp.get_ref()
-                                    .set_write_timeout(Some(Duration::from_secs(120)))
-                                    .ok();
+                        self.user_message = Some(UserMessage::Info(format!(
+                            "Uploading {} file(s) and {} folder(s) via FTP...",
+                            file_count,
+                            commands.len()
+                        )));
 
-                                // Login with configured password or anonymous
-                                if let Some(ref pwd) = password {
-                                    if !pwd.is_empty() {
-                                        ftp.login("admin", pwd)
-                                            .map_err(|e| format!("FTP login failed: {}", e))?;
+                        commands.push(Command::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    use std::io::Cursor;
+                                    use std::path::PathBuf;
+                                    use std::time::Duration;
+                                    use suppaftp::FtpStream;
+
+                                    let addr = format!("{}:21", host);
+                                    let mut ftp = FtpStream::connect(&addr)
+                                        .map_err(|e| format!("FTP connect failed: {}", e))?;
+
+                                    ftp.get_ref()
+                                        .set_write_timeout(Some(Duration::from_secs(120)))
+                                        .ok();
+
+                                    // Login with configured password or anonymous
+                                    if let Some(ref pwd) = password {
+                                        if !pwd.is_empty() {
+                                            ftp.login("admin", pwd)
+                                                .map_err(|e| format!("FTP login failed: {}", e))?;
+                                        } else {
+                                            ftp.login("anonymous", "anonymous")
+                                                .map_err(|e| format!("FTP login failed: {}", e))?;
+                                        }
                                     } else {
                                         ftp.login("anonymous", "anonymous")
                                             .map_err(|e| format!("FTP login failed: {}", e))?;
                                     }
-                                } else {
-                                    ftp.login("anonymous", "anonymous")
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
-                                }
 
-                                ftp.transfer_type(suppaftp::types::FileType::Binary)
-                                    .map_err(|e| format!("Set binary mode failed: {}", e))?;
+                                    ftp.transfer_type(suppaftp::types::FileType::Binary)
+                                        .map_err(|e| format!("Set binary mode failed: {}", e))?;
 
-                                ftp.cwd(&remote_dest)
-                                    .map_err(|e| format!("Cannot access {}: {}", remote_dest, e))?;
-
-                                let mut uploaded = 0;
-                                for local_path in &files_to_copy {
-                                    let local_path: &PathBuf = local_path;
-                                    let data =
-                                        std::fs::read(local_path.as_path()).map_err(|e| {
-                                            format!("Cannot read {}: {}", local_path.display(), e)
-                                        })?;
-
-                                    let filename = local_path
-                                        .file_name()
-                                        .and_then(|n: &std::ffi::OsStr| n.to_str())
-                                        .unwrap_or("file")
-                                        .to_string();
-
-                                    let mut cursor = Cursor::new(data);
-                                    ftp.put_file(&filename, &mut cursor).map_err(|e| {
-                                        format!("FTP upload {} failed: {}", filename, e)
+                                    ftp.cwd(&remote_dest_clone).map_err(|e| {
+                                        format!("Cannot access {}: {}", remote_dest_clone, e)
                                     })?;
 
-                                    uploaded += 1;
-                                }
+                                    let mut uploaded = 0;
+                                    for local_path in &files_to_copy {
+                                        let local_path: &PathBuf = local_path;
+                                        let data =
+                                            std::fs::read(local_path.as_path()).map_err(|e| {
+                                                format!(
+                                                    "Cannot read {}: {}",
+                                                    local_path.display(),
+                                                    e
+                                                )
+                                            })?;
 
-                                let _ = ftp.quit();
+                                        let filename = local_path
+                                            .file_name()
+                                            .and_then(|n: &std::ffi::OsStr| n.to_str())
+                                            .unwrap_or("file")
+                                            .to_string();
 
-                                Ok(format!("Uploaded {} file(s)", uploaded))
-                            })
-                            .await
-                            .map_err(|e| e.to_string())?
-                        },
-                        Message::CopyComplete,
-                    );
+                                        let mut cursor = Cursor::new(data);
+                                        ftp.put_file(&filename, &mut cursor).map_err(|e| {
+                                            format!("FTP upload {} failed: {}", filename, e)
+                                        })?;
+
+                                        uploaded += 1;
+                                    }
+
+                                    let _ = ftp.quit();
+
+                                    Ok(format!("Uploaded {} file(s)", uploaded))
+                                })
+                                .await
+                                .map_err(|e| e.to_string())?
+                            },
+                            Message::CopyComplete,
+                        ));
+                    } else {
+                        self.user_message = Some(UserMessage::Error(
+                            "Not connected to Ultimate64".to_string(),
+                        ));
+                        return Command::none();
+                    }
                 } else {
+                    // Only directories being uploaded
+                    self.user_message = Some(UserMessage::Info(format!(
+                        "Uploading {} folder(s) via FTP...",
+                        commands.len()
+                    )));
+                }
+
+                if commands.is_empty() {
                     self.user_message = Some(UserMessage::Error(
                         "Not connected to Ultimate64".to_string(),
                     ));
+                    return Command::none();
                 }
-                Command::none()
+
+                return Command::batch(commands);
             }
 
             Message::CopyRemoteToLocal => {
