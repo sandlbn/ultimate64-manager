@@ -11,6 +11,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::{Rest, drives::MountMode};
 
+/// Timeout for REST API operations to prevent hangs when device goes offline
+const REST_TIMEOUT_SECS: u64 = 5;
+/// Longer timeout for run_disk which includes boot delays
+const RUN_DISK_TIMEOUT_SECS: u64 = 15;
+
 #[derive(Debug, Clone)]
 pub enum FileBrowserMessage {
     SelectDirectory,
@@ -655,21 +660,30 @@ async fn mount_disk_async(
     );
 
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = connection.blocking_lock();
-        conn.mount_disk_image(&path, drive.clone(), mode, false)
-            .map_err(|e| {
-                log::error!("Mount error: {}", e);
-                e.to_string()
-            })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?;
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
+            conn.mount_disk_image(&path, drive.clone(), mode, false)
+                .map_err(|e| {
+                    log::error!("Mount error: {}", e);
+                    e.to_string()
+                })
+        }),
+    )
+    .await;
 
-    if result.is_ok() {
-        log::info!("Mount successful");
+    match result {
+        Ok(Ok(inner)) => {
+            if inner.is_ok() {
+                log::info!("Mount successful");
+            }
+            inner
+        }
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Mount timed out - device may be offline".to_string()),
     }
-    result
 }
 
 async fn run_disk_async(
@@ -682,38 +696,47 @@ async fn run_disk_async(
     // Determine device number based on drive
     let device_num = if drive == "a" { "8" } else { "9" };
 
-    tokio::task::spawn_blocking(move || {
-        let conn = connection.blocking_lock();
+    // Use longer timeout because this operation includes boot delays (~8.5s of sleeps)
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(RUN_DISK_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
 
-        // 1. Mount the disk image (read-only is fine for running)
-        conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
-            .map_err(|e| format!("Mount failed: {}", e))?;
+            // 1. Mount the disk image (read-only is fine for running)
+            conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
+                .map_err(|e| format!("Mount failed: {}", e))?;
 
-        // Small delay to ensure mount completes
-        std::thread::sleep(std::time::Duration::from_millis(500));
+            // Small delay to ensure mount completes
+            std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // 2. Reset the machine
-        conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
+            // 2. Reset the machine
+            conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
 
-        // Wait for C64 to boot up
-        std::thread::sleep(std::time::Duration::from_secs(3));
+            // Wait for C64 to boot up
+            std::thread::sleep(std::time::Duration::from_secs(3));
 
-        // 3. Type LOAD"*",8,1 (or 9) and RUN
-        let load_cmd = format!("load \"*\",{},1\n", device_num);
-        conn.type_text(&load_cmd)
-            .map_err(|e| format!("Type LOAD failed: {}", e))?;
+            // 3. Type LOAD"*",8,1 (or 9) and RUN
+            let load_cmd = format!("load \"*\",{},1\n", device_num);
+            conn.type_text(&load_cmd)
+                .map_err(|e| format!("Type LOAD failed: {}", e))?;
 
-        // Wait for program to load
-        std::thread::sleep(std::time::Duration::from_secs(5));
+            // Wait for program to load
+            std::thread::sleep(std::time::Duration::from_secs(5));
 
-        // 4. Type RUN
-        conn.type_text("run\n")
-            .map_err(|e| format!("Type RUN failed: {}", e))?;
+            // 4. Type RUN
+            conn.type_text("run\n")
+                .map_err(|e| format!("Type RUN failed: {}", e))?;
 
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?
+            Ok(())
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Run disk timed out - device may be offline".to_string()),
+    }
 }
 
 async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Result<(), String> {
@@ -730,20 +753,29 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
         .map(|s| s.to_lowercase());
 
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
-    tokio::task::spawn_blocking(move || {
-        let conn = connection.blocking_lock();
-        match ext.as_deref() {
-            Some("crt") => {
-                log::info!("Running as CRT cartridge");
-                conn.run_crt(&data).map_err(|e| e.to_string())
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
+            match ext.as_deref() {
+                Some("crt") => {
+                    log::info!("Running as CRT cartridge");
+                    conn.run_crt(&data).map_err(|e| e.to_string())
+                }
+                Some("prg") => {
+                    log::info!("Running as PRG");
+                    conn.run_prg(&data).map_err(|e| e.to_string())
+                }
+                _ => Err("Unsupported file type".to_string()),
             }
-            Some("prg") => {
-                log::info!("Running as PRG");
-                conn.run_prg(&data).map_err(|e| e.to_string())
-            }
-            _ => Err("Unsupported file type".to_string()),
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Load timed out - device may be offline".to_string()),
+    }
 }
