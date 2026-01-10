@@ -769,7 +769,8 @@ impl Application for Ultimate64Browser {
 
                 // Stop video streaming if active to prevent hangs
                 if self.video_streaming.is_streaming {
-                    self.video_streaming
+                    let _ = self
+                        .video_streaming
                         .update(StreamingMessage::StopStream, None);
                 }
 
