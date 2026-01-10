@@ -1,8 +1,8 @@
 use iced::{
     Command, Element, Length,
     widget::{
-        Column, Space, button, checkbox, column, container, horizontal_rule, pick_list, row,
-        scrollable, text, text_input, tooltip,
+        Column, Space, button, checkbox, column, horizontal_rule, pick_list, row, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::collections::HashSet;
@@ -258,9 +258,7 @@ impl FileBrowser {
             }
             FileBrowserMessage::SelectAll => {
                 for file in &self.files {
-                    if !file.is_dir {
-                        self.checked_files.insert(file.path.clone());
-                    }
+                    self.checked_files.insert(file.path.clone());
                 }
                 Command::none()
             }
@@ -542,17 +540,13 @@ impl FileBrowser {
         };
 
         // Build the row: [checkbox] [name...] [type] [action]
-        let checkbox_element: Element<'_, FileBrowserMessage> = if entry.is_dir {
-            container(Space::with_width(24)).into()
-        } else {
-            let path_clone = entry.path.clone();
-            checkbox("", is_checked)
-                .on_toggle(move |checked| {
-                    FileBrowserMessage::ToggleFileCheck(path_clone.clone(), checked)
-                })
-                .size(16)
-                .into()
-        };
+        let path_clone = entry.path.clone();
+        let checkbox_element: Element<'_, FileBrowserMessage> = checkbox("", is_checked)
+            .on_toggle(move |checked| {
+                FileBrowserMessage::ToggleFileCheck(path_clone.clone(), checked)
+            })
+            .size(16)
+            .into();
 
         let file_row = row![
             // Checkbox (only for files, not dirs)

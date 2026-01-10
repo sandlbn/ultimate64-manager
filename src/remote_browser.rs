@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::Rest;
+use walkdir::WalkDir;
 
 use crate::api;
 
@@ -23,6 +24,8 @@ pub enum RemoteBrowserMessage {
     DownloadComplete(Result<(String, Vec<u8>), String>),
     UploadFile(PathBuf, String), // local path, remote destination
     UploadComplete(Result<String, String>),
+    UploadDirectory(PathBuf, String), // local directory path, remote destination
+    UploadDirectoryComplete(Result<String, String>),
     // Runners - execute files on Ultimate64
     RunPrg(String),
     RunCrt(String),
@@ -215,6 +218,34 @@ impl RemoteBrowser {
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Upload failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            RemoteBrowserMessage::UploadDirectory(local_path, remote_dest) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Uploading directory...".to_string());
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    Command::perform(
+                        upload_directory_ftp(host, local_path, remote_dest, password),
+                        RemoteBrowserMessage::UploadDirectoryComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Command::none()
+                }
+            }
+
+            RemoteBrowserMessage::UploadDirectoryComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Directory upload failed: {}", e));
                     }
                 }
                 Command::none()
@@ -964,6 +995,167 @@ async fn upload_file_ftp(
         let _ = ftp.quit();
 
         Ok(filename)
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?;
+
+    result
+}
+
+// Upload directory recursively via FTP
+async fn upload_directory_ftp(
+    host: String,
+    local_path: PathBuf,
+    remote_dest: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    log::info!(
+        "FTP: Uploading directory {} to {}",
+        local_path.display(),
+        remote_dest
+    );
+
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Cursor;
+        use std::time::Duration;
+        use suppaftp::FtpStream;
+
+        let addr = format!("{}:21", host);
+        let mut ftp =
+            FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+
+        ftp.get_ref()
+            .set_write_timeout(Some(Duration::from_secs(120)))
+            .ok();
+
+        // Login with password or anonymous
+        if let Some(ref pwd) = password {
+            if !pwd.is_empty() {
+                ftp.login("admin", pwd)
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+        } else {
+            ftp.login("anonymous", "anonymous")
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        }
+
+        // Set binary transfer mode
+        ftp.transfer_type(suppaftp::types::FileType::Binary)
+            .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+
+        // Get the directory name to create on remote
+        let dir_name = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| "Invalid directory name".to_string())?;
+
+        // Build base remote path
+        let base_remote = if remote_dest.ends_with('/') {
+            format!("{}{}", remote_dest, dir_name)
+        } else {
+            format!("{}/{}", remote_dest, dir_name)
+        };
+
+        let mut dirs_created = 0;
+        let mut files_uploaded = 0;
+        let mut errors: Vec<String> = Vec::new();
+
+        // Walk the directory tree
+        for entry in WalkDir::new(&local_path).min_depth(0) {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(format!("Walk error: {}", e));
+                    continue;
+                }
+            };
+
+            // Get relative path from the source directory
+            let relative = match entry.path().strip_prefix(&local_path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            // Build remote path
+            let remote_path = if relative.as_os_str().is_empty() {
+                base_remote.clone()
+            } else {
+                // Convert path separators to forward slashes for FTP
+                let relative_str = relative.to_string_lossy().replace('\\', "/");
+                format!("{}/{}", base_remote, relative_str)
+            };
+
+            if entry.file_type().is_dir() {
+                // Create directory on remote (ignore errors if it exists)
+                log::debug!("FTP: Creating directory {}", remote_path);
+                match ftp.mkdir(&remote_path) {
+                    Ok(_) => {
+                        dirs_created += 1;
+                        log::debug!("FTP: Created directory {}", remote_path);
+                    }
+                    Err(e) => {
+                        // Directory might already exist, log but continue
+                        log::debug!("FTP: mkdir {} (may exist): {}", remote_path, e);
+                    }
+                }
+            } else if entry.file_type().is_file() {
+                // Upload file
+                log::debug!("FTP: Uploading file to {}", remote_path);
+
+                // Read file data
+                let data = match std::fs::read(entry.path()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        errors.push(format!("Read {}: {}", entry.path().display(), e));
+                        continue;
+                    }
+                };
+
+                // Get parent directory and filename
+                let (parent_dir, filename) = if let Some(pos) = remote_path.rfind('/') {
+                    (&remote_path[..pos], &remote_path[pos + 1..])
+                } else {
+                    ("/", remote_path.as_str())
+                };
+
+                // Change to parent directory
+                if let Err(e) = ftp.cwd(parent_dir) {
+                    errors.push(format!("CWD {}: {}", parent_dir, e));
+                    continue;
+                }
+
+                // Upload the file
+                let mut cursor = Cursor::new(data);
+                match ftp.put_file(filename, &mut cursor) {
+                    Ok(_) => {
+                        files_uploaded += 1;
+                        log::debug!("FTP: Uploaded {}", remote_path);
+                    }
+                    Err(e) => {
+                        errors.push(format!("Upload {}: {}", filename, e));
+                    }
+                }
+            }
+        }
+
+        let _ = ftp.quit();
+
+        // Build result message
+        let mut msg = format!(
+            "Uploaded: {} files, {} directories",
+            files_uploaded, dirs_created
+        );
+        if !errors.is_empty() {
+            msg.push_str(&format!(" ({} errors)", errors.len()));
+            for err in errors.iter().take(3) {
+                log::warn!("Upload error: {}", err);
+            }
+        }
+
+        Ok(msg)
     })
     .await
     .map_err(|e| format!("Task error: {}", e))?;
