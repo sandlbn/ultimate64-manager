@@ -1,7 +1,7 @@
 [package]
 name = "ultimate64-manager"
 version = "0.2.6"
-edition = "2024"
+edition = "2021"
 description = "Ultimate64 Manager - Control your Ultimate64/Ultimate-II+"
 authors = ["Marcin Spoczynski"]
 license = "MIT"
@@ -11,7 +11,7 @@ iced = { version = "0.12", features = ["tokio", "image", "canvas"] }
 tokio = { version = "1", features = ["full"] }
 ultimate64 = "0.5.5"
 anyhow = "1.0"
-rfd = "0.15"
+rfd = "0.17.1"
 walkdir = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
