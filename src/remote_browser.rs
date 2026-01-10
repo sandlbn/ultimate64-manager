@@ -13,6 +13,11 @@ use walkdir::WalkDir;
 
 use crate::api;
 
+/// Timeout for FTP operations to prevent hangs when device goes offline
+const FTP_TIMEOUT_SECS: u64 = 15;
+/// Longer timeout for directory uploads which may take time
+const FTP_UPLOAD_DIR_TIMEOUT_SECS: u64 = 120;
+
 #[derive(Debug, Clone)]
 pub enum RemoteBrowserMessage {
     RefreshFiles,
@@ -698,77 +703,84 @@ async fn fetch_files_ftp(
 ) -> Result<Vec<RemoteFileEntry>, String> {
     log::info!("FTP: Listing {} on {}", path, host);
 
-    let result = tokio::task::spawn_blocking(move || {
-        use std::time::Duration;
-        use suppaftp::FtpStream;
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::time::Duration;
+            use suppaftp::FtpStream;
 
-        // Connect to FTP server (port 21)
-        let addr = format!("{}:21", host);
-        let mut ftp =
-            FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            // Connect to FTP server (port 21)
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
 
-        // Set timeout
-        ftp.get_ref()
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .ok();
-        ftp.get_ref()
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .ok();
+            // Set timeout
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .ok();
+            ftp.get_ref()
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .ok();
 
-        // Login with password or anonymous
-        if let Some(ref pwd) = password {
-            if !pwd.is_empty() {
-                ftp.login("admin", pwd)
-                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
             } else {
                 ftp.login("anonymous", "anonymous")
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
-        } else {
-            ftp.login("anonymous", "anonymous")
-                .map_err(|e| format!("FTP login failed: {}", e))?;
-        }
 
-        // Change to directory
-        let ftp_path = if path.is_empty() || path == "/" {
-            "/"
-        } else {
-            &path
-        };
-        ftp.cwd(ftp_path)
-            .map_err(|e| format!("Cannot access {}: {}", ftp_path, e))?;
+            // Change to directory
+            let ftp_path = if path.is_empty() || path == "/" {
+                "/"
+            } else {
+                &path
+            };
+            ftp.cwd(ftp_path)
+                .map_err(|e| format!("Cannot access {}: {}", ftp_path, e))?;
 
-        // List directory
-        let list = ftp
-            .list(None)
-            .map_err(|e| format!("FTP list failed: {}", e))?;
+            // List directory
+            let list = ftp
+                .list(None)
+                .map_err(|e| format!("FTP list failed: {}", e))?;
 
-        let mut entries = Vec::new();
+            let mut entries = Vec::new();
 
-        for line in list {
-            if let Some(entry) = parse_ftp_line(&line, &path) {
-                if entry.name != "." && entry.name != ".." {
-                    entries.push(entry);
+            for line in list {
+                if let Some(entry) = parse_ftp_line(&line, &path) {
+                    if entry.name != "." && entry.name != ".." {
+                        entries.push(entry);
+                    }
                 }
             }
-        }
 
-        // Sort: directories first, then by name
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        });
+            // Sort: directories first, then by name
+            entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            });
 
-        // Logout
-        let _ = ftp.quit();
+            // Logout
+            let _ = ftp.quit();
 
-        Ok(entries)
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?;
+            Ok(entries)
+        }),
+    )
+    .await;
 
-    result
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP list timed out - device may be offline".to_string()),
+    }
 }
 
 // Parse FTP LIST line (Unix or DOS format)
@@ -870,62 +882,69 @@ async fn download_file_ftp(
 ) -> Result<(String, Vec<u8>), String> {
     log::info!("FTP: Downloading {}", remote_path);
 
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        use std::time::Duration;
-        use suppaftp::FtpStream;
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
 
-        let addr = format!("{}:21", host);
-        let mut ftp =
-            FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
 
-        ftp.get_ref()
-            .set_read_timeout(Some(Duration::from_secs(60)))
-            .ok();
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .ok();
 
-        // Login with password or anonymous
-        if let Some(ref pwd) = password {
-            if !pwd.is_empty() {
-                ftp.login("admin", pwd)
-                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
             } else {
                 ftp.login("anonymous", "anonymous")
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
-        } else {
-            ftp.login("anonymous", "anonymous")
-                .map_err(|e| format!("FTP login failed: {}", e))?;
-        }
 
-        // Set binary transfer mode
-        ftp.transfer_type(suppaftp::types::FileType::Binary)
-            .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+            // Set binary transfer mode
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-        // Get filename from path
-        let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
+            // Get filename from path
+            let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
 
-        // Retrieve file
-        let mut reader = ftp
-            .retr_as_stream(&remote_path)
-            .map_err(|e| format!("FTP download failed: {}", e))?;
+            // Retrieve file
+            let mut reader = ftp
+                .retr_as_stream(&remote_path)
+                .map_err(|e| format!("FTP download failed: {}", e))?;
 
-        let mut data = Vec::new();
-        reader
-            .read_to_end(&mut data)
-            .map_err(|e| format!("Read error: {}", e))?;
+            let mut data = Vec::new();
+            reader
+                .read_to_end(&mut data)
+                .map_err(|e| format!("Read error: {}", e))?;
 
-        // Finalize transfer
-        ftp.finalize_retr_stream(reader)
-            .map_err(|e| format!("Transfer finalize error: {}", e))?;
+            // Finalize transfer
+            ftp.finalize_retr_stream(reader)
+                .map_err(|e| format!("Transfer finalize error: {}", e))?;
 
-        let _ = ftp.quit();
+            let _ = ftp.quit();
 
-        Ok((filename, data))
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?;
+            Ok((filename, data))
+        }),
+    )
+    .await;
 
-    result
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP download timed out - device may be offline".to_string()),
+    }
 }
 
 // Upload file via FTP
@@ -937,69 +956,77 @@ async fn upload_file_ftp(
 ) -> Result<String, String> {
     log::info!("FTP: Uploading {} to {}", local_path.display(), remote_dest);
 
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::Cursor;
-        use std::time::Duration;
-        use suppaftp::FtpStream;
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
 
-        // Read local file
-        let data = std::fs::read(&local_path).map_err(|e| format!("Cannot read file: {}", e))?;
+            // Read local file
+            let data =
+                std::fs::read(&local_path).map_err(|e| format!("Cannot read file: {}", e))?;
 
-        let filename = local_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file")
-            .to_string();
+            let filename = local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
 
-        let addr = format!("{}:21", host);
-        let mut ftp =
-            FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
 
-        ftp.get_ref()
-            .set_write_timeout(Some(Duration::from_secs(120)))
-            .ok();
+            ftp.get_ref()
+                .set_write_timeout(Some(Duration::from_secs(120)))
+                .ok();
 
-        // Login with password or anonymous
-        if let Some(ref pwd) = password {
-            if !pwd.is_empty() {
-                ftp.login("admin", pwd)
-                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
             } else {
                 ftp.login("anonymous", "anonymous")
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
-        } else {
-            ftp.login("anonymous", "anonymous")
-                .map_err(|e| format!("FTP login failed: {}", e))?;
-        }
 
-        // Set binary transfer mode
-        ftp.transfer_type(suppaftp::types::FileType::Binary)
-            .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+            // Set binary transfer mode
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-        // Change to destination directory
-        let dest_dir = if remote_dest.ends_with('/') {
-            remote_dest.as_str()
-        } else {
-            remote_dest.rsplit_once('/').map(|(d, _)| d).unwrap_or("/")
-        };
+            // Change to destination directory
+            let dest_dir = if remote_dest.ends_with('/') {
+                remote_dest.as_str()
+            } else {
+                remote_dest.rsplit_once('/').map(|(d, _)| d).unwrap_or("/")
+            };
 
-        ftp.cwd(dest_dir)
-            .map_err(|e| format!("Cannot access {}: {}", dest_dir, e))?;
+            ftp.cwd(dest_dir)
+                .map_err(|e| format!("Cannot access {}: {}", dest_dir, e))?;
 
-        // Upload file
-        let mut cursor = Cursor::new(data);
-        ftp.put_file(&filename, &mut cursor)
-            .map_err(|e| format!("FTP upload failed: {}", e))?;
+            // Upload file
+            let mut cursor = Cursor::new(data);
+            ftp.put_file(&filename, &mut cursor)
+                .map_err(|e| format!("FTP upload failed: {}", e))?;
 
-        let _ = ftp.quit();
+            let _ = ftp.quit();
 
-        Ok(filename)
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?;
+            Ok(filename)
+        }),
+    )
+    .await;
 
-    result
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP upload timed out - device may be offline".to_string()),
+    }
 }
 
 // Upload directory recursively via FTP
@@ -1015,150 +1042,157 @@ async fn upload_directory_ftp(
         remote_dest
     );
 
-    let result = tokio::task::spawn_blocking(move || {
-        use std::io::Cursor;
-        use std::time::Duration;
-        use suppaftp::FtpStream;
+    // Use longer timeout for directory uploads which may take time
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_UPLOAD_DIR_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
 
-        let addr = format!("{}:21", host);
-        let mut ftp =
-            FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
 
-        ftp.get_ref()
-            .set_write_timeout(Some(Duration::from_secs(120)))
-            .ok();
+            ftp.get_ref()
+                .set_write_timeout(Some(Duration::from_secs(120)))
+                .ok();
 
-        // Login with password or anonymous
-        if let Some(ref pwd) = password {
-            if !pwd.is_empty() {
-                ftp.login("admin", pwd)
-                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
             } else {
                 ftp.login("anonymous", "anonymous")
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
-        } else {
-            ftp.login("anonymous", "anonymous")
-                .map_err(|e| format!("FTP login failed: {}", e))?;
-        }
 
-        // Set binary transfer mode
-        ftp.transfer_type(suppaftp::types::FileType::Binary)
-            .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+            // Set binary transfer mode
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-        // Get the directory name to create on remote
-        let dir_name = local_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| "Invalid directory name".to_string())?;
+            // Get the directory name to create on remote
+            let dir_name = local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| "Invalid directory name".to_string())?;
 
-        // Build base remote path
-        let base_remote = if remote_dest.ends_with('/') {
-            format!("{}{}", remote_dest, dir_name)
-        } else {
-            format!("{}/{}", remote_dest, dir_name)
-        };
-
-        let mut dirs_created = 0;
-        let mut files_uploaded = 0;
-        let mut errors: Vec<String> = Vec::new();
-
-        // Walk the directory tree
-        for entry in WalkDir::new(&local_path).min_depth(0) {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    errors.push(format!("Walk error: {}", e));
-                    continue;
-                }
-            };
-
-            // Get relative path from the source directory
-            let relative = match entry.path().strip_prefix(&local_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            // Build remote path
-            let remote_path = if relative.as_os_str().is_empty() {
-                base_remote.clone()
+            // Build base remote path
+            let base_remote = if remote_dest.ends_with('/') {
+                format!("{}{}", remote_dest, dir_name)
             } else {
-                // Convert path separators to forward slashes for FTP
-                let relative_str = relative.to_string_lossy().replace('\\', "/");
-                format!("{}/{}", base_remote, relative_str)
+                format!("{}/{}", remote_dest, dir_name)
             };
 
-            if entry.file_type().is_dir() {
-                // Create directory on remote (ignore errors if it exists)
-                log::debug!("FTP: Creating directory {}", remote_path);
-                match ftp.mkdir(&remote_path) {
-                    Ok(_) => {
-                        dirs_created += 1;
-                        log::debug!("FTP: Created directory {}", remote_path);
-                    }
-                    Err(e) => {
-                        // Directory might already exist, log but continue
-                        log::debug!("FTP: mkdir {} (may exist): {}", remote_path, e);
-                    }
-                }
-            } else if entry.file_type().is_file() {
-                // Upload file
-                log::debug!("FTP: Uploading file to {}", remote_path);
+            let mut dirs_created = 0;
+            let mut files_uploaded = 0;
+            let mut errors: Vec<String> = Vec::new();
 
-                // Read file data
-                let data = match std::fs::read(entry.path()) {
-                    Ok(d) => d,
+            // Walk the directory tree
+            for entry in WalkDir::new(&local_path).min_depth(0) {
+                let entry = match entry {
+                    Ok(e) => e,
                     Err(e) => {
-                        errors.push(format!("Read {}: {}", entry.path().display(), e));
+                        errors.push(format!("Walk error: {}", e));
                         continue;
                     }
                 };
 
-                // Get parent directory and filename
-                let (parent_dir, filename) = if let Some(pos) = remote_path.rfind('/') {
-                    (&remote_path[..pos], &remote_path[pos + 1..])
-                } else {
-                    ("/", remote_path.as_str())
+                // Get relative path from the source directory
+                let relative = match entry.path().strip_prefix(&local_path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
                 };
 
-                // Change to parent directory
-                if let Err(e) = ftp.cwd(parent_dir) {
-                    errors.push(format!("CWD {}: {}", parent_dir, e));
-                    continue;
-                }
+                // Build remote path
+                let remote_path = if relative.as_os_str().is_empty() {
+                    base_remote.clone()
+                } else {
+                    // Convert path separators to forward slashes for FTP
+                    let relative_str = relative.to_string_lossy().replace('\\', "/");
+                    format!("{}/{}", base_remote, relative_str)
+                };
 
-                // Upload the file
-                let mut cursor = Cursor::new(data);
-                match ftp.put_file(filename, &mut cursor) {
-                    Ok(_) => {
-                        files_uploaded += 1;
-                        log::debug!("FTP: Uploaded {}", remote_path);
+                if entry.file_type().is_dir() {
+                    // Create directory on remote (ignore errors if it exists)
+                    log::debug!("FTP: Creating directory {}", remote_path);
+                    match ftp.mkdir(&remote_path) {
+                        Ok(_) => {
+                            dirs_created += 1;
+                            log::debug!("FTP: Created directory {}", remote_path);
+                        }
+                        Err(e) => {
+                            // Directory might already exist, log but continue
+                            log::debug!("FTP: mkdir {} (may exist): {}", remote_path, e);
+                        }
                     }
-                    Err(e) => {
-                        errors.push(format!("Upload {}: {}", filename, e));
+                } else if entry.file_type().is_file() {
+                    // Upload file
+                    log::debug!("FTP: Uploading file to {}", remote_path);
+
+                    // Read file data
+                    let data = match std::fs::read(entry.path()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            errors.push(format!("Read {}: {}", entry.path().display(), e));
+                            continue;
+                        }
+                    };
+
+                    // Get parent directory and filename
+                    let (parent_dir, filename) = if let Some(pos) = remote_path.rfind('/') {
+                        (&remote_path[..pos], &remote_path[pos + 1..])
+                    } else {
+                        ("/", remote_path.as_str())
+                    };
+
+                    // Change to parent directory
+                    if let Err(e) = ftp.cwd(parent_dir) {
+                        errors.push(format!("CWD {}: {}", parent_dir, e));
+                        continue;
+                    }
+
+                    // Upload the file
+                    let mut cursor = Cursor::new(data);
+                    match ftp.put_file(filename, &mut cursor) {
+                        Ok(_) => {
+                            files_uploaded += 1;
+                            log::debug!("FTP: Uploaded {}", remote_path);
+                        }
+                        Err(e) => {
+                            errors.push(format!("Upload {}: {}", filename, e));
+                        }
                     }
                 }
             }
-        }
 
-        let _ = ftp.quit();
+            let _ = ftp.quit();
 
-        // Build result message
-        let mut msg = format!(
-            "Uploaded: {} files, {} directories",
-            files_uploaded, dirs_created
-        );
-        if !errors.is_empty() {
-            msg.push_str(&format!(" ({} errors)", errors.len()));
-            for err in errors.iter().take(3) {
-                log::warn!("Upload error: {}", err);
+            // Build result message
+            let mut msg = format!(
+                "Uploaded: {} files, {} directories",
+                files_uploaded, dirs_created
+            );
+            if !errors.is_empty() {
+                msg.push_str(&format!(" ({} errors)", errors.len()));
+                for err in errors.iter().take(3) {
+                    log::warn!("Upload error: {}", err);
+                }
             }
-        }
 
-        Ok(msg)
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e))?;
+            Ok(msg)
+        }),
+    )
+    .await;
 
-    result
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP directory upload timed out - device may be offline".to_string()),
+    }
 }

@@ -18,6 +18,8 @@ use ultimate64::Rest;
 // MD5 hash size
 const MD5_HASH_SIZE: usize = 16;
 const DEFAULT_SONG_DURATION: u32 = 180; // 3 minutes default
+/// Timeout for REST API operations to prevent hangs when device goes offline
+const REST_TIMEOUT_SECS: u64 = 5;
 
 /// SID file header information
 #[derive(Debug, Clone, Default)]
@@ -271,7 +273,7 @@ impl MusicPlayer {
         match message {
             // === Playback Controls ===
             MusicPlayerMessage::Play => {
-                // If paused, just update state
+                // If paused, just update state (main.rs will call resume API)
                 if self.playback_state == PlaybackState::Paused {
                     if let Some(idx) = self.current_playing {
                         if let Some(entry) = self.playlist.get(idx) {
@@ -350,12 +352,22 @@ impl MusicPlayer {
                 if let Some(conn) = connection {
                     return Command::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || {
-                                let conn = conn.blocking_lock();
-                                conn.reset().map_err(|e| e.to_string())
-                            })
-                            .await
-                            .map_err(|e| format!("Task error: {}", e))?
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = conn.blocking_lock();
+                                    conn.reset().map_err(|e| e.to_string())
+                                }),
+                            )
+                            .await;
+
+                            match result {
+                                Ok(Ok(inner)) => inner,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => {
+                                    Err("Reset timed out - device may be offline".to_string())
+                                }
+                            }
                         },
                         |result| {
                             if let Err(e) = result {
@@ -1318,7 +1330,7 @@ impl MusicPlayer {
                     } else {
                         entry.name.clone()
                     };
-                    let name = truncate_string(&display_name, 50);
+                    let name = truncate_string(&display_name, 25);
 
                     let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 
@@ -1752,15 +1764,24 @@ async fn play_music_file(
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
 
-    tokio::task::spawn_blocking(move || {
-        let conn = connection.blocking_lock();
-        match file_type {
-            MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
-            MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
+            match file_type {
+                MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
+                MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),
+            }
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Play timed out - device may be offline".to_string()),
+    }
 }
 
 async fn download_song_lengths_async() -> Result<String, String> {

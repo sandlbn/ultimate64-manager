@@ -665,7 +665,10 @@ impl Application for Ultimate64Browser {
                         let url = format!("{}/v1/machine:pause", host);
                         let pause_cmd = Command::perform(
                             async move {
-                                let client = reqwest::Client::new();
+                                let client = reqwest::Client::builder()
+                                    .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
+                                    .build()
+                                    .map_err(|e| format!("Client error: {}", e))?;
                                 client
                                     .put(&url)
                                     .send()
@@ -693,7 +696,10 @@ impl Application for Ultimate64Browser {
                             let url = format!("{}/v1/machine:resume", host);
                             let resume_cmd = Command::perform(
                                 async move {
-                                    let client = reqwest::Client::new();
+                                    let client = reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
+                                        .build()
+                                        .map_err(|e| format!("Client error: {}", e))?;
                                     client
                                         .put(&url)
                                         .send()
@@ -760,6 +766,14 @@ impl Application for Ultimate64Browser {
 
             Message::DisconnectPressed => {
                 log::info!("Disconnecting...");
+
+                // Stop video streaming if active to prevent hangs
+                if self.video_streaming.is_streaming {
+                    let _ = self
+                        .video_streaming
+                        .update(StreamingMessage::StopStream, None);
+                }
+
                 self.connection = None;
                 self.host_url = None;
                 self.status.connected = false;
@@ -917,15 +931,26 @@ impl Application for Ultimate64Browser {
 
                             return Command::perform(
                                 async move {
-                                    tokio::task::spawn_blocking(move || {
-                                        let conn = conn.blocking_lock();
-                                        // Add newline to execute the command
-                                        conn.type_text(&format!("{}\n", cmd))
-                                            .map(|_| format!("Sent: {}", cmd))
-                                            .map_err(|e| format!("Failed to send: {}", e))
-                                    })
-                                    .await
-                                    .unwrap_or_else(|e| Err(format!("Task error: {}", e)))
+                                    let result = tokio::time::timeout(
+                                        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                        tokio::task::spawn_blocking(move || {
+                                            let conn = conn.blocking_lock();
+                                            // Add newline to execute the command
+                                            conn.type_text(&format!("{}\n", cmd))
+                                                .map(|_| format!("Sent: {}", cmd))
+                                                .map_err(|e| format!("Failed to send: {}", e))
+                                        }),
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(Ok(r)) => r,
+                                        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                        Err(_) => {
+                                            Err("Command timed out - device may be offline"
+                                                .to_string())
+                                        }
+                                    }
                                 },
                                 |result| match result {
                                     Ok(msg) => {
@@ -971,14 +996,24 @@ impl Application for Ultimate64Browser {
                     let conn = conn.clone();
                     Command::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || {
-                                let conn = conn.blocking_lock();
-                                conn.reset()
-                                    .map(|_| "Machine reset successfully".to_string())
-                                    .map_err(|e| format!("Reset failed: {}", e))
-                            })
-                            .await
-                            .map_err(|e| format!("Task error: {}", e))?
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = conn.blocking_lock();
+                                    conn.reset()
+                                        .map(|_| "Machine reset successfully".to_string())
+                                        .map_err(|e| format!("Reset failed: {}", e))
+                                }),
+                            )
+                            .await;
+
+                            match result {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => {
+                                    Err("Reset timed out - device may be offline".to_string())
+                                }
+                            }
                         },
                         Message::MachineCommandCompleted,
                     )
@@ -993,7 +1028,10 @@ impl Application for Ultimate64Browser {
                     let url = format!("{}/v1/machine:reboot", host);
                     Command::perform(
                         async move {
-                            let client = reqwest::Client::new();
+                            let client = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
+                                .build()
+                                .map_err(|e| format!("Client error: {}", e))?;
                             client
                                 .put(&url)
                                 .send()
@@ -1014,7 +1052,10 @@ impl Application for Ultimate64Browser {
                     let url = format!("{}/v1/machine:pause", host);
                     Command::perform(
                         async move {
-                            let client = reqwest::Client::new();
+                            let client = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
+                                .build()
+                                .map_err(|e| format!("Client error: {}", e))?;
                             client
                                 .put(&url)
                                 .send()
@@ -1035,7 +1076,10 @@ impl Application for Ultimate64Browser {
                     let url = format!("{}/v1/machine:resume", host);
                     Command::perform(
                         async move {
-                            let client = reqwest::Client::new();
+                            let client = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
+                                .build()
+                                .map_err(|e| format!("Client error: {}", e))?;
                             client
                                 .put(&url)
                                 .send()
@@ -1056,14 +1100,24 @@ impl Application for Ultimate64Browser {
                     let conn = conn.clone();
                     Command::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || {
-                                let conn = conn.blocking_lock();
-                                conn.poweroff()
-                                    .map(|_| "Machine powered off".to_string())
-                                    .map_err(|e| format!("Poweroff failed: {}", e))
-                            })
-                            .await
-                            .map_err(|e| format!("Task error: {}", e))?
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = conn.blocking_lock();
+                                    conn.poweroff()
+                                        .map(|_| "Machine powered off".to_string())
+                                        .map_err(|e| format!("Poweroff failed: {}", e))
+                                }),
+                            )
+                            .await;
+
+                            match result {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => {
+                                    Err("Poweroff timed out - device may be offline".to_string())
+                                }
+                            }
                         },
                         Message::MachineCommandCompleted,
                     )
@@ -1754,70 +1808,114 @@ async fn execute_template_commands(
         let conn = connection.clone();
 
         if command.starts_with("RESET") {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.reset().map_err(|e| format!("Reset failed: {}", e))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))??;
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    let conn = conn.blocking_lock();
+                    conn.reset().map_err(|e| format!("Reset failed: {}", e))
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(r)) => r?,
+                Ok(Err(e)) => return Err(format!("Task error: {}", e)),
+                Err(_) => return Err("Reset timed out - device may be offline".to_string()),
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         } else if let Some(text) = command.strip_prefix("TYPE ") {
             let text = text.to_string();
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.type_text(&text)
-                    .map_err(|e| format!("Type failed: {}", e))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))??;
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    let conn = conn.blocking_lock();
+                    conn.type_text(&text)
+                        .map_err(|e| format!("Type failed: {}", e))
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(r)) => r?,
+                Ok(Err(e)) => return Err(format!("Task error: {}", e)),
+                Err(_) => return Err("Type command timed out - device may be offline".to_string()),
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else if command.starts_with("LOAD") {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.type_text("load\"*\",8,1\n")
-                    .map_err(|e| format!("Load failed: {}", e))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))??;
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    let conn = conn.blocking_lock();
+                    conn.type_text("load\"*\",8,1\n")
+                        .map_err(|e| format!("Load failed: {}", e))
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(r)) => r?,
+                Ok(Err(e)) => return Err(format!("Task error: {}", e)),
+                Err(_) => return Err("Load command timed out - device may be offline".to_string()),
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         } else if command.starts_with("RUN") {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.blocking_lock();
-                conn.type_text("run\n")
-                    .map_err(|e| format!("Run failed: {}", e))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))??;
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                tokio::task::spawn_blocking(move || {
+                    let conn = conn.blocking_lock();
+                    conn.type_text("run\n")
+                        .map_err(|e| format!("Run failed: {}", e))
+                }),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(r)) => r?,
+                Ok(Err(e)) => return Err(format!("Task error: {}", e)),
+                Err(_) => return Err("Run command timed out - device may be offline".to_string()),
+            }
         }
     }
 
     Ok(())
 }
 
+/// Timeout for REST API operations to prevent hangs when device goes offline
+const REST_TIMEOUT_SECS: u64 = 5;
+
 async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, String> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
-    tokio::task::spawn_blocking(move || {
-        let conn = connection.blocking_lock();
+    // Wrap in timeout to prevent hangs when device is offline
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
 
-        let device_info = match conn.info() {
-            Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),
-            Err(e) => return Err(format!("Failed to get device info: {}", e)),
-        };
+            let device_info = match conn.info() {
+                Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),
+                Err(e) => return Err(format!("Failed to get device info: {}", e)),
+            };
 
-        let mounted_disks = match conn.drive_list() {
-            Ok(drives) => drives
-                .into_iter()
-                .filter_map(|(name, drive)| drive.image_file.map(|file| (name, file)))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+            let mounted_disks = match conn.drive_list() {
+                Ok(drives) => drives
+                    .into_iter()
+                    .filter_map(|(name, drive)| drive.image_file.map(|file| (name, file)))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
 
-        Ok(StatusInfo {
-            connected: true,
-            device_info,
-            mounted_disks,
-        })
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))?
+            Ok(StatusInfo {
+                connected: true,
+                device_info,
+                mounted_disks,
+            })
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Connection timed out - device may be offline".to_string()),
+    }
 }
