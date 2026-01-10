@@ -271,7 +271,7 @@ impl MusicPlayer {
         match message {
             // === Playback Controls ===
             MusicPlayerMessage::Play => {
-                // If paused, just update state (main.rs will call resume API)
+                // If paused, just update state
                 if self.playback_state == PlaybackState::Paused {
                     if let Some(idx) = self.current_playing {
                         if let Some(entry) = self.playlist.get(idx) {
@@ -1318,7 +1318,7 @@ impl MusicPlayer {
                     } else {
                         entry.name.clone()
                     };
-                    let name = truncate_string(&display_name, 25);
+                    let name = truncate_string(&display_name, 50);
 
                     let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 

@@ -1,6 +1,8 @@
 use iced::{
     Command, Element, Length,
-    widget::{Column, button, column, horizontal_rule, row, scrollable, text, tooltip},
+    widget::{
+        Column, Space, button, column, horizontal_rule, row, scrollable, text, text_input, tooltip,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -31,6 +33,8 @@ pub enum RemoteBrowserMessage {
     MountDisk(String, String, String), // path, drive (a/b), mode (readwrite/readonly/unlinked)
     MountComplete(Result<String, String>),
     RunDisk(String, String), // path, drive - mount and reset
+    // Filter
+    FilterChanged(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +55,7 @@ pub struct RemoteBrowser {
     pub is_connected: bool,
     pub host_address: Option<String>,
     pub password: Option<String>,
+    pub filter: String,
 }
 
 impl Default for RemoteBrowser {
@@ -64,6 +69,7 @@ impl Default for RemoteBrowser {
             is_connected: false,
             host_address: None,
             password: None,
+            filter: String::new(),
         }
     }
 }
@@ -330,10 +336,19 @@ impl RemoteBrowser {
                     Command::none()
                 }
             }
+
+            RemoteBrowserMessage::FilterChanged(value) => {
+                self.filter = value;
+                Command::none()
+            }
         }
     }
 
-    pub fn view(&self) -> Element<'_, RemoteBrowserMessage> {
+    pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
         // Path display
         let display_path = if self.current_path.len() > 35 {
             format!("...{}", &self.current_path[self.current_path.len() - 32..])
@@ -341,23 +356,31 @@ impl RemoteBrowser {
             self.current_path.clone()
         };
 
-        // Navigation buttons
+        // Navigation buttons with filter
         let nav_buttons = row![
             tooltip(
-                button(text("Up").size(11))
+                button(text("Up").size(normal))
                     .on_press(RemoteBrowserMessage::NavigateUp)
                     .padding([4, 8]),
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
             .style(iced::theme::Container::Box),
+            Space::with_width(Length::Fill),
+            text("Filter:").size(small),
+            text_input("filter...", &self.filter)
+                .on_input(RemoteBrowserMessage::FilterChanged)
+                .size(normal)
+                .padding(4)
+                .width(Length::Fixed(100.0)),
         ]
-        .spacing(5);
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
 
         // Quick navigation to common paths
         let quick_nav = row![
             tooltip(
-                button(text("/").size(10))
+                button(text("/").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
                     .padding([2, 6]),
                 "Root directory",
@@ -365,7 +388,7 @@ impl RemoteBrowser {
             )
             .style(iced::theme::Container::Box),
             tooltip(
-                button(text("Usb0").size(10))
+                button(text("Usb0").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/Usb0".to_string()))
                     .padding([2, 6]),
                 "USB Drive 0",
@@ -373,7 +396,7 @@ impl RemoteBrowser {
             )
             .style(iced::theme::Container::Box),
             tooltip(
-                button(text("Usb1").size(10))
+                button(text("Usb1").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/Usb1".to_string()))
                     .padding([2, 6]),
                 "USB Drive 1",
@@ -381,7 +404,7 @@ impl RemoteBrowser {
             )
             .style(iced::theme::Container::Box),
             tooltip(
-                button(text("SD").size(10))
+                button(text("SD").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
                     .padding([2, 6]),
                 "SD Card",
@@ -392,24 +415,34 @@ impl RemoteBrowser {
         .spacing(3);
 
         // Path and status
-        let path_display = text(display_path).size(11);
-        let status = text(self.status_message.as_deref().unwrap_or("")).size(10);
+        let path_display = text(display_path).size(normal);
+        let status = text(self.status_message.as_deref().unwrap_or("")).size(small);
 
         // File list
         let file_list: Element<'_, RemoteBrowserMessage> = if self.files.is_empty() {
             if self.is_loading {
-                text("Loading...").size(12).into()
+                text("Loading...").size(normal).into()
             } else if !self.is_connected {
                 text("Connect to Ultimate64 to browse files")
-                    .size(12)
+                    .size(normal)
                     .into()
             } else {
-                text("Empty directory").size(12).into()
+                text("Empty directory").size(normal).into()
             }
         } else {
+            // Filter files based on filter text
+            let filtered_files: Vec<&RemoteFileEntry> = self
+                .files
+                .iter()
+                .filter(|f| {
+                    self.filter.is_empty()
+                        || f.name.to_lowercase().contains(&self.filter.to_lowercase())
+                })
+                .collect();
+
             let mut items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
 
-            for (i, entry) in self.files.iter().enumerate() {
+            for (i, entry) in filtered_files.iter().enumerate() {
                 if i > 0 {
                     // Add divider between rows
                     items.push(horizontal_rule(1).into());
@@ -436,7 +469,7 @@ impl RemoteBrowser {
                 let ext = entry.name.to_lowercase();
                 let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     tooltip(
-                        button(text("Open").size(10))
+                        button(text("Open").size(small))
                             .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
                             .padding([2, 8]),
                         "Open folder",
@@ -446,7 +479,7 @@ impl RemoteBrowser {
                     .into()
                 } else if ext.ends_with(".prg") {
                     tooltip(
-                        button(text("Run").size(10))
+                        button(text("Run").size(small))
                             .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
                             .padding([2, 8]),
                         "Load and run PRG file",
@@ -456,7 +489,7 @@ impl RemoteBrowser {
                     .into()
                 } else if ext.ends_with(".crt") {
                     tooltip(
-                        button(text("Run").size(10))
+                        button(text("Run").size(small))
                             .on_press(RemoteBrowserMessage::RunCrt(entry.path.clone()))
                             .padding([2, 8]),
                         "Load cartridge image",
@@ -466,7 +499,7 @@ impl RemoteBrowser {
                     .into()
                 } else if ext.ends_with(".sid") {
                     tooltip(
-                        button(text("Play").size(10))
+                        button(text("Play").size(small))
                             .on_press(RemoteBrowserMessage::PlaySid(entry.path.clone()))
                             .padding([2, 8]),
                         "Play SID music",
@@ -476,7 +509,7 @@ impl RemoteBrowser {
                     .into()
                 } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m") {
                     tooltip(
-                        button(text("Play").size(10))
+                        button(text("Play").size(small))
                             .on_press(RemoteBrowserMessage::PlayMod(entry.path.clone()))
                             .padding([2, 8]),
                         "Play MOD/tracker music",
@@ -493,7 +526,7 @@ impl RemoteBrowser {
                     // Disk image - show run and mount buttons
                     row![
                         tooltip(
-                            button(text("Run").size(9))
+                            button(text("Run").size(tiny))
                                 .on_press(RemoteBrowserMessage::RunDisk(
                                     entry.path.clone(),
                                     "a".to_string(),
@@ -504,7 +537,7 @@ impl RemoteBrowser {
                         )
                         .style(iced::theme::Container::Box),
                         tooltip(
-                            button(text("A:RW").size(9))
+                            button(text("A:RW").size(tiny))
                                 .on_press(RemoteBrowserMessage::MountDisk(
                                     entry.path.clone(),
                                     "a".to_string(),
@@ -516,7 +549,7 @@ impl RemoteBrowser {
                         )
                         .style(iced::theme::Container::Box),
                         tooltip(
-                            button(text("A:RO").size(9))
+                            button(text("A:RO").size(tiny))
                                 .on_press(RemoteBrowserMessage::MountDisk(
                                     entry.path.clone(),
                                     "a".to_string(),
@@ -528,7 +561,7 @@ impl RemoteBrowser {
                         )
                         .style(iced::theme::Container::Box),
                         tooltip(
-                            button(text("B:RW").size(9))
+                            button(text("B:RW").size(tiny))
                                 .on_press(RemoteBrowserMessage::MountDisk(
                                     entry.path.clone(),
                                     "b".to_string(),
@@ -548,13 +581,13 @@ impl RemoteBrowser {
 
                 let file_row = row![
                     // Clickable filename
-                    button(text(&display_name).size(11))
+                    button(text(&display_name).size(normal))
                         .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
                         .padding([4, 6])
                         .width(Length::Fill)
                         .style(iced::theme::Button::Text),
                     // Type label
-                    text(type_label).size(9).width(Length::Fixed(28.0)),
+                    text(type_label).size(tiny).width(Length::Fixed(28.0)),
                     // Action button
                     action_button,
                 ]

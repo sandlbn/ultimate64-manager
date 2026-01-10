@@ -1153,7 +1153,7 @@ impl Application for Ultimate64Browser {
             Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
             Tab::Configuration => self
                 .config_editor
-                .view(self.status.connected)
+                .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::ConfigEditor),
             Tab::Settings => self.view_settings(),
         })
@@ -1336,7 +1336,9 @@ impl Ultimate64Browser {
         let right_pane = container(column![
             right_header,
             horizontal_rule(1),
-            self.remote_browser.view().map(Message::RemoteBrowser),
+            self.remote_browser
+                .view(self.settings.preferences.font_size)
+                .map(Message::RemoteBrowser),
         ])
         .width(Length::FillPortion(1))
         .height(Length::Fill)
