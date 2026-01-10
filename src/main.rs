@@ -5,8 +5,8 @@
 use iced::{
     Application, Command, Element, Length, Settings, Subscription, Theme, executor,
     widget::{
-        Space, button, column, container, horizontal_rule, horizontal_space, pick_list, row, text,
-        text_input, tooltip,
+        Space, button, column, container, horizontal_rule, horizontal_space, pick_list, row,
+        scrollable, text, text_input, tooltip,
     },
 };
 use std::path::PathBuf;
@@ -148,6 +148,7 @@ pub enum Message {
 
     // Settings
     DefaultSongDurationChanged(String),
+    FontSizeChanged(String),
 
     // Starting directory settings
     BrowseFileBrowserStartDir,
@@ -221,6 +222,7 @@ pub struct Ultimate64Browser {
     // Input fields
     host_input: String,
     password_input: String,
+    font_size_input: String,
 
     // Video streaming
     video_streaming: VideoStreaming,
@@ -263,6 +265,7 @@ impl Application for Ultimate64Browser {
             config_editor: ConfigEditor::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
+            font_size_input: settings.preferences.font_size.to_string(),
             settings: settings.clone(),
             host_url: None,
             template_manager: TemplateManager::new(),
@@ -1033,6 +1036,20 @@ impl Application for Ultimate64Browser {
                 Command::none()
             }
 
+            Message::FontSizeChanged(value) => {
+                self.font_size_input = value.clone();
+                if let Ok(size) = value.parse::<u32>() {
+                    if size >= 8 && size <= 24 {
+                        self.settings.preferences.font_size = size;
+                        // Save settings
+                        if let Err(e) = self.settings.save() {
+                            log::error!("Failed to save settings: {}", e);
+                        }
+                    }
+                }
+                Command::none()
+            }
+
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Command::perform(
                 async {
@@ -1136,7 +1153,7 @@ impl Application for Ultimate64Browser {
             Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
             Tab::Configuration => self
                 .config_editor
-                .view(self.status.connected)
+                .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::ConfigEditor),
             Tab::Settings => self.view_settings(),
         })
@@ -1269,7 +1286,9 @@ impl Ultimate64Browser {
         let left_pane = container(column![
             left_header,
             horizontal_rule(1),
-            self.left_browser.view().map(Message::LeftBrowser),
+            self.left_browser
+                .view(self.settings.preferences.font_size)
+                .map(Message::LeftBrowser),
         ])
         .width(Length::FillPortion(1))
         .height(Length::Fill)
@@ -1317,7 +1336,9 @@ impl Ultimate64Browser {
         let right_pane = container(column![
             right_header,
             horizontal_rule(1),
-            self.remote_browser.view().map(Message::RemoteBrowser),
+            self.remote_browser
+                .view(self.settings.preferences.font_size)
+                .map(Message::RemoteBrowser),
         ])
         .width(Length::FillPortion(1))
         .height(Length::Fill)
@@ -1356,7 +1377,9 @@ impl Ultimate64Browser {
     }
 
     fn view_music_player(&self) -> Element<'_, Message> {
-        self.music_player.view().map(Message::MusicPlayer)
+        self.music_player
+            .view(self.settings.preferences.font_size)
+            .map(Message::MusicPlayer)
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
@@ -1487,6 +1510,24 @@ impl Ultimate64Browser {
             .align_items(iced::Alignment::Center),
         ];
 
+        let ui_section = column![
+            Space::with_height(20),
+            horizontal_rule(1),
+            Space::with_height(10),
+            text("UI SETTINGS").size(18),
+            Space::with_height(10),
+            row![
+                text("Font size:").size(14),
+                text_input("12", &self.font_size_input)
+                    .on_input(Message::FontSizeChanged)
+                    .padding(8)
+                    .width(Length::Fixed(60.0)),
+                text("(8-24, applies to File Browser and Music Player)").size(11),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center),
+        ];
+
         let debug_section = column![
             Space::with_height(20),
             horizontal_rule(1),
@@ -1496,17 +1537,19 @@ impl Ultimate64Browser {
             text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
         ];
 
-        container(
+        scrollable(container(
             column![
                 connection_section,
                 status_section,
                 starting_dirs_section,
                 music_section,
+                ui_section,
                 debug_section
             ]
             .spacing(5)
             .padding(20),
-        )
+        ))
+        .height(Length::Fill)
         .into()
     }
 

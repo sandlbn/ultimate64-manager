@@ -449,13 +449,18 @@ impl ConfigEditor {
             .unwrap_or(false)
     }
 
-    pub fn view(&self, is_connected: bool) -> Element<'_, ConfigEditorMessage> {
+    pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, ConfigEditorMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let large = (font_size + 2) as u16;
+        let header = (font_size + 4) as u16;
+
         // === LEFT PANE: Category list ===
         let category_header = container(
             column![
-                text("CATEGORIES").size(12),
+                text("CATEGORIES").size(normal),
                 row![
-                    button(text("Load").size(10))
+                    button(text("Load").size(small))
                         .on_press(ConfigEditorMessage::LoadCategories)
                         .padding([4, 8]),
                 ]
@@ -472,7 +477,7 @@ impl ConfigEditor {
                 } else {
                     "Connect to Ultimate64 first"
                 })
-                .size(11),
+                .size(normal),
             )
             .padding(10)
             .into()
@@ -490,7 +495,7 @@ impl ConfigEditor {
                         cat.clone()
                     };
 
-                    button(text(&label).size(11))
+                    button(text(&label).size(normal))
                         .on_press(ConfigEditorMessage::SelectCategory(cat.clone()))
                         .padding([6, 10])
                         .width(Length::Fill)
@@ -516,16 +521,16 @@ impl ConfigEditor {
         let flash_controls = container(
             column![
                 horizontal_rule(1),
-                text("FLASH MEMORY").size(10),
-                button(text("Save to Flash").size(10))
+                text("FLASH MEMORY").size(small),
+                button(text("Save to Flash").size(small))
                     .on_press(ConfigEditorMessage::SaveToFlash)
                     .padding([4, 8])
                     .width(Length::Fill),
-                button(text("Load from Flash").size(10))
+                button(text("Load from Flash").size(small))
                     .on_press(ConfigEditorMessage::LoadFromFlash)
                     .padding([4, 8])
                     .width(Length::Fill),
-                button(text("Reset to Default").size(10))
+                button(text("Reset to Default").size(small))
                     .on_press(ConfigEditorMessage::ResetToDefault)
                     .padding([4, 8])
                     .width(Length::Fill),
@@ -555,19 +560,21 @@ impl ConfigEditor {
                             .as_deref()
                             .unwrap_or("Select a category")
                     )
-                    .size(14),
+                    .size(large),
                     Space::with_width(Length::Fill),
                     if self.has_unsaved_changes {
-                        text("* Modified").size(10).style(iced::theme::Text::Color(
-                            iced::Color::from_rgb(0.9, 0.7, 0.0),
-                        ))
+                        text("* Modified")
+                            .size(small)
+                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                                0.9, 0.7, 0.0,
+                            )))
                     } else {
-                        text("").size(10)
+                        text("").size(small)
                     },
                 ]
                 .align_items(iced::Alignment::Center),
                 row![
-                    button(text("Apply All").size(10))
+                    button(text("Apply All").size(small))
                         .on_press(ConfigEditorMessage::SaveAllChanges)
                         .padding([4, 10])
                         .style(if self.has_unsaved_changes {
@@ -575,19 +582,21 @@ impl ConfigEditor {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    button(text("Revert").size(10))
+                    button(text("Revert").size(small))
                         .on_press(ConfigEditorMessage::RevertChanges)
                         .padding([4, 8]),
-                    button(text("Refresh").size(10))
+                    button(text("Refresh").size(small))
                         .on_press(ConfigEditorMessage::RefreshCategory)
                         .padding([4, 8]),
                     Space::with_width(10),
-                    text_input("Filter...", &self.search_filter)
+                    text("Filter:").size(small),
+                    text_input("filter...", &self.search_filter)
                         .on_input(ConfigEditorMessage::SearchChanged)
-                        .size(11)
+                        .size(normal)
                         .width(Length::Fixed(120.0)),
                 ]
-                .spacing(5),
+                .spacing(5)
+                .align_items(iced::Alignment::Center),
             ]
             .spacing(5),
         )
@@ -595,11 +604,11 @@ impl ConfigEditor {
 
         let options_list: Element<'_, ConfigEditorMessage> = if self.current_items.is_empty() {
             container(if self.is_loading {
-                text("Loading...").size(12)
+                text("Loading...").size(normal)
             } else if self.selected_category.is_some() {
-                text("No items in this category").size(12)
+                text("No items in this category").size(normal)
             } else {
-                text("Select a category from the left").size(12)
+                text("Select a category from the left").size(normal)
             })
             .padding(20)
             .center_x()
@@ -618,7 +627,7 @@ impl ConfigEditor {
 
             let items: Vec<Element<'_, ConfigEditorMessage>> = filtered_items
                 .iter()
-                .map(|opt| self.view_option(opt))
+                .map(|opt| self.view_option(opt, font_size))
                 .collect();
 
             scrollable(
@@ -640,40 +649,39 @@ impl ConfigEditor {
         // === BOTTOM: Status bar ===
         let pending_count: usize = self.pending_changes.values().map(|v| v.len()).sum();
 
-        let status_bar = container(
-            row![
-                if let Some(err) = &self.error_message {
-                    text(err)
-                        .size(11)
-                        .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                            0.9, 0.3, 0.3,
-                        )))
-                } else if let Some(status) = &self.status_message {
-                    text(status).size(11)
-                } else {
-                    text("").size(11)
-                },
-                Space::with_width(Length::Fill),
-                text(format!("{} items", self.current_items.len())).size(11),
-                Space::with_width(10),
-                if pending_count > 0 {
-                    text(format!("{} pending", pending_count)).size(11)
-                } else {
-                    text("").size(11)
-                },
-                Space::with_width(10),
-                if self.is_loading {
-                    text("Loading...").size(11)
-                } else {
-                    text("").size(11)
-                },
-            ]
-            .align_items(iced::Alignment::Center),
-        )
-        .padding([5, 10]);
+        let status_bar =
+            container(
+                row![
+                    if let Some(err) = &self.error_message {
+                        text(err).size(normal).style(iced::theme::Text::Color(
+                            iced::Color::from_rgb(0.9, 0.3, 0.3),
+                        ))
+                    } else if let Some(status) = &self.status_message {
+                        text(status).size(normal)
+                    } else {
+                        text("").size(normal)
+                    },
+                    Space::with_width(Length::Fill),
+                    text(format!("{} items", self.current_items.len())).size(normal),
+                    Space::with_width(10),
+                    if pending_count > 0 {
+                        text(format!("{} pending", pending_count)).size(normal)
+                    } else {
+                        text("").size(normal)
+                    },
+                    Space::with_width(10),
+                    if self.is_loading {
+                        text("Loading...").size(normal)
+                    } else {
+                        text("").size(normal)
+                    },
+                ]
+                .align_items(iced::Alignment::Center),
+            )
+            .padding([5, 10]);
 
         column![
-            text("CONFIGURATION EDITOR").size(16),
+            text("CONFIGURATION EDITOR").size(header),
             horizontal_rule(1),
             row![left_pane, vertical_rule(1), right_pane].height(Length::Fill),
             horizontal_rule(1),
@@ -684,20 +692,23 @@ impl ConfigEditor {
         .into()
     }
 
-    fn view_option(&self, opt: &ConfigOption) -> Element<'_, ConfigEditorMessage> {
+    fn view_option(&self, opt: &ConfigOption, font_size: u32) -> Element<'_, ConfigEditorMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+
         let is_modified = self.is_item_modified(&opt.category, &opt.name);
 
         let name_row = row![
-            text(&opt.name).size(12),
+            text(&opt.name).size(normal),
             Space::with_width(5),
             if is_modified {
                 text("*")
-                    .size(12)
+                    .size(normal)
                     .style(iced::theme::Text::Color(iced::Color::from_rgb(
                         0.9, 0.7, 0.0,
                     )))
             } else {
-                text("").size(12)
+                text("").size(normal)
             },
         ]
         .align_items(iced::Alignment::Center);
@@ -705,128 +716,127 @@ impl ConfigEditor {
         let default_text = if let Some(details) = &opt.details {
             if let Some(default) = &details.default {
                 text(format!("Default: {}", format_value(default)))
-                    .size(10)
+                    .size(small)
                     .style(iced::theme::Text::Color(iced::Color::from_rgb(
                         0.1, 0.1, 0.1,
                     )))
             } else {
-                text("").size(10)
+                text("").size(small)
             }
         } else {
-            text("").size(10)
+            text("").size(small)
         };
 
         let category = opt.category.clone();
         let name = opt.name.clone();
 
-        let control: Element<'_, ConfigEditorMessage> =
-            match &opt.option_type {
-                ConfigOptionType::Enum => {
-                    let options = opt
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.options.clone())
-                        .unwrap_or_default();
-                    let current_value = opt.current_value.as_str().map(|s| s.to_string());
-                    let cat = category.clone();
-                    let n = name.clone();
+        let control: Element<'_, ConfigEditorMessage> = match &opt.option_type {
+            ConfigOptionType::Enum => {
+                let options = opt
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.options.clone())
+                    .unwrap_or_default();
+                let current_value = opt.current_value.as_str().map(|s| s.to_string());
+                let cat = category.clone();
+                let n = name.clone();
 
-                    if options.is_empty() {
-                        let val = current_value.unwrap_or_default();
-                        text_input("", &val)
-                            .on_input(move |v| {
-                                ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
-                            })
-                            .size(11)
-                            .width(Length::Fixed(250.0))
-                            .into()
-                    } else {
-                        pick_list(options, current_value, move |v| {
-                            ConfigEditorMessage::EnumValueChanged(cat.clone(), n.clone(), v)
-                        })
-                        .text_size(11)
-                        .width(Length::Fixed(250.0))
-                        .into()
-                    }
-                }
-
-                ConfigOptionType::Integer => {
-                    let current_value = opt.current_value.as_i64().unwrap_or(0);
-                    let (min, max) = if let Some(details) = &opt.details {
-                        (details.min.unwrap_or(0), details.max.unwrap_or(100))
-                    } else {
-                        (0, 100)
-                    };
-                    let format = opt
-                        .details
-                        .as_ref()
-                        .and_then(|d| d.format.clone())
-                        .unwrap_or_else(|| "%d".to_string());
-                    let cat = category.clone();
-                    let n = name.clone();
-
-                    let unit = if format.contains("dB") {
-                        " dB"
-                    } else if format.ends_with('%') {
-                        "%"
-                    } else {
-                        ""
-                    };
-
-                    row![
-                        slider(min as f64..=max as f64, current_value as f64, move |v| {
-                            ConfigEditorMessage::IntValueChanged(cat.clone(), n.clone(), v as i64)
-                        })
-                        .step(1.0)
-                        .width(Length::Fixed(150.0)),
-                        Space::with_width(10),
-                        text(format!("{}{}", current_value, unit)).size(11),
-                        Space::with_width(10),
-                        text(format!("[{} - {}]", min, max)).size(10).style(
-                            iced::theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))
-                        ),
-                    ]
-                    .spacing(5)
-                    .align_items(iced::Alignment::Center)
-                    .into()
-                }
-
-                ConfigOptionType::Bool => {
-                    let current_str = opt.current_value.as_str().unwrap_or("");
-                    let current_value = matches!(
-                        current_str.to_lowercase().as_str(),
-                        "enabled" | "yes" | "on" | "true" | "1"
-                    );
-                    let cat = category.clone();
-                    let n = name.clone();
-
-                    row![
-                        toggler(String::new(), current_value, move |v| {
-                            ConfigEditorMessage::BoolValueChanged(cat.clone(), n.clone(), v)
-                        })
-                        .size(18),
-                        Space::with_width(10),
-                        text(if current_value { "Yes" } else { "No" }).size(11),
-                    ]
-                    .spacing(5)
-                    .align_items(iced::Alignment::Center)
-                    .into()
-                }
-
-                ConfigOptionType::String | ConfigOptionType::Unknown => {
-                    let current_value = format_value(&opt.current_value);
-                    let cat = category.clone();
-                    let n = name.clone();
-
-                    text_input("", &current_value)
+                if options.is_empty() {
+                    let val = current_value.unwrap_or_default();
+                    text_input("", &val)
                         .on_input(move |v| {
                             ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
                         })
-                        .size(11)
+                        .size(normal)
                         .width(Length::Fixed(250.0))
                         .into()
+                } else {
+                    pick_list(options, current_value, move |v| {
+                        ConfigEditorMessage::EnumValueChanged(cat.clone(), n.clone(), v)
+                    })
+                    .text_size(normal)
+                    .width(Length::Fixed(250.0))
+                    .into()
                 }
-            };
+            }
+
+            ConfigOptionType::Integer => {
+                let current_value = opt.current_value.as_i64().unwrap_or(0);
+                let (min, max) = if let Some(details) = &opt.details {
+                    (details.min.unwrap_or(0), details.max.unwrap_or(100))
+                } else {
+                    (0, 100)
+                };
+                let format = opt
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.format.clone())
+                    .unwrap_or_else(|| "%d".to_string());
+                let cat = category.clone();
+                let n = name.clone();
+
+                let unit = if format.contains("dB") {
+                    " dB"
+                } else if format.ends_with('%') {
+                    "%"
+                } else {
+                    ""
+                };
+
+                row![
+                    slider(min as f64..=max as f64, current_value as f64, move |v| {
+                        ConfigEditorMessage::IntValueChanged(cat.clone(), n.clone(), v as i64)
+                    })
+                    .step(1.0)
+                    .width(Length::Fixed(150.0)),
+                    Space::with_width(10),
+                    text(format!("{}{}", current_value, unit)).size(normal),
+                    Space::with_width(10),
+                    text(format!("[{} - {}]", min, max)).size(small).style(
+                        iced::theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))
+                    ),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center)
+                .into()
+            }
+
+            ConfigOptionType::Bool => {
+                let current_str = opt.current_value.as_str().unwrap_or("");
+                let current_value = matches!(
+                    current_str.to_lowercase().as_str(),
+                    "enabled" | "yes" | "on" | "true" | "1"
+                );
+                let cat = category.clone();
+                let n = name.clone();
+
+                row![
+                    toggler(String::new(), current_value, move |v| {
+                        ConfigEditorMessage::BoolValueChanged(cat.clone(), n.clone(), v)
+                    })
+                    .size(18),
+                    Space::with_width(10),
+                    text(if current_value { "Yes" } else { "No" }).size(normal),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center)
+                .into()
+            }
+
+            ConfigOptionType::String | ConfigOptionType::Unknown => {
+                let current_value = format_value(&opt.current_value);
+                let cat = category.clone();
+                let n = name.clone();
+
+                text_input("", &current_value)
+                    .on_input(move |v| {
+                        ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
+                    })
+                    .size(normal)
+                    .width(Length::Fixed(250.0))
+                    .into()
+            }
+        };
 
         container(column![name_row, default_text, control,].spacing(3))
             .padding([8, 10])

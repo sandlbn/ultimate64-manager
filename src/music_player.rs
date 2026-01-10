@@ -271,7 +271,7 @@ impl MusicPlayer {
         match message {
             // === Playback Controls ===
             MusicPlayerMessage::Play => {
-                // If paused, just update state (main.rs will call resume API)
+                // If paused, just update state
                 if self.playback_state == PlaybackState::Paused {
                     if let Some(idx) = self.current_playing {
                         if let Some(entry) = self.playlist.get(idx) {
@@ -952,7 +952,12 @@ impl MusicPlayer {
         }
     }
 
-    pub fn view(&self) -> Element<'_, MusicPlayerMessage> {
+    pub fn view(&self, font_size: u32) -> Element<'_, MusicPlayerMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let large = (font_size + 2) as u16;
+        let header = (font_size + 4) as u16;
+
         // === TOP: Now playing info ===
         let now_playing_text = if let Some(idx) = self.current_playing {
             if let Some(entry) = self.playlist.get(idx) {
@@ -977,7 +982,7 @@ impl MusicPlayer {
             "No track selected".to_string()
         };
 
-        let now_playing = text(&now_playing_text).size(14);
+        let now_playing = text(&now_playing_text).size(large);
 
         // Time display
         let remaining = self
@@ -992,16 +997,16 @@ impl MusicPlayer {
             remaining / 60,
             remaining % 60
         ))
-        .size(12);
+        .size(normal);
 
         // Transport buttons - separate file and subsong navigation
         let transport = row![
             // File navigation
-            button(text("|<").size(12))
+            button(text("|<").size(normal))
                 .on_press(MusicPlayerMessage::PreviousFile)
                 .padding([4, 8]),
             // Subsong navigation
-            button(text("<<").size(12))
+            button(text("<<").size(normal))
                 .on_press(MusicPlayerMessage::PreviousSubsong)
                 .padding([4, 6]),
             button(
@@ -1010,7 +1015,7 @@ impl MusicPlayer {
                 } else {
                     "Play"
                 })
-                .size(12)
+                .size(normal)
             )
             .on_press(if self.playback_state == PlaybackState::Playing {
                 MusicPlayerMessage::Pause
@@ -1018,15 +1023,15 @@ impl MusicPlayer {
                 MusicPlayerMessage::Play
             })
             .padding([4, 12]),
-            button(text("Stop").size(12))
+            button(text("Stop").size(normal))
                 .on_press(MusicPlayerMessage::Stop)
                 .padding([4, 8]),
             // Subsong navigation
-            button(text(">>").size(12))
+            button(text(">>").size(normal))
                 .on_press(MusicPlayerMessage::NextSubsong)
                 .padding([4, 6]),
             // File navigation
-            button(text(">|").size(12))
+            button(text(">|").size(normal))
                 .on_press(MusicPlayerMessage::NextFile)
                 .padding([4, 8]),
             // Subsong indicator
@@ -1034,7 +1039,7 @@ impl MusicPlayer {
                 "Tune {}/{}",
                 self.current_subsong, self.max_subsongs
             ))
-            .size(11),
+            .size(normal),
         ]
         .spacing(5)
         .align_items(iced::Alignment::Center);
@@ -1047,7 +1052,7 @@ impl MusicPlayer {
                 } else {
                     "Shuffle"
                 })
-                .size(10)
+                .size(small)
             )
             .on_press(MusicPlayerMessage::ToggleShuffle)
             .padding([3, 6])
@@ -1062,7 +1067,7 @@ impl MusicPlayer {
                 } else {
                     "Repeat"
                 })
-                .size(10)
+                .size(small)
             )
             .on_press(MusicPlayerMessage::ToggleRepeat)
             .padding([3, 6])
@@ -1104,39 +1109,39 @@ impl MusicPlayer {
 
         let browser_header = container(
             column![
-                text("LOCAL FILES").size(12),
+                text("LOCAL FILES").size(normal),
                 row![
-                    button(text("Browse").size(10))
+                    button(text("Browse").size(small))
                         .on_press(MusicPlayerMessage::SelectDirectory)
                         .padding([3, 8]),
-                    button(text("Up").size(10))
+                    button(text("Up").size(small))
                         .on_press(MusicPlayerMessage::NavigateUp)
                         .padding([3, 8]),
-                    button(text("Refresh").size(10))
+                    button(text("Refresh").size(small))
                         .on_press(MusicPlayerMessage::RefreshBrowser)
                         .padding([3, 8]),
-                    button(text("Add All").size(10))
+                    button(text("Add All").size(small))
                         .on_press(MusicPlayerMessage::AddAllToPlaylist)
                         .padding([3, 8]),
                     Space::with_width(Length::Fill),
-                    text("Filter:").size(10),
+                    text("Filter:").size(small),
                     text_input("filter...", &self.browser_filter)
                         .on_input(MusicPlayerMessage::BrowserFilterChanged)
-                        .size(10)
+                        .size(small)
                         .padding(4)
                         .width(Length::Fixed(100.0)),
                 ]
                 .spacing(5)
                 .align_items(iced::Alignment::Center),
-                text(&dir_display).size(10),
-                text(format!("{} music files", music_file_count)).size(10),
+                text(&dir_display).size(small),
+                text(format!("{} music files", music_file_count)).size(small),
             ]
             .spacing(5),
         )
         .padding(10);
 
         let browser_list: Element<'_, MusicPlayerMessage> = if self.browser_entries.is_empty() {
-            container(text("Empty directory").size(11))
+            container(text("Empty directory").size(normal))
                 .padding(10)
                 .into()
         } else {
@@ -1163,7 +1168,7 @@ impl MusicPlayer {
                         BrowserEntryType::Directory => {
                             // Directory entry - click to navigate
                             row![
-                                button(text(format!("[DIR] {}", entry.name)).size(11))
+                                button(text(format!("[DIR] {}", entry.name)).size(normal))
                                     .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                     .padding([6, 8])
                                     .width(Length::Fill)
@@ -1189,7 +1194,8 @@ impl MusicPlayer {
 
                             row![
                                 button(
-                                    text(format!("{}{} {}", icon, subsong_info, display)).size(11)
+                                    text(format!("{}{} {}", icon, subsong_info, display))
+                                        .size(normal)
                                 )
                                 .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                 .padding([6, 8])
@@ -1199,10 +1205,10 @@ impl MusicPlayer {
                                 } else {
                                     iced::theme::Button::Text
                                 }),
-                                button(text(">").size(10))
+                                button(text(">").size(small))
                                     .on_press(MusicPlayerMessage::AddAndPlay(*idx))
                                     .padding([4, 8]),
-                                button(text("+").size(10))
+                                button(text("+").size(small))
                                     .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
                                     .padding([4, 8]),
                             ]
@@ -1233,19 +1239,19 @@ impl MusicPlayer {
         // === RIGHT PANE: Playlist ===
         let playlist_header = container(
             column![
-                text("PLAYLIST").size(12),
+                text("PLAYLIST").size(normal),
                 row![
                     text_input("Playlist name", &self.playlist_name)
                         .on_input(MusicPlayerMessage::PlaylistNameChanged)
-                        .size(10)
+                        .size(small)
                         .width(Length::Fixed(120.0)),
-                    button(text("Save").size(10))
+                    button(text("Save").size(small))
                         .on_press(MusicPlayerMessage::SavePlaylist)
                         .padding([3, 6]),
-                    button(text("Load").size(10))
+                    button(text("Load").size(small))
                         .on_press(MusicPlayerMessage::LoadPlaylist)
                         .padding([3, 6]),
-                    button(text("Clear").size(10))
+                    button(text("Clear").size(small))
                         .on_press(MusicPlayerMessage::ClearPlaylist)
                         .padding([3, 6]),
                 ]
@@ -1255,14 +1261,14 @@ impl MusicPlayer {
                     self.playlist.len(),
                     format_total_duration(&self.playlist, self.default_song_duration)
                 ))
-                .size(10),
+                .size(small),
             ]
             .spacing(5),
         )
         .padding(10);
 
         let playlist_list: Element<'_, MusicPlayerMessage> = if self.playlist.is_empty() {
-            container(text("Playlist is empty\nDouble-click files to add and play").size(11))
+            container(text("Playlist is empty\nDouble-click files to add and play").size(normal))
                 .padding(10)
                 .into()
         } else {
@@ -1312,7 +1318,9 @@ impl MusicPlayer {
                     } else {
                         entry.name.clone()
                     };
-                    let name = truncate_string(&display_name, 25);
+                    let name = truncate_string(&display_name, 50);
+
+                    let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 
                     row![
                         button(
@@ -1320,7 +1328,7 @@ impl MusicPlayer {
                                 "{} [{}{}] {} ({})",
                                 prefix, icon, subsong_info, name, duration_str
                             ))
-                            .size(10)
+                            .size(small)
                         )
                         .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
                         .padding([6, 8])
@@ -1330,13 +1338,13 @@ impl MusicPlayer {
                         } else {
                             iced::theme::Button::Text
                         }),
-                        button(text("^").size(9))
+                        button(text("^").size(tiny))
                             .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
                             .padding([4, 6]),
-                        button(text("v").size(9))
+                        button(text("v").size(tiny))
                             .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
                             .padding([4, 6]),
-                        button(text("X").size(9))
+                        button(text("X").size(tiny))
                             .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
                             .padding([4, 6]),
                     ]
@@ -1358,7 +1366,7 @@ impl MusicPlayer {
         // Play selected button
         let playlist_controls = container(if let Some(selected) = self.playlist_selected {
             row![
-                button(text("Play Selected").size(10))
+                button(text("Play Selected").size(small))
                     .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
                     .padding([4, 10]),
             ]
@@ -1388,16 +1396,16 @@ impl MusicPlayer {
 
         let db_controls = container(
             row![
-                text("Song Lengths:").size(10),
-                button(text("Download HVSC").size(10))
+                text("Song Lengths:").size(small),
+                button(text("Download HVSC").size(small))
                     .on_press(MusicPlayerMessage::DownloadSongLengths)
                     .padding([3, 8]),
-                button(text("Load File").size(10))
+                button(text("Load File").size(small))
                     .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
                     .padding([3, 8]),
-                text(&db_status).size(10),
+                text(&db_status).size(small),
                 Space::with_width(Length::Fill),
-                text(&self.status_message).size(10),
+                text(&self.status_message).size(small),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center),
@@ -1408,7 +1416,7 @@ impl MusicPlayer {
         let main_content = row![browser_pane, vertical_rule(1), playlist_pane].height(Length::Fill);
 
         column![
-            text("MUSIC PLAYER").size(16),
+            text("MUSIC PLAYER").size(header),
             horizontal_rule(1),
             top_bar,
             horizontal_rule(1),

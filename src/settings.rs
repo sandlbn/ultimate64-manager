@@ -35,6 +35,12 @@ pub struct Preferences {
     pub show_hidden_files: bool,
     #[serde(default = "default_song_duration")]
     pub default_song_duration: u32, // Default duration for songs without known length (in seconds)
+    #[serde(default = "default_font_size")]
+    pub font_size: u32, // Base font size for UI elements
+}
+
+fn default_font_size() -> u32 {
+    12
 }
 
 fn default_song_duration() -> u32 {
@@ -60,6 +66,7 @@ impl Default for AppSettings {
                 default_mount_mode: String::from("readwrite"),
                 show_hidden_files: false,
                 default_song_duration: 180, // 3 minutes
+                font_size: 12,
             },
         }
     }

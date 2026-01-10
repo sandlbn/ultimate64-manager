@@ -291,7 +291,11 @@ impl FileBrowser {
         &self.current_directory
     }
 
-    pub fn view(&self) -> Element<'_, FileBrowserMessage> {
+    pub fn view(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
         // Current path display (truncated if too long)
         let path_str = self.current_directory.to_string_lossy();
         let display_path = if path_str.len() > 40 {
@@ -303,7 +307,7 @@ impl FileBrowser {
         // Navigation buttons with filter
         let nav_buttons = row![
             tooltip(
-                button(text("Up").size(11))
+                button(text("Up").size(normal))
                     .on_press(FileBrowserMessage::NavigateUp)
                     .padding([4, 8]),
                 "Go to parent folder",
@@ -311,7 +315,7 @@ impl FileBrowser {
             )
             .style(iced::theme::Container::Box),
             tooltip(
-                button(text("Browse").size(11))
+                button(text("Browse").size(normal))
                     .on_press(FileBrowserMessage::SelectDirectory)
                     .padding([4, 8]),
                 "Choose a different folder",
@@ -319,10 +323,10 @@ impl FileBrowser {
             )
             .style(iced::theme::Container::Box),
             Space::with_width(Length::Fill),
-            text("Filter:").size(10),
+            text("Filter:").size(small),
             text_input("filter...", &self.filter)
                 .on_input(FileBrowserMessage::FilterChanged)
-                .size(11)
+                .size(normal)
                 .padding(4)
                 .width(Length::Fixed(100.0)),
         ]
@@ -330,11 +334,11 @@ impl FileBrowser {
         .align_items(iced::Alignment::Center);
 
         // Path display
-        let path_display = text(display_path).size(11);
+        let path_display = text(display_path).size(normal);
 
         // Drive selection and selection controls
         let controls_row = row![
-            text("Mount:").size(10),
+            text("Mount:").size(small),
             tooltip(
                 pick_list(
                     DriveOption::get_all(),
@@ -342,7 +346,7 @@ impl FileBrowser {
                     FileBrowserMessage::DriveSelected,
                 )
                 .placeholder("Drive")
-                .text_size(11)
+                .text_size(normal)
                 .width(Length::Fixed(95.0)),
                 "Select target drive for mounting disks",
                 tooltip::Position::Bottom,
@@ -350,7 +354,7 @@ impl FileBrowser {
             .style(iced::theme::Container::Box),
             Space::with_width(10),
             tooltip(
-                button(text("All").size(9))
+                button(text("All").size(tiny))
                     .on_press(FileBrowserMessage::SelectAll)
                     .padding([2, 6]),
                 "Select all files",
@@ -358,7 +362,7 @@ impl FileBrowser {
             )
             .style(iced::theme::Container::Box),
             tooltip(
-                button(text("None").size(9))
+                button(text("None").size(tiny))
                     .on_press(FileBrowserMessage::SelectNone)
                     .padding([2, 6]),
                 "Deselect all files",
@@ -366,7 +370,7 @@ impl FileBrowser {
             )
             .style(iced::theme::Container::Box),
             Space::with_width(Length::Fill),
-            text(format!("{} files", self.files.len())).size(10),
+            text(format!("{} files", self.files.len())).size(small),
         ]
         .spacing(5)
         .align_items(iced::Alignment::Center);
@@ -374,9 +378,9 @@ impl FileBrowser {
         // Checked count
         let checked_count = self.checked_files.len();
         let selection_info = if checked_count > 0 {
-            text(format!("{} selected", checked_count)).size(10)
+            text(format!("{} selected", checked_count)).size(small)
         } else {
-            text("").size(10)
+            text("").size(small)
         };
 
         // Filter files based on filter text
@@ -396,7 +400,7 @@ impl FileBrowser {
                 // Add divider between rows
                 file_list.push(horizontal_rule(1).into());
             }
-            file_list.push(self.view_file_entry(*entry));
+            file_list.push(self.view_file_entry(*entry, font_size));
         }
 
         let scrollable_list = scrollable(
@@ -408,9 +412,9 @@ impl FileBrowser {
 
         // Status message
         let status = if let Some(msg) = &self.status_message {
-            text(msg).size(10)
+            text(msg).size(small)
         } else {
-            text("").size(10)
+            text("").size(small)
         };
 
         column![
@@ -426,7 +430,15 @@ impl FileBrowser {
         .into()
     }
 
-    fn view_file_entry(&self, entry: &FileEntry) -> Element<'_, FileBrowserMessage> {
+    fn view_file_entry(
+        &self,
+        entry: &FileEntry,
+        font_size: u32,
+    ) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
         let is_checked = self.checked_files.contains(&entry.path);
 
         // File type label
@@ -456,7 +468,7 @@ impl FileBrowser {
         let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
             // Directory - click to enter
             tooltip(
-                button(text("Open").size(10))
+                button(text("Open").size(small))
                     .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
                     .padding([2, 8]),
                 "Open folder",
@@ -477,38 +489,38 @@ impl FileBrowser {
                     };
                     row![
                         tooltip(
-                            button(text("Run").size(10))
+                            button(text("Run").size(small))
                                 .on_press(FileBrowserMessage::RunDisk(
                                     entry.path.clone(),
                                     self.selected_drive.to_drive_string(),
                                 ))
                                 .padding([2, 5]),
                             text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
-                                .size(11),
+                                .size(normal),
                             tooltip::Position::Top,
                         )
                         .style(iced::theme::Container::Box),
                         tooltip(
-                            button(text(format!("{}:RW", drive)).size(10))
+                            button(text(format!("{}:RW", drive)).size(small))
                                 .on_press(FileBrowserMessage::MountDisk(
                                     entry.path.clone(),
                                     self.selected_drive.to_drive_string(),
                                     MountMode::ReadWrite,
                                 ))
                                 .padding([2, 5]),
-                            text(format!("Mount as Drive {} (Read/Write)", drive_num)).size(11),
+                            text(format!("Mount as Drive {} (Read/Write)", drive_num)).size(normal),
                             tooltip::Position::Top,
                         )
                         .style(iced::theme::Container::Box),
                         tooltip(
-                            button(text(format!("{}:RO", drive)).size(10))
+                            button(text(format!("{}:RO", drive)).size(small))
                                 .on_press(FileBrowserMessage::MountDisk(
                                     entry.path.clone(),
                                     self.selected_drive.to_drive_string(),
                                     MountMode::ReadOnly,
                                 ))
                                 .padding([2, 5]),
-                            text(format!("Mount as Drive {} (Read Only)", drive_num)).size(11),
+                            text(format!("Mount as Drive {} (Read Only)", drive_num)).size(normal),
                             tooltip::Position::Top,
                         )
                         .style(iced::theme::Container::Box),
@@ -517,7 +529,7 @@ impl FileBrowser {
                     .into()
                 }
                 Some("prg") | Some("crt") => tooltip(
-                    button(text("Run").size(10))
+                    button(text("Run").size(small))
                         .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone()))
                         .padding([2, 10]),
                     "Load and run on Ultimate64",
@@ -546,13 +558,13 @@ impl FileBrowser {
             // Checkbox (only for files, not dirs)
             checkbox_element,
             // Clickable filename (truncated)
-            button(text(&display_name).size(11))
+            button(text(&display_name).size(normal))
                 .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
                 .padding([4, 6])
                 .width(Length::Fill)
                 .style(iced::theme::Button::Text),
             // Type label
-            text(type_label).size(9).width(Length::Fixed(28.0)),
+            text(type_label).size(tiny).width(Length::Fixed(28.0)),
             // Action button
             action_button,
         ]
