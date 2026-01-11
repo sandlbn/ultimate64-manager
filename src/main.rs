@@ -22,6 +22,7 @@ mod music_player;
 mod remote_browser;
 mod settings;
 mod streaming;
+mod telnet;
 mod templates;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
@@ -780,6 +781,8 @@ impl Application for Ultimate64Browser {
                 self.status.device_info = None;
                 self.status.mounted_disks.clear();
                 self.remote_browser.set_host(None, None);
+                // Clear telnet host for video streaming control
+                self.video_streaming.set_telnet_host(None);
                 self.user_message = Some(UserMessage::Info(
                     "Disconnected from Ultimate64".to_string(),
                 ));
@@ -1786,6 +1789,9 @@ impl Ultimate64Browser {
                 // Don't set connected = true here - let StatusUpdated verify the connection
                 self.remote_browser
                     .set_host(Some(http_url), self.settings.connection.password.clone());
+                // Set telnet host for video streaming control
+                self.video_streaming
+                    .set_telnet_host(Some(self.settings.connection.host.clone()));
                 self.user_message = Some(UserMessage::Info(format!(
                     "Connecting to {}...",
                     self.settings.connection.host
