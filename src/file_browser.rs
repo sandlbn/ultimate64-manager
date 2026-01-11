@@ -341,8 +341,8 @@ impl FileBrowser {
 
         // Current path display (truncated if too long)
         let path_str = self.current_directory.to_string_lossy();
-        let display_path = if path_str.len() > 40 {
-            format!("...{}", &path_str[path_str.len() - 37..])
+        let display_path = if path_str.len() > 45 {
+            format!("...{}", &path_str[path_str.len() - 43..])
         } else {
             path_str.to_string()
         };
@@ -611,7 +611,7 @@ impl FileBrowser {
         };
 
         // Truncate long filenames
-        let max_name_len = 32;
+        let max_name_len = 45;
         let display_name = if entry.name.len() > max_name_len {
             format!("{}...", &entry.name[..max_name_len - 3])
         } else {
@@ -732,15 +732,30 @@ impl FileBrowser {
             .size(16)
             .into();
 
+        // Wrap filename in tooltip if truncated to show full name
+        let filename_button = button(text(&display_name).size(normal))
+            .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
+            .padding([4, 6])
+            .width(Length::Fill)
+            .style(iced::theme::Button::Text);
+
+        let filename_element: Element<'_, FileBrowserMessage> = if entry.name.len() > max_name_len {
+            tooltip(
+                filename_button,
+                text(&entry.name).size(normal),
+                tooltip::Position::Top,
+            )
+            .style(iced::theme::Container::Box)
+            .into()
+        } else {
+            filename_button.into()
+        };
+
         let file_row = row![
             // Checkbox (only for files, not dirs)
             checkbox_element,
-            // Clickable filename (truncated)
-            button(text(&display_name).size(normal))
-                .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
-                .padding([4, 6])
-                .width(Length::Fill)
-                .style(iced::theme::Button::Text),
+            // Clickable filename (truncated, with tooltip if needed)
+            filename_element,
             // Type label
             text(type_label).size(tiny).width(Length::Fixed(28.0)),
             // Action button
