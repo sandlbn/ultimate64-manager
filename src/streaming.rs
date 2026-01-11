@@ -28,7 +28,6 @@ pub const VIC_HEIGHT: u32 = 272;
 // Audio constants
 const AUDIO_PORT_OFFSET: u16 = 1; // Audio port = video port + 1
 const AUDIO_SAMPLE_RATE: u32 = 48000; // Output sample rate (what cpal uses)
-const AUDIO_CHANNELS: u16 = 2;
 // const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
@@ -1480,37 +1479,68 @@ impl VideoStreaming {
                 }
             }
 
-            // Try to get a supported config, preferring f32 format
-            // Priority: f32 (Mac/most compatible) > i16 (Windows) > any format
+            // Try to get a supported config, preferring f32 format and stereo
+            // 1. Stereo (2ch) with f32 format ->
+            // 2. Stereo (2ch) with any format ->
+            // 3. Multi-channel (4-8ch) with f32 - upmix stereo to front L/R ->
+            // 4. Multi-channel with any format ->
             let supported_config = match device.supported_output_configs() {
                 Ok(configs) => {
                     let configs_vec: Vec<_> = configs.collect();
 
-                    // First try: f32 with matching channels and sample rate
+                    // Helper to check sample rate compatibility
+                    let rate_ok = |c: &&cpal::SupportedStreamConfigRange| {
+                        c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
+                            && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                    };
+
+                    // First try: stereo (2ch) with f32
                     configs_vec
                         .iter()
                         .find(|c| {
-                            c.channels() == AUDIO_CHANNELS
-                                && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
-                                && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                            c.channels() == 2
+                                && rate_ok(c)
                                 && c.sample_format() == cpal::SampleFormat::F32
                         })
                         .or_else(|| {
-                            // Second try: i16 with matching channels and sample rate
+                            // Second try: stereo with i16
                             configs_vec.iter().find(|c| {
-                                c.channels() == AUDIO_CHANNELS
-                                    && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
-                                    && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                                c.channels() == 2
+                                    && rate_ok(c)
                                     && c.sample_format() == cpal::SampleFormat::I16
                             })
                         })
                         .or_else(|| {
-                            // Third try: any format with matching channels and sample rate
+                            // Third try: stereo with any format
+                            configs_vec.iter().find(|c| c.channels() == 2 && rate_ok(c))
+                        })
+                        .or_else(|| {
+                            // Fourth try: multi-channel (4-8ch) with f32 - we'll upmix
                             configs_vec.iter().find(|c| {
-                                c.channels() == AUDIO_CHANNELS
-                                    && c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
-                                    && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
+                                c.channels() >= 4
+                                    && c.channels() <= 8
+                                    && rate_ok(c)
+                                    && c.sample_format() == cpal::SampleFormat::F32
                             })
+                        })
+                        .or_else(|| {
+                            // Fifth try: multi-channel with i16
+                            configs_vec.iter().find(|c| {
+                                c.channels() >= 4
+                                    && c.channels() <= 8
+                                    && rate_ok(c)
+                                    && c.sample_format() == cpal::SampleFormat::I16
+                            })
+                        })
+                        .or_else(|| {
+                            // Sixth try: multi-channel with any format
+                            configs_vec
+                                .iter()
+                                .find(|c| c.channels() >= 4 && c.channels() <= 8 && rate_ok(c))
+                        })
+                        .or_else(|| {
+                            // Last resort: any config that supports our sample rate
+                            configs_vec.iter().find(|c| rate_ok(c))
                         })
                         .cloned()
                         .map(|c| c.with_sample_rate(cpal::SampleRate(AUDIO_SAMPLE_RATE)))
@@ -1527,17 +1557,13 @@ impl VideoStreaming {
                     (c.config(), c.sample_format())
                 }
                 None => {
-                    log::warn!("No matching config found, trying default f32 config");
-                    (
-                        cpal::StreamConfig {
-                            channels: AUDIO_CHANNELS,
-                            sample_rate: cpal::SampleRate(AUDIO_SAMPLE_RATE),
-                            buffer_size: cpal::BufferSize::Default,
-                        },
-                        cpal::SampleFormat::F32,
-                    )
+                    log::error!("No compatible audio config found - audio will not work");
+                    return;
                 }
             };
+
+            // Track output channel count for upmixing stereo -> N channels
+            let output_channels = stream_config.channels as usize;
 
             log::info!(
                 "Audio stream config: {} channels, {} Hz, format: {:?}, buffer: {:?}",
@@ -1572,11 +1598,28 @@ impl VideoStreaming {
                                     }
                                 }
 
-                                // Normal playback - consume samples from buffer
-                                for sample in data.iter_mut() {
-                                    *sample = state.samples.pop_front().unwrap_or(0.0);
+                                // Handle multi-channel output by upmixing stereo
+                                // Stereo source goes to channels 0 (L) and 1 (R), rest get silence
+                                if output_channels == 2 {
+                                    // Standard stereo - consume samples directly
+                                    for sample in data.iter_mut() {
+                                        *sample = state.samples.pop_front().unwrap_or(0.0);
+                                    }
+                                } else {
+                                    // Multi-channel: upmix stereo to front L/R only
+                                    // Standard channel layout: 0=FL, 1=FR, 2=FC, 3=LFE, 4=RL, 5=RR, ...
+                                    for frame in data.chunks_mut(output_channels) {
+                                        let left = state.samples.pop_front().unwrap_or(0.0);
+                                        let right = state.samples.pop_front().unwrap_or(0.0);
+                                        // Front Left and Front Right get the stereo signal
+                                        if frame.len() > 0 { frame[0] = left; }
+                                        if frame.len() > 1 { frame[1] = right; }
+                                        // All other channels get silence
+                                        for ch in frame.iter_mut().skip(2) {
+                                            *ch = 0.0;
+                                        }
+                                    }
                                 }
-
                                 // Log warning if buffer is getting low (potential underrun)
                                 if state.samples.len() < JITTER_BUFFER_MIN_SAMPLES / 2 {
                                     log::trace!(
@@ -1606,7 +1649,6 @@ impl VideoStreaming {
                         &stream_config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                             if let Ok(mut state) = consumer.lock() {
-                                // Jitter buffer: wait until we have enough samples before starting playback
                                 if !state.buffering_complete {
                                     if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
                                         state.buffering_complete = true;
@@ -1615,7 +1657,6 @@ impl VideoStreaming {
                                             state.samples.len()
                                         );
                                     } else {
-                                        // Still buffering, output silence
                                         for sample in data.iter_mut() {
                                             *sample = 0;
                                         }
@@ -1623,11 +1664,28 @@ impl VideoStreaming {
                                     }
                                 }
 
-                                // Normal playback - consume samples from buffer
-                                for sample in data.iter_mut() {
-                                    // Convert f32 back to i16
-                                    let f = state.samples.pop_front().unwrap_or(0.0);
-                                    *sample = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                // Handle multi-channel output
+                                if output_channels == 2 {
+                                    for sample in data.iter_mut() {
+                                        let f = state.samples.pop_front().unwrap_or(0.0);
+                                        *sample = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                    }
+                                } else {
+                                    // Multi-channel: upmix stereo to front L/R only
+                                    for frame in data.chunks_mut(output_channels) {
+                                        let left = state.samples.pop_front().unwrap_or(0.0);
+                                        let right = state.samples.pop_front().unwrap_or(0.0);
+
+                                        if frame.len() > 0 {
+                                            frame[0] = (left * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                        }
+                                        if frame.len() > 1 {
+                                            frame[1] = (right * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                        }
+                                        for ch in frame.iter_mut().skip(2) {
+                                            *ch = 0;
+                                        }
+                                    }
                                 }
                             } else {
                                 for sample in data.iter_mut() {
@@ -1651,7 +1709,6 @@ impl VideoStreaming {
                         &stream_config,
                         move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
                             if let Ok(mut state) = consumer.lock() {
-                                // Jitter buffer: wait until we have enough samples before starting playback
                                 if !state.buffering_complete {
                                     if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
                                         state.buffering_complete = true;
@@ -1660,23 +1717,40 @@ impl VideoStreaming {
                                             state.samples.len()
                                         );
                                     } else {
-                                        // Still buffering, output silence
                                         for sample in data.iter_mut() {
-                                            *sample = 32768; // Silence for unsigned
+                                            *sample = 32768;
                                         }
                                         return;
                                     }
                                 }
 
-                                // Normal playback - consume samples from buffer
-                                for sample in data.iter_mut() {
-                                    // Convert f32 (-1.0 to 1.0) to u16 (0 to 65535)
-                                    let f = state.samples.pop_front().unwrap_or(0.0);
-                                    *sample = ((f + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                // Handle multi-channel output
+                                if output_channels == 2 {
+                                    for sample in data.iter_mut() {
+                                        let f = state.samples.pop_front().unwrap_or(0.0);
+                                        *sample = ((f + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                    }
+                                } else {
+                                    // Multi-channel: upmix stereo to front L/R only
+                                    for frame in data.chunks_mut(output_channels) {
+                                        let left = state.samples.pop_front().unwrap_or(0.0);
+                                        let right = state.samples.pop_front().unwrap_or(0.0);
+
+                                        if frame.len() > 0 {
+                                            frame[0] = ((left + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                        }
+                                        if frame.len() > 1 {
+                                            frame[1] = ((right + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                        }
+                                        // 32768 is silence for u16 audio
+                                        for ch in frame.iter_mut().skip(2) {
+                                            *ch = 32768;
+                                        }
+                                    }
                                 }
                             } else {
                                 for sample in data.iter_mut() {
-                                    *sample = 32768; // Silence for unsigned
+                                    *sample = 32768;
                                 }
                             }
                         },
