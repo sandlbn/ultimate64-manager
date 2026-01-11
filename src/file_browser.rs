@@ -1,8 +1,8 @@
 use iced::{
     Command, Element, Length,
     widget::{
-        Column, Space, button, checkbox, column, horizontal_rule, pick_list, row, scrollable, text,
-        text_input, tooltip,
+        Column, Space, button, checkbox, column, container, horizontal_rule, pick_list, row,
+        scrollable, text, text_input, tooltip,
     },
 };
 use std::collections::HashSet;
@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::{Rest, drives::MountMode};
+
+use crate::disk_image::{self, DiskInfo, FileType};
 
 /// Timeout for REST API operations to prevent hangs when device goes offline
 const REST_TIMEOUT_SECS: u64 = 5;
@@ -35,6 +37,10 @@ pub enum FileBrowserMessage {
     DriveSelected(DriveOption),
     NavigateToPath(PathBuf),
     FilterChanged(String),
+    // Disk info popup
+    ShowDiskInfo(PathBuf),
+    DiskInfoLoaded(Result<DiskInfo, String>),
+    CloseDiskInfo,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +89,10 @@ pub struct FileBrowser {
     selected_drive: DriveOption,
     status_message: Option<String>,
     filter: String,
+    // Disk info popup state
+    disk_info_popup: Option<DiskInfo>,
+    disk_info_path: Option<PathBuf>,
+    disk_info_loading: bool,
 }
 
 impl FileBrowser {
@@ -102,6 +112,9 @@ impl FileBrowser {
             selected_drive: DriveOption::A,
             status_message: None,
             filter: String::new(),
+            disk_info_popup: None,
+            disk_info_path: None,
+            disk_info_loading: false,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -275,6 +288,33 @@ impl FileBrowser {
                 self.filter = value;
                 Command::none()
             }
+            // Disk info popup messages
+            FileBrowserMessage::ShowDiskInfo(path) => {
+                self.disk_info_loading = true;
+                self.disk_info_path = Some(path.clone());
+                Command::perform(
+                    async move { load_disk_info_async(path).await },
+                    FileBrowserMessage::DiskInfoLoaded,
+                )
+            }
+            FileBrowserMessage::DiskInfoLoaded(result) => {
+                self.disk_info_loading = false;
+                match result {
+                    Ok(info) => {
+                        self.disk_info_popup = Some(info);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed to read disk: {}", e));
+                        self.disk_info_path = None;
+                    }
+                }
+                Command::none()
+            }
+            FileBrowserMessage::CloseDiskInfo => {
+                self.disk_info_popup = None;
+                self.disk_info_path = None;
+                Command::none()
+            }
         }
     }
     #[allow(dead_code)]
@@ -386,50 +426,161 @@ impl FileBrowser {
             text("").size(small)
         };
 
-        // Filter files based on filter text
-        let filtered_files: Vec<&FileEntry> = self
-            .files
-            .iter()
-            .filter(|f| {
-                self.filter.is_empty()
-                    || f.name.to_lowercase().contains(&self.filter.to_lowercase())
-            })
-            .collect();
-
-        // File list with row dividers
-        let mut file_list: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
-        for (i, entry) in filtered_files.iter().enumerate() {
-            if i > 0 {
-                // Add divider between rows
-                file_list.push(horizontal_rule(1).into());
-            }
-            file_list.push(self.view_file_entry(*entry, font_size));
-        }
-
-        let scrollable_list = scrollable(
-            Column::with_children(file_list)
-                .spacing(0)
-                .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
-        )
-        .height(Length::Fill);
-
         // Status message
-        let status = if let Some(msg) = &self.status_message {
+        let status = if self.disk_info_loading {
+            text("Loading disk info...").size(small)
+        } else if let Some(msg) = &self.status_message {
             text(msg).size(small)
         } else {
             text("").size(small)
         };
 
-        column![
-            path_display,
-            nav_buttons,
-            controls_row,
-            selection_info,
-            scrollable_list,
-            status,
+        // If disk info popup is open, show it instead of the file list
+        if let Some(disk_info) = &self.disk_info_popup {
+            let popup = self.view_disk_info_popup(disk_info, font_size);
+
+            column![
+                path_display,
+                nav_buttons,
+                controls_row,
+                selection_info,
+                popup,
+                status,
+            ]
+            .spacing(3)
+            .padding(5)
+            .into()
+        } else {
+            // Filter files based on filter text
+            let filtered_files: Vec<&FileEntry> = self
+                .files
+                .iter()
+                .filter(|f| {
+                    self.filter.is_empty()
+                        || f.name.to_lowercase().contains(&self.filter.to_lowercase())
+                })
+                .collect();
+
+            // File list with row dividers
+            let mut file_list: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+            for (i, entry) in filtered_files.iter().enumerate() {
+                if i > 0 {
+                    // Add divider between rows
+                    file_list.push(horizontal_rule(1).into());
+                }
+                file_list.push(self.view_file_entry(*entry, font_size));
+            }
+
+            let scrollable_list = scrollable(
+                Column::with_children(file_list)
+                    .spacing(0)
+                    .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
+            )
+            .height(Length::Fill);
+
+            column![
+                path_display,
+                nav_buttons,
+                controls_row,
+                selection_info,
+                scrollable_list,
+                status,
+            ]
+            .spacing(3)
+            .padding(5)
+            .into()
+        }
+    }
+
+    fn view_disk_info_popup(
+        &self,
+        disk_info: &DiskInfo,
+        font_size: u32,
+    ) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
+        // Header with disk name and close button
+        let header = row![
+            text(format!("{} - ", disk_info.kind)).size(small),
+            text(format!("\"{}\"", disk_info.name)).size(normal),
+            Space::with_width(Length::Fill),
+            text(format!("{} {}", disk_info.disk_id, disk_info.dos_type)).size(small),
+            Space::with_width(10),
+            tooltip(
+                button(text("Close").size(small))
+                    .on_press(FileBrowserMessage::CloseDiskInfo)
+                    .padding([4, 10]),
+                "Close directory listing",
+                tooltip::Position::Left,
+            )
+            .style(iced::theme::Container::Box),
         ]
-        .spacing(3)
-        .padding(5)
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
+
+        // Directory listing
+        let mut listing_items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+
+        for entry in &disk_info.entries {
+            let type_color = match entry.file_type {
+                FileType::Prg => iced::Color::from_rgb(0.5, 0.8, 0.5),
+                FileType::Seq => iced::Color::from_rgb(0.5, 0.5, 0.8),
+                FileType::Rel => iced::Color::from_rgb(0.8, 0.8, 0.5),
+                _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
+            };
+
+            let lock_indicator = if entry.locked { " <" } else { "" };
+            let closed_indicator = if !entry.closed { "*" } else { "" };
+
+            let entry_row = row![
+                text(format!("{:>4}", entry.size_blocks))
+                    .size(tiny)
+                    .width(Length::Fixed(35.0)),
+                text(format!("\"{}\"", entry.name))
+                    .size(tiny)
+                    .width(Length::Fill),
+                text(format!(
+                    "{}{}{}",
+                    closed_indicator, entry.file_type, lock_indicator
+                ))
+                .size(tiny)
+                .style(iced::theme::Text::Color(type_color)),
+            ]
+            .spacing(5)
+            .align_items(iced::Alignment::Center);
+
+            listing_items.push(entry_row.into());
+        }
+
+        // Footer with blocks free
+        let footer = row![
+            text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(small),
+            Space::with_width(Length::Fill),
+            text(format!("{} files", disk_info.entries.len())).size(tiny),
+        ]
+        .spacing(10);
+
+        // Scrollable listing
+        let listing =
+            scrollable(Column::with_children(listing_items).spacing(2)).height(Length::Fill);
+
+        // Popup container with border styling
+        container(
+            column![
+                header,
+                horizontal_rule(1),
+                listing,
+                horizontal_rule(1),
+                footer,
+            ]
+            .spacing(5)
+            .padding(10),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(iced::theme::Container::Box)
         .into()
     }
 
@@ -467,6 +618,9 @@ impl FileBrowser {
             entry.name.clone()
         };
 
+        // Check if this is a disk image that can show info
+        let is_disk_image = matches!(entry.extension.as_deref(), Some("d64") | Some("d71"));
+
         // Action button based on file type
         let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
             // Directory - click to enter
@@ -490,46 +644,71 @@ impl FileBrowser {
                         DriveOption::A => "8",
                         DriveOption::B => "9",
                     };
-                    row![
-                        tooltip(
-                            button(text("Run").size(small))
-                                .on_press(FileBrowserMessage::RunDisk(
-                                    entry.path.clone(),
-                                    self.selected_drive.to_drive_string(),
-                                ))
-                                .padding([2, 5]),
-                            text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
-                                .size(normal),
-                            tooltip::Position::Top,
+
+                    // Build row with optional info button for D64/D71
+                    let mut buttons = row![].spacing(2);
+
+                    // Info button for D64/D71 only
+                    if is_disk_image {
+                        buttons = buttons.push(
+                            tooltip(
+                                button(text("?").size(small))
+                                    .on_press(FileBrowserMessage::ShowDiskInfo(entry.path.clone()))
+                                    .padding([2, 5]),
+                                "Show disk directory listing",
+                                tooltip::Position::Top,
+                            )
+                            .style(iced::theme::Container::Box),
+                        );
+                    }
+
+                    buttons = buttons
+                        .push(
+                            tooltip(
+                                button(text("Run").size(small))
+                                    .on_press(FileBrowserMessage::RunDisk(
+                                        entry.path.clone(),
+                                        self.selected_drive.to_drive_string(),
+                                    ))
+                                    .padding([2, 5]),
+                                text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
+                                    .size(normal),
+                                tooltip::Position::Top,
+                            )
+                            .style(iced::theme::Container::Box),
                         )
-                        .style(iced::theme::Container::Box),
-                        tooltip(
-                            button(text(format!("{}:RW", drive)).size(small))
-                                .on_press(FileBrowserMessage::MountDisk(
-                                    entry.path.clone(),
-                                    self.selected_drive.to_drive_string(),
-                                    MountMode::ReadWrite,
-                                ))
-                                .padding([2, 5]),
-                            text(format!("Mount as Drive {} (Read/Write)", drive_num)).size(normal),
-                            tooltip::Position::Top,
+                        .push(
+                            tooltip(
+                                button(text(format!("{}:RW", drive)).size(small))
+                                    .on_press(FileBrowserMessage::MountDisk(
+                                        entry.path.clone(),
+                                        self.selected_drive.to_drive_string(),
+                                        MountMode::ReadWrite,
+                                    ))
+                                    .padding([2, 5]),
+                                text(format!("Mount as Drive {} (Read/Write)", drive_num))
+                                    .size(normal),
+                                tooltip::Position::Top,
+                            )
+                            .style(iced::theme::Container::Box),
                         )
-                        .style(iced::theme::Container::Box),
-                        tooltip(
-                            button(text(format!("{}:RO", drive)).size(small))
-                                .on_press(FileBrowserMessage::MountDisk(
-                                    entry.path.clone(),
-                                    self.selected_drive.to_drive_string(),
-                                    MountMode::ReadOnly,
-                                ))
-                                .padding([2, 5]),
-                            text(format!("Mount as Drive {} (Read Only)", drive_num)).size(normal),
-                            tooltip::Position::Top,
-                        )
-                        .style(iced::theme::Container::Box),
-                    ]
-                    .spacing(2)
-                    .into()
+                        .push(
+                            tooltip(
+                                button(text(format!("{}:RO", drive)).size(small))
+                                    .on_press(FileBrowserMessage::MountDisk(
+                                        entry.path.clone(),
+                                        self.selected_drive.to_drive_string(),
+                                        MountMode::ReadOnly,
+                                    ))
+                                    .padding([2, 5]),
+                                text(format!("Mount as Drive {} (Read Only)", drive_num))
+                                    .size(normal),
+                                tooltip::Position::Top,
+                            )
+                            .style(iced::theme::Container::Box),
+                        );
+
+                    buttons.into()
                 }
                 Some("prg") | Some("crt") => tooltip(
                     button(text("Run").size(small))
@@ -644,6 +823,13 @@ impl FileBrowser {
 
         log::debug!("Loaded {} items from {}", self.files.len(), path.display());
     }
+}
+
+async fn load_disk_info_async(path: PathBuf) -> Result<DiskInfo, String> {
+    // Run disk reading in blocking task to avoid blocking async runtime
+    tokio::task::spawn_blocking(move || disk_image::read_disk_info(&path))
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
 }
 
 async fn mount_disk_async(

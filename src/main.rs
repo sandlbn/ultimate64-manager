@@ -17,6 +17,7 @@ use url::Host;
 
 mod api;
 mod config_editor;
+mod disk_image;
 mod file_browser;
 mod music_player;
 mod remote_browser;
