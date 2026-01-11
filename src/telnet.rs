@@ -15,24 +15,23 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 /// Read/write timeout in seconds
 const IO_TIMEOUT_SECS: u64 = 2;
 
-// ANSI escape sequences for menu navigation
-const F1_KEY_VT100: &[u8] = b"\x1bOP";
-const F1_KEY_XTERM: &[u8] = b"\x1b[11~";
-const F1_KEY_LINUX: &[u8] = b"\x1b[[A";
-const F5_KEY: &[u8] = b"\x1b[15~";
-const ENTER_KEY: &[u8] = b"\r";
-const ESC_KEY: &[u8] = b"\x1b";
-const DOWN_ARROW: &[u8] = b"\x1b[B";
-const UP_ARROW: &[u8] = b"\x1b[A";
-const RIGHT_ARROW: &[u8] = b"\x1b[C";
-#[allow(dead_code)] // Disable and enable when we will have full telnet support
-const LEFT_ARROW: &[u8] = b"\x1b[D";
+// ANSI escape sequences for menu navigation (public for UI use)
+pub const F1_KEY_VT100: &[u8] = b"\x1bOP";
+pub const F1_KEY_XTERM: &[u8] = b"\x1b[11~";
+pub const F1_KEY_LINUX: &[u8] = b"\x1b[[A";
+pub const F5_KEY: &[u8] = b"\x1b[15~";
+pub const ENTER_KEY: &[u8] = b"\r";
+pub const ESC_KEY: &[u8] = b"\x1b";
+pub const DOWN_ARROW: &[u8] = b"\x1b[B";
+pub const UP_ARROW: &[u8] = b"\x1b[A";
+pub const RIGHT_ARROW: &[u8] = b"\x1b[C";
+pub const LEFT_ARROW: &[u8] = b"\x1b[D";
 
 /// Represents a menu item with its name and position
 #[derive(Debug, Clone)]
-struct MenuItem {
-    name: String,
-    position: usize,
+pub struct MenuItem {
+    pub name: String,
+    pub position: usize,
 }
 
 /// Result type for telnet operations
@@ -85,19 +84,19 @@ impl MenuNavigator {
     }
 
     /// Send a key sequence
-    fn send_key(&mut self, key: &[u8]) -> TelnetResult<()> {
+    pub fn send_key(&mut self, key: &[u8]) -> TelnetResult<()> {
         self.stream
             .write_all(key)
             .map_err(|e| format!("Telnet write failed: {}", e))?;
         self.stream
             .flush()
             .map_err(|e| format!("Telnet flush failed: {}", e))?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
         Ok(())
     }
 
     /// Read response from telnet
-    fn read_response(&mut self) -> TelnetResult<String> {
+    pub fn read_response(&mut self) -> TelnetResult<String> {
         let mut buffer = vec![0u8; 4096];
         let mut response = Vec::new();
 
@@ -118,7 +117,7 @@ impl MenuNavigator {
     }
 
     /// Strip ANSI codes from text
-    fn strip_ansi(text: &str) -> String {
+    pub fn strip_ansi(text: &str) -> String {
         // Simple ANSI stripping - handles most common escape sequences
         let mut result = String::new();
         let mut chars = text.chars().peekable();
@@ -159,7 +158,7 @@ impl MenuNavigator {
     }
 
     /// Parse menu items from screen output
-    fn parse_menu_items(&self, text: &str) -> Vec<MenuItem> {
+    pub fn parse_menu_items(&self, text: &str) -> Vec<MenuItem> {
         let cleaned = Self::strip_ansi(text);
         let mut items = Vec::new();
 
@@ -268,7 +267,7 @@ impl MenuNavigator {
     /// Tries multiple key sequences to support different board types:
     /// - Ultimate64: F1 key
     /// - Elite II: F5 key
-    fn open_menu(&mut self) -> TelnetResult<Vec<MenuItem>> {
+    pub fn open_menu(&mut self) -> TelnetResult<Vec<MenuItem>> {
         log::debug!("Telnet: Opening menu...");
 
         // Try different F1 escape sequences (for Ultimate64)
@@ -281,7 +280,7 @@ impl MenuNavigator {
         for (seq, name) in f1_sequences {
             log::trace!("Telnet: Trying {}...", name);
             self.send_key(seq)?;
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(500));
 
             let response = self.read_response()?;
             let items = self.parse_menu_items(&response);
@@ -301,7 +300,7 @@ impl MenuNavigator {
         // Try F5 as fallback (for Elite II)
         log::debug!("Telnet: F1 variants didn't work, trying F5 (Elite II)...");
         self.send_key(F5_KEY)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(500));
 
         let response = self.read_response()?;
         let items = self.parse_menu_items(&response);
@@ -318,7 +317,7 @@ impl MenuNavigator {
     }
 
     /// Find menu item by name (case-insensitive, partial match)
-    fn find_item(&self, name: &str) -> Option<&MenuItem> {
+    pub fn find_item(&self, name: &str) -> Option<&MenuItem> {
         let name_lower = name.to_lowercase();
 
         // Try exact match first
@@ -338,7 +337,7 @@ impl MenuNavigator {
     }
 
     /// Navigate to a menu item by name
-    fn navigate_to(&mut self, name: &str) -> TelnetResult<()> {
+    pub fn navigate_to(&mut self, name: &str) -> TelnetResult<()> {
         let target_position = self
             .find_item(name)
             .ok_or_else(|| {
@@ -365,12 +364,12 @@ impl MenuNavigator {
         if moves > 0 {
             for _ in 0..moves {
                 self.send_key(DOWN_ARROW)?;
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
             }
         } else if moves < 0 {
             for _ in 0..moves.abs() {
                 self.send_key(UP_ARROW)?;
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(100));
             }
         }
 
@@ -381,10 +380,10 @@ impl MenuNavigator {
     }
 
     /// Open submenu (press right arrow) and parse its items
-    fn open_submenu(&mut self) -> TelnetResult<Vec<MenuItem>> {
+    pub fn open_submenu(&mut self) -> TelnetResult<Vec<MenuItem>> {
         log::debug!("Telnet: Opening submenu...");
         self.send_key(RIGHT_ARROW)?;
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(400));
 
         let response = self.read_response()?;
         let items = self.parse_menu_items(&response);
@@ -397,39 +396,86 @@ impl MenuNavigator {
     }
 
     /// Press enter
-    fn press_enter(&mut self) -> TelnetResult<String> {
+    pub fn press_enter(&mut self) -> TelnetResult<String> {
         log::debug!("Telnet: Pressing ENTER...");
         self.send_key(ENTER_KEY)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(400));
         self.read_response()
     }
 
     /// Press enter twice (for confirming dialogs)
-    fn press_enter_twice(&mut self) -> TelnetResult<String> {
+    pub fn press_enter_twice(&mut self) -> TelnetResult<String> {
         log::debug!("Telnet: Pressing ENTER twice...");
         self.send_key(ENTER_KEY)?;
         std::thread::sleep(Duration::from_millis(300));
         self.send_key(ENTER_KEY)?;
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(400));
         self.read_response()
     }
 
     /// Press escape to close menu
-    fn close_menu(&mut self) -> TelnetResult<()> {
+    pub fn close_menu(&mut self) -> TelnetResult<()> {
         log::debug!("Telnet: Closing menu...");
         self.send_key(ESC_KEY)?;
         let _ = self.read_response();
         Ok(())
     }
 
-    /// Go back (press left arrow) for now disable to use for full implementation
-    #[allow(dead_code)]
-    fn go_back(&mut self) -> TelnetResult<()> {
+    /// Go back (press left arrow)
+    pub fn go_back(&mut self) -> TelnetResult<()> {
         log::debug!("Telnet: Going back...");
         self.send_key(LEFT_ARROW)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
         let _ = self.read_response();
         Ok(())
+    }
+
+    /// Get current position in menu
+    pub fn current_position(&self) -> usize {
+        self.current_position
+    }
+
+    /// Get current menu items
+    pub fn current_menu_items(&self) -> &[MenuItem] {
+        &self.current_menu_items
+    }
+
+    /// Send a key and read the response
+    pub fn send_key_and_read(&mut self, key: &[u8]) -> TelnetResult<String> {
+        self.send_key(key)?;
+        std::thread::sleep(Duration::from_millis(150));
+        self.read_response()
+    }
+
+    /// Navigate to a position by index (relative movement from current position)
+    pub fn navigate_to_position(&mut self, target: usize) -> TelnetResult<()> {
+        let moves = target as i32 - self.current_position as i32;
+
+        if moves > 0 {
+            for _ in 0..moves {
+                self.send_key(DOWN_ARROW)?;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        } else if moves < 0 {
+            for _ in 0..moves.abs() {
+                self.send_key(UP_ARROW)?;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+
+        self.current_position = target;
+        let _ = self.read_response();
+        Ok(())
+    }
+
+    /// Set the current position (for tracking without movement)
+    pub fn set_position(&mut self, pos: usize) {
+        self.current_position = pos;
+    }
+
+    /// Reset position to 0 (e.g., after directory change)
+    pub fn reset_position(&mut self) {
+        self.current_position = 0;
     }
 }
 
@@ -569,7 +615,7 @@ pub fn enable_all_streams(host: &str) -> TelnetResult<()> {
     log::info!("Telnet: VIC Stream enabled");
 
     // Wait a moment for the menu to settle
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(500));
 
     // === Enable Audio Stream ===
     // After enabling VIC Stream, menu has closed, so re-open everything
@@ -634,8 +680,9 @@ pub fn disable_all_streams(host: &str) -> TelnetResult<()> {
     log::info!("Telnet: VIC Stream disabled");
 
     // Wait a moment for the menu to settle
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(500));
 
+    // === Disable Audio Stream ===
     // After disabling VIC Stream, menu has closed, so re-open everything
     let items = nav.open_menu()?;
     if items.is_empty() {
@@ -664,6 +711,20 @@ pub fn disable_all_streams(host: &str) -> TelnetResult<()> {
 
     log::info!("Telnet: All streams disabled successfully");
     Ok(())
+}
+
+/// Check if telnet connection to the host is possible
+pub fn check_connection(host: &str) -> TelnetResult<bool> {
+    match MenuNavigator::new(host) {
+        Ok(_) => {
+            log::debug!("Telnet: Connection to {} successful", host);
+            Ok(true)
+        }
+        Err(e) => {
+            log::debug!("Telnet: Connection to {} failed: {}", host, e);
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(test)]

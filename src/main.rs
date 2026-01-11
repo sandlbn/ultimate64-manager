@@ -23,6 +23,7 @@ mod remote_browser;
 mod settings;
 mod streaming;
 mod telnet;
+mod telnet_ui;
 mod templates;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
@@ -139,6 +140,9 @@ pub enum Message {
     Streaming(StreamingMessage),
     ExitFullscreen,
 
+    // Telnet UI
+    TelnetUi(telnet_ui::TelnetUiMessage),
+
     // Machine control
     ResetMachine,
     RebootMachine,
@@ -166,6 +170,7 @@ pub enum Tab {
     MusicPlayer,
     VideoViewer,
     Configuration,
+    TelnetNav,
     Settings,
 }
 
@@ -176,6 +181,7 @@ impl std::fmt::Display for Tab {
             Tab::MusicPlayer => write!(f, "Music Player"),
             Tab::VideoViewer => write!(f, "Video Viewer"),
             Tab::Configuration => write!(f, "Configuration"),
+            Tab::TelnetNav => write!(f, "Telnet"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -227,6 +233,9 @@ pub struct Ultimate64Browser {
 
     // Video streaming
     video_streaming: VideoStreaming,
+
+    // Telnet UI for menu navigation
+    telnet_ui: telnet_ui::TelnetUi,
 }
 
 impl Application for Ultimate64Browser {
@@ -279,6 +288,7 @@ impl Application for Ultimate64Browser {
             },
             user_message: None,
             video_streaming: VideoStreaming::new(),
+            telnet_ui: telnet_ui::TelnetUi::new(),
         };
 
         // Auto-connect if host is configured
@@ -994,6 +1004,8 @@ impl Application for Ultimate64Browser {
                 Command::none()
             }
 
+            Message::TelnetUi(msg) => self.telnet_ui.update(msg).map(Message::TelnetUi),
+
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -1257,6 +1269,7 @@ impl Application for Ultimate64Browser {
                 self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
                 self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
                 self.tab_button("CONFIG", Tab::Configuration),
+                self.tab_button("TELNET", Tab::TelnetNav),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -1275,6 +1288,7 @@ impl Application for Ultimate64Browser {
                 .config_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::ConfigEditor),
+            Tab::TelnetNav => self.telnet_ui.view().map(Message::TelnetUi),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)
@@ -1792,6 +1806,9 @@ impl Ultimate64Browser {
                 // Set telnet host for video streaming control
                 self.video_streaming
                     .set_telnet_host(Some(self.settings.connection.host.clone()));
+                // Set telnet host for telnet UI
+                self.telnet_ui
+                    .set_host(self.settings.connection.host.clone());
                 self.user_message = Some(UserMessage::Info(format!(
                     "Connecting to {}...",
                     self.settings.connection.host
