@@ -1266,21 +1266,36 @@ impl MusicPlayer {
                                 String::new()
                             };
 
-                            let display = truncate_string(&entry.name, 28);
+                            let max_name_len = 40;
+                            let display = truncate_string(&entry.name, max_name_len);
+                            let is_truncated = entry.name.chars().count() > max_name_len;
+
+                            let file_button = button(
+                                text(format!("{}{} {}", icon, subsong_info, display)).size(normal),
+                            )
+                            .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
+                            .padding([6, 8])
+                            .width(Length::Fill)
+                            .style(if is_selected {
+                                iced::theme::Button::Primary
+                            } else {
+                                iced::theme::Button::Text
+                            });
+
+                            let file_element: Element<'_, MusicPlayerMessage> = if is_truncated {
+                                tooltip(
+                                    file_button,
+                                    text(&entry.name).size(normal),
+                                    tooltip::Position::Top,
+                                )
+                                .style(iced::theme::Container::Box)
+                                .into()
+                            } else {
+                                file_button.into()
+                            };
 
                             row![
-                                button(
-                                    text(format!("{}{} {}", icon, subsong_info, display))
-                                        .size(normal)
-                                )
-                                .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
-                                .padding([6, 8])
-                                .width(Length::Fill)
-                                .style(if is_selected {
-                                    iced::theme::Button::Primary
-                                } else {
-                                    iced::theme::Button::Text
-                                }),
+                                file_element,
                                 tooltip(
                                     button(text(">").size(small))
                                         .on_press(MusicPlayerMessage::AddAndPlay(*idx))
@@ -1419,26 +1434,42 @@ impl MusicPlayer {
                     } else {
                         entry.name.clone()
                     };
-                    let name = truncate_string(&display_name, 25);
+                    let max_name_len = 40;
+                    let name = truncate_string(&display_name, max_name_len);
+                    let is_truncated = display_name.chars().count() > max_name_len;
 
                     let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 
-                    row![
-                        button(
-                            text(format!(
-                                "{} [{}{}] {} ({})",
-                                prefix, icon, subsong_info, name, duration_str
-                            ))
-                            .size(small)
+                    let playlist_button = button(
+                        text(format!(
+                            "{} [{}{}] {} ({})",
+                            prefix, icon, subsong_info, name, duration_str
+                        ))
+                        .size(small),
+                    )
+                    .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .style(if is_selected || is_playing {
+                        iced::theme::Button::Primary
+                    } else {
+                        iced::theme::Button::Text
+                    });
+
+                    let playlist_element: Element<'_, MusicPlayerMessage> = if is_truncated {
+                        tooltip(
+                            playlist_button,
+                            text(&display_name).size(small),
+                            tooltip::Position::Top,
                         )
-                        .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
-                        .padding([6, 8])
-                        .width(Length::Fill)
-                        .style(if is_selected || is_playing {
-                            iced::theme::Button::Primary
-                        } else {
-                            iced::theme::Button::Text
-                        }),
+                        .style(iced::theme::Container::Box)
+                        .into()
+                    } else {
+                        playlist_button.into()
+                    };
+
+                    row![
+                        playlist_element,
                         tooltip(
                             button(text("^").size(tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))

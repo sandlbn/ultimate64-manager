@@ -484,8 +484,6 @@ impl RemoteBrowser {
                     items.push(horizontal_rule(1).into());
                 }
 
-                let is_selected = self.selected_file.as_ref() == Some(&entry.path);
-
                 // File type label
                 let type_label = if entry.is_dir {
                     ""
@@ -494,7 +492,7 @@ impl RemoteBrowser {
                 };
 
                 // Truncate long filenames
-                let max_name_len = 28;
+                let max_name_len = 45;
                 let display_name = if entry.name.len() > max_name_len {
                     format!("{}...", &entry.name[..max_name_len - 3])
                 } else {
@@ -615,13 +613,29 @@ impl RemoteBrowser {
                     iced::widget::Space::with_width(0).into()
                 };
 
+                // Wrap filename in tooltip if truncated to show full name
+                let is_truncated = entry.name.len() > max_name_len;
+                let filename_button = button(text(&display_name).size(normal))
+                    .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
+                    .padding([4, 6])
+                    .width(Length::Fill)
+                    .style(iced::theme::Button::Text);
+
+                let filename_element: Element<'_, RemoteBrowserMessage> = if is_truncated {
+                    tooltip(
+                        filename_button,
+                        text(&entry.name).size(normal),
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else {
+                    filename_button.into()
+                };
+
                 let file_row = row![
-                    // Clickable filename
-                    button(text(&display_name).size(normal))
-                        .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
-                        .padding([4, 6])
-                        .width(Length::Fill)
-                        .style(iced::theme::Button::Text),
+                    // Clickable filename (with tooltip if truncated)
+                    filename_element,
                     // Type label
                     text(type_label).size(tiny).width(Length::Fixed(28.0)),
                     // Action button
@@ -631,17 +645,12 @@ impl RemoteBrowser {
                 .align_items(iced::Alignment::Center)
                 .padding([2, 4]);
 
-                if is_selected {
-                    items.push(column![file_row].width(Length::Fill).into());
-                } else {
-                    items.push(file_row.into());
-                }
+                items.push(file_row.into());
             }
 
             scrollable(
                 Column::with_children(items)
                     .spacing(0)
-                    .width(Length::Fill)
                     .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
             )
             .height(Length::Fill)
