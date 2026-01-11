@@ -2,7 +2,7 @@ use iced::{
     Command, Element, Length, Subscription,
     widget::{
         Column, Space, button, column, container, horizontal_rule, progress_bar, row, scrollable,
-        text, text_input, vertical_rule,
+        text, text_input, tooltip, vertical_rule,
     },
 };
 use rand::seq::SliceRandom;
@@ -1014,38 +1014,72 @@ impl MusicPlayer {
         // Transport buttons - separate file and subsong navigation
         let transport = row![
             // File navigation
-            button(text("|<").size(normal))
-                .on_press(MusicPlayerMessage::PreviousFile)
-                .padding([4, 8]),
-            // Subsong navigation
-            button(text("<<").size(normal))
-                .on_press(MusicPlayerMessage::PreviousSubsong)
-                .padding([4, 6]),
-            button(
-                text(if self.playback_state == PlaybackState::Playing {
-                    "Pause"
-                } else {
-                    "Play"
-                })
-                .size(normal)
+            tooltip(
+                button(text("|<").size(normal))
+                    .on_press(MusicPlayerMessage::PreviousFile)
+                    .padding([4, 8]),
+                "Previous file in playlist",
+                tooltip::Position::Bottom,
             )
-            .on_press(if self.playback_state == PlaybackState::Playing {
-                MusicPlayerMessage::Pause
-            } else {
-                MusicPlayerMessage::Play
-            })
-            .padding([4, 12]),
-            button(text("Stop").size(normal))
-                .on_press(MusicPlayerMessage::Stop)
-                .padding([4, 8]),
+            .style(iced::theme::Container::Box),
             // Subsong navigation
-            button(text(">>").size(normal))
-                .on_press(MusicPlayerMessage::NextSubsong)
-                .padding([4, 6]),
+            tooltip(
+                button(text("<<").size(normal))
+                    .on_press(MusicPlayerMessage::PreviousSubsong)
+                    .padding([4, 6]),
+                "Previous subsong within current file",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(
+                    text(if self.playback_state == PlaybackState::Playing {
+                        "Pause"
+                    } else {
+                        "Play"
+                    })
+                    .size(normal)
+                )
+                .on_press(if self.playback_state == PlaybackState::Playing {
+                    MusicPlayerMessage::Pause
+                } else {
+                    MusicPlayerMessage::Play
+                })
+                .padding([4, 12]),
+                if self.playback_state == PlaybackState::Playing {
+                    "Pause playback"
+                } else {
+                    "Start or resume playback"
+                },
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(text("Stop").size(normal))
+                    .on_press(MusicPlayerMessage::Stop)
+                    .padding([4, 8]),
+                "Stop playback and reset to beginning",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            // Subsong navigation
+            tooltip(
+                button(text(">>").size(normal))
+                    .on_press(MusicPlayerMessage::NextSubsong)
+                    .padding([4, 6]),
+                "Next subsong within current file",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
             // File navigation
-            button(text(">|").size(normal))
-                .on_press(MusicPlayerMessage::NextFile)
-                .padding([4, 8]),
+            tooltip(
+                button(text(">|").size(normal))
+                    .on_press(MusicPlayerMessage::NextFile)
+                    .padding([4, 8]),
+                "Next file in playlist",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
             // Subsong indicator
             text(format!(
                 "Tune {}/{}",
@@ -1058,36 +1092,46 @@ impl MusicPlayer {
 
         // Mode toggles
         let modes = row![
-            button(
-                text(if self.shuffle_enabled {
-                    "Shuffle: ON"
+            tooltip(
+                button(
+                    text(if self.shuffle_enabled {
+                        "Shuffle: ON"
+                    } else {
+                        "Shuffle"
+                    })
+                    .size(small)
+                )
+                .on_press(MusicPlayerMessage::ToggleShuffle)
+                .padding([3, 6])
+                .style(if self.shuffle_enabled {
+                    iced::theme::Button::Primary
                 } else {
-                    "Shuffle"
-                })
-                .size(small)
+                    iced::theme::Button::Secondary
+                }),
+                "Randomize playlist order",
+                tooltip::Position::Bottom,
             )
-            .on_press(MusicPlayerMessage::ToggleShuffle)
-            .padding([3, 6])
-            .style(if self.shuffle_enabled {
-                iced::theme::Button::Primary
-            } else {
-                iced::theme::Button::Secondary
-            }),
-            button(
-                text(if self.repeat_enabled {
-                    "Repeat: ON"
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(
+                    text(if self.repeat_enabled {
+                        "Repeat: ON"
+                    } else {
+                        "Repeat"
+                    })
+                    .size(small)
+                )
+                .on_press(MusicPlayerMessage::ToggleRepeat)
+                .padding([3, 6])
+                .style(if self.repeat_enabled {
+                    iced::theme::Button::Primary
                 } else {
-                    "Repeat"
-                })
-                .size(small)
+                    iced::theme::Button::Secondary
+                }),
+                "Repeat playlist when finished",
+                tooltip::Position::Bottom,
             )
-            .on_press(MusicPlayerMessage::ToggleRepeat)
-            .padding([3, 6])
-            .style(if self.repeat_enabled {
-                iced::theme::Button::Primary
-            } else {
-                iced::theme::Button::Secondary
-            }),
+            .style(iced::theme::Container::Box),
         ]
         .spacing(5);
 
@@ -1123,18 +1167,38 @@ impl MusicPlayer {
             column![
                 text("LOCAL FILES").size(normal),
                 row![
-                    button(text("Browse").size(small))
-                        .on_press(MusicPlayerMessage::SelectDirectory)
-                        .padding([3, 8]),
-                    button(text("Up").size(small))
-                        .on_press(MusicPlayerMessage::NavigateUp)
-                        .padding([3, 8]),
-                    button(text("Refresh").size(small))
-                        .on_press(MusicPlayerMessage::RefreshBrowser)
-                        .padding([3, 8]),
-                    button(text("Add All").size(small))
-                        .on_press(MusicPlayerMessage::AddAllToPlaylist)
-                        .padding([3, 8]),
+                    tooltip(
+                        button(text("Browse").size(small))
+                            .on_press(MusicPlayerMessage::SelectDirectory)
+                            .padding([3, 8]),
+                        "Select a directory to browse",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Up").size(small))
+                            .on_press(MusicPlayerMessage::NavigateUp)
+                            .padding([3, 8]),
+                        "Go to parent directory",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Refresh").size(small))
+                            .on_press(MusicPlayerMessage::RefreshBrowser)
+                            .padding([3, 8]),
+                        "Refresh current directory listing",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Add All").size(small))
+                            .on_press(MusicPlayerMessage::AddAllToPlaylist)
+                            .padding([3, 8]),
+                        "Add all music files from current directory to playlist",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
                     Space::with_width(Length::Fill),
                     text("Filter:").size(small),
                     text_input("filter...", &self.browser_filter)
@@ -1217,12 +1281,22 @@ impl MusicPlayer {
                                 } else {
                                     iced::theme::Button::Text
                                 }),
-                                button(text(">").size(small))
-                                    .on_press(MusicPlayerMessage::AddAndPlay(*idx))
-                                    .padding([4, 8]),
-                                button(text("+").size(small))
-                                    .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
-                                    .padding([4, 8]),
+                                tooltip(
+                                    button(text(">").size(small))
+                                        .on_press(MusicPlayerMessage::AddAndPlay(*idx))
+                                        .padding([4, 8]),
+                                    "Add to playlist and play immediately",
+                                    tooltip::Position::Bottom,
+                                )
+                                .style(iced::theme::Container::Box),
+                                tooltip(
+                                    button(text("+").size(small))
+                                        .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
+                                        .padding([4, 8]),
+                                    "Add to playlist",
+                                    tooltip::Position::Bottom,
+                                )
+                                .style(iced::theme::Container::Box),
                             ]
                             .spacing(4)
                             .align_items(iced::Alignment::Center)
@@ -1257,15 +1331,30 @@ impl MusicPlayer {
                         .on_input(MusicPlayerMessage::PlaylistNameChanged)
                         .size(small)
                         .width(Length::Fixed(120.0)),
-                    button(text("Save").size(small))
-                        .on_press(MusicPlayerMessage::SavePlaylist)
-                        .padding([3, 6]),
-                    button(text("Load").size(small))
-                        .on_press(MusicPlayerMessage::LoadPlaylist)
-                        .padding([3, 6]),
-                    button(text("Clear").size(small))
-                        .on_press(MusicPlayerMessage::ClearPlaylist)
-                        .padding([3, 6]),
+                    tooltip(
+                        button(text("Save").size(small))
+                            .on_press(MusicPlayerMessage::SavePlaylist)
+                            .padding([3, 6]),
+                        "Save playlist to a JSON file",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Load").size(small))
+                            .on_press(MusicPlayerMessage::LoadPlaylist)
+                            .padding([3, 6]),
+                        "Load playlist from a JSON file",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Clear").size(small))
+                            .on_press(MusicPlayerMessage::ClearPlaylist)
+                            .padding([3, 6]),
+                        "Remove all items from playlist",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
                 ]
                 .spacing(5),
                 text(format!(
@@ -1350,15 +1439,30 @@ impl MusicPlayer {
                         } else {
                             iced::theme::Button::Text
                         }),
-                        button(text("^").size(tiny))
-                            .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
-                            .padding([4, 6]),
-                        button(text("v").size(tiny))
-                            .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
-                            .padding([4, 6]),
-                        button(text("X").size(tiny))
-                            .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
-                            .padding([4, 6]),
+                        tooltip(
+                            button(text("^").size(tiny))
+                                .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
+                                .padding([4, 6]),
+                            "Move up in playlist",
+                            tooltip::Position::Bottom,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
+                            button(text("v").size(tiny))
+                                .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
+                                .padding([4, 6]),
+                            "Move down in playlist",
+                            tooltip::Position::Bottom,
+                        )
+                        .style(iced::theme::Container::Box),
+                        tooltip(
+                            button(text("X").size(tiny))
+                                .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
+                                .padding([4, 6]),
+                            "Remove from playlist",
+                            tooltip::Position::Bottom,
+                        )
+                        .style(iced::theme::Container::Box),
                     ]
                     .spacing(2)
                     .align_items(iced::Alignment::Center)
@@ -1378,9 +1482,14 @@ impl MusicPlayer {
         // Play selected button
         let playlist_controls = container(if let Some(selected) = self.playlist_selected {
             row![
-                button(text("Play Selected").size(small))
-                    .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
-                    .padding([4, 10]),
+                tooltip(
+                    button(text("Play Selected").size(small))
+                        .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
+                        .padding([4, 10]),
+                    "Start playing the selected track",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
             ]
         } else {
             row![]
@@ -1409,12 +1518,22 @@ impl MusicPlayer {
         let db_controls = container(
             row![
                 text("Song Lengths:").size(small),
-                button(text("Download HVSC").size(small))
-                    .on_press(MusicPlayerMessage::DownloadSongLengths)
-                    .padding([3, 8]),
-                button(text("Load File").size(small))
-                    .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
-                    .padding([3, 8]),
+                tooltip(
+                    button(text("Download HVSC").size(small))
+                        .on_press(MusicPlayerMessage::DownloadSongLengths)
+                        .padding([3, 8]),
+                    "Download song length database from HVSC\n(High Voltage SID Collection)",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Load File").size(small))
+                        .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
+                        .padding([3, 8]),
+                    "Load song length database from local file",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
                 text(&db_status).size(small),
                 Space::with_width(Length::Fill),
                 text(&self.status_message).size(small),

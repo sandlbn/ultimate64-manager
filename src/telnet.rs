@@ -16,7 +16,7 @@ const CONNECT_TIMEOUT_SECS: u64 = 5;
 const IO_TIMEOUT_SECS: u64 = 2;
 
 // ANSI escape sequences for menu navigation
-const F1_KEY_VT100: &[u8] = b"\x1bOP";
+const F1_KEY_VT5: &[u8] = b"\x1bOP";
 const F1_KEY_XTERM: &[u8] = b"\x1b[11~";
 const F1_KEY_LINUX: &[u8] = b"\x1b[[A";
 const F5_KEY: &[u8] = b"\x1b[15~";
@@ -92,7 +92,7 @@ impl MenuNavigator {
         self.stream
             .flush()
             .map_err(|e| format!("Telnet flush failed: {}", e))?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
         Ok(())
     }
 
@@ -106,7 +106,7 @@ impl MenuNavigator {
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&buffer[..n]);
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => break,
@@ -273,7 +273,7 @@ impl MenuNavigator {
 
         // Try different F1 escape sequences (for Ultimate64)
         let f1_sequences: &[(&[u8], &str)] = &[
-            (F1_KEY_VT100, "F1 VT100"),
+            (F1_KEY_VT5, "F1 VT5"),
             (F1_KEY_XTERM, "F1 xterm"),
             (F1_KEY_LINUX, "F1 linux"),
         ];
@@ -281,7 +281,7 @@ impl MenuNavigator {
         for (seq, name) in f1_sequences {
             log::trace!("Telnet: Trying {}...", name);
             self.send_key(seq)?;
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(5));
 
             let response = self.read_response()?;
             let items = self.parse_menu_items(&response);
@@ -301,7 +301,7 @@ impl MenuNavigator {
         // Try F5 as fallback (for Elite II)
         log::debug!("Telnet: F1 variants didn't work, trying F5 (Elite II)...");
         self.send_key(F5_KEY)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
 
         let response = self.read_response()?;
         let items = self.parse_menu_items(&response);
@@ -365,12 +365,12 @@ impl MenuNavigator {
         if moves > 0 {
             for _ in 0..moves {
                 self.send_key(DOWN_ARROW)?;
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
             }
         } else if moves < 0 {
             for _ in 0..moves.abs() {
                 self.send_key(UP_ARROW)?;
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(5));
             }
         }
 
@@ -384,7 +384,7 @@ impl MenuNavigator {
     fn open_submenu(&mut self) -> TelnetResult<Vec<MenuItem>> {
         log::debug!("Telnet: Opening submenu...");
         self.send_key(RIGHT_ARROW)?;
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(5));
 
         let response = self.read_response()?;
         let items = self.parse_menu_items(&response);
@@ -400,7 +400,7 @@ impl MenuNavigator {
     fn press_enter(&mut self) -> TelnetResult<String> {
         log::debug!("Telnet: Pressing ENTER...");
         self.send_key(ENTER_KEY)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
         self.read_response()
     }
 
@@ -408,9 +408,9 @@ impl MenuNavigator {
     fn press_enter_twice(&mut self) -> TelnetResult<String> {
         log::debug!("Telnet: Pressing ENTER twice...");
         self.send_key(ENTER_KEY)?;
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(5));
         self.send_key(ENTER_KEY)?;
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(5));
         self.read_response()
     }
 
@@ -427,7 +427,7 @@ impl MenuNavigator {
     fn go_back(&mut self) -> TelnetResult<()> {
         log::debug!("Telnet: Going back...");
         self.send_key(LEFT_ARROW)?;
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(5));
         let _ = self.read_response();
         Ok(())
     }
@@ -569,7 +569,7 @@ pub fn enable_all_streams(host: &str) -> TelnetResult<()> {
     log::info!("Telnet: VIC Stream enabled");
 
     // Wait a moment for the menu to settle
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(5));
 
     // === Enable Audio Stream ===
     // After enabling VIC Stream, menu has closed, so re-open everything
@@ -634,7 +634,7 @@ pub fn disable_all_streams(host: &str) -> TelnetResult<()> {
     log::info!("Telnet: VIC Stream disabled");
 
     // Wait a moment for the menu to settle
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(5));
 
     // After disabling VIC Stream, menu has closed, so re-open everything
     let items = nav.open_menu()?;

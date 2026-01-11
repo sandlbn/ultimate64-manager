@@ -2,7 +2,7 @@ use iced::{
     Command, Element, Length,
     widget::{
         Column, Space, button, column, container, horizontal_rule, pick_list, row, scrollable,
-        slider, text, text_input, toggler, vertical_rule,
+        slider, text, text_input, toggler, tooltip, vertical_rule,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -460,9 +460,14 @@ impl ConfigEditor {
             column![
                 text("CATEGORIES").size(normal),
                 row![
-                    button(text("Load").size(small))
-                        .on_press(ConfigEditorMessage::LoadCategories)
-                        .padding([4, 8]),
+                    tooltip(
+                        button(text("Load").size(small))
+                            .on_press(ConfigEditorMessage::LoadCategories)
+                            .padding([4, 8]),
+                        "Fetch configuration categories from Ultimate64",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
                 ]
                 .spacing(5),
             ]
@@ -522,18 +527,33 @@ impl ConfigEditor {
             column![
                 horizontal_rule(1),
                 text("FLASH MEMORY").size(small),
-                button(text("Save to Flash").size(small))
-                    .on_press(ConfigEditorMessage::SaveToFlash)
-                    .padding([4, 8])
-                    .width(Length::Fill),
-                button(text("Load from Flash").size(small))
-                    .on_press(ConfigEditorMessage::LoadFromFlash)
-                    .padding([4, 8])
-                    .width(Length::Fill),
-                button(text("Reset to Default").size(small))
-                    .on_press(ConfigEditorMessage::ResetToDefault)
-                    .padding([4, 8])
-                    .width(Length::Fill),
+                tooltip(
+                    button(text("Save to Flash").size(small))
+                        .on_press(ConfigEditorMessage::SaveToFlash)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Save current configuration to flash memory\n(persists across reboots)",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Load from Flash").size(small))
+                        .on_press(ConfigEditorMessage::LoadFromFlash)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Load configuration from flash memory\n(discards current settings)",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Reset to Default").size(small))
+                        .on_press(ConfigEditorMessage::ResetToDefault)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Reset all settings to factory defaults",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(5),
         )
@@ -574,20 +594,35 @@ impl ConfigEditor {
                 ]
                 .align_items(iced::Alignment::Center),
                 row![
-                    button(text("Apply All").size(small))
-                        .on_press(ConfigEditorMessage::SaveAllChanges)
-                        .padding([4, 10])
-                        .style(if self.has_unsaved_changes {
-                            iced::theme::Button::Primary
-                        } else {
-                            iced::theme::Button::Secondary
-                        }),
-                    button(text("Revert").size(small))
-                        .on_press(ConfigEditorMessage::RevertChanges)
-                        .padding([4, 8]),
-                    button(text("Refresh").size(small))
-                        .on_press(ConfigEditorMessage::RefreshCategory)
-                        .padding([4, 8]),
+                    tooltip(
+                        button(text("Apply All").size(small))
+                            .on_press(ConfigEditorMessage::SaveAllChanges)
+                            .padding([4, 10])
+                            .style(if self.has_unsaved_changes {
+                                iced::theme::Button::Primary
+                            } else {
+                                iced::theme::Button::Secondary
+                            }),
+                        "Send all pending changes to Ultimate64",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Revert").size(small))
+                            .on_press(ConfigEditorMessage::RevertChanges)
+                            .padding([4, 8]),
+                        "Discard all pending changes",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
+                    tooltip(
+                        button(text("Refresh").size(small))
+                            .on_press(ConfigEditorMessage::RefreshCategory)
+                            .padding([4, 8]),
+                        "Reload current category from Ultimate64",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(iced::theme::Container::Box),
                     Space::with_width(10),
                     text("Filter:").size(small),
                     text_input("filter...", &self.search_filter)
