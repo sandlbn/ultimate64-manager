@@ -1362,15 +1362,25 @@ impl Ultimate64Browser {
 
         // Show Connect button when disconnected, Refresh button when connected
         let action_button: Element<'_, Message> = if self.status.connected {
-            button(text("Refresh").size(12))
-                .on_press(Message::RefreshStatus)
-                .padding([4, 8])
-                .into()
+            tooltip(
+                button(text("Refresh").size(12))
+                    .on_press(Message::RefreshStatus)
+                    .padding([4, 8]),
+                "Refresh connection status and mounted disks",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box)
+            .into()
         } else {
-            button(text("Connect").size(12))
-                .on_press(Message::ConnectPressed)
-                .padding([4, 8])
-                .into()
+            tooltip(
+                button(text("Connect").size(12))
+                    .on_press(Message::ConnectPressed)
+                    .padding([4, 8]),
+                "Connect to Ultimate64",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box)
+            .into()
         };
 
         container(
@@ -1421,7 +1431,7 @@ impl Ultimate64Browser {
                     button(text(">>").size(14))
                         .on_press(Message::CopyLocalToRemote)
                         .padding([8, 12]),
-                    "Upload to Ultimate64",
+                    "Upload checked files to Ultimate64",
                     tooltip::Position::Right,
                 )
                 .style(iced::theme::Container::Box),
@@ -1430,7 +1440,7 @@ impl Ultimate64Browser {
                     button(text("<<").size(14))
                         .on_press(Message::CopyRemoteToLocal)
                         .padding([8, 12]),
-                    "Download from Ultimate64",
+                    "Download selected file from Ultimate64",
                     tooltip::Position::Left,
                 )
                 .style(iced::theme::Container::Box),
@@ -1446,9 +1456,14 @@ impl Ultimate64Browser {
             text(format!("ULTIMATE64 {}", connection_indicator))
                 .size(12)
                 .width(Length::Fill),
-            button(text("Refresh").size(10))
-                .on_press(Message::RemoteBrowser(RemoteBrowserMessage::RefreshFiles))
-                .padding([2, 6]),
+            tooltip(
+                button(text("Refresh").size(10))
+                    .on_press(Message::RemoteBrowser(RemoteBrowserMessage::RefreshFiles))
+                    .padding([2, 6]),
+                "Refresh remote file listing",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
         ]
         .padding(5)
         .align_items(iced::Alignment::Center);
@@ -1479,9 +1494,14 @@ impl Ultimate64Browser {
                 )
                 .placeholder("Select template...")
                 .width(Length::Fixed(200.0)),
-                button(text("Execute").size(12))
-                    .on_press(Message::ExecuteTemplate)
-                    .padding([4, 12]),
+                tooltip(
+                    button(text("Execute").size(12))
+                        .on_press(Message::ExecuteTemplate)
+                        .padding([4, 12]),
+                    "Run the selected template commands",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center),
@@ -1519,15 +1539,30 @@ impl Ultimate64Browser {
                 .width(Length::Fixed(300.0)),
             Space::with_height(15),
             row![
-                button(text("Connect"))
-                    .on_press(Message::ConnectPressed)
-                    .padding([10, 20]),
-                button(text("Disconnect"))
-                    .on_press(Message::DisconnectPressed)
-                    .padding([10, 20]),
-                button(text("Test Connection"))
-                    .on_press(Message::RefreshStatus)
-                    .padding([10, 20]),
+                tooltip(
+                    button(text("Connect"))
+                        .on_press(Message::ConnectPressed)
+                        .padding([10, 20]),
+                    "Connect to Ultimate64 and save settings",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Disconnect"))
+                        .on_press(Message::DisconnectPressed)
+                        .padding([10, 20]),
+                    "Disconnect from Ultimate64",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Test Connection"))
+                        .on_press(Message::RefreshStatus)
+                        .padding([10, 20]),
+                    "Test connection and refresh status",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10),
         ];
@@ -1582,12 +1617,22 @@ impl Ultimate64Browser {
                 text(&file_browser_start_dir_display)
                     .size(12)
                     .width(Length::Fixed(400.0)),
-                button(text("Browse").size(11))
-                    .on_press(Message::BrowseFileBrowserStartDir)
-                    .padding([4, 10]),
-                button(text("Clear").size(11))
-                    .on_press(Message::ClearFileBrowserStartDir)
-                    .padding([4, 10]),
+                tooltip(
+                    button(text("Browse").size(11))
+                        .on_press(Message::BrowseFileBrowserStartDir)
+                        .padding([4, 10]),
+                    "Select starting directory for File Browser",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Clear").size(11))
+                        .on_press(Message::ClearFileBrowserStartDir)
+                        .padding([4, 10]),
+                    "Reset to home directory",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center),
@@ -1597,12 +1642,22 @@ impl Ultimate64Browser {
                 text(&music_player_start_dir_display)
                     .size(12)
                     .width(Length::Fixed(400.0)),
-                button(text("Browse").size(11))
-                    .on_press(Message::BrowseMusicPlayerStartDir)
-                    .padding([4, 10]),
-                button(text("Clear").size(11))
-                    .on_press(Message::ClearMusicPlayerStartDir)
-                    .padding([4, 10]),
+                tooltip(
+                    button(text("Browse").size(11))
+                        .on_press(Message::BrowseMusicPlayerStartDir)
+                        .padding([4, 10]),
+                    "Select starting directory for Music Player",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Clear").size(11))
+                        .on_press(Message::ClearMusicPlayerStartDir)
+                        .padding([4, 10]),
+                    "Reset to home directory",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center),
@@ -1695,9 +1750,14 @@ impl Ultimate64Browser {
                 text(format!("{}{}", prefix, message))
                     .size(12)
                     .style(iced::theme::Text::Color(color)),
-                button(text("X").size(10))
-                    .on_press(Message::DismissMessage)
-                    .padding([2, 6]),
+                tooltip(
+                    button(text("X").size(10))
+                        .on_press(Message::DismissMessage)
+                        .padding([2, 6]),
+                    "Dismiss message",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center)
@@ -1710,22 +1770,47 @@ impl Ultimate64Browser {
             row![
                 status_text,
                 horizontal_space(),
-                button(text("PAUSE").size(11))
-                    .on_press(Message::PauseMachine)
-                    .padding([4, 8]),
-                button(text("RESUME").size(11))
-                    .on_press(Message::ResumeMachine)
-                    .padding([4, 8]),
+                tooltip(
+                    button(text("PAUSE").size(11))
+                        .on_press(Message::PauseMachine)
+                        .padding([4, 8]),
+                    "Pause the C64 CPU",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("RESUME").size(11))
+                        .on_press(Message::ResumeMachine)
+                        .padding([4, 8]),
+                    "Resume the C64 CPU",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
                 text("|").size(12),
-                button(text("RESET").size(11))
-                    .on_press(Message::ResetMachine)
-                    .padding([4, 8]),
-                button(text("REBOOT").size(11))
-                    .on_press(Message::RebootMachine)
-                    .padding([4, 8]),
-                button(text("POWER OFF").size(11))
-                    .on_press(Message::PoweroffMachine)
-                    .padding([4, 8]),
+                tooltip(
+                    button(text("RESET").size(11))
+                        .on_press(Message::ResetMachine)
+                        .padding([4, 8]),
+                    "Reset the C64 (soft reset)",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("REBOOT").size(11))
+                        .on_press(Message::RebootMachine)
+                        .padding([4, 8]),
+                    "Reboot the Ultimate64 device",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("POWER OFF").size(11))
+                        .on_press(Message::PoweroffMachine)
+                        .padding([4, 8]),
+                    "Power off the Ultimate64",
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(6)
             .align_items(iced::Alignment::Center),
