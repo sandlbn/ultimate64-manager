@@ -18,6 +18,8 @@ use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use ultimate64::petscii::Petscii;
 
+use crate::telnet;
+
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
@@ -30,7 +32,6 @@ const AUDIO_CHANNELS: u16 = 2;
 // const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
-
 
 // Derived from the C64's clock frequencies
 const AUDIO_SAMPLE_RATE_PAL: f64 = 47982.8869047619;
@@ -118,6 +119,11 @@ pub enum StreamingMessage {
     KeyPressed(Key, Modifiers),  // Key press event with modifiers
     KeyReleased(Key),            // Key release event
     KeySent(Result<(), String>), // Result of sending key to C64
+    // Telnet stream control messages
+    TelnetControlToggled(bool), // Enable/disable telnet stream control
+    TelnetHostChanged(String),  // Set the host for telnet commands
+    TelnetStreamEnabled(Result<(), String>), // Result of enabling stream via telnet
+    TelnetStreamDisabled(Result<(), String>), // Result of disabling stream via telnet
 }
 
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
@@ -221,6 +227,10 @@ pub struct VideoStreaming {
     // Keyboard control
     pub keyboard_enabled: bool, // Whether keyboard capture is active
     last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
+    // Telnet stream control
+    pub telnet_control_enabled: bool, // Whether to send telnet commands to enable/disable streams
+    pub telnet_host: Option<String>,  // Host for telnet connection (usually same as REST host)
+    pub telnet_status: String,        // Status message for telnet operations
 }
 
 impl Default for VideoStreaming {
@@ -253,7 +263,15 @@ impl VideoStreaming {
             last_click_time: None,
             keyboard_enabled: false,
             last_key_time: None,
+            telnet_control_enabled: false,
+            telnet_host: None,
+            telnet_status: String::new(),
         }
+    }
+
+    /// Set the telnet host for stream control
+    pub fn set_telnet_host(&mut self, host: Option<String>) {
+        self.telnet_host = host;
     }
 
     pub fn update(
@@ -263,10 +281,65 @@ impl VideoStreaming {
     ) -> Command<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {
+                // If telnet control is enabled, enable streams on U64 via telnet menu
+                if self.telnet_control_enabled {
+                    if let Some(host) = &self.telnet_host {
+                        let host = host.clone();
+                        let audio_enabled = self.audio_enabled;
+                        self.telnet_status = "Enabling streams via telnet...".to_string();
+
+                        // Start local stream reception
+                        self.start_stream();
+
+                        // Then enable streams on Ultimate64 via telnet
+                        return Command::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    if audio_enabled {
+                                        telnet::enable_all_streams(&host)
+                                    } else {
+                                        telnet::enable_stream(&host, telnet::StreamType::Video)
+                                    }
+                                })
+                                .await
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            StreamingMessage::TelnetStreamEnabled,
+                        );
+                    } else {
+                        self.telnet_status = "No host configured for telnet".to_string();
+                    }
+                }
+
                 self.start_stream();
                 Command::none()
             }
             StreamingMessage::StopStream => {
+                // If telnet control is enabled, disable streams on U64 via telnet first
+                // Then stop local reception when TelnetStreamDisabled is received
+                if self.telnet_control_enabled {
+                    if let Some(host) = &self.telnet_host {
+                        let host = host.clone();
+                        let audio_enabled = self.audio_enabled;
+                        self.telnet_status = "Disabling streams via telnet...".to_string();
+
+                        return Command::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    if audio_enabled {
+                                        telnet::disable_all_streams(&host)
+                                    } else {
+                                        telnet::disable_stream(&host, telnet::StreamType::Video)
+                                    }
+                                })
+                                .await
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            StreamingMessage::TelnetStreamDisabled,
+                        );
+                    }
+                }
+
                 self.stop_stream();
                 Command::none()
             }
@@ -563,6 +636,62 @@ impl VideoStreaming {
             StreamingMessage::KeySent(result) => {
                 if let Err(e) = result {
                     log::error!("Failed to send key to C64: {}", e);
+                }
+                Command::none()
+            }
+
+            // ==================== Telnet Stream Control Messages ====================
+            StreamingMessage::TelnetControlToggled(enabled) => {
+                self.telnet_control_enabled = enabled;
+                log::info!(
+                    "Telnet stream control: {}",
+                    if enabled { "ENABLED" } else { "DISABLED" }
+                );
+                if enabled && self.telnet_host.is_none() {
+                    self.telnet_status = "Warning: No host configured".to_string();
+                } else {
+                    self.telnet_status.clear();
+                }
+                Command::none()
+            }
+
+            StreamingMessage::TelnetHostChanged(host) => {
+                if host.is_empty() {
+                    self.telnet_host = None;
+                } else {
+                    self.telnet_host = Some(host);
+                }
+                Command::none()
+            }
+
+            StreamingMessage::TelnetStreamEnabled(result) => {
+                match result {
+                    Ok(()) => {
+                        self.telnet_status = "Streams enabled via telnet".to_string();
+                        log::info!("Telnet: Streams enabled successfully");
+                    }
+                    Err(e) => {
+                        self.telnet_status = format!("Telnet error: {}", e);
+                        log::error!("Telnet enable failed: {}", e);
+                    }
+                }
+                Command::none()
+            }
+
+            StreamingMessage::TelnetStreamDisabled(result) => {
+                match result {
+                    Ok(()) => {
+                        self.telnet_status = "Streams disabled via telnet".to_string();
+                        log::info!("Telnet: Streams disabled successfully");
+                    }
+                    Err(e) => {
+                        self.telnet_status = format!("Telnet error: {}", e);
+                        log::error!("Telnet disable failed: {}", e);
+                    }
+                }
+                // Now stop local stream reception (after U64 has stopped sending)
+                if self.is_streaming {
+                    self.stop_stream();
                 }
                 Command::none()
             }
@@ -986,6 +1115,34 @@ impl VideoStreaming {
         .spacing(5)
         .align_items(iced::Alignment::Center);
 
+        // Telnet stream control section
+        let telnet_status_text = if !self.telnet_status.is_empty() {
+            text(&self.telnet_status).size(9)
+        } else if self.telnet_control_enabled {
+            if self.telnet_host.is_some() {
+                text("Ready to control streams").size(9)
+            } else {
+                text("No host configured").size(9)
+            }
+        } else {
+            text("Disabled").size(9)
+        };
+
+        let telnet_section = column![
+            text("Telnet Stream Control").size(12),
+            tooltip(
+                checkbox("Enable telnet control", self.telnet_control_enabled)
+                    .on_toggle(StreamingMessage::TelnetControlToggled)
+                    .size(16)
+                    .text_size(11),
+                "Automatically enable/disable streams on Ultimate64 via telnet menu\n(Works with Ultimate64 F1 menu and Elite II F5 menu)",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            telnet_status_text,
+        ]
+        .spacing(5);
+
         // Command prompt section
         let command_history_items: Vec<Element<'_, StreamingMessage>> = self
             .command_history
@@ -1024,6 +1181,8 @@ impl VideoStreaming {
                 scale_section,
                 iced::widget::horizontal_rule(1),
                 stream_controls,
+                iced::widget::horizontal_rule(1),
+                telnet_section,
                 iced::widget::horizontal_rule(1),
                 command_section,
             ]
