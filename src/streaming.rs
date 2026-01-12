@@ -18,8 +18,6 @@ use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use ultimate64::petscii::Petscii;
 
-use crate::telnet;
-
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
@@ -118,11 +116,8 @@ pub enum StreamingMessage {
     KeyPressed(Key, Modifiers),  // Key press event with modifiers
     KeyReleased(Key),            // Key release event
     KeySent(Result<(), String>), // Result of sending key to C64
-    // Telnet stream control messages
-    TelnetControlToggled(bool), // Enable/disable telnet stream control
-    TelnetHostChanged(String),  // Set the host for telnet commands
-    TelnetStreamEnabled(Result<(), String>), // Result of enabling stream via telnet
-    TelnetStreamDisabled(Result<(), String>), // Result of disabling stream via telnet
+    // Ultimate64 host configuration
+    UltimateHostChanged(String), // Set the host for stream control
 }
 
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
@@ -226,10 +221,8 @@ pub struct VideoStreaming {
     // Keyboard control
     pub keyboard_enabled: bool, // Whether keyboard capture is active
     last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
-    // Telnet stream control
-    pub telnet_control_enabled: bool, // Whether to send telnet commands to enable/disable streams
-    pub telnet_host: Option<String>,  // Host for telnet connection (usually same as REST host)
-    pub telnet_status: String,        // Status message for telnet operations
+    // Ultimate64 host for stream control (binary protocol on port 64)
+    pub ultimate_host: Option<String>,
 }
 
 impl Default for VideoStreaming {
@@ -262,15 +255,13 @@ impl VideoStreaming {
             last_click_time: None,
             keyboard_enabled: false,
             last_key_time: None,
-            telnet_control_enabled: false,
-            telnet_host: None,
-            telnet_status: String::new(),
+            ultimate_host: None,
         }
     }
 
-    /// Set the telnet host for stream control
-    pub fn set_telnet_host(&mut self, host: Option<String>) {
-        self.telnet_host = host;
+    /// Set the Ultimate64 host for stream control
+    pub fn set_ultimate_host(&mut self, host: Option<String>) {
+        self.ultimate_host = host;
     }
 
     pub fn update(
@@ -280,65 +271,10 @@ impl VideoStreaming {
     ) -> Command<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {
-                // If telnet control is enabled, enable streams on U64 via telnet menu
-                if self.telnet_control_enabled {
-                    if let Some(host) = &self.telnet_host {
-                        let host = host.clone();
-                        let audio_enabled = self.audio_enabled;
-                        self.telnet_status = "Enabling streams via telnet...".to_string();
-
-                        // Start local stream reception
-                        self.start_stream();
-
-                        // Then enable streams on Ultimate64 via telnet
-                        return Command::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    if audio_enabled {
-                                        telnet::enable_all_streams(&host)
-                                    } else {
-                                        telnet::enable_stream(&host, telnet::StreamType::Video)
-                                    }
-                                })
-                                .await
-                                .map_err(|e| format!("Task error: {}", e))?
-                            },
-                            StreamingMessage::TelnetStreamEnabled,
-                        );
-                    } else {
-                        self.telnet_status = "No host configured for telnet".to_string();
-                    }
-                }
-
                 self.start_stream();
                 Command::none()
             }
             StreamingMessage::StopStream => {
-                // If telnet control is enabled, disable streams on U64 via telnet first
-                // Then stop local reception when TelnetStreamDisabled is received
-                if self.telnet_control_enabled {
-                    if let Some(host) = &self.telnet_host {
-                        let host = host.clone();
-                        let audio_enabled = self.audio_enabled;
-                        self.telnet_status = "Disabling streams via telnet...".to_string();
-
-                        return Command::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    if audio_enabled {
-                                        telnet::disable_all_streams(&host)
-                                    } else {
-                                        telnet::disable_stream(&host, telnet::StreamType::Video)
-                                    }
-                                })
-                                .await
-                                .map_err(|e| format!("Task error: {}", e))?
-                            },
-                            StreamingMessage::TelnetStreamDisabled,
-                        );
-                    }
-                }
-
                 self.stop_stream();
                 Command::none()
             }
@@ -475,7 +411,7 @@ impl VideoStreaming {
                             match c.as_str() {
                                 "'" => Some(34),   // Shift+' = "
                                 ";" => Some(58),   // Shift+; = :
-                                "," => Some(60),   // Shift+, = <
+                                "," => Some(60),   // Shift+, =
                                 "." => Some(62),   // Shift+. = >
                                 "/" => Some(63),   // Shift+/ = ?
                                 "1" => Some(33),   // Shift+1 = !
@@ -639,58 +575,11 @@ impl VideoStreaming {
                 Command::none()
             }
 
-            // ==================== Telnet Stream Control Messages ====================
-            StreamingMessage::TelnetControlToggled(enabled) => {
-                self.telnet_control_enabled = enabled;
-                log::info!(
-                    "Telnet stream control: {}",
-                    if enabled { "ENABLED" } else { "DISABLED" }
-                );
-                if enabled && self.telnet_host.is_none() {
-                    self.telnet_status = "Warning: No host configured".to_string();
-                } else {
-                    self.telnet_status.clear();
-                }
-                Command::none()
-            }
-
-            StreamingMessage::TelnetHostChanged(host) => {
+            StreamingMessage::UltimateHostChanged(host) => {
                 if host.is_empty() {
-                    self.telnet_host = None;
+                    self.ultimate_host = None;
                 } else {
-                    self.telnet_host = Some(host);
-                }
-                Command::none()
-            }
-
-            StreamingMessage::TelnetStreamEnabled(result) => {
-                match result {
-                    Ok(()) => {
-                        self.telnet_status = "Streams enabled via telnet".to_string();
-                        log::info!("Telnet: Streams enabled successfully");
-                    }
-                    Err(e) => {
-                        self.telnet_status = format!("Telnet error: {}", e);
-                        log::error!("Telnet enable failed: {}", e);
-                    }
-                }
-                Command::none()
-            }
-
-            StreamingMessage::TelnetStreamDisabled(result) => {
-                match result {
-                    Ok(()) => {
-                        self.telnet_status = "Streams disabled via telnet".to_string();
-                        log::info!("Telnet: Streams disabled successfully");
-                    }
-                    Err(e) => {
-                        self.telnet_status = format!("Telnet error: {}", e);
-                        log::error!("Telnet disable failed: {}", e);
-                    }
-                }
-                // Now stop local stream reception (after U64 has stopped sending)
-                if self.is_streaming {
-                    self.stop_stream();
+                    self.ultimate_host = Some(host);
                 }
                 Command::none()
             }
@@ -895,10 +784,9 @@ impl VideoStreaming {
             }
         } else {
             let status_info = match self.stream_mode {
-                StreamMode::Unicast => format!(
-                    "Unicast mode: Configure Ultimate64 to send to YOUR_IP:{}",
-                    self.listen_port
-                ),
+                StreamMode::Unicast => {
+                    format!("Unicast mode: Will send to Ultimate64 at port 64 to start stream",)
+                }
                 StreamMode::Multicast => {
                     "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
                 }
@@ -1114,34 +1002,6 @@ impl VideoStreaming {
         .spacing(5)
         .align_items(iced::Alignment::Center);
 
-        // Telnet stream control section
-        let telnet_status_text = if !self.telnet_status.is_empty() {
-            text(&self.telnet_status).size(9)
-        } else if self.telnet_control_enabled {
-            if self.telnet_host.is_some() {
-                text("Ready to control streams").size(9)
-            } else {
-                text("No host configured").size(9)
-            }
-        } else {
-            text("Disabled").size(9)
-        };
-
-        let telnet_section = column![
-            text("Telnet Stream Control").size(12),
-            tooltip(
-                checkbox("Enable telnet control", self.telnet_control_enabled)
-                    .on_toggle(StreamingMessage::TelnetControlToggled)
-                    .size(16)
-                    .text_size(11),
-                "Automatically enable/disable streams on Ultimate64 via telnet menu\n(Works with Ultimate64 F1 menu and Elite II F5 menu)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box),
-            telnet_status_text,
-        ]
-        .spacing(5);
-
         // Command prompt section
         let command_history_items: Vec<Element<'_, StreamingMessage>> = self
             .command_history
@@ -1180,8 +1040,6 @@ impl VideoStreaming {
                 scale_section,
                 iced::widget::horizontal_rule(1),
                 stream_controls,
-                iced::widget::horizontal_rule(1),
-                telnet_section,
                 iced::widget::horizontal_rule(1),
                 command_section,
             ]
@@ -1252,6 +1110,11 @@ impl VideoStreaming {
         let port: u16 = self.listen_port.parse().unwrap_or(11000);
         let mode = self.stream_mode;
 
+        // Clone what we need BEFORE the closure
+        let frame_buffer = self.frame_buffer.clone();
+        let stop_signal = self.stop_signal.clone();
+        let packets_counter = self.packets_received.clone();
+
         log::info!("Starting video stream... mode={:?}, port={}", mode, port);
         self.stop_signal.store(false, Ordering::Relaxed);
 
@@ -1260,57 +1123,86 @@ impl VideoStreaming {
             *p = 0;
         }
 
-        let frame_buffer = self.frame_buffer.clone();
-        let stop_signal = self.stop_signal.clone();
-        let packets_counter = self.packets_received.clone();
+        // 1. FIRST: Bind UDP socket BEFORE sending control commands
+        let socket = match mode {
+            StreamMode::Unicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+                Ok(s) => {
+                    log::info!("Unicast socket bound to 0.0.0.0:{}", port);
+                    s
+                }
+                Err(e) => {
+                    log::error!("Failed to bind unicast socket: {}", e);
+                    return;
+                }
+            },
+            StreamMode::Multicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+                Ok(s) => {
+                    let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
+                    let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                    if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
+                        log::error!("Failed to join multicast group: {}", e);
+                        return;
+                    }
+                    log::info!("Multicast socket joined 239.0.1.64:{}", port);
+                    s
+                }
+                Err(e) => {
+                    log::error!("Failed to bind multicast socket: {}", e);
+                    return;
+                }
+            },
+        };
+
+        if let Err(e) = socket.set_nonblocking(true) {
+            log::error!("Failed to set non-blocking: {}", e);
+            return;
+        }
+
+        // 2. Small delay to ensure socket is fully ready
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // 3. NOW send control commands to Ultimate64 via binary protocol (port 64)
+        if let Some(ultimate_ip) = &self.ultimate_host {
+            if let Some(my_ip) = get_local_ip() {
+                log::info!(
+                    "Sending stream start commands to {} (my IP: {})",
+                    ultimate_ip,
+                    my_ip
+                );
+
+                // Send stop commands first to reset U64 state
+                let _ = send_stop_command(ultimate_ip, 0x20);
+                let _ = send_stop_command(ultimate_ip, 0x21);
+
+                // Send video stream start command
+                if let Err(e) = send_stream_command(ultimate_ip, &my_ip, port, 0x20) {
+                    log::error!("Failed to send video start command: {}", e);
+                }
+
+                // Send audio stream start command
+                let audio_port = port + 1;
+                if let Err(e) = send_stream_command(ultimate_ip, &my_ip, audio_port, 0x21) {
+                    log::error!("Failed to send audio start command: {}", e);
+                }
+            } else {
+                log::error!("Could not detect local IP address");
+            }
+        } else {
+            log::warn!("No Ultimate64 host configured, skipping stream control commands");
+        }
+
         self.is_streaming = true;
 
+        // 4. Spawn thread - socket is moved in, cloned values already extracted
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
 
-            let socket = match mode {
-                StreamMode::Unicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
-                    Ok(s) => {
-                        log::info!("Unicast socket bound to 0.0.0.0:{}", port);
-                        s
-                    }
-                    Err(e) => {
-                        log::error!("Failed to bind unicast socket: {}", e);
-                        return;
-                    }
-                },
-                StreamMode::Multicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
-                    Ok(s) => {
-                        let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
-                        let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
-                        if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
-                            log::error!("Failed to join multicast group: {}", e);
-                            return;
-                        }
-                        log::info!("Multicast socket joined 239.0.1.64:{}", port);
-                        s
-                    }
-                    Err(e) => {
-                        log::error!("Failed to bind multicast socket: {}", e);
-                        return;
-                    }
-                },
-            };
-
-            if let Err(e) = socket.set_nonblocking(true) {
-                log::error!("Failed to set non-blocking: {}", e);
-                return;
-            }
-
-            // Buffer for receiving packets
             let mut recv_buf = [0u8; 1024];
-
-            // RGBA frame buffer (384 * 272 * 4 bytes)
             let rgba_size = (VIC_WIDTH * VIC_HEIGHT * 4) as usize;
             let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
             let mut first_packet = true;
 
-            // Build color lookup table (2 pixels packed per byte -> 8 bytes RGBA output)
+            // Build color lookup table
             let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
             for i in 0..256 {
                 let hi = (i >> 4) & 0x0F;
@@ -1318,10 +1210,7 @@ impl VideoStreaming {
                 let c_hi = &C64_PALETTE[hi];
                 let c_lo = &C64_PALETTE[lo];
                 color_lut.push([
-                    c_lo[0], c_lo[1], c_lo[2],
-                    255, // LEFT pixel (low nibble) - first in memory
-                    c_hi[0], c_hi[1], c_hi[2],
-                    255, // RIGHT pixel (high nibble) - second in memory
+                    c_lo[0], c_lo[1], c_lo[2], 255, c_hi[0], c_hi[1], c_hi[2], 255,
                 ]);
             }
 
@@ -1336,18 +1225,15 @@ impl VideoStreaming {
                             continue;
                         }
 
-                        // Count packets
                         if let Ok(mut p) = packets_counter.lock() {
                             *p += 1;
                         }
 
-                        // Parse header
                         let line_raw = u16::from_le_bytes([recv_buf[4], recv_buf[5]]);
                         let pixels_in_line =
                             u16::from_le_bytes([recv_buf[6], recv_buf[7]]) as usize;
                         let lines_in_packet = recv_buf[8] as usize;
 
-                        // Log first packet info
                         if first_packet {
                             first_packet = false;
                             log::info!(
@@ -1358,13 +1244,12 @@ impl VideoStreaming {
                             );
                         }
 
-                        let line_num = (line_raw & 0x7FFF) as usize; // Strip MSB (sync flag)
+                        let line_num = (line_raw & 0x7FFF) as usize;
                         let is_frame_end = (line_raw & 0x8000) != 0;
 
                         let payload = &recv_buf[HEADER_SIZE..size];
-                        let bytes_per_line = pixels_in_line / 2; // 2 pixels per byte = 192 bytes/line
+                        let bytes_per_line = pixels_in_line / 2;
 
-                        // Process each line in the packet
                         for l in 0..lines_in_packet {
                             let y = line_num + l;
                             if y >= VIC_HEIGHT as usize {
@@ -1372,8 +1257,6 @@ impl VideoStreaming {
                             }
 
                             let payload_offset = l * bytes_per_line;
-
-                            // Write pixels to RGBA buffer using VIC_WIDTH stride
                             let row_offset = y * (VIC_WIDTH as usize) * 4;
 
                             for x in 0..bytes_per_line {
@@ -1383,19 +1266,16 @@ impl VideoStreaming {
                                 let packed_byte = payload[payload_offset + x] as usize;
                                 let colors = &color_lut[packed_byte];
 
-                                // Each packed byte = 2 pixels
                                 let pixel_x = x * 2;
                                 if pixel_x + 1 < VIC_WIDTH as usize {
                                     let offset = row_offset + pixel_x * 4;
                                     if offset + 7 < rgba_frame.len() {
-                                        // Copy 8 bytes (2 RGBA pixels) from lookup table
                                         rgba_frame[offset..offset + 8].copy_from_slice(colors);
                                     }
                                 }
                             }
                         }
 
-                        // On frame end, copy to shared buffer
                         if is_frame_end {
                             if let Ok(mut fb) = frame_buffer.lock() {
                                 *fb = Some(rgba_frame.clone());
@@ -1412,7 +1292,6 @@ impl VideoStreaming {
                 }
             }
 
-            // Leave multicast group if needed
             if mode == StreamMode::Multicast {
                 let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
                 let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
@@ -1424,7 +1303,6 @@ impl VideoStreaming {
 
         self.stream_handle = Some(handle);
 
-        // Start audio stream if enabled
         if self.audio_enabled {
             self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode);
         }
@@ -1961,6 +1839,14 @@ impl VideoStreaming {
         }
 
         log::info!("Stopping video and audio streams...");
+
+        // Send stop commands to Ultimate64 before stopping local reception
+        if let Some(ultimate_ip) = &self.ultimate_host {
+            log::info!("Sending stream stop commands to {}", ultimate_ip);
+            let _ = send_stop_command(ultimate_ip, 0x20); // Stop video
+            let _ = send_stop_command(ultimate_ip, 0x21); // Stop audio
+        }
+
         self.stop_signal.store(true, Ordering::Relaxed);
         self.keyboard_enabled = false;
 
@@ -2383,4 +2269,83 @@ fn set_pixel(data: &mut [u8], width: usize, x: usize, y: usize, pixel: &[u8; 4])
 #[inline]
 fn colors_equal(a: &[u8; 4], b: &[u8; 4]) -> bool {
     a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+
+/// Send binary stream control command to Ultimate64 (port 64)
+fn send_stream_command(
+    ultimate_ip: &str,
+    my_ip: &str,
+    port: u16,
+    stream_cmd: u8,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let dest = format!("{}:{}", my_ip, port);
+    let dest_bytes = dest.as_bytes();
+
+    // Build command: <cmd> 0xFF <param_len> 0x00 <duration_lo> <duration_hi> <dest_string>
+    let mut cmd = Vec::with_capacity(6 + dest_bytes.len());
+    cmd.push(stream_cmd); // 0x20 for video, 0x21 for audio
+    cmd.push(0xFF); // Command marker
+    cmd.push((2 + dest_bytes.len()) as u8); // Param length (duration + dest string)
+    cmd.push(0x00); // Param length high byte
+    cmd.push(0x00); // Duration low byte (0 = forever)
+    cmd.push(0x00); // Duration high byte
+    cmd.extend_from_slice(dest_bytes);
+
+    log::info!(
+        "Sending {} bytes to {}:64 -> {:02X?}",
+        cmd.len(),
+        ultimate_ip,
+        cmd
+    );
+    log::info!("Destination string: {}", dest);
+
+    let addr: std::net::SocketAddr = format!("{}:64", ultimate_ip)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    let written = stream.write(&cmd)?;
+    log::info!("Wrote {} bytes", written);
+
+    Ok(())
+}
+
+/// Send stop command to Ultimate64 (port 64)
+fn send_stop_command(ultimate_ip: &str, stream_cmd: u8) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Stop command: 0x30 for video, 0x31 for audio (stream_cmd + 0x10)
+    let stop_cmd = stream_cmd + 0x10;
+    let cmd = [stop_cmd, 0xFF, 0x00, 0x00];
+
+    log::debug!("Sending STOP command to {}:64 -> {:02X?}", ultimate_ip, cmd);
+
+    let addr: std::net::SocketAddr = format!("{}:64", ultimate_ip)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
+    stream.write_all(&cmd)?;
+
+    Ok(())
+}
+
+/// Detect local IP address that can reach the network
+fn get_local_ip() -> Option<String> {
+    // Method: Try to get IP by creating a UDP socket (doesn't actually send anything)
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        // Connect to a public IP (doesn't send data, just determines route)
+        if socket.connect("8.8.8.8:80").is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return Some(addr.ip().to_string());
+            }
+        }
+    }
+    None
 }
