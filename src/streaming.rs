@@ -1923,29 +1923,66 @@ impl VideoStreaming {
 
         log::info!("Stopping video and audio streams...");
 
-        // Send stop commands to Ultimate64 before stopping local reception
-        if let Some(ultimate_ip) = &self.ultimate_host {
-            log::info!("Sending stream stop commands to {}", ultimate_ip);
-            let _ = send_stop_command(ultimate_ip, 0x20); // Stop video
-            let _ = send_stop_command(ultimate_ip, 0x21); // Stop audio
-        }
-
+        // Set stop signal first so threads start exiting
         self.stop_signal.store(true, Ordering::Relaxed);
         self.keyboard_enabled = false;
 
-        // Stop video thread
+        // Send stop commands to Ultimate64 (with timeout to prevent hang)
+        if let Some(ultimate_ip) = &self.ultimate_host {
+            log::info!("Sending stream stop commands to {}", ultimate_ip);
+            let ip = ultimate_ip.clone();
+
+            // Run in thread with timeout
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = send_stop_command(&ip, 0x20); // Stop video
+                let _ = send_stop_command(&ip, 0x21); // Stop audio
+                let _ = tx.send(());
+            });
+
+            // Wait max 500ms for stop commands
+            if rx.recv_timeout(Duration::from_millis(500)).is_err() {
+                log::warn!("Stop commands timed out - device may be offline");
+            }
+        }
+
+        // Stop video thread with timeout
         if let Some(handle) = self.stream_handle.take() {
-            let _ = handle.join();
+            let start = std::time::Instant::now();
+            while !handle.is_finished() && start.elapsed() < Duration::from_millis(500) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                log::warn!("Video thread did not stop in time");
+            }
         }
 
-        // Stop audio playback thread
+        // Stop audio playback thread with timeout
         if let Some(handle) = self.audio_stream_handle.take() {
-            let _ = handle.join();
+            let start = std::time::Instant::now();
+            while !handle.is_finished() && start.elapsed() < Duration::from_millis(500) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                log::warn!("Audio playback thread did not stop in time");
+            }
         }
 
-        // Stop audio network thread
+        // Stop audio network thread with timeout
         if let Some(handle) = self.audio_network_handle.take() {
-            let _ = handle.join();
+            let start = std::time::Instant::now();
+            while !handle.is_finished() && start.elapsed() < Duration::from_millis(500) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                log::warn!("Audio network thread did not stop in time");
+            }
         }
 
         // Clear audio buffer
