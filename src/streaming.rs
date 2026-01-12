@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use iced::widget::image::FilterMethod;
 use iced::{
     Command, Element, Length, Subscription,
     event::{self, Event},
@@ -8,6 +9,7 @@ use iced::{
         scrollable, text, text_input, tooltip,
     },
 };
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,9 +92,12 @@ impl std::fmt::Display for StreamMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
     #[default]
-    Nearest, // Sharp pixels (default)
+    Int2x, // Integer 2x scale (sharp pixels)
+    Int3x, // Integer 3x scale
+
     Scale2x,   // EPX/Scale2x smoothing
-    Scanlines, // Sharp pixels + CRT scanline effect
+    Scanlines, // CRT scanline effect
+    CRT,       // Shadow mask + scanlines
 }
 
 #[derive(Debug, Clone)]
@@ -197,11 +202,34 @@ impl AudioBufferState {
         }
     }
 }
+impl ScaleMode {
+    fn to_u8(self) -> u8 {
+        match self {
+            ScaleMode::Int2x => 0,
+            ScaleMode::Int3x => 1,
+            ScaleMode::Scale2x => 2,
+            ScaleMode::Scanlines => 3,
+            ScaleMode::CRT => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ScaleMode::Int2x,
+            1 => ScaleMode::Int3x,
+            2 => ScaleMode::Scale2x,
+            3 => ScaleMode::Scanlines,
+            4 => ScaleMode::CRT,
+            _ => ScaleMode::Int2x,
+        }
+    }
+}
 
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA frame from network
-    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Unscaled frame for screenshots
+    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Scaled RGBA for display
+    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA for screenshots
+    pub frame_dimensions: Arc<Mutex<(u32, u32)>>,  // Current scaled dimensions
     pub scaled_buffer: Option<Vec<u8>>,            // Scaled frame for display
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
@@ -223,6 +251,7 @@ pub struct VideoStreaming {
     last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
     // Ultimate64 host for stream control (binary protocol on port 64)
     pub ultimate_host: Option<String>,
+    scale_mode_shared: Arc<std::sync::atomic::AtomicU8>, // For thread to read
 }
 
 impl Default for VideoStreaming {
@@ -237,6 +266,7 @@ impl VideoStreaming {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
             image_buffer: Arc::new(Mutex::new(None)),
+            frame_dimensions: Arc::new(Mutex::new((VIC_WIDTH * 2, VIC_HEIGHT * 2))),
             scaled_buffer: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
@@ -245,7 +275,7 @@ impl VideoStreaming {
             command_input: String::new(),
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
-            scale_mode: ScaleMode::Nearest,
+            scale_mode: ScaleMode::Int2x,
             listen_port: "11000".to_string(),
             packets_received: Arc::new(Mutex::new(0)),
             audio_packets_received: Arc::new(Mutex::new(0)),
@@ -256,6 +286,7 @@ impl VideoStreaming {
             keyboard_enabled: false,
             last_key_time: None,
             ultimate_host: None,
+            scale_mode_shared: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -279,23 +310,10 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Frame buffer contains RGBA data - apply scaling based on mode
-                if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(rgba_data) = &*frame_guard {
-                        // Apply scaling (Nearest = no processing, just clone)
-                        let scaled = match self.scale_mode {
-                            ScaleMode::Nearest => rgba_data.clone(),
-                            ScaleMode::Scale2x => scale2x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
-                            ScaleMode::Scanlines => {
-                                apply_scanlines(rgba_data, VIC_WIDTH, VIC_HEIGHT)
-                            }
-                        };
-                        self.scaled_buffer = Some(scaled);
-
-                        // Also update image_buffer for screenshots (unscaled)
-                        if let Ok(mut img_guard) = self.image_buffer.lock() {
-                            *img_guard = Some(rgba_data.clone());
-                        }
+                // Frame is already scaled in the receive thread, just copy to display buffer
+                if let Ok(fb) = self.frame_buffer.lock() {
+                    if let Some(data) = &*fb {
+                        self.scaled_buffer = Some(data.clone());
                     }
                 }
                 Command::none()
@@ -350,6 +368,8 @@ impl VideoStreaming {
             }
             StreamingMessage::ScaleModeChanged(mode) => {
                 self.scale_mode = mode;
+                self.scale_mode_shared
+                    .store(mode.to_u8(), Ordering::Relaxed);
                 Command::none()
             }
             StreamingMessage::PortChanged(port) => {
@@ -589,19 +609,16 @@ impl VideoStreaming {
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
         // Image dimensions based on scale mode
-        let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
-            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+        // In view() and view_fullscreen(), replace the fixed dimensions:
+        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
+            *dims
+        } else {
+            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
         };
 
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use scaled buffer if available and not in Nearest mode
-            let frame_data = if self.scale_mode != ScaleMode::Nearest {
-                self.scaled_buffer.clone()
-            } else {
-                self.image_buffer.lock().ok().and_then(|g| g.clone())
-            };
+            let frame_data = self.scaled_buffer.clone();
 
             if let Some(rgba_data) = frame_data {
                 let handle =
@@ -679,20 +696,17 @@ impl VideoStreaming {
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
         // Image dimensions for the handle (based on scale mode processing)
-        let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
-            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+        // In view() and view_fullscreen(), replace the fixed dimensions:
+        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
+            *dims
+        } else {
+            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
         };
 
         // === LEFT SIDE: Video display (fluid scaling) ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use scaled buffer if available, otherwise fall back to image buffer
-            let frame_data = if self.scale_mode != ScaleMode::Nearest {
-                self.scaled_buffer.clone()
-            } else {
-                self.image_buffer.lock().ok().and_then(|g| g.clone())
-            };
+            let frame_data = self.scaled_buffer.clone();
 
             if let Some(rgba_data) = frame_data {
                 // Create an image handle from RGBA data
@@ -705,14 +719,16 @@ impl VideoStreaming {
                     iced_image(handle)
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
+                        .content_fit(iced::ContentFit::Contain)
+                        .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
-
                 let scale_label = match self.scale_mode {
-                    ScaleMode::Nearest => "Nearest",
-                    ScaleMode::Scale2x => "Scale2x",
+                    ScaleMode::Int2x => "2x",
+                    ScaleMode::Int3x => "3x",
+                    ScaleMode::Scale2x => "Smooth",
                     ScaleMode::Scanlines => "Scanlines",
+                    ScaleMode::CRT => "CRT",
                 };
 
                 column![
@@ -866,20 +882,33 @@ impl VideoStreaming {
             text("Video Scale").size(12),
             row![
                 tooltip(
-                    button(text("Nearest").size(10))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Nearest))
+                    button(text("2x").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int2x))
                         .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Nearest {
+                        .style(if self.scale_mode == ScaleMode::Int2x {
                             iced::theme::Button::Primary
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "Sharp pixels (fastest)",
+                    "Integer 2x (sharp pixels)",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
                 tooltip(
-                    button(text("Scale2x").size(10))
+                    button(text("3x").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int3x))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::Int3x {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Integer 3x (sharp pixels)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Smooth").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scale2x {
@@ -887,10 +916,13 @@ impl VideoStreaming {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "Smoothed edges (EPX algorithm)",
+                    "Scale2x edge smoothing",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
+            ]
+            .spacing(3),
+            row![
                 tooltip(
                     button(text("Scanlines").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
@@ -900,16 +932,27 @@ impl VideoStreaming {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "CRT scanline effect",
+                    "CRT scanlines",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("CRT").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::CRT))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::CRT {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "CRT shadow mask + scanlines",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
             ]
             .spacing(3),
         ]
-        .spacing(5);
-
-        // Stream controls with keyboard toggle
+        .spacing(5); // Stream controls with keyboard toggle
         let screenshot_button = if self.is_streaming {
             button(text("Screenshot").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
@@ -1112,8 +1155,15 @@ impl VideoStreaming {
 
         // Clone what we need BEFORE the closure
         let frame_buffer = self.frame_buffer.clone();
+        let image_buffer = self.image_buffer.clone();
+        let frame_dimensions = self.frame_dimensions.clone();
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
+        let scale_mode_shared = self.scale_mode_shared.clone();
+
+        // Sync current scale mode to shared atomic
+        self.scale_mode_shared
+            .store(self.scale_mode.to_u8(), Ordering::Relaxed);
 
         log::info!("Starting video stream... mode={:?}, port={}", mode, port);
         self.stop_signal.store(false, Ordering::Relaxed);
@@ -1170,16 +1220,13 @@ impl VideoStreaming {
                     my_ip
                 );
 
-                // Send stop commands first to reset U64 state
                 let _ = send_stop_command(ultimate_ip, 0x20);
                 let _ = send_stop_command(ultimate_ip, 0x21);
 
-                // Send video stream start command
                 if let Err(e) = send_stream_command(ultimate_ip, &my_ip, port, 0x20) {
                     log::error!("Failed to send video start command: {}", e);
                 }
 
-                // Send audio stream start command
                 let audio_port = port + 1;
                 if let Err(e) = send_stream_command(ultimate_ip, &my_ip, audio_port, 0x21) {
                     log::error!("Failed to send audio start command: {}", e);
@@ -1193,7 +1240,7 @@ impl VideoStreaming {
 
         self.is_streaming = true;
 
-        // 4. Spawn thread - socket is moved in, cloned values already extracted
+        // 4. Spawn thread - do scaling here
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
 
@@ -1276,9 +1323,46 @@ impl VideoStreaming {
                             }
                         }
 
+                        // Frame complete - apply scaling and store
                         if is_frame_end {
+                            // Store raw frame for screenshots
+                            if let Ok(mut img) = image_buffer.lock() {
+                                *img = Some(rgba_frame.clone());
+                            }
+
+                            // Get current scale mode and apply scaling
+                            let current_mode =
+                                ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
+
+                            let (scaled, dims) = match current_mode {
+                                ScaleMode::Int2x => (
+                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::Int3x => (
+                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 3),
+                                    (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+                                ),
+                                ScaleMode::Scale2x => (
+                                    scale2x(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::Scanlines => (
+                                    apply_scanlines(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::CRT => (
+                                    apply_crt_effect(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                            }; // Store scaled frame for display
                             if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(rgba_frame.clone());
+                                *fb = Some(scaled);
+                            }
+
+                            // Store dimensions
+                            if let Ok(mut d) = frame_dimensions.lock() {
+                                *d = dims;
                             }
                         }
                     }
@@ -1307,7 +1391,6 @@ impl VideoStreaming {
             self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode);
         }
     }
-
     fn start_audio_stream(&mut self, port: u16, mode: StreamMode) {
         log::info!("Starting audio stream on port {}", port);
 
@@ -2348,4 +2431,96 @@ fn get_local_ip() -> Option<String> {
         }
     }
     None
+}
+
+/// CRT effect
+fn apply_crt_effect(input: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    let scanline_bright: f32 = 0.5;
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = get_pixel(input, w, h, x, y);
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+
+            // Shadow mask pattern - alternates based on x position
+            // This simulates the RGB phosphor arrangement
+            let phase = x % 3;
+
+            let (r_mult, g_mult, b_mult) = match phase {
+                0 => (1.0, 0.85, 0.85), // Emphasize red
+                1 => (0.85, 1.0, 0.85), // Emphasize green
+                _ => (0.85, 0.85, 1.0), // Emphasize blue
+            };
+
+            // Apply bloom to bright pixels
+            let bloom = 1.1;
+            let bright_pixel = [
+                ((r * r_mult * bloom).min(255.0)) as u8,
+                ((g * g_mult * bloom).min(255.0)) as u8,
+                ((b * b_mult * bloom).min(255.0)) as u8,
+                255,
+            ];
+
+            // Scanline version (darker)
+            let dark_pixel = [
+                ((r * r_mult * scanline_bright).min(255.0)) as u8,
+                ((g * g_mult * scanline_bright).min(255.0)) as u8,
+                ((b * b_mult * scanline_bright).min(255.0)) as u8,
+                255,
+            ];
+
+            let out_x = x * 2;
+            let out_y = y * 2;
+
+            // Top row - bright with shadow mask tint
+            set_pixel(&mut output, out_w, out_x, out_y, &bright_pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y, &bright_pixel);
+
+            // Bottom row - scanline (darker)
+            set_pixel(&mut output, out_w, out_x, out_y + 1, &dark_pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y + 1, &dark_pixel);
+        }
+    }
+
+    output
+}
+/// Integer scaling - perfect pixel replication with no filtering
+/// Fast integer scaling - copies entire rows at once
+fn integer_scale(input: &[u8], width: u32, height: u32, scale: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let s = scale as usize;
+    let out_w = w * s;
+    let out_h = h * s;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    for y in 0..h {
+        let src_row_start = y * w * 4;
+
+        // Build one scaled row
+        let mut scaled_row = Vec::with_capacity(out_w * 4);
+        for x in 0..w {
+            let src_idx = src_row_start + x * 4;
+            // Repeat each pixel 'scale' times horizontally
+            for _ in 0..s {
+                scaled_row.extend_from_slice(&input[src_idx..src_idx + 4]);
+            }
+        }
+
+        // Copy the scaled row 'scale' times vertically
+        for dy in 0..s {
+            let out_row_start = (y * s + dy) * out_w * 4;
+            output[out_row_start..out_row_start + scaled_row.len()].copy_from_slice(&scaled_row);
+        }
+    }
+
+    output
 }
