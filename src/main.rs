@@ -2064,10 +2064,27 @@ impl Drop for Ultimate64Browser {
 
         // Reset C64 if music was playing
         if self.music_player.playback_state == PlaybackState::Playing {
-            log::info!("Resetting C64 on drop");
             if let Some(conn) = &self.connection {
-                if let Ok(c) = conn.try_lock() {
-                    let _ = c.reset();
+                log::info!("Resetting C64 on drop...");
+                let conn = conn.clone();
+
+                // Run reset with timeout using std::thread
+                let (tx, rx) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    let result = if let Ok(c) = conn.try_lock() {
+                        c.reset().map_err(|e| e.to_string())
+                    } else {
+                        Err("Could not acquire lock".to_string())
+                    };
+                    let _ = tx.send(result);
+                });
+
+                // Wait max 1 second for reset to complete
+                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(Ok(())) => log::info!("C64 reset successful"),
+                    Ok(Err(e)) => log::warn!("C64 reset failed: {}", e),
+                    Err(_) => log::warn!("C64 reset timed out - device may be offline"),
                 }
             }
         }
