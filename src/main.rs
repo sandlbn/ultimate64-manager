@@ -158,6 +158,7 @@ pub enum Message {
     BrowseMusicPlayerStartDir,
     MusicPlayerStartDirSelected(Option<PathBuf>),
     ClearMusicPlayerStartDir,
+    // Window close
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -335,28 +336,56 @@ impl Application for Ultimate64Browser {
             }
 
             Message::LeftBrowser(msg) => {
+                // Check if this is a "run" operation that should stop music
+                let should_stop_music = matches!(
+                    &msg,
+                    FileBrowserMessage::RunDisk(_, _) | FileBrowserMessage::LoadAndRun(_)
+                ) && self.music_player.playback_state
+                    == PlaybackState::Playing;
+
                 let should_refresh = matches!(msg, FileBrowserMessage::MountCompleted(Ok(_)));
+
                 let cmd = self
                     .left_browser
                     .update(msg, self.connection.clone())
                     .map(Message::LeftBrowser);
 
-                if should_refresh {
-                    Command::batch(vec![
-                        cmd,
-                        Command::perform(
-                            async {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                            },
-                            |_| Message::RefreshStatus,
-                        ),
-                    ])
-                } else {
-                    cmd
+                let mut commands = vec![cmd];
+
+                // Stop music player if running a cartridge/disk
+                if should_stop_music {
+                    log::info!("Stopping music player - running cartridge/disk");
+                    commands.push(
+                        self.music_player
+                            .update(MusicPlayerMessage::Stop, self.connection.clone())
+                            .map(Message::MusicPlayer),
+                    );
                 }
+
+                if should_refresh {
+                    commands.push(Command::perform(
+                        async {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                        },
+                        |_| Message::RefreshStatus,
+                    ));
+                }
+
+                Command::batch(commands)
             }
 
             Message::RemoteBrowser(msg) => {
+                // Check if this is a "run" operation that should stop music
+                let should_stop_music = matches!(
+                    &msg,
+                    RemoteBrowserMessage::RunPrg(_)
+                        | RemoteBrowserMessage::RunCrt(_)
+                        | RemoteBrowserMessage::PlaySid(_)
+                        | RemoteBrowserMessage::PlayMod(_)
+                        | RemoteBrowserMessage::RunDisk(_, _)
+                ) && self.music_player.playback_state
+                    == PlaybackState::Playing;
+
                 // Intercept UploadDirectoryComplete to show result in main status bar
                 if let RemoteBrowserMessage::UploadDirectoryComplete(ref result) = msg {
                     match result {
@@ -368,11 +397,24 @@ impl Application for Ultimate64Browser {
                         }
                     }
                 }
-                self.remote_browser
-                    .update(msg, self.connection.clone())
-                    .map(Message::RemoteBrowser)
-            }
 
+                let cmd = self
+                    .remote_browser
+                    .update(msg, self.connection.clone())
+                    .map(Message::RemoteBrowser);
+
+                if should_stop_music {
+                    log::info!("Stopping music player - running file from Ultimate64");
+                    Command::batch(vec![
+                        cmd,
+                        self.music_player
+                            .update(MusicPlayerMessage::Stop, self.connection.clone())
+                            .map(Message::MusicPlayer),
+                    ])
+                } else {
+                    cmd
+                }
+            }
             Message::ActivePaneChanged(pane) => {
                 self.active_pane = pane;
                 Command::none()
@@ -539,7 +581,6 @@ impl Application for Ultimate64Browser {
 
                 return Command::batch(commands);
             }
-
             Message::CopyRemoteToLocal => {
                 // Copy selected remote file to local directory
                 if let Some(remote_path) = self.remote_browser.get_selected_file() {
@@ -1303,7 +1344,6 @@ impl Application for Ultimate64Browser {
 
     fn subscription(&self) -> Subscription<Message> {
         use iced::keyboard;
-
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
         let keyboard_sub = keyboard::on_key_press(|key, modifiers| match key {
             keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
@@ -2008,5 +2048,28 @@ async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, S
         Ok(Ok(status)) => status,
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("Connection timed out - device may be offline".to_string()),
+    }
+}
+impl Drop for Ultimate64Browser {
+    fn drop(&mut self) {
+        log::info!("Application dropping, cleaning up...");
+
+        // Stop video streaming
+        if self.video_streaming.is_streaming {
+            log::info!("Stopping video stream on drop");
+            self.video_streaming
+                .stop_signal
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Reset C64 if music was playing
+        if self.music_player.playback_state == PlaybackState::Playing {
+            log::info!("Resetting C64 on drop");
+            if let Some(conn) = &self.connection {
+                if let Ok(c) = conn.try_lock() {
+                    let _ = c.reset();
+                }
+            }
+        }
     }
 }
