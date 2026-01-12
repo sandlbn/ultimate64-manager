@@ -1,4 +1,5 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use iced::widget::image::FilterMethod;
 use iced::{
     Command, Element, Length, Subscription,
     event::{self, Event},
@@ -8,6 +9,7 @@ use iced::{
         scrollable, text, text_input, tooltip,
     },
 };
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,9 +92,12 @@ impl std::fmt::Display for StreamMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
     #[default]
-    Nearest, // Sharp pixels (default)
+    Int2x, // Integer 2x scale (sharp pixels)
+    Int3x,     // Integer 3x scale
     Scale2x,   // EPX/Scale2x smoothing
-    Scanlines, // Sharp pixels + CRT scanline effect
+    Scale3x,   // Scale3x 3x smoothing
+    Scanlines, // CRT scanline effect (2x)
+    CRT,       // Enhanced CRT with glow (2x)
 }
 
 #[derive(Debug, Clone)]
@@ -245,7 +250,7 @@ impl VideoStreaming {
             command_input: String::new(),
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
-            scale_mode: ScaleMode::Nearest,
+            scale_mode: ScaleMode::Int2x,
             listen_port: "11000".to_string(),
             packets_received: Arc::new(Mutex::new(0)),
             audio_packets_received: Arc::new(Mutex::new(0)),
@@ -279,20 +284,20 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Frame buffer contains RGBA data - apply scaling based on mode
                 if let Ok(frame_guard) = self.frame_buffer.lock() {
                     if let Some(rgba_data) = &*frame_guard {
-                        // Apply scaling (Nearest = no processing, just clone)
                         let scaled = match self.scale_mode {
-                            ScaleMode::Nearest => rgba_data.clone(),
+                            ScaleMode::Int2x => integer_scale(rgba_data, VIC_WIDTH, VIC_HEIGHT, 2),
+                            ScaleMode::Int3x => integer_scale(rgba_data, VIC_WIDTH, VIC_HEIGHT, 3),
                             ScaleMode::Scale2x => scale2x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
+                            ScaleMode::Scale3x => scale3x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
                             ScaleMode::Scanlines => {
                                 apply_scanlines(rgba_data, VIC_WIDTH, VIC_HEIGHT)
                             }
+                            ScaleMode::CRT => apply_crt_effect(rgba_data, VIC_WIDTH, VIC_HEIGHT),
                         };
                         self.scaled_buffer = Some(scaled);
 
-                        // Also update image_buffer for screenshots (unscaled)
                         if let Ok(mut img_guard) = self.image_buffer.lock() {
                             *img_guard = Some(rgba_data.clone());
                         }
@@ -590,18 +595,15 @@ impl VideoStreaming {
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
         // Image dimensions based on scale mode
         let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
-            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            ScaleMode::Int2x | ScaleMode::Scale2x | ScaleMode::Scanlines | ScaleMode::CRT => {
+                (VIC_WIDTH * 2, VIC_HEIGHT * 2)
+            }
+            ScaleMode::Int3x | ScaleMode::Scale3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
         };
 
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use scaled buffer if available and not in Nearest mode
-            let frame_data = if self.scale_mode != ScaleMode::Nearest {
-                self.scaled_buffer.clone()
-            } else {
-                self.image_buffer.lock().ok().and_then(|g| g.clone())
-            };
+            let frame_data = self.scaled_buffer.clone();
 
             if let Some(rgba_data) = frame_data {
                 let handle =
@@ -680,19 +682,16 @@ impl VideoStreaming {
 
         // Image dimensions for the handle (based on scale mode processing)
         let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Nearest => (VIC_WIDTH, VIC_HEIGHT),
-            ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-            ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            ScaleMode::Int2x | ScaleMode::Scale2x | ScaleMode::Scanlines | ScaleMode::CRT => {
+                (VIC_WIDTH * 2, VIC_HEIGHT * 2)
+            }
+            ScaleMode::Int3x | ScaleMode::Scale3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
         };
 
         // === LEFT SIDE: Video display (fluid scaling) ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use scaled buffer if available, otherwise fall back to image buffer
-            let frame_data = if self.scale_mode != ScaleMode::Nearest {
-                self.scaled_buffer.clone()
-            } else {
-                self.image_buffer.lock().ok().and_then(|g| g.clone())
-            };
+            let frame_data = self.scaled_buffer.clone();
 
             if let Some(rgba_data) = frame_data {
                 // Create an image handle from RGBA data
@@ -705,14 +704,18 @@ impl VideoStreaming {
                     iced_image(handle)
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
+                        .content_fit(iced::ContentFit::Contain)
+                        .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
 
                 let scale_label = match self.scale_mode {
-                    ScaleMode::Nearest => "Nearest",
+                    ScaleMode::Int2x => "Int2x",
+                    ScaleMode::Int3x => "Int3x",
                     ScaleMode::Scale2x => "Scale2x",
+                    ScaleMode::Scale3x => "Scale3x",
                     ScaleMode::Scanlines => "Scanlines",
+                    ScaleMode::CRT => "CRT",
                 };
 
                 column![
@@ -866,20 +869,33 @@ impl VideoStreaming {
             text("Video Scale").size(12),
             row![
                 tooltip(
-                    button(text("Nearest").size(10))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Nearest))
+                    button(text("2x").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int2x))
                         .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Nearest {
+                        .style(if self.scale_mode == ScaleMode::Int2x {
                             iced::theme::Button::Primary
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "Sharp pixels (fastest)",
+                    "Integer 2x (sharp pixels)",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
                 tooltip(
-                    button(text("Scale2x").size(10))
+                    button(text("3x").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int3x))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::Int3x {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "Integer 3x (sharp pixels)",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Smooth").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scale2x {
@@ -887,10 +903,13 @@ impl VideoStreaming {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "Smoothed edges (EPX algorithm)",
+                    "Scale2x edge smoothing",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
+            ]
+            .spacing(3),
+            row![
                 tooltip(
                     button(text("Scanlines").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
@@ -900,7 +919,20 @@ impl VideoStreaming {
                         } else {
                             iced::theme::Button::Secondary
                         }),
-                    "CRT scanline effect",
+                    "CRT scanlines",
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("CRT").size(10))
+                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::CRT))
+                        .padding([4, 6])
+                        .style(if self.scale_mode == ScaleMode::CRT {
+                            iced::theme::Button::Primary
+                        } else {
+                            iced::theme::Button::Secondary
+                        }),
+                    "CRT shadow mask + scanlines",
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
@@ -2348,4 +2380,201 @@ fn get_local_ip() -> Option<String> {
         }
     }
     None
+}
+
+/// Scale3x algorithm - 3x upscale with edge smoothing
+fn scale3x(input: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let out_w = w * 3;
+    let out_h = h * 3;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    for y in 0..h {
+        for x in 0..w {
+            //   A B C
+            //   D E F
+            //   G H I
+            let a = get_pixel(input, w, h, x.saturating_sub(1), y.saturating_sub(1));
+            let b = get_pixel(input, w, h, x, y.saturating_sub(1));
+            let c = get_pixel(input, w, h, (x + 1).min(w - 1), y.saturating_sub(1));
+            let d = get_pixel(input, w, h, x.saturating_sub(1), y);
+            let e = get_pixel(input, w, h, x, y); // Center
+            let f = get_pixel(input, w, h, (x + 1).min(w - 1), y);
+            let g = get_pixel(input, w, h, x.saturating_sub(1), (y + 1).min(h - 1));
+            let h_px = get_pixel(input, w, h, x, (y + 1).min(h - 1));
+            let i = get_pixel(input, w, h, (x + 1).min(w - 1), (y + 1).min(h - 1));
+
+            // Scale3x rules for 3x3 output block
+            let mut out = [[e; 3]; 3];
+
+            // Top-left
+            if colors_equal(&d, &b) && !colors_equal(&d, &h_px) && !colors_equal(&b, &f) {
+                out[0][0] = d;
+            }
+            // Top-center
+            if (colors_equal(&d, &b)
+                && !colors_equal(&d, &h_px)
+                && !colors_equal(&b, &f)
+                && !colors_equal(&e, &c))
+                || (colors_equal(&b, &f)
+                    && !colors_equal(&d, &b)
+                    && !colors_equal(&h_px, &f)
+                    && !colors_equal(&e, &a))
+            {
+                out[0][1] = b;
+            }
+            // Top-right
+            if colors_equal(&b, &f) && !colors_equal(&d, &b) && !colors_equal(&h_px, &f) {
+                out[0][2] = f;
+            }
+            // Middle-left
+            if (colors_equal(&d, &b)
+                && !colors_equal(&d, &h_px)
+                && !colors_equal(&b, &f)
+                && !colors_equal(&e, &g))
+                || (colors_equal(&d, &h_px)
+                    && !colors_equal(&d, &b)
+                    && !colors_equal(&h_px, &f)
+                    && !colors_equal(&e, &a))
+            {
+                out[1][0] = d;
+            }
+            // Middle-right
+            if (colors_equal(&b, &f)
+                && !colors_equal(&d, &b)
+                && !colors_equal(&h_px, &f)
+                && !colors_equal(&e, &i))
+                || (colors_equal(&h_px, &f)
+                    && !colors_equal(&d, &h_px)
+                    && !colors_equal(&b, &f)
+                    && !colors_equal(&e, &c))
+            {
+                out[1][2] = f;
+            }
+            // Bottom-left
+            if colors_equal(&d, &h_px) && !colors_equal(&d, &b) && !colors_equal(&h_px, &f) {
+                out[2][0] = d;
+            }
+            // Bottom-center
+            if (colors_equal(&d, &h_px)
+                && !colors_equal(&d, &b)
+                && !colors_equal(&h_px, &f)
+                && !colors_equal(&e, &i))
+                || (colors_equal(&h_px, &f)
+                    && !colors_equal(&d, &h_px)
+                    && !colors_equal(&b, &f)
+                    && !colors_equal(&e, &g))
+            {
+                out[2][1] = h_px;
+            }
+            // Bottom-right
+            if colors_equal(&h_px, &f) && !colors_equal(&d, &h_px) && !colors_equal(&b, &f) {
+                out[2][2] = f;
+            }
+
+            // Write 3x3 output block
+            let out_x = x * 3;
+            let out_y = y * 3;
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    set_pixel(&mut output, out_w, out_x + dx, out_y + dy, &out[dy][dx]);
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// CRT effect
+fn apply_crt_effect(input: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let out_w = w * 2;
+    let out_h = h * 2;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    let scanline_bright: f32 = 0.5;
+
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = get_pixel(input, w, h, x, y);
+            let r = pixel[0] as f32;
+            let g = pixel[1] as f32;
+            let b = pixel[2] as f32;
+
+            // Shadow mask pattern - alternates based on x position
+            // This simulates the RGB phosphor arrangement
+            let phase = x % 3;
+
+            let (r_mult, g_mult, b_mult) = match phase {
+                0 => (1.0, 0.85, 0.85), // Emphasize red
+                1 => (0.85, 1.0, 0.85), // Emphasize green
+                _ => (0.85, 0.85, 1.0), // Emphasize blue
+            };
+
+            // Apply bloom to bright pixels
+            let bloom = 1.1;
+            let bright_pixel = [
+                ((r * r_mult * bloom).min(255.0)) as u8,
+                ((g * g_mult * bloom).min(255.0)) as u8,
+                ((b * b_mult * bloom).min(255.0)) as u8,
+                255,
+            ];
+
+            // Scanline version (darker)
+            let dark_pixel = [
+                ((r * r_mult * scanline_bright).min(255.0)) as u8,
+                ((g * g_mult * scanline_bright).min(255.0)) as u8,
+                ((b * b_mult * scanline_bright).min(255.0)) as u8,
+                255,
+            ];
+
+            let out_x = x * 2;
+            let out_y = y * 2;
+
+            // Top row - bright with shadow mask tint
+            set_pixel(&mut output, out_w, out_x, out_y, &bright_pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y, &bright_pixel);
+
+            // Bottom row - scanline (darker)
+            set_pixel(&mut output, out_w, out_x, out_y + 1, &dark_pixel);
+            set_pixel(&mut output, out_w, out_x + 1, out_y + 1, &dark_pixel);
+        }
+    }
+
+    output
+}
+/// Integer scaling - perfect pixel replication with no filtering
+/// Fast integer scaling - copies entire rows at once
+fn integer_scale(input: &[u8], width: u32, height: u32, scale: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let s = scale as usize;
+    let out_w = w * s;
+    let out_h = h * s;
+    let mut output = vec![0u8; out_w * out_h * 4];
+
+    for y in 0..h {
+        let src_row_start = y * w * 4;
+
+        // Build one scaled row
+        let mut scaled_row = Vec::with_capacity(out_w * 4);
+        for x in 0..w {
+            let src_idx = src_row_start + x * 4;
+            // Repeat each pixel 'scale' times horizontally
+            for _ in 0..s {
+                scaled_row.extend_from_slice(&input[src_idx..src_idx + 4]);
+            }
+        }
+
+        // Copy the scaled row 'scale' times vertically
+        for dy in 0..s {
+            let out_row_start = (y * s + dy) * out_w * 4;
+            output[out_row_start..out_row_start + scaled_row.len()].copy_from_slice(&scaled_row);
+        }
+    }
+
+    output
 }
