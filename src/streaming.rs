@@ -93,11 +93,11 @@ impl std::fmt::Display for StreamMode {
 pub enum ScaleMode {
     #[default]
     Int2x, // Integer 2x scale (sharp pixels)
-    Int3x,     // Integer 3x scale
+    Int3x, // Integer 3x scale
+
     Scale2x,   // EPX/Scale2x smoothing
-    Scale3x,   // Scale3x 3x smoothing
-    Scanlines, // CRT scanline effect (2x)
-    CRT,       // Enhanced CRT with glow (2x)
+    Scanlines, // CRT scanline effect
+    CRT,       // Shadow mask + scanlines
 }
 
 #[derive(Debug, Clone)]
@@ -202,11 +202,34 @@ impl AudioBufferState {
         }
     }
 }
+impl ScaleMode {
+    fn to_u8(self) -> u8 {
+        match self {
+            ScaleMode::Int2x => 0,
+            ScaleMode::Int3x => 1,
+            ScaleMode::Scale2x => 2,
+            ScaleMode::Scanlines => 3,
+            ScaleMode::CRT => 4,
+        }
+    }
+
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => ScaleMode::Int2x,
+            1 => ScaleMode::Int3x,
+            2 => ScaleMode::Scale2x,
+            3 => ScaleMode::Scanlines,
+            4 => ScaleMode::CRT,
+            _ => ScaleMode::Int2x,
+        }
+    }
+}
 
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA frame from network
-    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Unscaled frame for screenshots
+    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Scaled RGBA for display
+    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA for screenshots
+    pub frame_dimensions: Arc<Mutex<(u32, u32)>>,  // Current scaled dimensions
     pub scaled_buffer: Option<Vec<u8>>,            // Scaled frame for display
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
@@ -228,6 +251,7 @@ pub struct VideoStreaming {
     last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
     // Ultimate64 host for stream control (binary protocol on port 64)
     pub ultimate_host: Option<String>,
+    scale_mode_shared: Arc<std::sync::atomic::AtomicU8>, // For thread to read
 }
 
 impl Default for VideoStreaming {
@@ -242,6 +266,7 @@ impl VideoStreaming {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
             image_buffer: Arc::new(Mutex::new(None)),
+            frame_dimensions: Arc::new(Mutex::new((VIC_WIDTH * 2, VIC_HEIGHT * 2))),
             scaled_buffer: None,
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
@@ -261,6 +286,7 @@ impl VideoStreaming {
             keyboard_enabled: false,
             last_key_time: None,
             ultimate_host: None,
+            scale_mode_shared: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -284,23 +310,10 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::FrameUpdate => {
-                if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(rgba_data) = &*frame_guard {
-                        let scaled = match self.scale_mode {
-                            ScaleMode::Int2x => integer_scale(rgba_data, VIC_WIDTH, VIC_HEIGHT, 2),
-                            ScaleMode::Int3x => integer_scale(rgba_data, VIC_WIDTH, VIC_HEIGHT, 3),
-                            ScaleMode::Scale2x => scale2x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
-                            ScaleMode::Scale3x => scale3x(rgba_data, VIC_WIDTH, VIC_HEIGHT),
-                            ScaleMode::Scanlines => {
-                                apply_scanlines(rgba_data, VIC_WIDTH, VIC_HEIGHT)
-                            }
-                            ScaleMode::CRT => apply_crt_effect(rgba_data, VIC_WIDTH, VIC_HEIGHT),
-                        };
-                        self.scaled_buffer = Some(scaled);
-
-                        if let Ok(mut img_guard) = self.image_buffer.lock() {
-                            *img_guard = Some(rgba_data.clone());
-                        }
+                // Frame is already scaled in the receive thread, just copy to display buffer
+                if let Ok(fb) = self.frame_buffer.lock() {
+                    if let Some(data) = &*fb {
+                        self.scaled_buffer = Some(data.clone());
                     }
                 }
                 Command::none()
@@ -355,6 +368,8 @@ impl VideoStreaming {
             }
             StreamingMessage::ScaleModeChanged(mode) => {
                 self.scale_mode = mode;
+                self.scale_mode_shared
+                    .store(mode.to_u8(), Ordering::Relaxed);
                 Command::none()
             }
             StreamingMessage::PortChanged(port) => {
@@ -594,11 +609,11 @@ impl VideoStreaming {
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
         // Image dimensions based on scale mode
-        let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Int2x | ScaleMode::Scale2x | ScaleMode::Scanlines | ScaleMode::CRT => {
-                (VIC_WIDTH * 2, VIC_HEIGHT * 2)
-            }
-            ScaleMode::Int3x | ScaleMode::Scale3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+        // In view() and view_fullscreen(), replace the fixed dimensions:
+        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
+            *dims
+        } else {
+            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
         };
 
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
@@ -681,11 +696,11 @@ impl VideoStreaming {
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
         // Image dimensions for the handle (based on scale mode processing)
-        let (img_width, img_height) = match self.scale_mode {
-            ScaleMode::Int2x | ScaleMode::Scale2x | ScaleMode::Scanlines | ScaleMode::CRT => {
-                (VIC_WIDTH * 2, VIC_HEIGHT * 2)
-            }
-            ScaleMode::Int3x | ScaleMode::Scale3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+        // In view() and view_fullscreen(), replace the fixed dimensions:
+        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
+            *dims
+        } else {
+            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
         };
 
         // === LEFT SIDE: Video display (fluid scaling) ===
@@ -708,12 +723,10 @@ impl VideoStreaming {
                         .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
-
                 let scale_label = match self.scale_mode {
-                    ScaleMode::Int2x => "Int2x",
-                    ScaleMode::Int3x => "Int3x",
-                    ScaleMode::Scale2x => "Scale2x",
-                    ScaleMode::Scale3x => "Scale3x",
+                    ScaleMode::Int2x => "2x",
+                    ScaleMode::Int3x => "3x",
+                    ScaleMode::Scale2x => "Smooth",
                     ScaleMode::Scanlines => "Scanlines",
                     ScaleMode::CRT => "CRT",
                 };
@@ -939,9 +952,7 @@ impl VideoStreaming {
             ]
             .spacing(3),
         ]
-        .spacing(5);
-
-        // Stream controls with keyboard toggle
+        .spacing(5); // Stream controls with keyboard toggle
         let screenshot_button = if self.is_streaming {
             button(text("Screenshot").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
@@ -1144,8 +1155,15 @@ impl VideoStreaming {
 
         // Clone what we need BEFORE the closure
         let frame_buffer = self.frame_buffer.clone();
+        let image_buffer = self.image_buffer.clone();
+        let frame_dimensions = self.frame_dimensions.clone();
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
+        let scale_mode_shared = self.scale_mode_shared.clone();
+
+        // Sync current scale mode to shared atomic
+        self.scale_mode_shared
+            .store(self.scale_mode.to_u8(), Ordering::Relaxed);
 
         log::info!("Starting video stream... mode={:?}, port={}", mode, port);
         self.stop_signal.store(false, Ordering::Relaxed);
@@ -1202,16 +1220,13 @@ impl VideoStreaming {
                     my_ip
                 );
 
-                // Send stop commands first to reset U64 state
                 let _ = send_stop_command(ultimate_ip, 0x20);
                 let _ = send_stop_command(ultimate_ip, 0x21);
 
-                // Send video stream start command
                 if let Err(e) = send_stream_command(ultimate_ip, &my_ip, port, 0x20) {
                     log::error!("Failed to send video start command: {}", e);
                 }
 
-                // Send audio stream start command
                 let audio_port = port + 1;
                 if let Err(e) = send_stream_command(ultimate_ip, &my_ip, audio_port, 0x21) {
                     log::error!("Failed to send audio start command: {}", e);
@@ -1225,7 +1240,7 @@ impl VideoStreaming {
 
         self.is_streaming = true;
 
-        // 4. Spawn thread - socket is moved in, cloned values already extracted
+        // 4. Spawn thread - do scaling here
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
 
@@ -1308,9 +1323,46 @@ impl VideoStreaming {
                             }
                         }
 
+                        // Frame complete - apply scaling and store
                         if is_frame_end {
+                            // Store raw frame for screenshots
+                            if let Ok(mut img) = image_buffer.lock() {
+                                *img = Some(rgba_frame.clone());
+                            }
+
+                            // Get current scale mode and apply scaling
+                            let current_mode =
+                                ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
+
+                            let (scaled, dims) = match current_mode {
+                                ScaleMode::Int2x => (
+                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::Int3x => (
+                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 3),
+                                    (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+                                ),
+                                ScaleMode::Scale2x => (
+                                    scale2x(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::Scanlines => (
+                                    apply_scanlines(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                                ScaleMode::CRT => (
+                                    apply_crt_effect(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                ),
+                            }; // Store scaled frame for display
                             if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(rgba_frame.clone());
+                                *fb = Some(scaled);
+                            }
+
+                            // Store dimensions
+                            if let Ok(mut d) = frame_dimensions.lock() {
+                                *d = dims;
                             }
                         }
                     }
@@ -1339,7 +1391,6 @@ impl VideoStreaming {
             self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode);
         }
     }
-
     fn start_audio_stream(&mut self, port: u16, mode: StreamMode) {
         log::info!("Starting audio stream on port {}", port);
 
@@ -2380,111 +2431,6 @@ fn get_local_ip() -> Option<String> {
         }
     }
     None
-}
-
-/// Scale3x algorithm - 3x upscale with edge smoothing
-fn scale3x(input: &[u8], width: u32, height: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let out_w = w * 3;
-    let out_h = h * 3;
-    let mut output = vec![0u8; out_w * out_h * 4];
-
-    for y in 0..h {
-        for x in 0..w {
-            //   A B C
-            //   D E F
-            //   G H I
-            let a = get_pixel(input, w, h, x.saturating_sub(1), y.saturating_sub(1));
-            let b = get_pixel(input, w, h, x, y.saturating_sub(1));
-            let c = get_pixel(input, w, h, (x + 1).min(w - 1), y.saturating_sub(1));
-            let d = get_pixel(input, w, h, x.saturating_sub(1), y);
-            let e = get_pixel(input, w, h, x, y); // Center
-            let f = get_pixel(input, w, h, (x + 1).min(w - 1), y);
-            let g = get_pixel(input, w, h, x.saturating_sub(1), (y + 1).min(h - 1));
-            let h_px = get_pixel(input, w, h, x, (y + 1).min(h - 1));
-            let i = get_pixel(input, w, h, (x + 1).min(w - 1), (y + 1).min(h - 1));
-
-            // Scale3x rules for 3x3 output block
-            let mut out = [[e; 3]; 3];
-
-            // Top-left
-            if colors_equal(&d, &b) && !colors_equal(&d, &h_px) && !colors_equal(&b, &f) {
-                out[0][0] = d;
-            }
-            // Top-center
-            if (colors_equal(&d, &b)
-                && !colors_equal(&d, &h_px)
-                && !colors_equal(&b, &f)
-                && !colors_equal(&e, &c))
-                || (colors_equal(&b, &f)
-                    && !colors_equal(&d, &b)
-                    && !colors_equal(&h_px, &f)
-                    && !colors_equal(&e, &a))
-            {
-                out[0][1] = b;
-            }
-            // Top-right
-            if colors_equal(&b, &f) && !colors_equal(&d, &b) && !colors_equal(&h_px, &f) {
-                out[0][2] = f;
-            }
-            // Middle-left
-            if (colors_equal(&d, &b)
-                && !colors_equal(&d, &h_px)
-                && !colors_equal(&b, &f)
-                && !colors_equal(&e, &g))
-                || (colors_equal(&d, &h_px)
-                    && !colors_equal(&d, &b)
-                    && !colors_equal(&h_px, &f)
-                    && !colors_equal(&e, &a))
-            {
-                out[1][0] = d;
-            }
-            // Middle-right
-            if (colors_equal(&b, &f)
-                && !colors_equal(&d, &b)
-                && !colors_equal(&h_px, &f)
-                && !colors_equal(&e, &i))
-                || (colors_equal(&h_px, &f)
-                    && !colors_equal(&d, &h_px)
-                    && !colors_equal(&b, &f)
-                    && !colors_equal(&e, &c))
-            {
-                out[1][2] = f;
-            }
-            // Bottom-left
-            if colors_equal(&d, &h_px) && !colors_equal(&d, &b) && !colors_equal(&h_px, &f) {
-                out[2][0] = d;
-            }
-            // Bottom-center
-            if (colors_equal(&d, &h_px)
-                && !colors_equal(&d, &b)
-                && !colors_equal(&h_px, &f)
-                && !colors_equal(&e, &i))
-                || (colors_equal(&h_px, &f)
-                    && !colors_equal(&d, &h_px)
-                    && !colors_equal(&b, &f)
-                    && !colors_equal(&e, &g))
-            {
-                out[2][1] = h_px;
-            }
-            // Bottom-right
-            if colors_equal(&h_px, &f) && !colors_equal(&d, &h_px) && !colors_equal(&b, &f) {
-                out[2][2] = f;
-            }
-
-            // Write 3x3 output block
-            let out_x = x * 3;
-            let out_y = y * 3;
-            for dy in 0..3 {
-                for dx in 0..3 {
-                    set_pixel(&mut output, out_w, out_x + dx, out_y + dy, &out[dy][dx]);
-                }
-            }
-        }
-    }
-
-    output
 }
 
 /// CRT effect
