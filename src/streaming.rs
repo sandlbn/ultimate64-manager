@@ -38,8 +38,12 @@ const AUDIO_SAMPLE_RATE_PAL: f64 = 47982.8869047619;
 const AUDIO_SAMPLE_RATE_NTSC: f64 = 47940.3408482143;
 
 // Jitter buffer settings
-const JITTER_BUFFER_MIN_SAMPLES: usize = 2400; // ~50ms at 48kHz - minimum before playback starts
-const JITTER_BUFFER_TARGET_SAMPLES: usize = 4800; // ~100ms target buffer level
+const JITTER_MIN_FRAMES: usize = 4800; // 100ms
+const JITTER_TARGET_FRAMES: usize = 9600; // 200ms
+
+const JITTER_BUFFER_MIN_SAMPLES: usize = JITTER_MIN_FRAMES * 2; // interleaved stereo f32
+const JITTER_BUFFER_TARGET_SAMPLES: usize = JITTER_TARGET_FRAMES * 2;
+const JITTER_BUFFER_MAX_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize * 2; // 1s stereo f32
 
 // Ultimate64 video packet header (12 bytes)
 // struct {
@@ -128,46 +132,33 @@ pub enum StreamingMessage {
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
 /// This prevents audio drift that would otherwise cause buffer underrun/overflow
 struct AudioResampler {
-    /// Ratio of input rate to output rate (e.g., 48000/47983 ≈ 1.00035)
-    ratio: f64,
-    /// Fractional position within current input sample pair
+    step: f64, // input_rate / output_rate  (NOT the other way)
     pos: f64,
-    /// Previous sample for interpolation (left channel)
     last_left: f32,
-    /// Previous sample for interpolation (right channel)
     last_right: f32,
 }
 
 impl AudioResampler {
     fn new(input_rate: f64, output_rate: f64) -> Self {
         Self {
-            ratio: output_rate / input_rate,
+            step: input_rate / output_rate,
             pos: 0.0,
             last_left: 0.0,
             last_right: 0.0,
         }
     }
 
-    /// Process stereo samples and output resampled data
-    /// Input: interleaved stereo samples [L, R, L, R, ...]
-    /// Output: pushed to the provided buffer
     fn process_stereo(&mut self, input: &[f32], output: &mut VecDeque<f32>) {
-        // Process samples in stereo pairs
         for chunk in input.chunks_exact(2) {
             let left = chunk[0];
             let right = chunk[1];
 
-            // Generate output samples using linear interpolation
-            while self.pos < 1.0 {
-                // Interpolate between last sample and current sample
+            // generate 0/1/2 output frames per input frame depending on step/pos
+            while self.pos <= 1.0 {
                 let t = self.pos as f32;
-                let out_left = self.last_left + (left - self.last_left) * t;
-                let out_right = self.last_right + (right - self.last_right) * t;
-
-                output.push_back(out_left);
-                output.push_back(out_right);
-
-                self.pos += self.ratio;
+                output.push_back(self.last_left + (left - self.last_left) * t);
+                output.push_back(self.last_right + (right - self.last_right) * t);
+                self.pos += self.step;
             }
 
             self.pos -= 1.0;
@@ -1589,9 +1580,8 @@ impl VideoStreaming {
                                     );
                                 }
                             } else {
-                                for sample in data.iter_mut() {
-                                    *sample = 0.0;
-                                }
+                                data.fill(0.0);
+                                return
                             }
                         },
                         |err| log::error!("Audio stream error: {}", err),
@@ -1869,18 +1859,14 @@ impl VideoStreaming {
 
                             // Buffer overflow protection: drop oldest samples to stay in sync
                             // This is better than dropping newest because it keeps audio in sync with video
-                            let max_buffer_size = AUDIO_BUFFER_SIZE * 2;
-                            if state.samples.len() > max_buffer_size {
-                                let overflow = state.samples.len() - JITTER_BUFFER_TARGET_SAMPLES;
-                                for _ in 0..overflow {
+                            if state.samples.len() > JITTER_BUFFER_MAX_SAMPLES {
+                                let to_drop = state
+                                    .samples
+                                    .len()
+                                    .saturating_sub(JITTER_BUFFER_TARGET_SAMPLES);
+                                for _ in 0..to_drop {
                                     state.samples.pop_front();
                                 }
-                                state.samples_dropped += overflow as u64;
-                                log::debug!(
-                                    "Audio buffer overflow: dropped {} oldest samples (total dropped: {})",
-                                    overflow,
-                                    state.samples_dropped
-                                );
                             }
                         }
                     }

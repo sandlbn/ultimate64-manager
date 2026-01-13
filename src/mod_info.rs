@@ -1,5 +1,5 @@
-//! Amiga MOD file parser based on: https://eblong.com/zarf/blorb/mod-spec.txt
-//! TODO: Add S3M
+//! Amiga MOD file parser
+//! Extracts module name, author (if found), and calculates approximate duration
 
 /// MOD file information
 #[derive(Debug, Clone)]
@@ -148,127 +148,120 @@ fn extract_author(text: &str) -> Option<String> {
 }
 
 /// Calculate approximate song duration by parsing pattern data
-///
-/// Formula: row_duration = (2.5 * speed) / tempo seconds
-/// Where: speed = ticks per row (default 6), tempo = BPM (default 125)
-///
-/// At defaults: row_duration = (2.5 * 6) / 125 = 0.12 seconds per row
 fn calculate_duration(data: &[u8], song_length: u8, num_patterns: u8, num_channels: u8) -> u32 {
+    // Pattern data layout:
+    // - Each pattern has 64 rows
+    // - Each row has `num_channels` notes
+    // - Each note is 4 bytes
     let channels = num_channels as usize;
     let pattern_size = 64 * channels * 4;
     let pattern_data_start = 1084;
 
     // Default speed (ticks per row) and tempo (BPM)
-    let mut speed: f64 = 6.0;
-    let mut tempo: f64 = 125.0;
+    let mut speed: u32 = 6;
+    let mut tempo: u32 = 125;
 
-    // Track total time in milliseconds (use f64 for precision)
-    let mut total_ms: f64 = 0.0;
-
+    // Track total rows and handle pattern breaks
+    let mut total_rows: u32 = 0;
     let pattern_table = &data[PATTERN_TABLE_OFFSET..PATTERN_TABLE_OFFSET + 128];
 
-    // Track visited positions to detect infinite loops
-    let mut visited_positions: std::collections::HashSet<(u8, u8)> =
-        std::collections::HashSet::new();
-
-    let mut pos: usize = 0;
-    let mut safety_counter = 0;
-    const MAX_ITERATIONS: usize = 10000; // Prevent infinite loops
-
-    while pos < song_length as usize && safety_counter < MAX_ITERATIONS {
-        safety_counter += 1;
-
+    // Process each position in the song
+    for pos in 0..song_length as usize {
         let pattern_num = pattern_table[pos] as usize;
         if pattern_num >= num_patterns as usize {
-            // Invalid pattern, skip
-            pos += 1;
+            total_rows += 64; // Assume full pattern if invalid
             continue;
         }
 
         let pattern_offset = pattern_data_start + pattern_num * pattern_size;
         if pattern_offset + pattern_size > data.len() {
-            pos += 1;
+            total_rows += 64;
             continue;
         }
 
-        // Process each row in the pattern
-        let mut row: usize = 0;
-        while row < 64 {
-            // Check for infinite loop (same position + row visited twice)
-            let state = (pos as u8, row as u8);
-            if visited_positions.contains(&state) {
-                // We've been here before - likely a loop, stop counting
-                return (total_ms / 1000.0).max(1.0) as u32;
-            }
-            visited_positions.insert(state);
+        // Scan pattern for effect commands
+        let mut rows_in_pattern = 64u32;
 
-            // Calculate time for this row: (2.5 * speed / tempo) seconds
-            let row_ms = (2500.0 * speed) / tempo;
-
-            // Check for pattern delay (EEx effect) - multiplies row duration
-            let mut pattern_delay: u32 = 0;
-
-            // Scan all channels for effects
+        'row_loop: for row in 0..64 {
             for channel in 0..channels {
                 let note_offset = pattern_offset + (row * channels * 4) + (channel * 4);
                 if note_offset + 3 >= data.len() {
                     continue;
                 }
 
+                // Note format: [sample_hi:4 | period_hi:4] [period_lo:8] [sample_lo:4 | effect:4] [param:8]
                 let effect = data[note_offset + 2] & 0x0F;
                 let param = data[note_offset + 3];
 
                 match effect {
-                    // Effect Fxx: Set speed (01-1F) or tempo (20-FF)
+                    // Effect Fxx: Set speed/tempo
                     0x0F => {
-                        if param == 0 {
-                            // F00 stops the song in some trackers, ignore
-                        } else if param < 0x20 {
-                            speed = param as f64;
-                        } else {
-                            tempo = param as f64;
+                        if param > 0 && param < 0x20 {
+                            speed = param as u32;
+                        } else if param >= 0x20 {
+                            tempo = param as u32;
                         }
                     }
-                    // Effect Dxx: Pattern break - go to next pattern at row x*10+y (DECIMAL!)
+                    // Effect Dxx: Pattern break
                     0x0D => {
-                        let break_row = ((param >> 4) * 10 + (param & 0x0F)) as usize;
-                        // Add remaining row time
-                        total_ms += row_ms;
-                        // Jump to next position at specified row
-                        pos += 1;
-                        row = break_row.min(63);
-                        continue;
+                        rows_in_pattern = row as u32 + 1;
+                        break 'row_loop;
                     }
-                    // Effect Bxx: Position jump
+                    // Effect Bxx: Position jump (we'll just count remaining rows)
                     0x0B => {
-                        total_ms += row_ms;
-                        let jump_pos = param as usize;
-                        if jump_pos <= pos {
-                            // Jumping backwards - likely a loop, stop here
-                            return (total_ms / 1000.0).max(1.0) as u32;
-                        }
-                        pos = jump_pos;
-                        row = 0;
-                        continue;
-                    }
-                    // Effect EEx: Pattern delay - repeat row x times
-                    0x0E => {
-                        if (param >> 4) == 0x0E {
-                            pattern_delay = (param & 0x0F) as u32;
-                        }
+                        rows_in_pattern = row as u32 + 1;
+                        break 'row_loop;
                     }
                     _ => {}
                 }
             }
-
-            // Add row time (with pattern delay multiplier)
-            total_ms += row_ms * (1 + pattern_delay) as f64;
-            row += 1;
         }
 
-        pos += 1;
+        total_rows += rows_in_pattern;
     }
 
+    // Calculate duration:
+    // - Each row takes `speed` ticks
+    // - Tick duration = 2.5 / tempo seconds
+    // - Row duration = speed * 2.5 / tempo seconds
+    let row_duration_ms = (speed as f64 * 2500.0 / tempo as f64) as u32;
+    let duration_ms = total_rows * row_duration_ms;
+
     // Return duration in seconds, minimum 1 second
-    (total_ms / 1000.0).max(1.0) as u32
+    (duration_ms / 1000).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_string() {
+        let data = b"Hello World\0\0\0\0\0";
+        assert_eq!(read_string(data), "Hello World");
+    }
+
+    #[test]
+    fn test_extract_author() {
+        assert_eq!(
+            extract_author("Cool Song by Jochen"),
+            Some("Jochen".to_string())
+        );
+        assert_eq!(
+            extract_author("mysong / Purple Motion"),
+            Some("Purple Motion".to_string())
+        );
+        assert_eq!(extract_author("test - Skaven"), Some("Skaven".to_string()));
+        assert_eq!(
+            extract_author("(Lizardking)"),
+            Some("Lizardking".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_channels() {
+        assert_eq!(detect_channels(b"M.K."), 4);
+        assert_eq!(detect_channels(b"8CHN"), 8);
+        assert_eq!(detect_channels(b"6CHN"), 6);
+    }
 }
