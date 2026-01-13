@@ -1,3 +1,4 @@
+use crate::mod_info;
 use iced::{
     Command, Element, Length, Subscription,
     widget::{
@@ -940,12 +941,52 @@ impl MusicPlayer {
                     return self.update(MusicPlayerMessage::Play, connection);
                 }
 
+                // Check if current song is a MOD (needs reset to stop looping)
+                let was_mod = self
+                    .current_playing
+                    .and_then(|idx| self.playlist.get(idx))
+                    .map(|entry| entry.file_type == MusicFileType::Mod)
+                    .unwrap_or(false);
+
                 // Move to next track
                 self.next_track();
 
                 if self.current_playing.is_some() {
                     self.elapsed_seconds = 0;
                     self.current_subsong = 1;
+
+                    // If previous song was MOD, reset first then play next
+                    if was_mod {
+                        if let Some(conn) = connection {
+                            let conn_clone = conn.clone();
+                            return Command::perform(
+                                async move {
+                                    let result = tokio::time::timeout(
+                                        tokio::time::Duration::from_secs(2),
+                                        tokio::task::spawn_blocking(move || {
+                                            let c = conn_clone.blocking_lock();
+                                            c.reset().map_err(|e| e.to_string())
+                                        }),
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(Ok(_)) => Ok(()),
+                                        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                        Err(_) => Err("Reset timed out".to_string()),
+                                    }
+                                },
+                                |result| {
+                                    if let Err(e) = result {
+                                        log::error!("MOD reset failed: {}", e);
+                                    }
+                                    // Play next song after reset
+                                    MusicPlayerMessage::Play
+                                },
+                            );
+                        }
+                    }
+
                     self.update(MusicPlayerMessage::Play, connection)
                 } else {
                     // End of playlist
@@ -953,10 +994,72 @@ impl MusicPlayer {
                         self.current_playing = Some(0);
                         self.elapsed_seconds = 0;
                         self.current_subsong = 1;
+
+                        // Reset before repeating if last was MOD
+                        if was_mod {
+                            if let Some(conn) = connection {
+                                let conn_clone = conn.clone();
+                                return Command::perform(
+                                    async move {
+                                        let result = tokio::time::timeout(
+                                            tokio::time::Duration::from_secs(2),
+                                            tokio::task::spawn_blocking(move || {
+                                                let c = conn_clone.blocking_lock();
+                                                c.reset().map_err(|e| e.to_string())
+                                            }),
+                                        )
+                                        .await;
+
+                                        match result {
+                                            Ok(Ok(_)) => Ok(()),
+                                            Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                            Err(_) => Err("Reset timed out".to_string()),
+                                        }
+                                    },
+                                    |result| {
+                                        if let Err(e) = result {
+                                            log::error!("MOD reset failed: {}", e);
+                                        }
+                                        MusicPlayerMessage::Play
+                                    },
+                                );
+                            }
+                        }
+
                         self.update(MusicPlayerMessage::Play, connection)
                     } else {
+                        // Playlist ended - stop playback on hardware
                         self.playback_state = PlaybackState::Stopped;
                         self.status_message = "Playlist ended".to_string();
+
+                        // Reset the C64 to stop MOD/SID playback
+                        if let Some(conn) = connection {
+                            return Command::perform(
+                                async move {
+                                    let result = tokio::time::timeout(
+                                        tokio::time::Duration::from_secs(2),
+                                        tokio::task::spawn_blocking(move || {
+                                            let conn = conn.blocking_lock();
+                                            conn.reboot().map_err(|e| e.to_string())
+                                        }),
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(Ok(inner)) => inner,
+                                        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                        Err(_) => Err("Reset timed out".to_string()),
+                                    }
+                                },
+                                |result| {
+                                    if let Err(e) = result {
+                                        log::error!("Reset failed: {}", e);
+                                    }
+                                    MusicPlayerMessage::PlaybackCompleted(Ok(()))
+                                },
+                            );
+                        }
+
                         Command::none()
                     }
                 }
@@ -1652,6 +1755,20 @@ impl MusicPlayer {
             } else {
                 entry.name = browser_entry.name.clone();
             }
+        }
+        if entry.file_type == MusicFileType::Mod {
+            if let Ok(data) = fs::read(&entry.path) {
+                if let Ok(info) = mod_info::parse_mod(&data) {
+                    entry.name = if let Some(author) = &info.author {
+                        format!("{} - {}", author, info.name)
+                    } else if !info.name.is_empty() {
+                        info.name.clone()
+                    } else {
+                        browser_entry.name.clone()
+                    };
+                    entry.duration = Some(info.duration_seconds);
+                }
+            }
         } else {
             entry.name = browser_entry.name.clone();
         }
@@ -1692,7 +1809,7 @@ impl MusicPlayer {
                         let ext_lower = ext_str.to_lowercase();
                         let file_type = match ext_lower.as_str() {
                             "sid" => Some(MusicFileType::Sid),
-                            "mod" | "s3m" | "xm" | "it" => Some(MusicFileType::Mod),
+                            "mod" => Some(MusicFileType::Mod),
                             _ => None,
                         };
 

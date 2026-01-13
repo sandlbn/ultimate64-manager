@@ -19,6 +19,7 @@ mod api;
 mod config_editor;
 mod disk_image;
 mod file_browser;
+mod mod_info;
 mod music_player;
 mod remote_browser;
 mod settings;
