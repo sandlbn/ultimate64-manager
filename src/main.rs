@@ -19,6 +19,7 @@ mod api;
 mod config_editor;
 mod disk_image;
 mod file_browser;
+mod memory_editor;
 mod mod_info;
 mod music_player;
 mod remote_browser;
@@ -28,6 +29,7 @@ mod templates;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
+use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
@@ -140,6 +142,8 @@ pub enum Message {
     Streaming(StreamingMessage),
     ExitFullscreen,
 
+    // Memory Editor
+    MemoryEditor(MemoryEditorMessage),
     // Machine control
     ResetMachine,
     RebootMachine,
@@ -167,6 +171,7 @@ pub enum Tab {
     DualPaneBrowser,
     MusicPlayer,
     VideoViewer,
+    MemoryEditor,
     Configuration,
     Settings,
 }
@@ -177,6 +182,7 @@ impl std::fmt::Display for Tab {
             Tab::DualPaneBrowser => write!(f, "File Browser"),
             Tab::MusicPlayer => write!(f, "Music Player"),
             Tab::VideoViewer => write!(f, "Video Viewer"),
+            Tab::MemoryEditor => write!(f, "Memory Editor"),
             Tab::Configuration => write!(f, "Configuration"),
             Tab::Settings => write!(f, "Settings"),
         }
@@ -211,6 +217,7 @@ pub struct Ultimate64Browser {
     active_pane: Pane,
 
     music_player: MusicPlayer,
+    memory_editor: MemoryEditor,
     config_editor: ConfigEditor,
     settings: AppSettings,
     template_manager: TemplateManager,
@@ -265,6 +272,7 @@ impl Application for Ultimate64Browser {
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
             music_player,
+            memory_editor: MemoryEditor::new(),
             config_editor: ConfigEditor::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
@@ -335,7 +343,10 @@ impl Application for Ultimate64Browser {
                 self.active_tab = tab;
                 Command::none()
             }
-
+            Message::MemoryEditor(msg) => self
+                .memory_editor
+                .update(msg, self.connection.clone())
+                .map(Message::MemoryEditor),
             Message::LeftBrowser(msg) => {
                 // Check if this is a "run" operation that should stop music
                 let should_stop_music = matches!(
@@ -1298,6 +1309,7 @@ impl Application for Ultimate64Browser {
                 self.tab_button("FILE BROWSER", Tab::DualPaneBrowser),
                 self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
                 self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
+                self.tab_button("MEMORY", Tab::MemoryEditor),
                 self.tab_button("CONFIG", Tab::Configuration),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
@@ -1313,6 +1325,10 @@ impl Application for Ultimate64Browser {
             Tab::DualPaneBrowser => self.view_dual_pane_browser(),
             Tab::MusicPlayer => self.view_music_player(),
             Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
+            Tab::MemoryEditor => self
+                .memory_editor
+                .view(self.status.connected, self.settings.preferences.font_size)
+                .map(Message::MemoryEditor),
             Tab::Configuration => self
                 .config_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
