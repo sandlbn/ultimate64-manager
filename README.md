@@ -30,6 +30,12 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Screenshot capture to Pictures folder
   - Unicast and multicast support
 - **Audio Streaming** – SID audio output via UDP
+- **Memory Editor** – Read and write C64 memory in real-time
+  - Quick access to common locations (Screen, VIC-II, SID, CIA, Zero Page, etc.)
+  - Hex, ASCII, Decimal, Binary display modes
+  - Search for byte patterns or ASCII text
+  - Fill memory ranges
+  - Click-to-edit bytes
 - **Configuration Editor** – Edit Ultimate configuration settings
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC and menus
