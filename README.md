@@ -11,6 +11,10 @@ A cross-platform desktop application for managing **Commodore 64 Ultimate**, **U
 Prebuilt binaries for macOS, Windows, and Linux (AppImage) are available on the GitHub **Releases** page:
 https://github.com/sandlbn/ultimate64-manager/releases
 
+> **Required:** Enable the following services in the **Ultimate / Commodore menu** (not in this app): **Web Remote Control**, **FTP File Service**, **Ultimate DMA Service**, and **Ultimate Ident**.  
+> If these services are disabled, **Ultimate64 Manager** will not be able to connect.
+
+
 ## Features
 
 - **Dual-Pane File Browser** – Local and remote file browsing side by side
