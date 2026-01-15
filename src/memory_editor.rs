@@ -544,7 +544,6 @@ impl MemoryEditor {
                 if let Some(path) = path {
                     if let Some(data) = &self.memory_data {
                         let data = data.clone();
-                        let address = self.current_address;
 
                         return Command::perform(
                             async move {
