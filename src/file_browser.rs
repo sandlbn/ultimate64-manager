@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::{Rest, drives::MountMode};
 
+use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
 
 /// Timeout for REST API operations to prevent hangs when device goes offline
@@ -41,6 +42,10 @@ pub enum FileBrowserMessage {
     ShowDiskInfo(PathBuf),
     DiskInfoLoaded(Result<DiskInfo, String>),
     CloseDiskInfo,
+    // Content preview popup (text/image files)
+    ShowContentPreview(PathBuf),
+    ContentPreviewLoaded(Result<ContentPreview, String>),
+    CloseContentPreview,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +98,10 @@ pub struct FileBrowser {
     disk_info_popup: Option<DiskInfo>,
     disk_info_path: Option<PathBuf>,
     disk_info_loading: bool,
+    // Content preview popup state (text/image files)
+    content_preview: Option<ContentPreview>,
+    content_preview_path: Option<PathBuf>,
+    content_preview_loading: bool,
 }
 
 impl FileBrowser {
@@ -115,6 +124,9 @@ impl FileBrowser {
             disk_info_popup: None,
             disk_info_path: None,
             disk_info_loading: false,
+            content_preview: None,
+            content_preview_path: None,
+            content_preview_loading: false,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -315,6 +327,33 @@ impl FileBrowser {
                 self.disk_info_path = None;
                 Command::none()
             }
+            // Content preview popup messages (text/image files)
+            FileBrowserMessage::ShowContentPreview(path) => {
+                self.content_preview_loading = true;
+                self.content_preview_path = Some(path.clone());
+                Command::perform(
+                    async move { load_content_preview_async(path).await },
+                    FileBrowserMessage::ContentPreviewLoaded,
+                )
+            }
+            FileBrowserMessage::ContentPreviewLoaded(result) => {
+                self.content_preview_loading = false;
+                match result {
+                    Ok(preview) => {
+                        self.content_preview = Some(preview);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed to load content: {}", e));
+                        self.content_preview_path = None;
+                    }
+                }
+                Command::none()
+            }
+            FileBrowserMessage::CloseContentPreview => {
+                self.content_preview = None;
+                self.content_preview_path = None;
+                Command::none()
+            }
         }
     }
     #[allow(dead_code)]
@@ -427,8 +466,8 @@ impl FileBrowser {
         };
 
         // Status message
-        let status = if self.disk_info_loading {
-            text("Loading disk info...").size(small)
+        let status = if self.disk_info_loading || self.content_preview_loading {
+            text("Loading...").size(small)
         } else if let Some(msg) = &self.status_message {
             text(msg).size(small)
         } else {
@@ -438,6 +477,21 @@ impl FileBrowser {
         // If disk info popup is open, show it instead of the file list
         if let Some(disk_info) = &self.disk_info_popup {
             let popup = self.view_disk_info_popup(disk_info, font_size);
+
+            column![
+                path_display,
+                nav_buttons,
+                controls_row,
+                selection_info,
+                popup,
+                status,
+            ]
+            .spacing(3)
+            .padding(5)
+            .into()
+        } else if let Some(content_preview) = &self.content_preview {
+            // If content preview popup is open, show it instead of the file list
+            let popup = self.view_content_preview_popup(content_preview, font_size);
 
             column![
                 path_display,
@@ -563,8 +617,12 @@ impl FileBrowser {
         .spacing(10);
 
         // Scrollable listing
-        let listing =
-            scrollable(Column::with_children(listing_items).spacing(2)).height(Length::Fill);
+        let listing = scrollable(
+            Column::with_children(listing_items)
+                .spacing(2)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
 
         // Popup container with border styling
         container(
@@ -582,6 +640,142 @@ impl FileBrowser {
         .height(Length::Fill)
         .style(iced::theme::Container::Box)
         .into()
+    }
+
+    fn view_content_preview_popup(
+        &self,
+        content: &ContentPreview,
+        font_size: u32,
+    ) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
+        match content {
+            ContentPreview::Text {
+                filename,
+                content,
+                line_count,
+            } => {
+                // Truncate long filenames
+                let display_name = if filename.len() > 40 {
+                    format!("{}...", &filename[..37])
+                } else {
+                    filename.clone()
+                };
+
+                // Header with filename and close button
+                let header = row![
+                    text("TEXT - ").size(small),
+                    text(&display_name).size(normal),
+                    Space::with_width(Length::Fill),
+                    text(format!("{} lines", line_count)).size(small),
+                    Space::with_width(10),
+                    tooltip(
+                        button(text("Close").size(small))
+                            .on_press(FileBrowserMessage::CloseContentPreview)
+                            .padding([4, 10]),
+                        "Close text preview",
+                        tooltip::Position::Left,
+                    )
+                    .style(iced::theme::Container::Box),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center);
+
+                // Text content with line numbers
+                let mut text_lines: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+                for (i, line) in content.lines().enumerate() {
+                    let line_row = row![
+                        text(format!("{:>4}", i + 1))
+                            .size(tiny)
+                            .width(Length::Fixed(35.0))
+                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                                0.5, 0.5, 0.5
+                            ))),
+                        text(line).size(tiny),
+                    ]
+                    .spacing(10);
+                    text_lines.push(line_row.into());
+                }
+
+                // Scrollable text content
+                let text_content = scrollable(
+                    Column::with_children(text_lines)
+                        .spacing(2)
+                        .padding([0, 12, 0, 0]),
+                )
+                .height(Length::Fill);
+
+                // Popup container
+                container(
+                    column![header, horizontal_rule(1), text_content,]
+                        .spacing(5)
+                        .padding(10),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(iced::theme::Container::Box)
+                .into()
+            }
+            ContentPreview::Image {
+                filename,
+                data,
+                width,
+                height,
+            } => {
+                // Truncate long filenames
+                let display_name = if filename.len() > 40 {
+                    format!("{}...", &filename[..37])
+                } else {
+                    filename.clone()
+                };
+
+                // Header with filename and close button
+                let header = row![
+                    text("IMAGE - ").size(small),
+                    text(&display_name).size(normal),
+                    Space::with_width(Length::Fill),
+                    text(format!("{}x{}", width, height)).size(small),
+                    Space::with_width(10),
+                    tooltip(
+                        button(text("Close").size(small))
+                            .on_press(FileBrowserMessage::CloseContentPreview)
+                            .padding([4, 10]),
+                        "Close image preview",
+                        tooltip::Position::Left,
+                    )
+                    .style(iced::theme::Container::Box),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center);
+
+                // Image display using iced's image widget
+                let image_handle = iced::widget::image::Handle::from_memory(data.clone());
+                let image_widget = iced::widget::image(image_handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill);
+
+                // Popup container
+                container(
+                    column![
+                        header,
+                        horizontal_rule(1),
+                        container(image_widget)
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .center_x()
+                            .center_y(),
+                    ]
+                    .spacing(5)
+                    .padding(10),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(iced::theme::Container::Box)
+                .into()
+            }
+        }
     }
 
     fn view_file_entry(
@@ -606,6 +800,8 @@ impl FileBrowser {
                 Some("sid") => "SID",
                 Some("mod") => "MOD",
                 Some("tap") | Some("t64") => "TAP",
+                Some("txt") | Some("atxt") | Some("nfo") | Some("diz") => "TXT",
+                Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") => "IMG",
                 _ => "",
             }
         };
@@ -620,6 +816,10 @@ impl FileBrowser {
 
         // Check if this is a disk image that can show info
         let is_disk_image = matches!(entry.extension.as_deref(), Some("d64") | Some("d71"));
+
+        // Check if this is a previewable text or image file
+        let is_text_file = dir_preview::is_text_file(&entry.path);
+        let is_image_file = dir_preview::is_image_file(&entry.path);
 
         // Action button based on file type
         let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
@@ -719,7 +919,36 @@ impl FileBrowser {
                 )
                 .style(iced::theme::Container::Box)
                 .into(),
-                _ => Space::with_width(0).into(),
+                _ => {
+                    // Check for text or image preview
+                    if is_text_file {
+                        tooltip(
+                            button(text("View").size(small))
+                                .on_press(FileBrowserMessage::ShowContentPreview(
+                                    entry.path.clone(),
+                                ))
+                                .padding([2, 8]),
+                            "View text content",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box)
+                        .into()
+                    } else if is_image_file {
+                        tooltip(
+                            button(text("View").size(small))
+                                .on_press(FileBrowserMessage::ShowContentPreview(
+                                    entry.path.clone(),
+                                ))
+                                .padding([2, 8]),
+                            "View image",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box)
+                        .into()
+                    } else {
+                        Space::with_width(0).into()
+                    }
+                }
             }
         };
 
@@ -796,6 +1025,7 @@ impl FileBrowser {
                         };
 
                         // Filter: show directories and relevant file types
+                        // Including text files and images for preview
                         if is_dir
                             || matches!(
                                 extension.as_deref(),
@@ -810,7 +1040,19 @@ impl FileBrowser {
                                     | Some("mod")
                                     | Some("tap")
                                     | Some("t64")
+                                    // Text files for readme preview
+                                    | Some("txt")
+                                    | Some("atxt")
+                                    | Some("nfo")
+                                    | Some("diz")
+                                    // Image files for preview
+                                    | Some("png")
+                                    | Some("jpg")
+                                    | Some("jpeg")
+                                    | Some("gif")
+                                    | Some("bmp")
                             )
+                            || dir_preview::is_text_file(&path)
                         {
                             Some(FileEntry {
                                 path,
@@ -845,6 +1087,17 @@ async fn load_disk_info_async(path: PathBuf) -> Result<DiskInfo, String> {
     tokio::task::spawn_blocking(move || disk_image::read_disk_info(&path))
         .await
         .map_err(|e| format!("Task error: {}", e))?
+}
+
+async fn load_content_preview_async(path: PathBuf) -> Result<ContentPreview, String> {
+    // Determine if text or image based on extension
+    if dir_preview::is_text_file(&path) {
+        dir_preview::load_text_file_async(path).await
+    } else if dir_preview::is_image_file(&path) {
+        dir_preview::load_image_file_async(path).await
+    } else {
+        Err("Unsupported file type for preview".to_string())
+    }
 }
 
 async fn mount_disk_async(
