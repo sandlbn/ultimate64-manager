@@ -151,6 +151,16 @@ pub enum MemoryEditorMessage {
     WriteByteCancel,
     WriteByteComplete(Result<(), String>),
 
+    // Save/Load dumps
+    SaveDump,
+    SaveDumpPathSelected(Option<std::path::PathBuf>),
+    SaveDumpComplete(Result<String, String>),
+    LoadDump,
+    LoadDumpPathSelected(Option<std::path::PathBuf>),
+    LoadDumpComplete(Result<Vec<u8>, String>),
+    WriteDumpToDevice,
+    WriteDumpComplete(Result<(), String>),
+
     // Quick location selection
     LocationSelected(MemoryLocation),
 
@@ -190,6 +200,9 @@ pub struct MemoryEditor {
     // Memory data
     memory_data: Option<Vec<u8>>,
 
+    // Pending load data (waiting for user confirmation to write)
+    pending_load_data: Option<Vec<u8>>,
+
     // Display settings
     display_mode: DisplayMode,
 
@@ -227,6 +240,7 @@ impl MemoryEditor {
             search_input: String::new(),
             fill_value_input: "00".to_string(),
             memory_data: None,
+            pending_load_data: None,
             display_mode: DisplayMode::Hex,
             search_matches: Vec::new(),
             selected_location: None,
@@ -496,6 +510,147 @@ impl MemoryEditor {
                 }
                 Command::none()
             }
+
+            // Save dump to file
+            MemoryEditorMessage::SaveDump => {
+                if self.memory_data.is_none() {
+                    self.status_message =
+                        Some("No memory data to save. Read memory first.".to_string());
+                    return Command::none();
+                }
+
+                let default_name = format!(
+                    "memdump_{:04X}_{:04X}.bin",
+                    self.current_address,
+                    self.current_address
+                        .wrapping_add(self.display_length.saturating_sub(1))
+                );
+
+                Command::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_file_name(&default_name)
+                            .add_filter("Binary dump", &["bin"])
+                            .add_filter("All files", &["*"])
+                            .save_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    MemoryEditorMessage::SaveDumpPathSelected,
+                )
+            }
+
+            MemoryEditorMessage::SaveDumpPathSelected(path) => {
+                if let Some(path) = path {
+                    if let Some(data) = &self.memory_data {
+                        let data = data.clone();
+                        let address = self.current_address;
+
+                        return Command::perform(
+                            async move {
+                                // Write binary data
+                                std::fs::write(&path, &data)
+                                    .map_err(|e| format!("Failed to save: {}", e))?;
+
+                                Ok(format!(
+                                    "Saved {} bytes to {}",
+                                    data.len(),
+                                    path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                                ))
+                            },
+                            MemoryEditorMessage::SaveDumpComplete,
+                        );
+                    }
+                }
+                Command::none()
+            }
+
+            MemoryEditorMessage::SaveDumpComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(e);
+                    }
+                }
+                Command::none()
+            }
+
+            // Load dump from file
+            MemoryEditorMessage::LoadDump => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Binary dump", &["bin"])
+                        .add_filter("All files", &["*"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                MemoryEditorMessage::LoadDumpPathSelected,
+            ),
+
+            MemoryEditorMessage::LoadDumpPathSelected(path) => {
+                if let Some(path) = path {
+                    return Command::perform(
+                        async move {
+                            std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))
+                        },
+                        MemoryEditorMessage::LoadDumpComplete,
+                    );
+                }
+                Command::none()
+            }
+
+            MemoryEditorMessage::LoadDumpComplete(result) => {
+                match result {
+                    Ok(data) => {
+                        let len = data.len();
+                        self.pending_load_data = Some(data);
+                        self.status_message = Some(format!(
+                            "Loaded {} bytes. Click 'Write to Device' to write to ${:04X}",
+                            len, self.current_address
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(e);
+                    }
+                }
+                Command::none()
+            }
+
+            MemoryEditorMessage::WriteDumpToDevice => {
+                if let (Some(conn), Some(data)) = (connection, self.pending_load_data.take()) {
+                    self.is_loading = true;
+                    let address = self.current_address;
+                    let len = data.len();
+                    self.status_message =
+                        Some(format!("Writing {} bytes to ${:04X}...", len, address));
+
+                    return Command::perform(
+                        async move { write_memory_async(conn, address, data).await },
+                        MemoryEditorMessage::WriteDumpComplete,
+                    );
+                } else {
+                    self.status_message = Some("No data to write or not connected".to_string());
+                }
+                Command::none()
+            }
+
+            MemoryEditorMessage::WriteDumpComplete(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(()) => {
+                        self.status_message = Some("Memory written successfully!".to_string());
+                        // Refresh to see changes
+                        return self.update(MemoryEditorMessage::ReadMemory, connection);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Write failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -693,17 +848,72 @@ impl MemoryEditor {
                     Some(MemoryEditorMessage::FillMemory)
                 })
                 .padding([5, 10]),
-            horizontal_space(),
-            if let Some(msg) = &self.status_message {
-                text(msg).size(small_font)
-            } else {
-                text("").size(small_font)
-            },
+            Space::with_width(Length::Fixed(20.0)),
+            // Save/Load dump buttons
+            button(text("Save Dump...").size(small_font))
+                .on_press_maybe(if self.is_loading || self.memory_data.is_none() {
+                    None
+                } else {
+                    Some(MemoryEditorMessage::SaveDump)
+                })
+                .padding([5, 10]),
+            button(text("Load Dump...").size(small_font))
+                .on_press_maybe(if self.is_loading {
+                    None
+                } else {
+                    Some(MemoryEditorMessage::LoadDump)
+                })
+                .padding([5, 10]),
         ]
         .spacing(10)
         .align_items(iced::Alignment::Center);
 
-        column![first_row, search_row, fill_row].spacing(8).into()
+        // Status row with optional "Write to Device" button
+        let status_row: Element<'_, MemoryEditorMessage> = if self.pending_load_data.is_some() {
+            row![
+                text(format!(
+                    "📁 {} bytes loaded, ready to write to ${:04X}",
+                    self.pending_load_data
+                        .as_ref()
+                        .map(|d| d.len())
+                        .unwrap_or(0),
+                    self.current_address
+                ))
+                .size(small_font)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.3, 0.8, 0.3
+                ))),
+                Space::with_width(Length::Fixed(10.0)),
+                button(text("Write to Device").size(small_font))
+                    .on_press_maybe(if self.is_loading {
+                        None
+                    } else {
+                        Some(MemoryEditorMessage::WriteDumpToDevice)
+                    })
+                    .padding([5, 15])
+                    .style(iced::theme::Button::Primary),
+                horizontal_space(),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center)
+            .into()
+        } else {
+            row![
+                if let Some(msg) = &self.status_message {
+                    text(msg).size(small_font)
+                } else {
+                    text("").size(small_font)
+                },
+                horizontal_space(),
+            ]
+            .spacing(10)
+            .align_items(iced::Alignment::Center)
+            .into()
+        };
+
+        column![first_row, search_row, fill_row, status_row]
+            .spacing(8)
+            .into()
     }
 
     fn view_memory_display(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
@@ -1136,5 +1346,40 @@ async fn fill_memory_async(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("Fill timed out - device may be offline".to_string()),
+    }
+}
+
+async fn write_memory_async(
+    connection: Arc<TokioMutex<Rest>>,
+    address: u16,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS * 4), // Longer timeout for large writes
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.blocking_lock();
+            // Write in chunks (API max is typically 256 bytes per call)
+            let chunk_size = 256usize;
+
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let remaining = data.len() - offset;
+                let write_size = remaining.min(chunk_size);
+                let current_addr = address.wrapping_add(offset as u16);
+
+                conn.write_mem(current_addr, &data[offset..offset + write_size])
+                    .map_err(|e| format!("Write failed at ${:04X}: {}", current_addr, e))?;
+
+                offset += write_size;
+            }
+            Ok(())
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Write timed out - device may be offline".to_string()),
     }
 }
