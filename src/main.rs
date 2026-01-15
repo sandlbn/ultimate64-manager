@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 use url::Host;
+use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
 mod config_editor;
@@ -26,6 +27,7 @@ mod remote_browser;
 mod settings;
 mod streaming;
 mod templates;
+mod version_check;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
@@ -163,7 +165,9 @@ pub enum Message {
     BrowseMusicPlayerStartDir,
     MusicPlayerStartDirSelected(Option<PathBuf>),
     ClearMusicPlayerStartDir,
-    // Window close
+    // Version check
+    VersionCheck(VersionCheckMessage),
+    OpenReleasePage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +240,8 @@ pub struct Ultimate64Browser {
 
     // Video streaming
     video_streaming: VideoStreaming,
+    // Update notification
+    new_version: Option<NewVersionInfo>,
 }
 
 impl Application for Ultimate64Browser {
@@ -282,6 +288,7 @@ impl Application for Ultimate64Browser {
             template_manager: TemplateManager::new(),
             selected_template: None,
             connection: None,
+            new_version: None,
             status: StatusInfo {
                 connected: false,
                 device_info: None,
@@ -290,6 +297,10 @@ impl Application for Ultimate64Browser {
             user_message: None,
             video_streaming: VideoStreaming::new(),
         };
+
+        // Check for updates on startup
+        let version_check_cmd =
+            version_check::check_for_updates(APP_VERSION).map(Message::VersionCheck);
 
         // Auto-connect if host is configured
         if !settings.connection.host.is_empty() {
@@ -300,19 +311,21 @@ impl Application for Ultimate64Browser {
             app.establish_connection();
             return (
                 app,
-                Command::perform(
-                    async {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                    },
-                    |_| Message::RefreshStatus,
-                ),
+                Command::batch(vec![
+                    Command::perform(
+                        async {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        },
+                        |_| Message::RefreshStatus,
+                    ),
+                    version_check_cmd,
+                ]),
             );
         }
 
         log::info!("No host configured, waiting for user input");
-        (app, Command::none())
+        (app, version_check_cmd)
     }
-
     fn title(&self) -> String {
         let connection_status = if self.status.connected {
             format!(" - Connected to {}", self.settings.connection.host)
@@ -702,7 +715,30 @@ impl Application for Ultimate64Browser {
                 }
                 Command::none()
             }
+            Message::VersionCheck(msg) => {
+                match msg {
+                    VersionCheckMessage::CheckComplete(result) => match result {
+                        Ok(Some(info)) => {
+                            log::info!("New version available: {}", info.version);
+                            self.new_version = Some(info);
+                        }
+                        Ok(None) => {
+                            log::debug!("Running latest version");
+                        }
+                        Err(e) => {
+                            log::warn!("Version check failed: {}", e);
+                        }
+                    },
+                }
+                Command::none()
+            }
 
+            Message::OpenReleasePage => {
+                if let Some(info) = &self.new_version {
+                    let _ = open::that(&info.download_url);
+                }
+                Command::none()
+            }
             Message::MusicPlayer(msg) => {
                 // Check if we need to pause or resume the machine
                 let was_paused = self.music_player.playback_state == PlaybackState::Paused;
@@ -1394,50 +1430,35 @@ impl Ultimate64Browser {
 
     fn view_connection_bar(&self) -> Element<'_, Message> {
         let status_indicator = if self.status.connected {
-            text("* CONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
+            text("● CONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
                 0.2, 0.8, 0.2,
             )))
         } else {
-            text("  DISCONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
+            text("○ DISCONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
                 0.8, 0.2, 0.2,
             )))
         };
 
         let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(12);
 
-        let mounted_text = if !self.status.mounted_disks.is_empty() {
-            let disks: Vec<String> = self
-                .status
-                .mounted_disks
-                .iter()
-                .map(|(drive, name)| format!("{}:{}", drive.to_uppercase(), name))
-                .collect();
-            text(disks.join(" | ")).size(12)
-        } else {
-            text("No disks mounted").size(12)
-        };
-
-        // Show Connect button when disconnected, Refresh button when connected
-        let action_button: Element<'_, Message> = if self.status.connected {
-            tooltip(
-                button(text("Refresh").size(12))
-                    .on_press(Message::RefreshStatus)
-                    .padding([4, 8]),
-                "Refresh connection status and mounted disks",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box)
+        // Update notification on the right side
+        let update_notification: Element<'_, Message> = if let Some(info) = &self.new_version {
+            row![
+                text(format!("🎉 {} available!", info.version))
+                    .size(12)
+                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                        0.3, 0.8, 0.3
+                    ))),
+                button(text("Download").size(11))
+                    .on_press(Message::OpenReleasePage)
+                    .padding([2, 8])
+                    .style(iced::theme::Button::Primary),
+            ]
+            .spacing(8)
+            .align_items(iced::Alignment::Center)
             .into()
         } else {
-            tooltip(
-                button(text("Connect").size(12))
-                    .on_press(Message::ConnectPressed)
-                    .padding([4, 8]),
-                "Connect to Ultimate64",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box)
-            .into()
+            Space::new(Length::Shrink, Length::Shrink).into()
         };
 
         container(
@@ -1445,18 +1466,15 @@ impl Ultimate64Browser {
                 status_indicator,
                 text(" | ").size(12),
                 device_text,
-                text(" | ").size(12),
-                mounted_text,
                 horizontal_space(),
+                update_notification,
             ]
-            .push(action_button)
             .spacing(10)
             .align_items(iced::Alignment::Center),
         )
-        .padding([5, 10])
+        .padding([8, 15])
         .into()
     }
-
     fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Left pane - Local files
         let left_header = row![
