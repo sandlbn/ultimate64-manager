@@ -3,10 +3,8 @@
 //! Provides functionality to convert between PETSCII (Commodore character encoding)
 //! and Unicode/ASCII for display purposes.
 
-use ultimate64::petscii::Petscii;
-
 /// Convert PETSCII bytes to a displayable string
-/// Handles padding characters and uses ultimate64 crate for reverse lookup
+/// Handles padding characters
 pub fn to_string(bytes: &[u8]) -> String {
     let mut result = String::new();
 
@@ -24,41 +22,42 @@ pub fn to_string(bytes: &[u8]) -> String {
 }
 
 /// Convert a single PETSCII byte to a displayable character
-/// Uses ultimate64::petscii::Petscii for reverse lookup where possible
+/// Uses direct mapping for reliable cross-platform behavior
 pub fn byte_to_char(petscii_code: u8) -> char {
-    // Try to find which ASCII character produces this PETSCII code
-    // by checking common printable characters
-    for c in ' '..='~' {
-        let petscii_bytes = Petscii::from_str_lossy(&c.to_string());
-        if !petscii_bytes.is_empty() {
-            let code = petscii_bytes[0];
-            if code == petscii_code {
-                return c;
-            }
-        }
-    }
-
-    // Fallback conversion for codes not found via Petscii lookup
     match petscii_code {
-        0x00..=0x1F => ' ',                  // Control characters
-        0x20 => ' ',                         // Space
-        0x21..=0x3F => petscii_code as char, // Numbers and symbols (same as ASCII)
+        // Control characters
+        0x00..=0x1F => ' ',
+        // Space
+        0x20 => ' ',
+        // Numbers and symbols (same as ASCII)
+        0x21..=0x3F => petscii_code as char,
+        // @ symbol
         0x40 => '@',
-        0x41..=0x5A => petscii_code as char, // Uppercase A-Z
+        // Uppercase A-Z (PETSCII standard)
+        0x41..=0x5A => petscii_code as char,
+        // Brackets and special chars
         0x5B => '[',
         0x5C => '£',
         0x5D => ']',
-        0x5E => '↑',
-        0x5F => '←',
-        0x60 => '─',
-        0x61..=0x7A => petscii_code as char, // Lowercase in shifted mode
-        0x7B..=0x7F => '▒',
-        0x80..=0x9F => '▒',
-        0xA0 => ' ',        // Shifted space (padding)
-        0xA1..=0xBF => '▒', // Graphics
-        0xC0 => '─',
-        0xC1..=0xDA => ((petscii_code - 0xC1) + b'A') as char, // Uppercase again
-        0xDB..=0xFF => '▒',                                    // More graphics
+        0x5E => '^', // Up arrow, use caret as ASCII substitute
+        0x5F => '_', // Left arrow, use underscore as ASCII substitute
+        // Horizontal line
+        0x60 => '-',
+        // Lowercase a-z (shifted mode)
+        0x61..=0x7A => petscii_code as char,
+        // Graphics characters
+        0x7B..=0x7F => '#',
+        0x80..=0x9F => '#',
+        // Shifted space (padding)
+        0xA0 => ' ',
+        // Graphics
+        0xA1..=0xBF => '#',
+        // Horizontal line
+        0xC0 => '-',
+        // Uppercase A-Z again (alternate range)
+        0xC1..=0xDA => ((petscii_code - 0xC1) + b'A') as char,
+        // More graphics
+        0xDB..=0xFF => '#',
     }
 }
 
