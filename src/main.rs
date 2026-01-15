@@ -18,11 +18,13 @@ use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
 mod config_editor;
+mod dir_preview;
 mod disk_image;
 mod file_browser;
 mod memory_editor;
 mod mod_info;
 mod music_player;
+mod petscii;
 mod remote_browser;
 mod settings;
 mod streaming;

@@ -8,7 +8,8 @@
 
 use std::fs;
 use std::path::Path;
-use ultimate64::petscii::Petscii;
+
+use crate::petscii;
 
 /// Disk image type
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -193,63 +194,6 @@ fn read_sector(data: &[u8], track: u8, sector: u8, kind: ImageKind) -> Option<&[
     }
 }
 
-/// Convert PETSCII bytes to a displayable string using ultimate64 crate
-fn petscii_to_string(bytes: &[u8]) -> String {
-    let mut result = String::new();
-
-    for &b in bytes {
-        // Skip $A0 padding (PETSCII shifted space used for padding)
-        if b == 0xA0 {
-            continue;
-        }
-
-        // Try to find ASCII char that maps to this PETSCII code
-        let ch = petscii_byte_to_char(b);
-        result.push(ch);
-    }
-
-    result.trim_end().to_string()
-}
-
-/// Convert a single PETSCII byte to a displayable character
-/// Uses ultimate64::petscii::Petscii for reverse lookup where possible
-fn petscii_byte_to_char(petscii_code: u8) -> char {
-    // Try to find which ASCII character produces this PETSCII code
-    // by checking common printable characters
-    for c in ' '..='~' {
-        let petscii_bytes = Petscii::from_str_lossy(&c.to_string());
-        if !petscii_bytes.is_empty() {
-            let code = petscii_bytes[0];
-            if code == petscii_code {
-                return c;
-            }
-        }
-    }
-
-    // Fallback conversion for codes not found via Petscii lookup
-    match petscii_code {
-        0x00..=0x1F => ' ',                  // Control characters
-        0x20 => ' ',                         // Space
-        0x21..=0x3F => petscii_code as char, // Numbers and symbols (same as ASCII)
-        0x40 => '@',
-        0x41..=0x5A => petscii_code as char, // Uppercase A-Z
-        0x5B => '[',
-        0x5C => '£',
-        0x5D => ']',
-        0x5E => '↑',
-        0x5F => '←',
-        0x60 => '─',
-        0x61..=0x7A => petscii_code as char, // Lowercase in shifted mode
-        0x7B..=0x7F => '▒',
-        0x80..=0x9F => '▒',
-        0xA0 => ' ',        // Shifted space (padding)
-        0xA1..=0xBF => '▒', // Graphics
-        0xC0 => '─',
-        0xC1..=0xDA => ((petscii_code - 0xC1) + b'A') as char, // Uppercase again
-        0xDB..=0xFF => '▒',                                    // More graphics
-    }
-}
-
 /// Count free blocks from BAM
 fn count_free_blocks(data: &[u8], kind: ImageKind) -> u16 {
     let bam = match read_sector(data, 18, 0, kind) {
@@ -311,15 +255,15 @@ pub fn read_disk_info_from_bytes(data: &[u8]) -> Result<DiskInfo, String> {
 
     // Extract disk name (bytes 144-159, 16 characters)
     let name_bytes = &bam[144..160];
-    let name = petscii_to_string(name_bytes);
+    let name = petscii::to_string(name_bytes);
 
     // Extract disk ID (bytes 162-163)
     let id_bytes = &bam[162..164];
-    let disk_id = petscii_to_string(id_bytes);
+    let disk_id = petscii::to_string(id_bytes);
 
     // Extract DOS type (bytes 165-166)
     let dos_bytes = &bam[165..167];
-    let dos_type = petscii_to_string(dos_bytes);
+    let dos_type = petscii::to_string(dos_bytes);
 
     // Count free blocks
     let blocks_free = count_free_blocks(data, kind);
@@ -374,7 +318,7 @@ fn read_directory(data: &[u8], kind: ImageKind) -> Result<Vec<DirEntry>, String>
 
             // Filename is bytes 5-20 (16 characters)
             let name_bytes = &entry_bytes[5..21];
-            let name = petscii_to_string(name_bytes);
+            let name = petscii::to_string(name_bytes);
 
             // File size in blocks (bytes 30-31, little-endian)
             let size_blocks = (entry_bytes[30] as u16) | ((entry_bytes[31] as u16) << 8);
