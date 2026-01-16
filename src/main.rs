@@ -983,7 +983,10 @@ impl Application for Ultimate64Browser {
             }
 
             Message::Streaming(msg) => {
+                self.video_streaming
+                    .set_api_password(self.settings.connection.password.clone());
                 // Handle screenshot result for user message
+
                 if let StreamingMessage::ScreenshotComplete(ref result) = msg {
                     match result {
                         Ok(path) => {
@@ -1041,7 +1044,7 @@ impl Application for Ultimate64Browser {
                                         Ok(Ok(r)) => r,
                                         Ok(Err(e)) => Err(format!("Task error: {}", e)),
                                         Err(_) => {
-                                            Err("Command timed out - device may be offline"
+                                            Err("Command timed out. The device may be offline or Web Remote Control is disabled."
                                                 .to_string())
                                         }
                                     }
