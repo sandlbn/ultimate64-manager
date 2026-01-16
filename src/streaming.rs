@@ -2378,13 +2378,14 @@ fn colors_equal(a: &[u8; 4], b: &[u8; 4]) -> bool {
 }
 
 /// Send binary stream control command to Ultimate64 (port 64)
+/// Falls back to REST API if binary protocol fails
 fn send_stream_command(
     ultimate_ip: &str,
     my_ip: &str,
     port: u16,
     stream_cmd: u8,
 ) -> std::io::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
@@ -2413,16 +2414,59 @@ fn send_stream_command(
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    let written = stream.write(&cmd)?;
-    log::info!("Wrote {} bytes", written);
+    // Try binary TCP first
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(mut stream) => {
+            let written = stream.write(&cmd)?;
+            log::info!("Wrote {} bytes via binary TCP", written);
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("Binary TCP failed: {}, trying REST API fallback", e);
+        }
+    }
+
+    // Fallback to REST API
+    let stream_name = match stream_cmd {
+        0x20 => "video",
+        0x21 => "audio",
+        0x22 => "debug",
+        _ => "video",
+    };
+
+    let path = format!("/v1/streams/{}:start?ip={}:{}", stream_name, my_ip, port);
+    let request = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        path, ultimate_ip
+    );
+
+    log::info!("REST API fallback: PUT http://{}{}", ultimate_ip, path);
+
+    let http_addr: std::net::SocketAddr = format!("{}:80", ultimate_ip)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut stream = TcpStream::connect_timeout(&http_addr, Duration::from_secs(5))?;
+    stream.write_all(request.as_bytes())?;
+
+    // Read response
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut response = [0u8; 256];
+    let _ = stream.read(&mut response);
+
+    let response_str = String::from_utf8_lossy(&response);
+    log::info!(
+        "REST API response: {}",
+        response_str.lines().next().unwrap_or("")
+    );
 
     Ok(())
 }
 
 /// Send stop command to Ultimate64 (port 64)
+/// Falls back to REST API if binary protocol fails
 fn send_stop_command(ultimate_ip: &str, stream_cmd: u8) -> std::io::Result<()> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
 
@@ -2436,8 +2480,51 @@ fn send_stop_command(ultimate_ip: &str, stream_cmd: u8) -> std::io::Result<()> {
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.write_all(&cmd)?;
+    // Try binary TCP first
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(mut stream) => {
+            stream.write_all(&cmd)?;
+            log::debug!("Stop command sent via binary TCP");
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("Binary TCP stop failed: {}, trying REST API fallback", e);
+        }
+    }
+
+    // Fallback to REST API
+    let stream_name = match stream_cmd {
+        0x20 => "video",
+        0x21 => "audio",
+        0x22 => "debug",
+        _ => "video",
+    };
+
+    let path = format!("/v1/streams/{}:stop", stream_name);
+    let request = format!(
+        "PUT {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        path, ultimate_ip
+    );
+
+    log::info!("REST API stop fallback: PUT http://{}{}", ultimate_ip, path);
+
+    let http_addr: std::net::SocketAddr = format!("{}:80", ultimate_ip)
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    let mut stream = TcpStream::connect_timeout(&http_addr, Duration::from_secs(5))?;
+    stream.write_all(request.as_bytes())?;
+
+    // Read response
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut response = [0u8; 256];
+    let _ = stream.read(&mut response);
+
+    let response_str = String::from_utf8_lossy(&response);
+    log::info!(
+        "REST API stop response: {}",
+        response_str.lines().next().unwrap_or("")
+    );
 
     Ok(())
 }
