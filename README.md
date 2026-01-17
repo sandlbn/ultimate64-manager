@@ -1,3 +1,27 @@
+Forked from `https://github.com/sandlbn/ultimate64-manager` - Application credit goes to sandlbn.  This repo simply contains the AppImage for Gentoo and similiar distros using non-Debian style lib directory structures.
+
+Linux AppImage determines display environment to run in.
+
+Combined Makefile for Win, OSX, and Linux.
+
+Build everything (Linux AppImage + macOS zip + Windows zip) 
+`make -f Makefile.unified zip`
+
+Build just the Linux AppImage
+`make -f Makefile.unified linux`
+or
+`make -f Makefile.unified linux-appimage`
+
+Build just the linux AppImage in a specific directory
+
+`make -f Makefile.unified linux-appimage LINUXDEPLOY=/full/path/to/linuxdeploy-x86_64.AppImage`
+
+Build just the macOS bundle + zip
+`make -f Makefile.unified zip-macos`
+
+Build just the Windows zip
+`make -f Makefile.unified zip-windows`
+
 # Ultimate64 Manager
 
 A cross-platform desktop application for managing **Commodore 64 Ultimate**, **Ultimate 64**, **Ultimate 64 Elite**, and **Ultimate-II+** devices. Browse files, mount disk images, stream VIC video/audio, play SID music, and edit device configuration.
