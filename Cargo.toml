@@ -27,7 +27,7 @@ cpal = "0.15"
 md5 = "0.7"
 urlencoding = "2.1"
 open = "5"
-ffmpeg-next = "8.0"
+ffmpeg-sys-next = { version = "8" }
 nix = { version = "0.29", features = ["fs"] }
 
 # Windows-specific dependencies

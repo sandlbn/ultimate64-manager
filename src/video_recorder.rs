@@ -10,6 +10,14 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
+// Windows-specific imports for hiding console window
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+/// Windows flag to create process without a console window
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 /// Default frame rate for PAL C64 (50 Hz)
 pub const DEFAULT_FPS: u32 = 50;
 
@@ -21,6 +29,18 @@ pub const DEFAULT_CHANNELS: u32 = 2;
 
 /// Cached ffmpeg path
 static FFMPEG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// Create a Command that hides the console window on Windows
+fn create_command<S: AsRef<std::ffi::OsStr>>(program: S) -> Command {
+    let mut cmd = Command::new(program);
+
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd
+}
 
 /// Find ffmpeg binary
 fn find_ffmpeg() -> Option<PathBuf> {
@@ -49,7 +69,12 @@ fn find_ffmpeg() -> Option<PathBuf> {
 
     // Try PATH first
     #[cfg(unix)]
-    if let Ok(output) = Command::new("which").arg("ffmpeg").output() {
+    if let Ok(output) = create_command("which")
+        .arg("ffmpeg")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
@@ -59,7 +84,12 @@ fn find_ffmpeg() -> Option<PathBuf> {
     }
 
     #[cfg(windows)]
-    if let Ok(output) = Command::new("where").arg("ffmpeg").output() {
+    if let Ok(output) = create_command("where")
+        .arg("ffmpeg")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
         if output.status.success() {
             if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
                 return Some(PathBuf::from(path.trim()));
@@ -76,7 +106,7 @@ fn find_ffmpeg() -> Option<PathBuf> {
     }
 
     // Try direct execution
-    if Command::new("ffmpeg")
+    if create_command("ffmpeg")
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -203,6 +233,12 @@ impl RecordingAudioBuffer {
     }
 }
 
+impl Default for RecordingAudioBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub type SharedRecordingAudioBuffer = Arc<Mutex<RecordingAudioBuffer>>;
 
 pub fn create_recording_audio_buffer() -> SharedRecordingAudioBuffer {
@@ -257,8 +293,10 @@ pub struct VideoRecorder {
 impl VideoRecorder {
     pub fn init() -> Result<(), String> {
         let path = get_ffmpeg_path()?;
-        let output = Command::new(path)
+        let output = create_command(path)
             .arg("-version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
             .output()
             .map_err(|e| format!("ffmpeg error: {}", e))?;
 
@@ -362,8 +400,8 @@ impl VideoRecorder {
             fs::create_dir_all(parent).ok();
         }
 
-        // Start ffmpeg for video
-        let mut child = Command::new(&self.ffmpeg_path)
+        // Start ffmpeg for video (with hidden console on Windows)
+        let mut child = create_command(&self.ffmpeg_path)
             .args([
                 "-y",
                 "-f",
@@ -539,7 +577,7 @@ impl VideoRecorder {
             }
         }
 
-        // Mux if audio was recorded
+        // Mux if audio was recorded (with hidden console on Windows)
         if self.audio_enabled && self.audio_samples_written > 0 {
             log::info!(
                 "Muxing {} video frames with {} audio samples...",
@@ -547,7 +585,7 @@ impl VideoRecorder {
                 self.audio_samples_written
             );
 
-            let result = Command::new(&self.ffmpeg_path)
+            let result = create_command(&self.ffmpeg_path)
                 .args([
                     "-y",
                     "-i",
@@ -638,8 +676,24 @@ impl VideoRecorder {
         self.state == RecorderState::Recording
     }
 
+    pub fn is_audio_enabled(&self) -> bool {
+        self.audio_enabled
+    }
+
     pub fn frame_count(&self) -> u64 {
         self.frame_count
+    }
+
+    pub fn audio_samples_written(&self) -> u64 {
+        self.audio_samples_written
+    }
+
+    pub fn duration_secs(&self) -> f64 {
+        if self.fps > 0 {
+            self.frame_count as f64 / self.fps as f64
+        } else {
+            0.0
+        }
     }
 }
 
