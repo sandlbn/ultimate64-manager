@@ -10,8 +10,10 @@ use iced::{
     },
 };
 
-use crate::video_recorder::{SharedRecorder, create_shared_recorder, generate_recording_path};
-
+use crate::video_recorder::{
+    SharedRecorder, SharedRecordingAudioBuffer, create_recording_audio_buffer,
+    create_shared_recorder, generate_recording_path,
+};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -254,6 +256,7 @@ pub struct VideoStreaming {
     pub is_recording: bool,
     pub recorder: Option<SharedRecorder>,
     pub recording_frame_count: Arc<Mutex<u64>>,
+    pub recording_audio_buffer: Option<SharedRecordingAudioBuffer>,
 }
 
 impl Default for VideoStreaming {
@@ -293,6 +296,7 @@ impl VideoStreaming {
             // Recording
             is_recording: false,
             recorder: Some(create_shared_recorder()),
+            recording_audio_buffer: Some(create_recording_audio_buffer()),
             recording_frame_count: Arc::new(Mutex::new(0)),
         }
     }
@@ -628,11 +632,36 @@ impl VideoStreaming {
                     return Command::none();
                 }
 
+                // Check if audio buffer has enough samples (at least 100ms = ~4800 frames)
+                const MIN_AUDIO_FRAMES: usize = 4800;
+
+                if self.audio_enabled {
+                    if let Some(ref buf) = self.recording_audio_buffer {
+                        if let Ok(b) = buf.lock() {
+                            if !b.is_ready(MIN_AUDIO_FRAMES) {
+                                log::warn!(
+                                    "Audio buffer not ready: {} frames (need {}), waiting...",
+                                    b.buffer_frames(),
+                                    MIN_AUDIO_FRAMES
+                                );
+                                // Could retry after a delay, or just proceed anyway
+                            }
+                        }
+                    }
+                }
+
+                // Clear is now optional - keeping existing samples helps avoid initial underrun
+                // Only clear if you want a "clean" start
+                // if let Some(ref buf) = self.recording_audio_buffer {
+                //     if let Ok(mut b) = buf.lock() {
+                //         b.clear();
+                //     }
+                // }
+
                 match generate_recording_path() {
                     Ok(output_path) => {
                         if let Some(ref recorder) = self.recorder {
                             if let Ok(mut rec) = recorder.lock() {
-                                // Calculate dimensions based on current scale mode
                                 let (rec_width, rec_height) = match self.scale_mode {
                                     ScaleMode::Int2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                     ScaleMode::Int3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
@@ -645,9 +674,9 @@ impl VideoStreaming {
                                     output_path,
                                     rec_width,
                                     rec_height,
-                                    50,    // fps (PAL)
-                                    47983, // AUDIO_SAMPLE_RATE_PAL
-                                    2,     // stereo
+                                    50,
+                                    47983,
+                                    2,
                                     self.audio_enabled,
                                 ) {
                                     Ok(()) => {
@@ -656,22 +685,18 @@ impl VideoStreaming {
                                             *count = 0;
                                         }
                                         log::info!(
-                                            "Recording started: {}x{} with audio: {}",
+                                            "Recording: {}x{} {:?}",
                                             rec_width,
                                             rec_height,
-                                            self.audio_enabled
+                                            self.scale_mode
                                         );
                                     }
-                                    Err(e) => {
-                                        log::error!("Failed to start recording: {}", e);
-                                    }
+                                    Err(e) => log::error!("Failed to start recording: {}", e),
                                 }
                             }
                         }
                     }
-                    Err(e) => {
-                        log::error!("Failed to generate recording path: {}", e);
-                    }
+                    Err(e) => log::error!("Failed to generate path: {}", e),
                 }
                 Command::none()
             }
@@ -1086,7 +1111,7 @@ impl VideoStreaming {
                 let frame_count = self.recording_frame_count.lock().map(|c| *c).unwrap_or(0);
                 let duration_secs = frame_count as f32 / 50.0;
 
-                button(text(format!("⏹ {:.1}s", duration_secs)).size(11))
+                button(text(format!("{:.1}s", duration_secs)).size(11))
                     .on_press(StreamingMessage::StopRecording)
                     .padding([6, 10])
                     .style(iced::theme::Button::Destructive)
@@ -1103,9 +1128,9 @@ impl VideoStreaming {
         let keyboard_btn = if self.is_streaming {
             button(
                 text(if self.keyboard_enabled {
-                    "⌨ Enabled"
+                    "Keyb. Enabled"
                 } else {
-                    "⌨ Disabled"
+                    "Keyb. Disabled"
                 })
                 .size(11),
             )
@@ -1292,7 +1317,7 @@ impl VideoStreaming {
         let port: u16 = self.listen_port.parse().unwrap_or(11000);
         let mode = self.stream_mode;
 
-        // Clone what we need BEFORE the closure
+        // Clone what we need for the video thread
         let frame_buffer = self.frame_buffer.clone();
         let image_buffer = self.image_buffer.clone();
         let frame_dimensions = self.frame_dimensions.clone();
@@ -1300,8 +1325,9 @@ impl VideoStreaming {
         let packets_counter = self.packets_received.clone();
         let scale_mode_shared = self.scale_mode_shared.clone();
 
-        // Recording: clone recorder and frame counter for the thread
+        // Recording: clone recorder, audio buffer, and frame counter
         let recorder = self.recorder.clone();
+        let recording_audio_buffer = self.recording_audio_buffer.clone();
         let recording_frame_count = self.recording_frame_count.clone();
 
         // Sync current scale mode to shared atomic
@@ -1316,7 +1342,14 @@ impl VideoStreaming {
             *p = 0;
         }
 
-        // 1. FIRST: Bind UDP socket BEFORE sending control commands
+        // Clear recording audio buffer for clean start
+        if let Some(ref buf) = self.recording_audio_buffer {
+            if let Ok(mut b) = buf.lock() {
+                b.clear();
+            }
+        }
+
+        // 1. Bind UDP socket BEFORE sending control commands
         let socket = match mode {
             StreamMode::Unicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
                 Ok(s) => {
@@ -1354,7 +1387,7 @@ impl VideoStreaming {
         // 2. Small delay to ensure socket is fully ready
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // 3. NOW send control commands to Ultimate64 via binary protocol (port 64)
+        // 3. Send control commands to Ultimate64
         if let Some(ultimate_ip) = &self.ultimate_host {
             if let Some(my_ip) = get_local_ip() {
                 log::info!(
@@ -1365,15 +1398,18 @@ impl VideoStreaming {
 
                 let password = self.api_password.clone();
 
+                // Stop existing streams first
                 let _ = send_stop_command(ultimate_ip, 0x20, password.as_deref());
                 let _ = send_stop_command(ultimate_ip, 0x21, password.as_deref());
 
+                // Start video stream
                 if let Err(e) =
                     send_stream_command(ultimate_ip, &my_ip, port, 0x20, password.as_deref())
                 {
                     log::error!("Failed to send video start command: {}", e);
                 }
 
+                // Start audio stream
                 let audio_port = port + 1;
                 if let Err(e) =
                     send_stream_command(ultimate_ip, &my_ip, audio_port, 0x21, password.as_deref())
@@ -1389,7 +1425,7 @@ impl VideoStreaming {
 
         self.is_streaming = true;
 
-        // 4. Spawn video receive thread - scaling and recording happens here
+        // 4. Spawn video receive thread
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
 
@@ -1476,14 +1512,14 @@ impl VideoStreaming {
                             }
                         }
 
-                        // Frame complete - apply scaling, record, and store
+                        // Frame complete - record, scale, and store
                         if is_frame_end {
-                            // Store raw frame for unscaled screenshots (optional)
+                            // Store raw frame for screenshots
                             if let Ok(mut img) = image_buffer.lock() {
                                 *img = Some(rgba_frame.clone());
                             }
 
-                            // Get current scale mode and apply scaling
+                            // Apply scaling for display
                             let current_mode =
                                 ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
 
@@ -1509,23 +1545,31 @@ impl VideoStreaming {
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                             };
-
-                            // Record SCALED frame if recording is active
+                            // RECORD with frame-synchronized audio FIRST
+                            // This ensures audio is pulled in sync with video frames
                             if let Some(ref rec_arc) = recorder {
                                 if let Ok(mut rec) = rec_arc.lock() {
                                     if rec.is_recording() {
-                                        // Write the scaled frame
-                                        if let Err(e) = rec.write_frame_rgba(&scaled) {
+                                        let result =
+                                            if let Some(ref audio_buf) = recording_audio_buffer {
+                                                // Record with synchronized audio
+                                                rec.write_frame_with_audio(&scaled, audio_buf)
+                                            } else {
+                                                // Record video only
+                                                rec.write_frame_rgba(&scaled)
+                                            };
+
+                                        if let Err(e) = result {
                                             log::error!("Recording error: {}", e);
                                         }
-                                        // Update frame count for UI display
+
+                                        // Update frame count for UI
                                         if let Ok(mut count) = recording_frame_count.lock() {
                                             *count = rec.frame_count();
                                         }
                                     }
                                 }
                             }
-
                             // Store scaled frame for display
                             if let Ok(mut fb) = frame_buffer.lock() {
                                 *fb = Some(scaled);
@@ -1561,14 +1605,19 @@ impl VideoStreaming {
 
         // Start audio stream if enabled
         if self.audio_enabled {
-            self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode, self.recorder.clone());
+            self.start_audio_stream(
+                port + AUDIO_PORT_OFFSET,
+                mode,
+                self.recording_audio_buffer.clone(),
+            );
         }
     }
+
     fn start_audio_stream(
         &mut self,
         port: u16,
         mode: StreamMode,
-        recorder: Option<SharedRecorder>,
+        recording_audio_buffer: Option<SharedRecordingAudioBuffer>,
     ) {
         log::info!("Starting audio stream on port {}", port);
 
@@ -1577,7 +1626,7 @@ impl VideoStreaming {
             *p = 0;
         }
 
-        // Create shared audio buffer with jitter buffer state
+        // Create shared audio buffer for PLAYBACK (jitter buffer)
         let audio_buffer: Arc<Mutex<AudioBufferState>> =
             Arc::new(Mutex::new(AudioBufferState::new()));
         self.audio_buffer = Some(audio_buffer.clone());
@@ -1588,7 +1637,7 @@ impl VideoStreaming {
         let stop_signal_net = self.stop_signal.clone();
         let audio_packets_counter = self.audio_packets_received.clone();
 
-        // Start audio output thread using cpal
+        // Start audio PLAYBACK thread using cpal
         let audio_handle = thread::spawn(move || {
             log::info!("Audio playback thread started");
 
@@ -1618,22 +1667,16 @@ impl VideoStreaming {
                 }
             }
 
-            // Try to get a supported config, preferring f32 format and stereo
-            // 1. Stereo (2ch) with f32 format ->
-            // 2. Stereo (2ch) with any format ->
-            // 3. Multi-channel (4-8ch) with f32 - upmix stereo to front L/R ->
-            // 4. Multi-channel with any format ->
+            // Try to get a supported config
             let supported_config = match device.supported_output_configs() {
                 Ok(configs) => {
                     let configs_vec: Vec<_> = configs.collect();
 
-                    // Helper to check sample rate compatibility
                     let rate_ok = |c: &&cpal::SupportedStreamConfigRange| {
                         c.min_sample_rate().0 <= AUDIO_SAMPLE_RATE
                             && c.max_sample_rate().0 >= AUDIO_SAMPLE_RATE
                     };
 
-                    // First try: stereo (2ch) with f32
                     configs_vec
                         .iter()
                         .find(|c| {
@@ -1642,19 +1685,14 @@ impl VideoStreaming {
                                 && c.sample_format() == cpal::SampleFormat::F32
                         })
                         .or_else(|| {
-                            // Second try: stereo with i16
                             configs_vec.iter().find(|c| {
                                 c.channels() == 2
                                     && rate_ok(c)
                                     && c.sample_format() == cpal::SampleFormat::I16
                             })
                         })
+                        .or_else(|| configs_vec.iter().find(|c| c.channels() == 2 && rate_ok(c)))
                         .or_else(|| {
-                            // Third try: stereo with any format
-                            configs_vec.iter().find(|c| c.channels() == 2 && rate_ok(c))
-                        })
-                        .or_else(|| {
-                            // Fourth try: multi-channel (4-8ch) with f32 - we'll upmix
                             configs_vec.iter().find(|c| {
                                 c.channels() >= 4
                                     && c.channels() <= 8
@@ -1663,7 +1701,6 @@ impl VideoStreaming {
                             })
                         })
                         .or_else(|| {
-                            // Fifth try: multi-channel with i16
                             configs_vec.iter().find(|c| {
                                 c.channels() >= 4
                                     && c.channels() <= 8
@@ -1672,15 +1709,11 @@ impl VideoStreaming {
                             })
                         })
                         .or_else(|| {
-                            // Sixth try: multi-channel with any format
                             configs_vec
                                 .iter()
                                 .find(|c| c.channels() >= 4 && c.channels() <= 8 && rate_ok(c))
                         })
-                        .or_else(|| {
-                            // Last resort: any config that supports our sample rate
-                            configs_vec.iter().find(|c| rate_ok(c))
-                        })
+                        .or_else(|| configs_vec.iter().find(|c| rate_ok(c)))
                         .cloned()
                         .map(|c| c.with_sample_rate(cpal::SampleRate(AUDIO_SAMPLE_RATE)))
                 }
@@ -1696,23 +1729,21 @@ impl VideoStreaming {
                     (c.config(), c.sample_format())
                 }
                 None => {
-                    log::error!("No compatible audio config found - audio will not work");
+                    log::error!("No compatible audio config found");
                     return;
                 }
             };
 
-            // Track output channel count for upmixing stereo -> N channels
             let output_channels = stream_config.channels as usize;
 
             log::info!(
-                "Audio stream config: {} channels, {} Hz, format: {:?}, buffer: {:?}",
+                "Audio stream config: {} channels, {} Hz, format: {:?}",
                 stream_config.channels,
                 stream_config.sample_rate.0,
-                sample_format,
-                stream_config.buffer_size
+                sample_format
             );
 
-            // Build stream based on the supported sample format
+            // Build stream based on supported sample format
             let stream: cpal::Stream = match sample_format {
                 cpal::SampleFormat::F32 => {
                     let consumer = consumer_buffer;
@@ -1720,27 +1751,21 @@ impl VideoStreaming {
                         &stream_config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                             if let Ok(mut state) = consumer.lock() {
-                                // Jitter buffer: wait until we have enough samples before starting playback
+                                // Jitter buffer: wait until enough samples
                                 if !state.buffering_complete {
                                     if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
                                         state.buffering_complete = true;
                                         log::info!(
-                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            "Audio jitter buffer filled ({} samples)",
                                             state.samples.len()
                                         );
                                     } else {
-                                        // Still buffering, output silence
-                                        for sample in data.iter_mut() {
-                                            *sample = 0.0;
-                                        }
+                                        data.fill(0.0);
                                         return;
                                     }
                                 }
 
-                                // Handle multi-channel output by upmixing stereo
-                                // Stereo source goes to channels 0 (L) and 1 (R), rest get silence
                                 if output_channels == 2 {
-                                    // Standard stereo - consume samples directly
                                     for sample in data.iter_mut() {
                                         *sample = state.samples.pop_front().unwrap_or(0.0);
                                     }
@@ -1751,24 +1776,26 @@ impl VideoStreaming {
                                         let left = state.samples.pop_front().unwrap_or(0.0);
                                         let right = state.samples.pop_front().unwrap_or(0.0);
                                         // Front Left and Front Right get the stereo signal
-                                        if frame.len() > 0 { frame[0] = left; }
-                                        if frame.len() > 1 { frame[1] = right; }
-                                        // All other channels get silence
+                                        if !frame.is_empty() {
+                                            frame[0] = left;
+                                        }
+                                        if frame.len() > 1 {
+                                            frame[1] = right;
+                                        }
                                         for ch in frame.iter_mut().skip(2) {
                                             *ch = 0.0;
                                         }
                                     }
                                 }
-                                // Log warning if buffer is getting low (potential underrun)
+
                                 if state.samples.len() < JITTER_BUFFER_MIN_SAMPLES / 2 {
                                     log::trace!(
-                                        "Audio buffer low: {} samples remaining",
+                                        "Audio buffer low: {} samples",
                                         state.samples.len()
                                     );
                                 }
                             } else {
                                 data.fill(0.0);
-                                return
                             }
                         },
                         |err| log::error!("Audio stream error: {}", err),
@@ -1791,34 +1818,32 @@ impl VideoStreaming {
                                     if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
                                         state.buffering_complete = true;
                                         log::info!(
-                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            "Audio jitter buffer filled ({} samples)",
                                             state.samples.len()
                                         );
                                     } else {
-                                        for sample in data.iter_mut() {
-                                            *sample = 0;
-                                        }
+                                        data.fill(0);
                                         return;
                                     }
                                 }
 
-                                // Handle multi-channel output
                                 if output_channels == 2 {
                                     for sample in data.iter_mut() {
                                         let f = state.samples.pop_front().unwrap_or(0.0);
                                         *sample = (f * 32767.0).clamp(-32768.0, 32767.0) as i16;
                                     }
                                 } else {
-                                    // Multi-channel: upmix stereo to front L/R only
                                     for frame in data.chunks_mut(output_channels) {
                                         let left = state.samples.pop_front().unwrap_or(0.0);
                                         let right = state.samples.pop_front().unwrap_or(0.0);
 
-                                        if frame.len() > 0 {
-                                            frame[0] = (left * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                        if !frame.is_empty() {
+                                            frame[0] =
+                                                (left * 32767.0).clamp(-32768.0, 32767.0) as i16;
                                         }
                                         if frame.len() > 1 {
-                                            frame[1] = (right * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                                            frame[1] =
+                                                (right * 32767.0).clamp(-32768.0, 32767.0) as i16;
                                         }
                                         for ch in frame.iter_mut().skip(2) {
                                             *ch = 0;
@@ -1826,9 +1851,7 @@ impl VideoStreaming {
                                     }
                                 }
                             } else {
-                                for sample in data.iter_mut() {
-                                    *sample = 0;
-                                }
+                                data.fill(0);
                             }
                         },
                         |err| log::error!("Audio stream error: {}", err),
@@ -1851,45 +1874,40 @@ impl VideoStreaming {
                                     if state.samples.len() >= JITTER_BUFFER_MIN_SAMPLES {
                                         state.buffering_complete = true;
                                         log::info!(
-                                            "Audio jitter buffer filled ({} samples), starting playback",
+                                            "Audio jitter buffer filled ({} samples)",
                                             state.samples.len()
                                         );
                                     } else {
-                                        for sample in data.iter_mut() {
-                                            *sample = 32768;
-                                        }
+                                        data.fill(32768);
                                         return;
                                     }
                                 }
 
-                                // Handle multi-channel output
                                 if output_channels == 2 {
                                     for sample in data.iter_mut() {
                                         let f = state.samples.pop_front().unwrap_or(0.0);
                                         *sample = ((f + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
                                     }
                                 } else {
-                                    // Multi-channel: upmix stereo to front L/R only
                                     for frame in data.chunks_mut(output_channels) {
                                         let left = state.samples.pop_front().unwrap_or(0.0);
                                         let right = state.samples.pop_front().unwrap_or(0.0);
 
-                                        if frame.len() > 0 {
-                                            frame[0] = ((left + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                        if !frame.is_empty() {
+                                            frame[0] =
+                                                ((left + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
                                         }
                                         if frame.len() > 1 {
-                                            frame[1] = ((right + 1.0) * 32767.5).clamp(0.0, 65535.0) as u16;
+                                            frame[1] = ((right + 1.0) * 32767.5).clamp(0.0, 65535.0)
+                                                as u16;
                                         }
-                                        // 32768 is silence for u16 audio
                                         for ch in frame.iter_mut().skip(2) {
                                             *ch = 32768;
                                         }
                                     }
                                 }
                             } else {
-                                for sample in data.iter_mut() {
-                                    *sample = 32768;
-                                }
+                                data.fill(32768);
                             }
                         },
                         |err| log::error!("Audio stream error: {}", err),
@@ -1920,12 +1938,11 @@ impl VideoStreaming {
                 thread::sleep(Duration::from_millis(100));
             }
 
-            // Stream will be dropped here, stopping playback
             drop(stream);
             log::info!("Audio playback thread stopped");
         });
 
-        // Start audio network receiver thread
+        // Start audio NETWORK receiver thread
         let network_handle = thread::spawn(move || {
             log::info!("Audio network thread started on port {}", port);
 
@@ -1966,11 +1983,11 @@ impl VideoStreaming {
             let mut recv_buf = [0u8; 2048];
             let mut first_packet = true;
 
-            // Create resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
+            // Resampler for playback (47983 Hz -> 48000 Hz)
             let mut resampler =
                 AudioResampler::new(AUDIO_SAMPLE_RATE_PAL, AUDIO_SAMPLE_RATE as f64);
 
-            // Temporary buffer for converted samples before resampling
+            // Temp buffer for converted samples
             let mut temp_samples: Vec<f32> = Vec::with_capacity(1024);
 
             loop {
@@ -1989,25 +2006,23 @@ impl VideoStreaming {
                             *p += 1;
                         }
 
-                        // Parse sequence number for gap detection
+                        // Parse sequence number
                         let packet_seq = u16::from_le_bytes([recv_buf[0], recv_buf[1]]);
 
-                        // Log first packet for debugging
                         if first_packet {
                             first_packet = false;
                             log::info!(
-                                "First audio packet: {} bytes (payload: {} bytes, {} samples), seq={}",
+                                "First audio packet: {} bytes (payload: {} bytes), seq={}",
                                 size,
                                 size - AUDIO_HEADER_SIZE,
-                                (size - AUDIO_HEADER_SIZE) / 2,
                                 packet_seq
                             );
                         }
 
-                        // Skip 2-byte sequence header, rest is i16 samples (little-endian)
+                        // Skip header, rest is i16 samples (little-endian)
                         let audio_data = &recv_buf[AUDIO_HEADER_SIZE..size];
 
-                        // Convert bytes to f32 samples (i16 -> f32 normalized to -1.0..1.0)
+                        // Convert to f32 samples
                         temp_samples.clear();
                         for chunk in audio_data.chunks_exact(2) {
                             let sample_i16 = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -2015,49 +2030,35 @@ impl VideoStreaming {
                             temp_samples.push(sample_f32);
                         }
 
-                        // Record ORIGINAL audio (before resampling) if recording is active
-                        // FFmpeg will handle the resampling from 47983 Hz to 48000 Hz
-                        if let Some(ref rec_arc) = recorder {
-                            if let Ok(mut rec) = rec_arc.lock() {
-                                if rec.is_recording() && rec.is_audio_enabled() {
-                                    if let Err(e) = rec.write_audio_f32(&temp_samples) {
-                                        log::error!("Audio recording error: {}", e);
-                                    }
-                                }
+                        // Push ORIGINAL samples to RECORDING buffer (no resampling)
+                        // Recording uses native 47983 Hz, ffmpeg resamples on mux
+                        if let Some(ref rec_buf) = recording_audio_buffer {
+                            if let Ok(mut buf) = rec_buf.lock() {
+                                buf.push_samples(&temp_samples);
                             }
                         }
 
-                        // Add resampled audio to buffer with jitter buffer management
+                        // Push RESAMPLED samples to PLAYBACK buffer
                         if let Ok(mut state) = producer_buffer.lock() {
-                            // Check for packet sequence gaps (packet loss detection)
+                            // Check for sequence gaps
                             if let Some(last) = state.last_seq {
                                 let expected = last.wrapping_add(1);
                                 if packet_seq != expected {
-                                    // Calculate gap size (handling wraparound)
-                                    let gap = if packet_seq > expected {
-                                        packet_seq - expected
-                                    } else {
-                                        // Wraparound case
-                                        (0xFFFF - expected) + packet_seq + 1
-                                    };
                                     state.packet_gaps += 1;
                                     log::debug!(
-                                        "Audio packet gap: expected seq {}, got {} (gap: {}, total gaps: {})",
+                                        "Audio packet gap: expected {}, got {} (gaps: {})",
                                         expected,
                                         packet_seq,
-                                        gap,
                                         state.packet_gaps
                                     );
                                 }
                             }
                             state.last_seq = Some(packet_seq);
 
-                            // Resample from Ultimate64's ~47983 Hz to 48000 Hz
-                            // This prevents long-term drift that would cause buffer underrun/overflow
+                            // Resample for playback (47983 -> 48000 Hz)
                             resampler.process_stereo(&temp_samples, &mut state.samples);
 
-                            // Buffer overflow protection: drop oldest samples to stay in sync
-                            // This is better than dropping newest because it keeps audio in sync with video
+                            // Overflow protection
                             if state.samples.len() > JITTER_BUFFER_MAX_SAMPLES {
                                 let to_drop = state
                                     .samples
@@ -2066,6 +2067,7 @@ impl VideoStreaming {
                                 for _ in 0..to_drop {
                                     state.samples.pop_front();
                                 }
+                                state.samples_dropped += to_drop as u64;
                             }
                         }
                     }
@@ -2079,6 +2081,7 @@ impl VideoStreaming {
                 }
             }
 
+            // Cleanup multicast
             if mode == StreamMode::Multicast {
                 let multicast_addr: std::net::Ipv4Addr = "239.0.1.65".parse().unwrap();
                 let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
@@ -2088,7 +2091,7 @@ impl VideoStreaming {
             // Log final statistics
             if let Ok(state) = producer_buffer.lock() {
                 log::info!(
-                    "Audio network thread stopped (packet gaps: {}, samples dropped: {})",
+                    "Audio network thread stopped (gaps: {}, dropped: {})",
                     state.packet_gaps,
                     state.samples_dropped
                 );
