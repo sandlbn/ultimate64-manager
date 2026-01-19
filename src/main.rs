@@ -40,7 +40,6 @@ use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings};
 use streaming::{StreamingMessage, VideoStreaming};
 use templates::{DiskTemplate, TemplateManager};
-use video_recorder::VideoRecorder;
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 

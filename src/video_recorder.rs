@@ -73,25 +73,6 @@ impl VideoRecorder {
         }
     }
 
-    /// Start recording to file (video only, for backwards compatibility)
-    pub fn start(
-        &mut self,
-        output_path: PathBuf,
-        width: u32,
-        height: u32,
-        fps: u32,
-    ) -> Result<(), String> {
-        self.start_with_audio(
-            output_path,
-            width,
-            height,
-            fps,
-            DEFAULT_SAMPLE_RATE,
-            DEFAULT_CHANNELS,
-            false,
-        )
-    }
-
     /// Start recording with audio support
     pub fn start_with_audio(
         &mut self,
@@ -244,24 +225,6 @@ impl VideoRecorder {
         Ok(())
     }
 
-    /// Write audio samples (signed 16-bit PCM, interleaved if stereo)
-    pub fn write_audio_i16(&mut self, samples: &[i16]) -> Result<(), String> {
-        if !self.audio_enabled {
-            return Ok(());
-        }
-
-        let file = self.audio_file.as_mut().ok_or("Audio not recording")?;
-
-        for &s in samples {
-            file.write_all(&s.to_le_bytes())
-                .map_err(|e| format!("Failed to write audio: {}", e))?;
-        }
-
-        self.audio_sample_count += samples.len() as u64 / self.channels as u64;
-
-        Ok(())
-    }
-
     /// Check if audio recording is enabled
     pub fn is_audio_enabled(&self) -> bool {
         self.audio_enabled
@@ -278,7 +241,7 @@ impl VideoRecorder {
         }
 
         // Wait for video ffmpeg to finish
-        if let Some(mut process) = self.ffmpeg_video.take() {
+        if let Some(process) = self.ffmpeg_video.take() {
             let output = process
                 .wait_with_output()
                 .map_err(|e| format!("Failed to wait for ffmpeg: {}", e))?;
@@ -378,10 +341,6 @@ impl VideoRecorder {
 
     pub fn frame_count(&self) -> u64 {
         self.frame_count
-    }
-
-    pub fn audio_sample_count(&self) -> u64 {
-        self.audio_sample_count
     }
 }
 

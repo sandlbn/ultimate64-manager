@@ -153,32 +153,6 @@ impl AudioResampler {
             last_right: 0.0,
         }
     }
-    /// Process stereo samples and output to a Vec instead of VecDeque
-    /// Process stereo samples and output to a Vec instead of VecDeque
-    pub fn process_stereo_to_vec(&mut self, input: &[f32], output: &mut Vec<f32>) {
-        // Process each stereo pair
-        for pair in input.chunks_exact(2) {
-            let left = pair[0];
-            let right = pair[1];
-
-            self.pos += self.step;
-
-            while self.pos >= 1.0 {
-                // Linear interpolation
-                let t = self.pos.fract() as f32;
-                let out_left = self.last_left + t * (left - self.last_left);
-                let out_right = self.last_right + t * (right - self.last_right);
-
-                output.push(out_left);
-                output.push(out_right);
-
-                self.pos -= 1.0;
-            }
-
-            self.last_left = left;
-            self.last_right = right;
-        }
-    }
     fn process_stereo(&mut self, input: &[f32], output: &mut VecDeque<f32>) {
         for chunk in input.chunks_exact(2) {
             let left = chunk[0];
