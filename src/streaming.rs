@@ -10,6 +10,8 @@ use iced::{
     },
 };
 
+use crate::video_recorder::{SharedRecorder, create_shared_recorder, generate_recording_path};
+
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,6 +129,10 @@ pub enum StreamingMessage {
     KeySent(Result<(), String>), // Result of sending key to C64
     // Ultimate64 host configuration
     UltimateHostChanged(String), // Set the host for stream control
+    // Recording messages
+    StartRecording,
+    StopRecording,
+    RecordingComplete(Result<String, String>),
 }
 
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
@@ -147,7 +153,32 @@ impl AudioResampler {
             last_right: 0.0,
         }
     }
+    /// Process stereo samples and output to a Vec instead of VecDeque
+    /// Process stereo samples and output to a Vec instead of VecDeque
+    pub fn process_stereo_to_vec(&mut self, input: &[f32], output: &mut Vec<f32>) {
+        // Process each stereo pair
+        for pair in input.chunks_exact(2) {
+            let left = pair[0];
+            let right = pair[1];
 
+            self.pos += self.step;
+
+            while self.pos >= 1.0 {
+                // Linear interpolation
+                let t = self.pos.fract() as f32;
+                let out_left = self.last_left + t * (left - self.last_left);
+                let out_right = self.last_right + t * (right - self.last_right);
+
+                output.push(out_left);
+                output.push(out_right);
+
+                self.pos -= 1.0;
+            }
+
+            self.last_left = left;
+            self.last_right = right;
+        }
+    }
     fn process_stereo(&mut self, input: &[f32], output: &mut VecDeque<f32>) {
         for chunk in input.chunks_exact(2) {
             let left = chunk[0];
@@ -245,6 +276,10 @@ pub struct VideoStreaming {
     // API password for REST API fallback
     pub api_password: Option<String>,
     scale_mode_shared: Arc<std::sync::atomic::AtomicU8>, // For thread to read
+    // Recording state
+    pub is_recording: bool,
+    pub recorder: Option<SharedRecorder>,
+    pub recording_frame_count: Arc<Mutex<u64>>,
 }
 
 impl Default for VideoStreaming {
@@ -281,6 +316,10 @@ impl VideoStreaming {
             ultimate_host: None,
             api_password: None,
             scale_mode_shared: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            // Recording
+            is_recording: false,
+            recorder: Some(create_shared_recorder()),
+            recording_frame_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -318,21 +357,27 @@ impl VideoStreaming {
                 Command::none()
             }
             StreamingMessage::TakeScreenshot => {
-                // Take screenshot from the existing image buffer
                 if !self.is_streaming {
                     return Command::none();
                 }
 
-                // Get current frame from buffer
-                let rgba_data = if let Ok(img_guard) = self.image_buffer.lock() {
-                    img_guard.clone()
+                // Use the scaled frame buffer instead of raw image buffer
+                let rgba_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
+                    fb_guard.clone()
                 } else {
                     None
                 };
 
+                // Get current dimensions
+                let (width, height) = if let Ok(dims) = self.frame_dimensions.lock() {
+                    *dims
+                } else {
+                    (VIC_WIDTH * 2, VIC_HEIGHT * 2)
+                };
+
                 if let Some(data) = rgba_data {
                     Command::perform(
-                        save_screenshot_to_pictures(data),
+                        save_screenshot_to_pictures(data, width, height),
                         StreamingMessage::ScreenshotComplete,
                     )
                 } else {
@@ -602,9 +647,96 @@ impl VideoStreaming {
                 }
                 Command::none()
             }
+
+            // ==================== Recording Messages ====================
+            StreamingMessage::StartRecording => {
+                if !self.is_streaming || self.is_recording {
+                    return Command::none();
+                }
+
+                match generate_recording_path() {
+                    Ok(output_path) => {
+                        if let Some(ref recorder) = self.recorder {
+                            if let Ok(mut rec) = recorder.lock() {
+                                // Calculate dimensions based on current scale mode
+                                let (rec_width, rec_height) = match self.scale_mode {
+                                    ScaleMode::Int2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                    ScaleMode::Int3x => (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+                                    ScaleMode::Scale2x => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                    ScaleMode::Scanlines => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                    ScaleMode::CRT => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+                                };
+
+                                match rec.start_with_audio(
+                                    output_path,
+                                    rec_width,
+                                    rec_height,
+                                    50,    // fps (PAL)
+                                    47983, // AUDIO_SAMPLE_RATE_PAL
+                                    2,     // stereo
+                                    self.audio_enabled,
+                                ) {
+                                    Ok(()) => {
+                                        self.is_recording = true;
+                                        if let Ok(mut count) = self.recording_frame_count.lock() {
+                                            *count = 0;
+                                        }
+                                        log::info!(
+                                            "Recording started: {}x{} with audio: {}",
+                                            rec_width,
+                                            rec_height,
+                                            self.audio_enabled
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::error!("Failed to start recording: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to generate recording path: {}", e);
+                    }
+                }
+                Command::none()
+            }
+            StreamingMessage::StopRecording => {
+                if !self.is_recording {
+                    return Command::none();
+                }
+
+                let result = if let Some(ref recorder) = self.recorder {
+                    if let Ok(mut rec) = recorder.lock() {
+                        rec.stop()
+                    } else {
+                        Err("Failed to lock recorder".to_string())
+                    }
+                } else {
+                    Err("No recorder available".to_string())
+                };
+
+                self.is_recording = false;
+
+                Command::perform(async move { result }, StreamingMessage::RecordingComplete)
+            }
+
+            StreamingMessage::RecordingComplete(result) => {
+                match result {
+                    Ok(path) => {
+                        log::info!("Recording saved to: {}", path);
+                        self.command_history
+                            .push(format!("Recording saved: {}", path));
+                    }
+                    Err(e) => {
+                        log::error!("Recording failed: {}", e);
+                        self.command_history.push(format!("Recording error: {}", e));
+                    }
+                }
+                Command::none()
+            }
         }
     }
-
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
         // Image dimensions based on scale mode
@@ -951,8 +1083,22 @@ impl VideoStreaming {
             ]
             .spacing(3),
         ]
-        .spacing(5); // Stream controls with keyboard toggle
-        let screenshot_button = if self.is_streaming {
+        .spacing(5);
+
+        // Stream controls with recording button
+        // Start/Stop button
+        let start_stop_btn = if self.is_streaming {
+            button(text("STOP").size(11))
+                .on_press(StreamingMessage::StopStream)
+                .padding([6, 14])
+        } else {
+            button(text("START").size(11))
+                .on_press(StreamingMessage::StartStream)
+                .padding([6, 14])
+        };
+
+        // Screenshot button
+        let screenshot_btn = if self.is_streaming {
             button(text("Screenshot").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
                 .padding([6, 10])
@@ -960,63 +1106,75 @@ impl VideoStreaming {
             button(text("Screenshot").size(11)).padding([6, 10])
         };
 
-        // Keyboard toggle button
-        let keyboard_button = if self.is_streaming {
-            tooltip(
-                button(
-                    text(if self.keyboard_enabled {
-                        "⌨ Enabled"
-                    } else {
-                        "⌨ Disabled"
-                    })
-                    .size(11),
-                )
-                .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
-                .padding([6, 10])
-                .style(if self.keyboard_enabled {
-                    iced::theme::Button::Primary
-                } else {
-                    iced::theme::Button::Secondary
-                }),
-                "Enable keyboard input to C64 (type in video window)",
-                tooltip::Position::Bottom,
-            )
-            .style(iced::theme::Container::Box)
+        // Record button
+        let record_btn = if self.is_streaming {
+            if self.is_recording {
+                let frame_count = self.recording_frame_count.lock().map(|c| *c).unwrap_or(0);
+                let duration_secs = frame_count as f32 / 50.0;
+
+                button(text(format!("⏹ {:.1}s", duration_secs)).size(11))
+                    .on_press(StreamingMessage::StopRecording)
+                    .padding([6, 10])
+                    .style(iced::theme::Button::Destructive)
+            } else {
+                button(text("Record").size(11))
+                    .on_press(StreamingMessage::StartRecording)
+                    .padding([6, 10])
+            }
         } else {
-            tooltip(
-                button(text("⌨ Disabled").size(11)).padding([6, 10]),
-                "Start streaming first",
-                tooltip::Position::Bottom,
+            button(text("Record").size(11)).padding([6, 10])
+        };
+
+        // Keyboard toggle button
+        let keyboard_btn = if self.is_streaming {
+            button(
+                text(if self.keyboard_enabled {
+                    "⌨ Enabled"
+                } else {
+                    "⌨ Disabled"
+                })
+                .size(11),
             )
-            .style(iced::theme::Container::Box)
+            .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
+            .padding([6, 10])
+            .style(if self.keyboard_enabled {
+                iced::theme::Button::Primary
+            } else {
+                iced::theme::Button::Secondary
+            })
+        } else {
+            button(text("⌨ Disabled").size(11)).padding([6, 10])
         };
 
         let stream_controls = column![
             text("Stream Control").size(12),
             row![
-                if self.is_streaming {
-                    tooltip(
-                        button(text("STOP").size(11))
-                            .on_press(StreamingMessage::StopStream)
-                            .padding([6, 14]),
-                        "Stop video stream",
-                        tooltip::Position::Bottom,
-                    )
-                    .style(iced::theme::Container::Box)
-                } else {
-                    tooltip(
-                        button(text("START").size(11))
-                            .on_press(StreamingMessage::StartStream)
-                            .padding([6, 14]),
-                        "Start video stream",
-                        tooltip::Position::Bottom,
-                    )
-                    .style(iced::theme::Container::Box)
-                },
                 tooltip(
-                    screenshot_button,
+                    start_stop_btn,
+                    if self.is_streaming {
+                        "Stop video stream"
+                    } else {
+                        "Start video stream"
+                    },
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    screenshot_btn,
                     if self.is_streaming {
                         "Capture frame to Pictures folder"
+                    } else {
+                        "Start streaming first"
+                    },
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    record_btn,
+                    if self.is_recording {
+                        "Stop recording"
+                    } else if self.is_streaming {
+                        "Start recording to MP4"
                     } else {
                         "Start streaming first"
                     },
@@ -1036,7 +1194,16 @@ impl VideoStreaming {
                     tooltip::Position::Bottom,
                 )
                 .style(iced::theme::Container::Box),
-                keyboard_button,
+                tooltip(
+                    keyboard_btn,
+                    if self.is_streaming {
+                        "Enable keyboard input to C64 (type in video window)"
+                    } else {
+                        "Start streaming first"
+                    },
+                    tooltip::Position::Bottom,
+                )
+                .style(iced::theme::Container::Box),
             ]
             .spacing(10)
             .align_items(iced::Alignment::Center),
@@ -1143,7 +1310,6 @@ impl VideoStreaming {
             Subscription::batch(subscriptions)
         }
     }
-
     fn start_stream(&mut self) {
         if self.is_streaming {
             return;
@@ -1159,6 +1325,10 @@ impl VideoStreaming {
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
         let scale_mode_shared = self.scale_mode_shared.clone();
+
+        // Recording: clone recorder and frame counter for the thread
+        let recorder = self.recorder.clone();
+        let recording_frame_count = self.recording_frame_count.clone();
 
         // Sync current scale mode to shared atomic
         self.scale_mode_shared
@@ -1245,7 +1415,7 @@ impl VideoStreaming {
 
         self.is_streaming = true;
 
-        // 4. Spawn thread - do scaling here
+        // 4. Spawn video receive thread - scaling and recording happens here
         let handle = thread::spawn(move || {
             log::info!("Video stream thread started");
 
@@ -1254,7 +1424,7 @@ impl VideoStreaming {
             let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
             let mut first_packet = true;
 
-            // Build color lookup table
+            // Build color lookup table for fast palette conversion
             let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
             for i in 0..256 {
                 let hi = (i >> 4) & 0x0F;
@@ -1262,7 +1432,8 @@ impl VideoStreaming {
                 let c_hi = &C64_PALETTE[hi];
                 let c_lo = &C64_PALETTE[lo];
                 color_lut.push([
-                    c_lo[0], c_lo[1], c_lo[2], 255, c_hi[0], c_hi[1], c_hi[2], 255,
+                    c_lo[0], c_lo[1], c_lo[2], 255, // LEFT pixel (low nibble)
+                    c_hi[0], c_hi[1], c_hi[2], 255, // RIGHT pixel (high nibble)
                 ]);
             }
 
@@ -1277,10 +1448,12 @@ impl VideoStreaming {
                             continue;
                         }
 
+                        // Update packet counter
                         if let Ok(mut p) = packets_counter.lock() {
                             *p += 1;
                         }
 
+                        // Parse packet header
                         let line_raw = u16::from_le_bytes([recv_buf[4], recv_buf[5]]);
                         let pixels_in_line =
                             u16::from_le_bytes([recv_buf[6], recv_buf[7]]) as usize;
@@ -1302,6 +1475,7 @@ impl VideoStreaming {
                         let payload = &recv_buf[HEADER_SIZE..size];
                         let bytes_per_line = pixels_in_line / 2;
 
+                        // Decode packet lines into RGBA frame buffer
                         for l in 0..lines_in_packet {
                             let y = line_num + l;
                             if y >= VIC_HEIGHT as usize {
@@ -1328,9 +1502,9 @@ impl VideoStreaming {
                             }
                         }
 
-                        // Frame complete - apply scaling and store
+                        // Frame complete - apply scaling, record, and store
                         if is_frame_end {
-                            // Store raw frame for screenshots
+                            // Store raw frame for unscaled screenshots (optional)
                             if let Ok(mut img) = image_buffer.lock() {
                                 *img = Some(rgba_frame.clone());
                             }
@@ -1360,7 +1534,25 @@ impl VideoStreaming {
                                     apply_crt_effect(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
-                            }; // Store scaled frame for display
+                            };
+
+                            // Record SCALED frame if recording is active
+                            if let Some(ref rec_arc) = recorder {
+                                if let Ok(mut rec) = rec_arc.lock() {
+                                    if rec.is_recording() {
+                                        // Write the scaled frame
+                                        if let Err(e) = rec.write_frame_rgba(&scaled) {
+                                            log::error!("Recording error: {}", e);
+                                        }
+                                        // Update frame count for UI display
+                                        if let Ok(mut count) = recording_frame_count.lock() {
+                                            *count = rec.frame_count();
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Store scaled frame for display
                             if let Ok(mut fb) = frame_buffer.lock() {
                                 *fb = Some(scaled);
                             }
@@ -1381,6 +1573,7 @@ impl VideoStreaming {
                 }
             }
 
+            // Cleanup multicast membership
             if mode == StreamMode::Multicast {
                 let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
                 let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
@@ -1392,11 +1585,17 @@ impl VideoStreaming {
 
         self.stream_handle = Some(handle);
 
+        // Start audio stream if enabled
         if self.audio_enabled {
-            self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode);
+            self.start_audio_stream(port + AUDIO_PORT_OFFSET, mode, self.recorder.clone());
         }
     }
-    fn start_audio_stream(&mut self, port: u16, mode: StreamMode) {
+    fn start_audio_stream(
+        &mut self,
+        port: u16,
+        mode: StreamMode,
+        recorder: Option<SharedRecorder>,
+    ) {
         log::info!("Starting audio stream on port {}", port);
 
         // Reset audio packet counter
@@ -1842,6 +2041,18 @@ impl VideoStreaming {
                             temp_samples.push(sample_f32);
                         }
 
+                        // Record ORIGINAL audio (before resampling) if recording is active
+                        // FFmpeg will handle the resampling from 47983 Hz to 48000 Hz
+                        if let Some(ref rec_arc) = recorder {
+                            if let Ok(mut rec) = rec_arc.lock() {
+                                if rec.is_recording() && rec.is_audio_enabled() {
+                                    if let Err(e) = rec.write_audio_f32(&temp_samples) {
+                                        log::error!("Audio recording error: {}", e);
+                                    }
+                                }
+                            }
+                        }
+
                         // Add resampled audio to buffer with jitter buffer management
                         if let Ok(mut state) = producer_buffer.lock() {
                             // Check for packet sequence gaps (packet loss detection)
@@ -1915,13 +2126,25 @@ impl VideoStreaming {
         self.audio_stream_handle = Some(audio_handle);
         self.audio_network_handle = Some(network_handle);
     }
-
     fn stop_stream(&mut self) {
         if !self.is_streaming {
             return;
         }
 
         log::info!("Stopping video and audio streams...");
+
+        // Stop recording first if active
+        if self.is_recording {
+            if let Some(ref recorder) = self.recorder {
+                if let Ok(mut rec) = recorder.lock() {
+                    match rec.stop() {
+                        Ok(path) => log::info!("Recording auto-saved to: {}", path),
+                        Err(e) => log::error!("Error stopping recording: {}", e),
+                    }
+                }
+            }
+            self.is_recording = false;
+        }
 
         // Set stop signal first so threads start exiting
         self.stop_signal.store(true, Ordering::Relaxed);
@@ -2010,7 +2233,6 @@ impl Drop for VideoStreaming {
         }
     }
 }
-
 // Custom style for black background in fullscreen mode
 struct BlackBackground;
 
@@ -2089,7 +2311,11 @@ fn decode_vic_frame(raw_data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Save screenshot from existing RGBA buffer to user's Pictures folder
-pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, String> {
+pub async fn save_screenshot_to_pictures(
+    rgba_data: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let timestamp = SystemTime::now()
@@ -2097,12 +2323,10 @@ pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, S
         .map_err(|e| e.to_string())?
         .as_secs();
 
-    // Get user's Pictures folder, fallback to home directory
     let pictures_dir = dirs::picture_dir()
         .or_else(dirs::home_dir)
         .ok_or_else(|| "Could not find Pictures or Home directory".to_string())?;
 
-    // Create Ultimate64 subfolder
     let screenshot_dir = pictures_dir.join("Ultimate64");
     std::fs::create_dir_all(&screenshot_dir)
         .map_err(|e| format!("Failed to create screenshot directory: {}", e))?;
@@ -2110,8 +2334,7 @@ pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, S
     let filename = format!("u64_screenshot_{}.png", timestamp);
     let path = screenshot_dir.join(&filename);
 
-    // Create image and save
-    let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
+    let img = image::RgbaImage::from_raw(width, height, rgba_data)
         .ok_or_else(|| "Failed to create image from frame data".to_string())?;
 
     img.save(&path)
