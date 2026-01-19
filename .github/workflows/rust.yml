@@ -17,7 +17,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies
-      run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          pkg-config \
+          libasound2-dev \
+          libavutil-dev \
+          libavcodec-dev \
+          libavformat-dev \
+          libavdevice-dev \
+          libavfilter-dev \
+          libswscale-dev \
+          libswresample-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests

@@ -30,6 +30,7 @@ mod settings;
 mod streaming;
 mod templates;
 mod version_check;
+mod video_recorder;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
@@ -47,7 +48,9 @@ pub fn main() -> iced::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
-
+    if let Err(e) = video_recorder::VideoRecorder::init() {
+        log::warn!("Video recording unavailable: {}", e);
+    }
     log::info!("===========================================");
     log::info!("Starting Ultimate64 Manager v{}", APP_VERSION);
     log::info!("===========================================");
