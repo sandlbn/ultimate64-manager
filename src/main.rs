@@ -49,7 +49,9 @@ pub fn main() -> iced::Result {
 
     #[cfg(target_os = "linux")]
     if std::env::var("WGPU_BACKEND").is_err() {
-        std::env::set_var("WGPU_BACKEND", "gl");
+        unsafe {
+            std::env::set_var("WGPU_BACKEND", "gl");
+        }
     }
     // Initialize logger - show info level by default, debug if RUST_LOG is set
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
