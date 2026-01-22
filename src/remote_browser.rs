@@ -13,9 +13,8 @@ use ultimate64::Rest;
 use walkdir::WalkDir;
 
 use crate::api;
-use crate::dir_preview::{self, ContentPreview};
+use crate::dir_preview::ContentPreview;
 use crate::disk_image::{self, DiskInfo, FileType};
-use crate::pdf_preview;
 
 /// Timeout for FTP operations to prevent hangs when device goes offline
 const FTP_TIMEOUT_SECS: u64 = 15;
