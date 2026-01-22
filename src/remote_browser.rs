@@ -15,11 +15,14 @@ use walkdir::WalkDir;
 use crate::api;
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
+use crate::pdf_preview;
 
 /// Timeout for FTP operations to prevent hangs when device goes offline
 const FTP_TIMEOUT_SECS: u64 = 15;
 /// Longer timeout for directory uploads which may take time
 const FTP_UPLOAD_DIR_TIMEOUT_SECS: u64 = 120;
+/// Longer timeout for content preview downloads (PDFs can be large)
+const FTP_PREVIEW_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Debug, Clone)]
 pub enum RemoteBrowserMessage {
@@ -444,6 +447,9 @@ impl RemoteBrowser {
             RemoteBrowserMessage::ShowContentPreview(path) => {
                 if let Some(host) = &self.host_address {
                     self.content_preview_loading = true;
+                    let filename = path.rsplit('/').next().unwrap_or("file");
+                    self.status_message = Some(format!("Downloading {}...", filename));
+
                     self.content_preview_path = Some(path.clone());
                     let host = host.clone();
                     let password = self.password.clone();
@@ -569,7 +575,30 @@ impl RemoteBrowser {
                 .align_items(iced::Alignment::Center)
                 .into();
         }
+        // Show loading panel while downloading content for preview
+        if self.content_preview_loading {
+            let loading_panel = container(
+                column![
+                    text("Downloading...").size(normal),
+                    text(self.content_preview_path.as_deref().unwrap_or("")).size(small),
+                ]
+                .spacing(10)
+                .align_items(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .center_y()
+            .style(iced::theme::Container::Box);
 
+            return column![nav_buttons, quick_nav, path_display, status, loading_panel,]
+                .spacing(5)
+                .padding(5)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_items(iced::Alignment::Center)
+                .into();
+        }
         // If content preview popup is open, show it instead of the file list
         if let Some(content_preview) = &self.content_preview {
             let popup = self.view_content_preview_popup(content_preview, font_size);
@@ -637,6 +666,7 @@ impl RemoteBrowser {
                 // Check if this is a previewable text or image file
                 let is_text_file = is_remote_text_file(&entry.name);
                 let is_image_file = is_remote_image_file(&entry.name);
+                let is_pdf_file = is_remote_pdf_file(&entry.name);
 
                 // Action button based on file type
                 let ext = entry.name.to_lowercase();
@@ -789,6 +819,16 @@ impl RemoteBrowser {
                             .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
                             .padding([2, 8]),
                         "View image",
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box)
+                    .into()
+                } else if is_pdf_file {
+                    tooltip(
+                        button(text("View").size(small))
+                            .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
+                            .padding([2, 8]),
+                        "View PDF",
                         tooltip::Position::Top,
                     )
                     .style(iced::theme::Container::Box)
@@ -1113,6 +1153,8 @@ fn get_file_icon(name: &str) -> &'static str {
         "TAP"
     } else if lower.ends_with(".reu") {
         "REU"
+    } else if lower.ends_with(".pdf") {
+        "PDF"
     } else if lower.ends_with(".txt")
         || lower.ends_with(".nfo")
         || lower.ends_with(".diz")
@@ -1329,8 +1371,78 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
     }
 
     None
-}
+} // Download file via FTP with longer timeout for previews
+async fn download_file_ftp_preview(
+    host: String,
+    remote_path: String,
+    password: Option<String>,
+) -> Result<(String, Vec<u8>), String> {
+    log::info!("FTP: Downloading preview {}", remote_path);
 
+    // Use longer timeout for preview downloads
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_PREVIEW_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .ok();
+
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            // Set binary transfer mode
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+
+            // Get filename from path
+            let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
+
+            // Retrieve file
+            let mut reader = ftp
+                .retr_as_stream(&remote_path)
+                .map_err(|e| format!("FTP download failed: {}", e))?;
+
+            let mut data = Vec::new();
+            reader
+                .read_to_end(&mut data)
+                .map_err(|e| format!("Read error: {}", e))?;
+
+            // Finalize transfer
+            ftp.finalize_retr_stream(reader)
+                .map_err(|e| format!("Transfer finalize error: {}", e))?;
+
+            let _ = ftp.quit();
+
+            Ok((filename, data))
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Download timed out - file may be too large".to_string()),
+    }
+}
 // Download file via FTP
 async fn download_file_ftp(
     host: String,
@@ -1670,7 +1782,10 @@ async fn load_remote_disk_info(
         .await
         .map_err(|e| format!("Task error: {}", e))?
 }
-
+fn is_remote_pdf_file(name: &str) -> bool {
+    name.to_lowercase().ends_with(".pdf")
+}
+/// Download a remote file via FTP and create a content preview
 /// Download a remote file via FTP and create a content preview
 async fn load_remote_content_preview(
     host: String,
@@ -1687,9 +1802,9 @@ async fn load_remote_content_preview(
         .to_string();
 
     // Download the file first
-    let (_, data) = download_file_ftp(host, remote_path.clone(), password).await?;
+    let (_, data) = download_file_ftp_preview(host, remote_path.clone(), password).await?;
 
-    // Determine if text or image based on filename
+    // Determine if text, image, or PDF based on filename
     if is_remote_text_file(&filename) {
         // Parse as text
         tokio::task::spawn_blocking(move || {
@@ -1735,6 +1850,9 @@ async fn load_remote_content_preview(
         })
         .await
         .map_err(|e| format!("Task error: {}", e))?
+    } else if is_remote_pdf_file(&filename) {
+        // Parse as PDF
+        crate::pdf_preview::load_pdf_preview_from_bytes_async(data, filename).await
     } else {
         Err("Unsupported file type for preview".to_string())
     }
