@@ -44,6 +44,13 @@ use templates::{DiskTemplate, TemplateManager};
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn main() -> iced::Result {
+    // Force OpenGL backend on Linux for better compatibility with multi-GPU systems
+    // Users can override with WGPU_BACKEND=vulkan if needed
+
+    #[cfg(target_os = "linux")]
+    if std::env::var("WGPU_BACKEND").is_err() {
+        std::env::set_var("WGPU_BACKEND", "gl");
+    }
     // Initialize logger - show info level by default, debug if RUST_LOG is set
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
