@@ -49,6 +49,9 @@ pub fn main() -> iced::Result {
 
     #[cfg(target_os = "linux")]
     if std::env::var("WGPU_BACKEND").is_err() {
+        // SAFETY: This is executed at program startup before any threads
+        // or GPU backends are initialized. No other threads can read
+        // environment variables at this point.
         unsafe {
             std::env::set_var("WGPU_BACKEND", "gl");
         }
