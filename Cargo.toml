@@ -27,6 +27,8 @@ cpal = "0.15"
 md5 = "0.7"
 urlencoding = "2.1"
 open = "5"
+lopdf = "0.32"
+pdf-extract = "0.7"
 
 # Windows-specific dependencies
 [target.'cfg(target_os = "windows")'.dependencies]

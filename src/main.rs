@@ -24,6 +24,7 @@ mod file_browser;
 mod memory_editor;
 mod mod_info;
 mod music_player;
+mod pdf_preview;
 mod petscii;
 mod remote_browser;
 mod settings;

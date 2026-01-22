@@ -13,6 +13,7 @@ use ultimate64::{Rest, drives::MountMode};
 
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
+use crate::pdf_preview;
 
 /// Timeout for REST API operations to prevent hangs when device goes offline
 const REST_TIMEOUT_SECS: u64 = 5;
@@ -802,6 +803,7 @@ impl FileBrowser {
                 Some("tap") | Some("t64") => "TAP",
                 Some("txt") | Some("atxt") | Some("nfo") | Some("diz") => "TXT",
                 Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") => "IMG",
+                Some("pdf") => "PDF",
                 _ => "",
             }
         };
@@ -820,6 +822,7 @@ impl FileBrowser {
         // Check if this is a previewable text or image file
         let is_text_file = dir_preview::is_text_file(&entry.path);
         let is_image_file = dir_preview::is_image_file(&entry.path);
+        let is_pdf_file = entry.extension.as_deref() == Some("pdf");
 
         // Action button based on file type
         let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
@@ -920,7 +923,7 @@ impl FileBrowser {
                 .style(iced::theme::Container::Box)
                 .into(),
                 _ => {
-                    // Check for text or image preview
+                    // Check for text, image, or PDF preview
                     if is_text_file {
                         tooltip(
                             button(text("View").size(small))
@@ -941,6 +944,18 @@ impl FileBrowser {
                                 ))
                                 .padding([2, 8]),
                             "View image",
+                            tooltip::Position::Top,
+                        )
+                        .style(iced::theme::Container::Box)
+                        .into()
+                    } else if is_pdf_file {
+                        tooltip(
+                            button(text("View").size(small))
+                                .on_press(FileBrowserMessage::ShowContentPreview(
+                                    entry.path.clone(),
+                                ))
+                                .padding([2, 8]),
+                            "View PDF",
                             tooltip::Position::Top,
                         )
                         .style(iced::theme::Container::Box)
@@ -1051,6 +1066,7 @@ impl FileBrowser {
                                     | Some("jpeg")
                                     | Some("gif")
                                     | Some("bmp")
+                                    | Some("pdf")
                             )
                             || dir_preview::is_text_file(&path)
                         {
@@ -1095,6 +1111,13 @@ async fn load_content_preview_async(path: PathBuf) -> Result<ContentPreview, Str
         dir_preview::load_text_file_async(path).await
     } else if dir_preview::is_image_file(&path) {
         dir_preview::load_image_file_async(path).await
+    } else if path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_lowercase())
+        == Some("pdf".to_string())
+    {
+        pdf_preview::load_pdf_preview_async(path).await
     } else {
         Err("Unsupported file type for preview".to_string())
     }
