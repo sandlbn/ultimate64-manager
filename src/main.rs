@@ -18,6 +18,7 @@ use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
 mod config_editor;
+mod config_presets;
 mod dir_preview;
 mod disk_image;
 mod file_browser;

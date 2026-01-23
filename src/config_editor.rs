@@ -1,3 +1,4 @@
+use crate::config_presets::{self, ConfigPreset};
 use iced::{
     Command, Element, Length,
     widget::{
@@ -78,6 +79,14 @@ pub enum ConfigEditorMessage {
     RevertChanges,
     RefreshCategory,
     SearchChanged(String),
+
+    // Preset operations
+    SavePreset,
+    SavePresetFileSelected(Option<std::path::PathBuf>),
+    SavePresetComplete(Result<String, String>),
+    LoadPreset,
+    LoadPresetFileSelected(Option<std::path::PathBuf>),
+    LoadPresetComplete(Result<ConfigPreset, String>),
 }
 
 pub struct ConfigEditor {
@@ -431,6 +440,124 @@ impl ConfigEditor {
                 self.search_filter = filter;
                 Command::none()
             }
+
+            ConfigEditorMessage::SavePreset => {
+                // Open file dialog to save current category as preset
+                if self.selected_category.is_none() || self.current_items.is_empty() {
+                    self.error_message =
+                        Some("No category selected or no items to save".to_string());
+                    return Command::none();
+                }
+
+                let category = self.selected_category.clone().unwrap_or_default();
+                let default_name =
+                    format!("{}_preset.json", category.to_lowercase().replace(' ', "_"));
+
+                Command::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Save Configuration Preset")
+                            .set_file_name(&default_name)
+                            .add_filter("JSON files", &["json"])
+                            .save_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    ConfigEditorMessage::SavePresetFileSelected,
+                )
+            }
+
+            ConfigEditorMessage::SavePresetFileSelected(path) => {
+                if let Some(path) = path {
+                    if let Some(category) = &self.selected_category {
+                        // Build preset from current items
+                        let mut items: std::collections::HashMap<String, serde_json::Value> =
+                            std::collections::HashMap::new();
+                        for (name, opt) in &self.current_items {
+                            items.insert(name.clone(), opt.current_value.clone());
+                        }
+
+                        let preset = config_presets::create_preset_from_items(
+                            category,
+                            &items,
+                            Some(category),
+                        );
+
+                        self.status_message = Some("Saving preset...".to_string());
+                        return Command::perform(
+                            config_presets::save_preset_async(preset, path),
+                            ConfigEditorMessage::SavePresetComplete,
+                        );
+                    }
+                }
+                Command::none()
+            }
+
+            ConfigEditorMessage::SavePresetComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Save preset failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            ConfigEditorMessage::LoadPreset => Command::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Load Configuration Preset")
+                        .add_filter("JSON files", &["json"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                ConfigEditorMessage::LoadPresetFileSelected,
+            ),
+
+            ConfigEditorMessage::LoadPresetFileSelected(path) => {
+                if let Some(path) = path {
+                    self.status_message = Some("Loading preset...".to_string());
+                    return Command::perform(
+                        config_presets::load_preset_async(path),
+                        ConfigEditorMessage::LoadPresetComplete,
+                    );
+                }
+                Command::none()
+            }
+
+            ConfigEditorMessage::LoadPresetComplete(result) => {
+                match result {
+                    Ok(preset) => {
+                        // Apply preset values to pending changes
+                        let mut applied_count = 0;
+                        for (category, items) in &preset.settings {
+                            for (item_name, value) in items {
+                                self.record_change(category, item_name, value.clone());
+                                // Update current item value if it's in the current view
+                                if let Some(opt) = self.current_items.get_mut(item_name) {
+                                    opt.current_value = value.clone();
+                                }
+                                applied_count += 1;
+                            }
+                        }
+
+                        let preset_name = preset.name.unwrap_or_else(|| "preset".to_string());
+                        self.status_message = Some(format!(
+                            "Loaded '{}': {} settings (click Apply All to save)",
+                            preset_name, applied_count
+                        ));
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Load preset failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
         }
     }
 
@@ -559,12 +686,41 @@ impl ConfigEditor {
         )
         .padding(10);
 
+        // Preset controls
+        let preset_controls = container(
+            column![
+                horizontal_rule(1),
+                text("PRESETS").size(small),
+                tooltip(
+                    button(text("Save Preset").size(small))
+                        .on_press(ConfigEditorMessage::SavePreset)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Save current category settings to a JSON file",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
+                tooltip(
+                    button(text("Load Preset").size(small))
+                        .on_press(ConfigEditorMessage::LoadPreset)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Load settings from a JSON preset file",
+                    tooltip::Position::Right,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(5),
+        )
+        .padding(10);
+
         let left_pane = container(
             column![
                 category_header,
                 horizontal_rule(1),
                 category_list,
                 flash_controls,
+                preset_controls,
             ]
             .spacing(0)
             .height(Length::Fill),
