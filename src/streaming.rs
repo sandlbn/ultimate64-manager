@@ -2432,9 +2432,7 @@ fn send_stream_command(
 
     log::info!("REST API: PUT http://{}{}", ultimate_ip, path);
 
-    let http_addr: std::net::SocketAddr = format!("{}:80", ultimate_ip)
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let http_addr = resolve_host(ultimate_ip, 80)?;
 
     match TcpStream::connect_timeout(&http_addr, Duration::from_secs(5)) {
         Ok(mut stream) => {
@@ -2489,9 +2487,7 @@ fn send_stream_command(
     );
     log::info!("Destination string: {}", dest);
 
-    let addr: std::net::SocketAddr = format!("{}:64", ultimate_ip)
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let addr = resolve_host(ultimate_ip, 64)?;
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     let written = stream.write(&cmd)?;
@@ -2534,9 +2530,7 @@ fn send_stop_command(
 
     log::info!("REST API stop: PUT http://{}{}", ultimate_ip, path);
 
-    let http_addr: std::net::SocketAddr = format!("{}:80", ultimate_ip)
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let http_addr = resolve_host(ultimate_ip, 80)?;
 
     match TcpStream::connect_timeout(&http_addr, Duration::from_secs(5)) {
         Ok(mut stream) => {
@@ -2582,9 +2576,7 @@ fn send_stop_command(
 
     log::debug!("Sending STOP command to {}:64 -> {:02X?}", ultimate_ip, cmd);
 
-    let addr: std::net::SocketAddr = format!("{}:64", ultimate_ip)
-        .parse()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let addr = resolve_host(ultimate_ip, 64)?;
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     stream.write_all(&cmd)?;
@@ -2696,4 +2688,16 @@ fn integer_scale(input: &[u8], width: u32, height: u32, scale: u32) -> Vec<u8> {
     }
 
     output
+}
+/// Resolve hostname to SocketAddr (supports both IP addresses and hostnames)
+fn resolve_host(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+
+    let addr_str = format!("{}:{}", host, port);
+    addr_str.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Could not resolve hostname: {}", host),
+        )
+    })
 }
