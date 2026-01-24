@@ -29,9 +29,11 @@ mod pdf_preview;
 mod petscii;
 mod remote_browser;
 mod settings;
+mod stream_control;
 mod streaming;
 mod templates;
 mod version_check;
+mod video_scaling;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
