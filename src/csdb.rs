@@ -424,31 +424,37 @@ impl CsdbClient {
             .await
             .with_context(|| format!("Failed to create directory {:?}", out_dir))?;
 
-        let final_url = self.resolve_final_url(&file.url).await?;
-        let filename = label_from_url(&final_url);
-        let out_path = out_dir.join(&filename);
+        // Use final_url which is already resolved
+        let download_url = if file.final_url.starts_with("http") {
+            file.final_url.clone()
+        } else {
+            self.resolve_final_url(&file.url).await?
+        };
+
+        let out_path = out_dir.join(&file.filename);
 
         let response = self
             .client
-            .get(&final_url)
+            .get(&download_url)
             .send()
             .await
-            .with_context(|| format!("Failed to download {}", final_url))?;
+            .with_context(|| format!("Failed to download {}", download_url))?;
 
         response
             .error_for_status_ref()
-            .with_context(|| format!("HTTP error downloading {}", final_url))?;
+            .with_context(|| format!("HTTP error downloading {}", download_url))?;
 
         let bytes = response
             .bytes()
             .await
-            .with_context(|| format!("Failed to read bytes from {}", final_url))?;
+            .with_context(|| format!("Failed to read bytes from {}", download_url))?;
 
-        let mut file = File::create(&out_path)
+        let mut out_file = File::create(&out_path)
             .await
             .with_context(|| format!("Failed to create file {:?}", out_path))?;
 
-        file.write_all(&bytes)
+        out_file
+            .write_all(&bytes)
             .await
             .with_context(|| format!("Failed to write to {:?}", out_path))?;
 
@@ -457,26 +463,31 @@ impl CsdbClient {
 
     /// Download file and return bytes directly (for running without saving)
     pub async fn download_file_bytes(&self, file: &ReleaseFile) -> Result<(String, Vec<u8>)> {
-        let final_url = self.resolve_final_url(&file.url).await?;
-        let filename = label_from_url(&final_url);
+        // Use final_url which is already resolved (avoids double resolution and handles pre-extracted URLs)
+        let download_url = if file.final_url.starts_with("http") {
+            file.final_url.clone()
+        } else {
+            // Fallback: resolve if final_url is not set properly
+            self.resolve_final_url(&file.url).await?
+        };
 
         let response = self
             .client
-            .get(&final_url)
+            .get(&download_url)
             .send()
             .await
-            .with_context(|| format!("Failed to download {}", final_url))?;
+            .with_context(|| format!("Failed to download {}", download_url))?;
 
         response
             .error_for_status_ref()
-            .with_context(|| format!("HTTP error downloading {}", final_url))?;
+            .with_context(|| format!("HTTP error downloading {}", download_url))?;
 
         let bytes = response
             .bytes()
             .await
-            .with_context(|| format!("Failed to read bytes from {}", final_url))?;
+            .with_context(|| format!("Failed to read bytes from {}", download_url))?;
 
-        Ok((filename, bytes.to_vec()))
+        Ok((file.filename.clone(), bytes.to_vec()))
     }
 
     // -------------------------------------------------------------------------
@@ -520,28 +531,62 @@ impl CsdbClient {
         let mut results = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // Pattern for search results - looking for release links with titles
-        // <a href="/release/?id=12345">Title</a>
-        let release_re = Regex::new(r#"href="(/release/\?id=(\d+))"[^>]*>([^<]+)</a>"#).unwrap();
+        // First pass: find all release links - be flexible with attributes
+        let release_re =
+            Regex::new(r#"<a\s[^>]*href="/release/\?id=(\d+)"[^>]*>([^<]+)</a>"#).unwrap();
 
-        for cap in release_re.captures_iter(html) {
-            let rel_path = &cap[1];
-            let rid = cap[2].to_string();
-            let title = strip_tags(&cap[3]);
+        // Regex for type: (C64 Something) or (C128 Something) etc.
+        let type_re =
+            Regex::new(r#"\((C64[^)]+|C128[^)]+|REU[^)]+|BBS[^)]+|Easy[^)]+|Other[^)]+)\)"#)
+                .unwrap();
+
+        // Regex for group/scener name inside font tag
+        let group_re =
+            Regex::new(r#"href="/(?:group|scener)/\?id=\d+"[^>]*><font[^>]*>([^<]+)</font>"#)
+                .unwrap();
+
+        // Alternative: group/scener without font tag
+        let group_alt_re =
+            Regex::new(r#"href="/(?:group|scener)/\?id=\d+"[^>]*>([^<]+)</a>"#).unwrap();
+
+        let matches: Vec<_> = release_re.captures_iter(html).collect();
+
+        for (i, cap) in matches.iter().enumerate() {
+            let rid = cap[1].to_string();
 
             if seen.contains(&rid) {
                 continue;
             }
             seen.insert(rid.clone());
 
-            let release_url = format!("https://csdb.dk{}", rel_path);
+            let title = strip_tags(&cap[2]);
+
+            // Get context: from end of this match to start of next match (or +500 chars)
+            let match_end = cap.get(0).unwrap().end();
+            let next_match_start = matches
+                .get(i + 1)
+                .map(|m| m.get(0).unwrap().start())
+                .unwrap_or(html.len());
+            let context_end = match_end + (500.min(next_match_start.saturating_sub(match_end)));
+            let context = &html[match_end..context_end.min(html.len())];
+
+            // Extract type from context
+            let release_type = type_re.captures(context).map(|c| strip_tags(&c[1]));
+
+            // Extract group from context (try font version first, then plain)
+            let group = group_re
+                .captures(context)
+                .map(|c| strip_tags(&c[1]))
+                .or_else(|| group_alt_re.captures(context).map(|c| strip_tags(&c[1])));
+
+            let release_url = format!("https://csdb.dk/release/?id={}", rid);
 
             results.push(SearchResult {
                 release_id: Some(rid),
                 title,
                 release_url,
-                group: None,
-                release_type: None,
+                group,
+                release_type,
                 year: None,
                 exact_match: false,
             });
@@ -625,25 +670,39 @@ impl CsdbClient {
     async fn build_file_list(&self, html: &str, base_url: &str) -> Result<Vec<ReleaseFile>> {
         let candidates = parse_candidates(html, base_url);
         let mut items = Vec::new();
+        let mut seen_filenames: HashSet<String> = HashSet::new();
 
         for (i, c) in candidates.into_iter().enumerate() {
             let index = i + 1;
-            let mut final_url = c.url.clone();
-            let mut filename = c.label.clone();
 
-            // Resolve download.php to final file URL
-            if c.kind == "download" {
+            // If we have a target URL from the link text, use it
+            let (final_url, filename) = if let Some(target) = &c.target_url {
+                // Skip FTP URLs - we can't download those
+                if target.starts_with("ftp://") {
+                    continue;
+                }
+                (target.clone(), c.label.clone())
+            } else if c.kind == "download" {
+                // Need to resolve the download.php redirect
                 match self.resolve_final_url(&c.url).await {
                     Ok(resolved) => {
-                        final_url = resolved.clone();
-                        filename = label_from_url(&resolved);
+                        let fname = label_from_url(&resolved);
+                        (resolved, fname)
                     }
                     Err(_) => {
-                        final_url = c.url.clone();
-                        filename = c.label.clone();
+                        // Skip failed resolutions
+                        continue;
                     }
                 }
+            } else {
+                (c.url.clone(), c.label.clone())
+            };
+
+            // Skip duplicate filenames
+            if seen_filenames.contains(&filename) {
+                continue;
             }
+            seen_filenames.insert(filename.clone());
 
             let ext = get_ext(&filename);
 
@@ -656,6 +715,11 @@ impl CsdbClient {
                 filename,
                 ext,
             });
+        }
+
+        // Re-index after filtering
+        for (i, item) in items.iter_mut().enumerate() {
+            item.index = i + 1;
         }
 
         Ok(items)
@@ -751,6 +815,7 @@ struct Candidate {
     url: String,
     id: Option<String>,
     label: String,
+    target_url: Option<String>, // The actual file URL (from link text)
 }
 
 // -----------------------------------------------------------------------------
@@ -802,68 +867,78 @@ fn url_join(base: &str, relative: &str) -> String {
 
 fn parse_candidates(html: &str, base_url: &str) -> Vec<Candidate> {
     let mut candidates = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut seen_urls: HashSet<String> = HashSet::new();
 
-    // download.php?id=... links (relative)
-    let download_re = Regex::new(r#"href="(download\.php\?id=\d+)""#).unwrap();
-    for cap in download_re.captures_iter(html) {
-        let rel = &cap[1];
-        let abs_url = url_join(base_url, rel);
-        let id_re = Regex::new(r"id=(\d+)").unwrap();
-        let id = id_re.captures(rel).map(|c| c[1].to_string());
+    // Pattern for downloadLinks table entries:
+    // <a href="download.php?id=140279">http://csdb.dk/getinternalfile.php/109865/coma-light-13-by-oxyron.zip</a>
+    // The link TEXT contains the actual target URL!
+    let download_table_re =
+        Regex::new(r#"<a\s+href="((?:/release/)?download\.php\?id=(\d+))"[^>]*>([^<]+)</a>"#)
+            .unwrap();
 
-        let key = ("download".to_string(), abs_url.clone());
-        if seen.contains(&key) {
+    for cap in download_table_re.captures_iter(html) {
+        let href = &cap[1];
+        let id = cap[2].to_string();
+        let link_text = cap[3].trim();
+
+        // The link text contains the actual target URL (http:// or ftp://)
+        // Extract filename from it
+        let (target_url, filename) =
+            if link_text.starts_with("http") || link_text.starts_with("ftp") {
+                let fname = label_from_url(link_text);
+                (link_text.to_string(), fname)
+            } else {
+                (String::new(), format!("download-{}", id))
+            };
+
+        // Skip duplicates by target URL or filename
+        let dedup_key = if !target_url.is_empty() {
+            target_url.clone()
+        } else {
+            format!("download.php?id={}", id)
+        };
+
+        if seen_urls.contains(&dedup_key) {
             continue;
         }
-        seen.insert(key);
+        seen_urls.insert(dedup_key);
+
+        let abs_url = if href.starts_with('/') {
+            format!("https://csdb.dk{}", href)
+        } else {
+            url_join(base_url, href)
+        };
 
         candidates.push(Candidate {
             kind: "download".to_string(),
             url: abs_url,
-            id: id.clone(),
-            label: format!("download.php?id={}", id.unwrap_or_default()),
+            id: Some(id),
+            label: filename,
+            target_url: if target_url.is_empty() {
+                None
+            } else {
+                Some(target_url)
+            },
         });
     }
 
-    // Also check for /release/download.php?id=... pattern
-    let release_download_re = Regex::new(r#"href="(/release/download\.php\?id=\d+)""#).unwrap();
-    for cap in release_download_re.captures_iter(html) {
-        let rel = &cap[1];
-        let abs_url = format!("https://csdb.dk{}", rel);
-        let id_re = Regex::new(r"id=(\d+)").unwrap();
-        let id = id_re.captures(rel).map(|c| c[1].to_string());
-
-        let key = ("download".to_string(), abs_url.clone());
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.insert(key);
-
-        candidates.push(Candidate {
-            kind: "download".to_string(),
-            url: abs_url,
-            id: id.clone(),
-            label: format!("download.php?id={}", id.unwrap_or_default()),
-        });
-    }
-
-    // direct getinternalfile.php/... links (absolute)
+    // Also look for direct getinternalfile.php links (absolute URLs in page)
     let internal_re =
         Regex::new(r#"https?://csdb\.dk/getinternalfile\.php/\d+/[^\s"'<>()]+"#).unwrap();
     for mat in internal_re.find_iter(html) {
         let abs_url = mat.as_str().to_string();
-        let key = ("internal".to_string(), abs_url.clone());
-        if seen.contains(&key) {
+
+        if seen_urls.contains(&abs_url) {
             continue;
         }
-        seen.insert(key);
+        seen_urls.insert(abs_url.clone());
 
         candidates.push(Candidate {
             kind: "internal".to_string(),
             url: abs_url.clone(),
             id: None,
             label: label_from_url(&abs_url),
+            target_url: Some(abs_url),
         });
     }
 

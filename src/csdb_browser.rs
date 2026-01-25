@@ -447,13 +447,17 @@ impl CsdbBrowser {
 
                         return Command::perform(
                             async move {
-                                tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
-                                    let client = CsdbClient::new().map_err(|e| e.to_string())?;
-                                    client
-                                        .download_file(&file, &out_dir)
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                })
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(120), // 2 minutes for large files
+                                    async {
+                                        let client =
+                                            CsdbClient::new().map_err(|e| e.to_string())?;
+                                        client
+                                            .download_file(&file, &out_dir)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    },
+                                )
                                 .await
                                 .map_err(|_| "Download timed out".to_string())?
                             },
@@ -493,22 +497,29 @@ impl CsdbBrowser {
                         let conn = connection.unwrap();
                         let drive = self.selected_drive.to_drive_string();
                         let device_num = self.selected_drive.device_number().to_string();
+                        let is_disk = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
 
                         return Command::perform(
                             async move {
-                                // First download the file
+                                // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
 
-                                let (filename, data) = client
-                                    .download_file_bytes(&file)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+                                let (filename, data) = tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(60),
+                                    client.download_file_bytes(&file),
+                                )
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                                .map_err(|e| e.to_string())?;
 
                                 // Determine file type and run
                                 let ext = file.ext.to_lowercase();
 
+                                // Use longer timeout for disk images (includes boot + load delays)
+                                let run_timeout = if is_disk { 30 } else { 15 };
+
                                 tokio::time::timeout(
-                                    tokio::time::Duration::from_secs(15),
+                                    tokio::time::Duration::from_secs(run_timeout),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
 
@@ -568,7 +579,9 @@ impl CsdbBrowser {
                                     }),
                                 )
                                 .await
-                                .map_err(|_| "Operation timed out".to_string())?
+                                .map_err(|_| {
+                                    "Run timed out - device may be busy or offline".to_string()
+                                })?
                                 .map_err(|e| format!("Task error: {}", e))?
                             },
                             CsdbBrowserMessage::RunFileCompleted,
@@ -630,15 +643,18 @@ impl CsdbBrowser {
 
                         return Command::perform(
                             async move {
-                                // First download the file
+                                // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
 
-                                let (filename, data) = client
-                                    .download_file_bytes(&file)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+                                let (filename, data) = tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(60),
+                                    client.download_file_bytes(&file),
+                                )
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                                .map_err(|e| e.to_string())?;
 
-                                // Save to temp and mount
+                                // Save to temp
                                 let temp_dir = std::env::temp_dir();
                                 let temp_path = temp_dir.join(&filename);
 
@@ -646,8 +662,9 @@ impl CsdbBrowser {
                                     .await
                                     .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
+                                // Mount (separate timeout)
                                 tokio::time::timeout(
-                                    tokio::time::Duration::from_secs(10),
+                                    tokio::time::Duration::from_secs(15),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
                                         conn.mount_disk_image(&temp_path, drive, mode, false)
@@ -656,7 +673,9 @@ impl CsdbBrowser {
                                     }),
                                 )
                                 .await
-                                .map_err(|_| "Mount timed out".to_string())?
+                                .map_err(|_| {
+                                    "Mount timed out - device may be busy or offline".to_string()
+                                })?
                                 .map_err(|e| format!("Task error: {}", e))?
                             },
                             CsdbBrowserMessage::MountCompleted,
@@ -1012,31 +1031,71 @@ impl CsdbBrowser {
     ) -> Element<'a, CsdbBrowserMessage> {
         let small = (font_size.saturating_sub(2)).max(8) as u16;
         let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 
         let title = release.title();
         let url = release.url();
         let id = release.id().unwrap_or_default();
+        let rtype = release.release_type();
+        let group = release.group();
 
-        let title_display = if title.len() > 50 {
-            format!("{}...", &title[..47])
+        let title_display = if title.len() > 30 {
+            format!("{}...", &title[..27])
         } else {
             title.to_string()
         };
 
+        // Type column
+        let type_display = rtype
+            .map(|t| {
+                if t.len() > 16 {
+                    format!("{}...", &t[..13])
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_default();
+
+        // Group column
+        let group_display = group
+            .map(|g| {
+                if g.len() > 18 {
+                    format!("{}...", &g[..15])
+                } else {
+                    g.to_string()
+                }
+            })
+            .unwrap_or_default();
+
         row![
             text(format!("[{}]", id))
-                .size(small)
-                .width(Length::Fixed(70.0)),
+                .size(tiny)
+                .width(Length::Fixed(70.0))
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.5, 0.5, 0.6
+                ))),
             tooltip(
                 button(text(&title_display).size(normal))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
                     .padding([4, 8])
-                    .width(Length::Fill)
+                    .width(Length::Fixed(250.0))
                     .style(iced::theme::Button::Text),
                 text(title).size(normal),
                 tooltip::Position::Top,
             )
             .style(iced::theme::Container::Box),
+            text(&type_display)
+                .size(tiny)
+                .width(Length::Fixed(130.0))
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.6, 0.8, 0.6
+                ))),
+            text(&group_display)
+                .size(tiny)
+                .width(Length::Fill)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.5, 0.7, 0.9
+                ))),
             tooltip(
                 button(text("View").size(small))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
@@ -1295,6 +1354,8 @@ trait ReleaseItem {
     fn title(&self) -> &str;
     fn url(&self) -> &str;
     fn id(&self) -> Option<&str>;
+    fn group(&self) -> Option<&str>;
+    fn release_type(&self) -> Option<&str>;
 }
 
 impl ReleaseItem for LatestRelease {
@@ -1309,6 +1370,14 @@ impl ReleaseItem for LatestRelease {
     fn id(&self) -> Option<&str> {
         Some(&self.release_id)
     }
+
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    fn release_type(&self) -> Option<&str> {
+        self.release_type.as_deref()
+    }
 }
 
 impl ReleaseItem for SearchResult {
@@ -1322,6 +1391,14 @@ impl ReleaseItem for SearchResult {
 
     fn id(&self) -> Option<&str> {
         self.release_id.as_deref()
+    }
+
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    fn release_type(&self) -> Option<&str> {
+        self.release_type.as_deref()
     }
 }
 
