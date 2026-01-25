@@ -1,6 +1,6 @@
 [package]
 name = "ultimate64-manager"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 description = "Ultimate64 Manager - Control your Ultimate64/Ultimate-II+"
 authors = ["Marcin Spoczynski"]
