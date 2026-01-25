@@ -20,7 +20,7 @@ use ultimate64::Rest;
 
 use crate::csdb::{
     CsdbClient, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory, SearchResult,
-    get_runnable_files,
+    TopListCategory, TopListEntry, get_runnable_files,
 };
 
 /// Timeout for CSDb operations
@@ -37,6 +37,11 @@ pub enum CsdbBrowserMessage {
     // Latest releases
     RefreshLatest,
     LatestLoaded(Result<Vec<LatestRelease>, String>),
+
+    // Top lists
+    TopListCategoryChanged(TopListCategory),
+    LoadTopList,
+    TopListLoaded(Result<Vec<TopListEntry>, String>),
 
     // Release selection
     SelectRelease(String), // release URL
@@ -161,6 +166,7 @@ impl FileFilter {
 pub enum ViewState {
     LatestReleases,
     SearchResults,
+    TopList,
     ReleaseDetails,
 }
 
@@ -175,6 +181,10 @@ pub struct CsdbBrowser {
 
     // Latest releases
     latest_releases: Vec<LatestRelease>,
+
+    // Top lists
+    top_list_category: TopListCategory,
+    top_list_entries: Vec<TopListEntry>,
 
     // Current release details
     current_release: Option<ReleaseDetails>,
@@ -206,6 +216,8 @@ impl CsdbBrowser {
             search_category: SearchCategory::default(),
             search_results: Vec::new(),
             latest_releases: Vec::new(),
+            top_list_category: TopListCategory::default(),
+            top_list_entries: Vec::new(),
             current_release: None,
             selected_file_index: None,
             selected_drive: DriveOption::A,
@@ -317,6 +329,52 @@ impl CsdbBrowser {
                 Command::none()
             }
 
+            CsdbBrowserMessage::TopListCategoryChanged(category) => {
+                self.top_list_category = category;
+                Command::none()
+            }
+
+            CsdbBrowserMessage::LoadTopList => {
+                self.is_loading = true;
+                self.status_message =
+                    Some(format!("Loading {} top list...", self.top_list_category));
+                let category = self.top_list_category;
+
+                Command::perform(
+                    async move {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
+                            async {
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+                                client
+                                    .get_top_list(category, 100)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                        )
+                        .await
+                        .map_err(|_| "Loading timed out".to_string())?
+                    },
+                    CsdbBrowserMessage::TopListLoaded,
+                )
+            }
+
+            CsdbBrowserMessage::TopListLoaded(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(entries) => {
+                        let count = entries.len();
+                        self.top_list_entries = entries;
+                        self.view_state = ViewState::TopList;
+                        self.status_message = Some(format!("Loaded top {} entries", count));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed to load top list: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
             CsdbBrowserMessage::SelectRelease(release_url) => {
                 self.is_loading = true;
                 self.status_message = Some("Loading release details...".to_string());
@@ -389,13 +447,17 @@ impl CsdbBrowser {
 
                         return Command::perform(
                             async move {
-                                tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
-                                    let client = CsdbClient::new().map_err(|e| e.to_string())?;
-                                    client
-                                        .download_file(&file, &out_dir)
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                })
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(120), // 2 minutes for large files
+                                    async {
+                                        let client =
+                                            CsdbClient::new().map_err(|e| e.to_string())?;
+                                        client
+                                            .download_file(&file, &out_dir)
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                    },
+                                )
                                 .await
                                 .map_err(|_| "Download timed out".to_string())?
                             },
@@ -435,22 +497,29 @@ impl CsdbBrowser {
                         let conn = connection.unwrap();
                         let drive = self.selected_drive.to_drive_string();
                         let device_num = self.selected_drive.device_number().to_string();
+                        let is_disk = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
 
                         return Command::perform(
                             async move {
-                                // First download the file
+                                // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
 
-                                let (filename, data) = client
-                                    .download_file_bytes(&file)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+                                let (filename, data) = tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(60),
+                                    client.download_file_bytes(&file),
+                                )
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                                .map_err(|e| e.to_string())?;
 
                                 // Determine file type and run
                                 let ext = file.ext.to_lowercase();
 
+                                // Use longer timeout for disk images (includes boot + load delays)
+                                let run_timeout = if is_disk { 30 } else { 15 };
+
                                 tokio::time::timeout(
-                                    tokio::time::Duration::from_secs(15),
+                                    tokio::time::Duration::from_secs(run_timeout),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
 
@@ -510,7 +579,9 @@ impl CsdbBrowser {
                                     }),
                                 )
                                 .await
-                                .map_err(|_| "Operation timed out".to_string())?
+                                .map_err(|_| {
+                                    "Run timed out - device may be busy or offline".to_string()
+                                })?
                                 .map_err(|e| format!("Task error: {}", e))?
                             },
                             CsdbBrowserMessage::RunFileCompleted,
@@ -572,15 +643,18 @@ impl CsdbBrowser {
 
                         return Command::perform(
                             async move {
-                                // First download the file
+                                // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
 
-                                let (filename, data) = client
-                                    .download_file_bytes(&file)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
+                                let (filename, data) = tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(60),
+                                    client.download_file_bytes(&file),
+                                )
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                                .map_err(|e| e.to_string())?;
 
-                                // Save to temp and mount
+                                // Save to temp
                                 let temp_dir = std::env::temp_dir();
                                 let temp_path = temp_dir.join(&filename);
 
@@ -588,8 +662,9 @@ impl CsdbBrowser {
                                     .await
                                     .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
+                                // Mount (separate timeout)
                                 tokio::time::timeout(
-                                    tokio::time::Duration::from_secs(10),
+                                    tokio::time::Duration::from_secs(15),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
                                         conn.mount_disk_image(&temp_path, drive, mode, false)
@@ -598,7 +673,9 @@ impl CsdbBrowser {
                                     }),
                                 )
                                 .await
-                                .map_err(|_| "Mount timed out".to_string())?
+                                .map_err(|_| {
+                                    "Mount timed out - device may be busy or offline".to_string()
+                                })?
                                 .map_err(|e| format!("Task error: {}", e))?
                             },
                             CsdbBrowserMessage::MountCompleted,
@@ -632,6 +709,8 @@ impl CsdbBrowser {
                 self.selected_file_index = None;
                 if !self.search_results.is_empty() {
                     self.view_state = ViewState::SearchResults;
+                } else if !self.top_list_entries.is_empty() {
+                    self.view_state = ViewState::TopList;
                 } else {
                     self.view_state = ViewState::LatestReleases;
                 }
@@ -651,28 +730,44 @@ impl CsdbBrowser {
                 .on_submit(CsdbBrowserMessage::SearchSubmit)
                 .padding(8)
                 .size(normal)
-                .width(Length::Fill),
+                .width(Length::FillPortion(3)),
             pick_list(
                 SearchCategory::all_categories(),
                 Some(self.search_category),
                 CsdbBrowserMessage::SearchCategoryChanged,
             )
             .text_size(normal)
-            .width(Length::Fixed(100.0)),
+            .width(Length::Fixed(90.0)),
             tooltip(
                 button(text("Search").size(normal))
                     .on_press(CsdbBrowserMessage::SearchSubmit)
-                    .padding([8, 16]),
+                    .padding([8, 12]),
                 "Search CSDb",
                 tooltip::Position::Bottom,
             )
             .style(iced::theme::Container::Box),
-            Space::with_width(10),
+            Space::with_width(15),
             tooltip(
                 button(text("Latest").size(normal))
                     .on_press(CsdbBrowserMessage::RefreshLatest)
-                    .padding([8, 16]),
-                "Load latest releases from CSDb",
+                    .padding([8, 12]),
+                "Load latest releases",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            Space::with_width(15),
+            pick_list(
+                TopListCategory::all_categories(),
+                Some(self.top_list_category),
+                CsdbBrowserMessage::TopListCategoryChanged,
+            )
+            .text_size(small)
+            .width(Length::Fixed(150.0)),
+            tooltip(
+                button(text("Top List").size(normal))
+                    .on_press(CsdbBrowserMessage::LoadTopList)
+                    .padding([8, 12]),
+                "Load top rated releases",
                 tooltip::Position::Bottom,
             )
             .style(iced::theme::Container::Box),
@@ -686,6 +781,7 @@ impl CsdbBrowser {
                 self.view_releases_list(&self.latest_releases, "Latest Releases", font_size)
             }
             ViewState::SearchResults => self.view_search_results(font_size),
+            ViewState::TopList => self.view_top_list(font_size),
             ViewState::ReleaseDetails => self.view_release_details(font_size, is_connected),
         };
 
@@ -822,6 +918,112 @@ impl CsdbBrowser {
         column![header, horizontal_rule(1), list,].spacing(5).into()
     }
 
+    fn view_top_list(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
+        if self.top_list_entries.is_empty() {
+            return container(
+                column![
+                    text("Top List").size(normal + 2),
+                    Space::with_height(20),
+                    text("No entries loaded. Select a category and click 'Top List'.").size(normal),
+                ]
+                .spacing(10)
+                .align_items(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .padding(20)
+            .into();
+        }
+
+        let header = row![
+            text(format!("Top List: {}", self.top_list_category)).size(normal + 2),
+            horizontal_space(),
+            text(format!("{} entries", self.top_list_entries.len())).size(small),
+        ]
+        .align_items(iced::Alignment::Center);
+
+        let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+        for entry in &self.top_list_entries {
+            let title = &entry.title;
+            let url = &entry.release_url;
+            let rank = entry.rank;
+
+            let title_display = if title.len() > 40 {
+                format!("{}...", &title[..37])
+            } else {
+                title.to_string()
+            };
+
+            // Rank color: gold for top 3, silver-ish for top 10, normal for others
+            let rank_color = if rank <= 3 {
+                iced::Color::from_rgb(1.0, 0.84, 0.0) // Gold
+            } else if rank <= 10 {
+                iced::Color::from_rgb(0.75, 0.75, 0.8) // Silver
+            } else {
+                iced::Color::from_rgb(0.6, 0.6, 0.6)
+            };
+
+            let mut entry_row = row![
+                text(format!("#{:<3}", rank))
+                    .size(small)
+                    .width(Length::Fixed(45.0))
+                    .style(iced::theme::Text::Color(rank_color)),
+                tooltip(
+                    button(text(&title_display).size(normal))
+                        .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .style(iced::theme::Button::Text),
+                    text(title).size(normal),
+                    tooltip::Position::Top,
+                )
+                .style(iced::theme::Container::Box),
+            ]
+            .spacing(5)
+            .align_items(iced::Alignment::Center);
+
+            // Show author if available
+            if let Some(author) = &entry.author {
+                entry_row = entry_row.push(
+                    text(format!("by {}", author))
+                        .size(tiny)
+                        .width(Length::Fixed(120.0))
+                        .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                            0.6, 0.7, 0.8,
+                        ))),
+                );
+            }
+
+            entry_row = entry_row.push(
+                tooltip(
+                    button(text("View").size(small))
+                        .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
+                        .padding([4, 10]),
+                    "View release details",
+                    tooltip::Position::Left,
+                )
+                .style(iced::theme::Container::Box),
+            );
+
+            items.push(entry_row.padding([4, 0]).into());
+            items.push(horizontal_rule(1).into());
+        }
+
+        let list = scrollable(
+            Column::with_children(items)
+                .spacing(0)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
+
+        column![header, horizontal_rule(1), list,].spacing(5).into()
+    }
+
     fn view_release_item<'a>(
         &'a self,
         release: &'a impl ReleaseItem,
@@ -829,31 +1031,71 @@ impl CsdbBrowser {
     ) -> Element<'a, CsdbBrowserMessage> {
         let small = (font_size.saturating_sub(2)).max(8) as u16;
         let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
 
         let title = release.title();
         let url = release.url();
         let id = release.id().unwrap_or_default();
+        let rtype = release.release_type();
+        let group = release.group();
 
-        let title_display = if title.len() > 50 {
-            format!("{}...", &title[..47])
+        let title_display = if title.len() > 30 {
+            format!("{}...", &title[..27])
         } else {
             title.to_string()
         };
 
+        // Type column
+        let type_display = rtype
+            .map(|t| {
+                if t.len() > 16 {
+                    format!("{}...", &t[..13])
+                } else {
+                    t.to_string()
+                }
+            })
+            .unwrap_or_default();
+
+        // Group column
+        let group_display = group
+            .map(|g| {
+                if g.len() > 18 {
+                    format!("{}...", &g[..15])
+                } else {
+                    g.to_string()
+                }
+            })
+            .unwrap_or_default();
+
         row![
             text(format!("[{}]", id))
-                .size(small)
-                .width(Length::Fixed(70.0)),
+                .size(tiny)
+                .width(Length::Fixed(70.0))
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.5, 0.5, 0.6
+                ))),
             tooltip(
                 button(text(&title_display).size(normal))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
                     .padding([4, 8])
-                    .width(Length::Fill)
+                    .width(Length::Fixed(250.0))
                     .style(iced::theme::Button::Text),
                 text(title).size(normal),
                 tooltip::Position::Top,
             )
             .style(iced::theme::Container::Box),
+            text(&type_display)
+                .size(tiny)
+                .width(Length::Fixed(130.0))
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.6, 0.8, 0.6
+                ))),
+            text(&group_display)
+                .size(tiny)
+                .width(Length::Fill)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.5, 0.7, 0.9
+                ))),
             tooltip(
                 button(text("View").size(small))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
@@ -1112,6 +1354,8 @@ trait ReleaseItem {
     fn title(&self) -> &str;
     fn url(&self) -> &str;
     fn id(&self) -> Option<&str>;
+    fn group(&self) -> Option<&str>;
+    fn release_type(&self) -> Option<&str>;
 }
 
 impl ReleaseItem for LatestRelease {
@@ -1126,6 +1370,14 @@ impl ReleaseItem for LatestRelease {
     fn id(&self) -> Option<&str> {
         Some(&self.release_id)
     }
+
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    fn release_type(&self) -> Option<&str> {
+        self.release_type.as_deref()
+    }
 }
 
 impl ReleaseItem for SearchResult {
@@ -1139,6 +1391,14 @@ impl ReleaseItem for SearchResult {
 
     fn id(&self) -> Option<&str> {
         self.release_id.as_deref()
+    }
+
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
+    fn release_type(&self) -> Option<&str> {
+        self.release_type.as_deref()
     }
 }
 
