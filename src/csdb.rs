@@ -60,6 +60,163 @@ impl std::fmt::Display for SearchCategory {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TopListCategory {
+    All,
+    BbsGraphics,
+    C128Release,
+    C64_1kIntro,
+    C64_256bIntro,
+    C64_4kGame,
+    C64_4kIntro,
+    C64BasicDemo,
+    C64Crack,
+    C64CrackIntro,
+    #[default]
+    C64Demo,
+    C64DiskCover,
+    C64Diskmag,
+    C64Dtv,
+    C64FakeDemo,
+    C64Game,
+    C64GamePreview,
+    C64Graphics,
+    C64GraphicsCollection,
+    C64Intro,
+    C64IntroCollection,
+    C64Invitation,
+    C64Misc,
+    C64Music,
+    C64MusicCollection,
+    C64OneFileDemo,
+    C64Papermag,
+    C64Tool,
+    EasyFlashRelease,
+    OtherPlatformC64Tool,
+    ReuRelease,
+}
+
+impl TopListCategory {
+    pub fn as_param(&self) -> &'static str {
+        match self {
+            TopListCategory::All => "",
+            TopListCategory::BbsGraphics => "(43)",
+            TopListCategory::C128Release => "(27)",
+            TopListCategory::C64_1kIntro => "(18)",
+            TopListCategory::C64_256bIntro => "(36)",
+            TopListCategory::C64_4kGame => "(35)",
+            TopListCategory::C64_4kIntro => "(4)",
+            TopListCategory::C64BasicDemo => "(22)",
+            TopListCategory::C64Crack => "(20)",
+            TopListCategory::C64CrackIntro => "(5)",
+            TopListCategory::C64Demo => "(1)",
+            TopListCategory::C64DiskCover => "(33)",
+            TopListCategory::C64Diskmag => "(13)",
+            TopListCategory::C64Dtv => "(40)",
+            TopListCategory::C64FakeDemo => "(24)",
+            TopListCategory::C64Game => "(11)",
+            TopListCategory::C64GamePreview => "(19)",
+            TopListCategory::C64Graphics => "(9)",
+            TopListCategory::C64GraphicsCollection => "(10)",
+            TopListCategory::C64Intro => "(3)",
+            TopListCategory::C64IntroCollection => "(44)",
+            TopListCategory::C64Invitation => "(16)",
+            TopListCategory::C64Misc => "(17)",
+            TopListCategory::C64Music => "(7)",
+            TopListCategory::C64MusicCollection => "(8)",
+            TopListCategory::C64OneFileDemo => "(2)",
+            TopListCategory::C64Papermag => "(26)",
+            TopListCategory::C64Tool => "(15)",
+            TopListCategory::EasyFlashRelease => "(46)",
+            TopListCategory::OtherPlatformC64Tool => "(21)",
+            TopListCategory::ReuRelease => "(6)",
+        }
+    }
+
+    pub fn all_categories() -> Vec<TopListCategory> {
+        vec![
+            TopListCategory::C64Demo,
+            TopListCategory::C64OneFileDemo,
+            TopListCategory::C64Intro,
+            TopListCategory::C64_4kIntro,
+            TopListCategory::C64_1kIntro,
+            TopListCategory::C64_256bIntro,
+            TopListCategory::C64Game,
+            TopListCategory::C64_4kGame,
+            TopListCategory::C64Music,
+            TopListCategory::C64MusicCollection,
+            TopListCategory::C64Graphics,
+            TopListCategory::C64GraphicsCollection,
+            TopListCategory::C64CrackIntro,
+            TopListCategory::C64Crack,
+            TopListCategory::C64Diskmag,
+            TopListCategory::C64Tool,
+            TopListCategory::C64Invitation,
+            TopListCategory::C64BasicDemo,
+            TopListCategory::C64Misc,
+            TopListCategory::C64DiskCover,
+            TopListCategory::C64IntroCollection,
+            TopListCategory::C64GamePreview,
+            TopListCategory::C64FakeDemo,
+            TopListCategory::C64Papermag,
+            TopListCategory::C128Release,
+            TopListCategory::ReuRelease,
+            TopListCategory::EasyFlashRelease,
+            TopListCategory::C64Dtv,
+            TopListCategory::BbsGraphics,
+            TopListCategory::OtherPlatformC64Tool,
+            TopListCategory::All,
+        ]
+    }
+}
+
+impl std::fmt::Display for TopListCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TopListCategory::All => write!(f, "All"),
+            TopListCategory::BbsGraphics => write!(f, "BBS Graphics"),
+            TopListCategory::C128Release => write!(f, "C128 Release"),
+            TopListCategory::C64_1kIntro => write!(f, "C64 1K Intro"),
+            TopListCategory::C64_256bIntro => write!(f, "C64 256b Intro"),
+            TopListCategory::C64_4kGame => write!(f, "C64 4K Game"),
+            TopListCategory::C64_4kIntro => write!(f, "C64 4K Intro"),
+            TopListCategory::C64BasicDemo => write!(f, "C64 Basic Demo"),
+            TopListCategory::C64Crack => write!(f, "C64 Crack"),
+            TopListCategory::C64CrackIntro => write!(f, "C64 Crack Intro"),
+            TopListCategory::C64Demo => write!(f, "C64 Demo"),
+            TopListCategory::C64DiskCover => write!(f, "C64 Disk Cover"),
+            TopListCategory::C64Diskmag => write!(f, "C64 Diskmag"),
+            TopListCategory::C64Dtv => write!(f, "C64 DTV"),
+            TopListCategory::C64FakeDemo => write!(f, "C64 Fake Demo"),
+            TopListCategory::C64Game => write!(f, "C64 Game"),
+            TopListCategory::C64GamePreview => write!(f, "C64 Game Preview"),
+            TopListCategory::C64Graphics => write!(f, "C64 Graphics"),
+            TopListCategory::C64GraphicsCollection => write!(f, "C64 Graphics Collection"),
+            TopListCategory::C64Intro => write!(f, "C64 Intro"),
+            TopListCategory::C64IntroCollection => write!(f, "C64 Intro Collection"),
+            TopListCategory::C64Invitation => write!(f, "C64 Invitation"),
+            TopListCategory::C64Misc => write!(f, "C64 Misc."),
+            TopListCategory::C64Music => write!(f, "C64 Music"),
+            TopListCategory::C64MusicCollection => write!(f, "C64 Music Collection"),
+            TopListCategory::C64OneFileDemo => write!(f, "C64 One-File Demo"),
+            TopListCategory::C64Papermag => write!(f, "C64 Papermag"),
+            TopListCategory::C64Tool => write!(f, "C64 Tool"),
+            TopListCategory::EasyFlashRelease => write!(f, "EasyFlash Release"),
+            TopListCategory::OtherPlatformC64Tool => write!(f, "Other Platform C64 Tool"),
+            TopListCategory::ReuRelease => write!(f, "REU Release"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopListEntry {
+    pub rank: usize,
+    pub release_id: Option<String>,
+    pub title: String,
+    pub release_url: String,
+    pub author: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub release_id: Option<String>,
@@ -195,6 +352,28 @@ impl CsdbClient {
         }
 
         Ok(releases)
+    }
+
+    /// Get top list from CSDb
+    pub async fn get_top_list(
+        &self,
+        category: TopListCategory,
+        limit: usize,
+    ) -> Result<Vec<TopListEntry>> {
+        let encoded_subtype = urlencoding::encode(category.as_param());
+        let url = format!(
+            "https://csdb.dk/toplist.php?type=release&subtype={}",
+            encoded_subtype
+        );
+
+        let html = self.http_get(&url).await?;
+        let mut entries = self.parse_top_list(&html);
+
+        if limit > 0 && entries.len() > limit {
+            entries.truncate(limit);
+        }
+
+        Ok(entries)
     }
 
     /// Get details and files for a specific release
@@ -405,6 +584,44 @@ impl CsdbClient {
         releases
     }
 
+    fn parse_top_list(&self, html: &str) -> Vec<TopListEntry> {
+        let mut entries = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        // Top list format: <td><a href="/release/?id=249713">Nine</a> by <a href="/scener/?id=16473">Lft</a></td>
+        // We need to find table rows with rank numbers
+
+        // Pattern to match release link with optional "by author"
+        let entry_re = Regex::new(
+            r#"<td[^>]*><a href="/release/\?id=(\d+)"[^>]*>([^<]+)</a>(?:\s*by\s*<a href="/(?:scener|group)/\?id=\d+"[^>]*>([^<]+)</a>)?</td>"#
+        ).unwrap();
+
+        let mut rank = 0;
+        for cap in entry_re.captures_iter(html) {
+            let rid = cap[1].to_string();
+            let title = strip_tags(&cap[2]);
+            let author = cap.get(3).map(|m| strip_tags(m.as_str()));
+
+            if seen.contains(&rid) {
+                continue;
+            }
+            seen.insert(rid.clone());
+
+            rank += 1;
+            let release_url = format!("https://csdb.dk/release/?id={}", rid);
+
+            entries.push(TopListEntry {
+                rank,
+                release_id: Some(rid),
+                title,
+                release_url,
+                author,
+            });
+        }
+
+        entries
+    }
+
     async fn build_file_list(&self, html: &str, base_url: &str) -> Result<Vec<ReleaseFile>> {
         let candidates = parse_candidates(html, base_url);
         let mut items = Vec::new();
@@ -459,7 +676,17 @@ impl CsdbClient {
     }
 
     fn extract_group_from_html(&self, html: &str) -> Option<String> {
-        // Look for "Released by" or group links
+        // Look for "Released by" section: <b>Released by :</b><br><a href="/scener/?id=...">Name</a>
+        // or <a href="/group/?id=...">GroupName</a>
+        let released_by_re = Regex::new(
+            r#"<b>Released by\s*:?\s*</b>.*?<a href="/(?:scener|group)/\?id=\d+"[^>]*>([^<]+)</a>"#,
+        )
+        .ok()?;
+        if let Some(cap) = released_by_re.captures(html) {
+            return Some(strip_tags(&cap[1]));
+        }
+
+        // Fallback: look for any group link
         let group_re = Regex::new(r#"href="/group/\?id=\d+"[^>]*>([^<]+)</a>"#).ok()?;
         if let Some(cap) = group_re.captures(html) {
             return Some(strip_tags(&cap[1]));
@@ -468,18 +695,31 @@ impl CsdbClient {
     }
 
     fn extract_release_type_from_html(&self, html: &str) -> Option<String> {
-        // Look for release type (Demo, Intro, Game, etc.)
-        let type_re = Regex::new(r"Type:\s*</td>\s*<td[^>]*>([^<]+)</td>").ok()?;
+        // Look for Type section: <b>Type :</b><br><a href="...">C64 One-File Demo</a>
+        let type_re = Regex::new(r#"<b>Type\s*:?\s*</b>.*?<a href="[^"]*">([^<]+)</a>"#).ok()?;
         if let Some(cap) = type_re.captures(html) {
+            return Some(strip_tags(&cap[1]));
+        }
+
+        // Fallback: plain text
+        let type_plain_re = Regex::new(r"Type:\s*</td>\s*<td[^>]*>([^<]+)</td>").ok()?;
+        if let Some(cap) = type_plain_re.captures(html) {
             return Some(strip_tags(&cap[1]));
         }
         None
     }
 
     fn extract_date_from_html(&self, html: &str) -> Option<String> {
-        // Look for release date
-        let date_re = Regex::new(r"Release Date:\s*</td>\s*<td[^>]*>([^<]+)</td>").ok()?;
+        // Look for Release Date section: <b>Release Date :</b><br><font color="#99c2ff">2 February 2025</font>
+        let date_re =
+            Regex::new(r#"<b>Release Date\s*:?\s*</b>.*?<font[^>]*>([^<]+)</font>"#).ok()?;
         if let Some(cap) = date_re.captures(html) {
+            return Some(strip_tags(&cap[1]));
+        }
+
+        // Fallback: plain text
+        let date_plain_re = Regex::new(r"Release Date:\s*</td>\s*<td[^>]*>([^<]+)</td>").ok()?;
+        if let Some(cap) = date_plain_re.captures(html) {
             return Some(strip_tags(&cap[1]));
         }
         None
@@ -500,6 +740,10 @@ impl Default for CsdbClient {
         Self::new().expect("Failed to create CsdbClient")
     }
 }
+
+// -----------------------------------------------------------------------------
+// Internal candidate structure for parsing
+// -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct Candidate {
