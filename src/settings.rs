@@ -2,6 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Stream control method for communicating with Ultimate64
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum StreamControlMethod {
+    /// Try REST API first, fall back to binary protocol (default)
+    #[default]
+    RestWithBinaryFallback,
+    /// Try binary protocol first, fall back to REST API
+    BinaryWithRestFallback,
+    /// Use only REST API (no fallback)
+    RestOnly,
+    /// Use only binary protocol on port 64 (no fallback)
+    BinaryOnly,
+}
+
+impl StreamControlMethod {
+    pub const ALL: [StreamControlMethod; 4] = [
+        StreamControlMethod::RestWithBinaryFallback,
+        StreamControlMethod::BinaryWithRestFallback,
+        StreamControlMethod::RestOnly,
+        StreamControlMethod::BinaryOnly,
+    ];
+}
+
+impl std::fmt::Display for StreamControlMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamControlMethod::RestWithBinaryFallback => write!(f, "REST API (binary fallback)"),
+            StreamControlMethod::BinaryWithRestFallback => write!(f, "Binary (REST fallback)"),
+            StreamControlMethod::RestOnly => write!(f, "REST API only"),
+            StreamControlMethod::BinaryOnly => write!(f, "Binary protocol only"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub connection: ConnectionSettings,
@@ -13,6 +47,9 @@ pub struct AppSettings {
 pub struct ConnectionSettings {
     pub host: String,
     pub password: Option<String>,
+    /// Stream control method for video/audio streaming
+    #[serde(default)]
+    pub stream_control_method: StreamControlMethod,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +90,7 @@ impl Default for AppSettings {
             connection: ConnectionSettings {
                 host: String::new(), // Empty by default - user must configure
                 password: None,
+                stream_control_method: StreamControlMethod::default(),
             },
             default_paths: DefaultPaths {
                 disk_images: None,
@@ -77,14 +115,12 @@ impl AppSettings {
         let config_dir = dirs::config_dir()
             .ok_or("Could not determine config directory")?
             .join("ultimate64-manager");
-
         fs::create_dir_all(&config_dir)?;
         Ok(config_dir.join("settings.json"))
     }
 
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
         let config_file = Self::config_path()?;
-
         log::debug!("Loading settings from: {:?}", config_file);
 
         if config_file.exists() {
@@ -100,12 +136,9 @@ impl AppSettings {
 
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         let config_file = Self::config_path()?;
-
         log::debug!("Saving settings to: {:?}", config_file);
-
         let contents = serde_json::to_string_pretty(self)?;
         fs::write(&config_file, contents)?;
-
         log::info!("Settings saved successfully");
         Ok(())
     }

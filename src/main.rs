@@ -43,7 +43,7 @@ use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
-use settings::{AppSettings, ConnectionSettings};
+use settings::{AppSettings, ConnectionSettings, StreamControlMethod};
 use streaming::{StreamingMessage, VideoStreaming};
 use templates::{DiskTemplate, TemplateManager};
 
@@ -151,6 +151,7 @@ pub enum Message {
     RefreshStatus,
     RefreshAfterConnect,
     StatusUpdated(Result<StatusInfo, String>),
+    StreamControlMethodChanged(StreamControlMethod),
 
     // Templates
     TemplateSelected(DiskTemplate),
@@ -324,6 +325,8 @@ impl Application for Ultimate64Browser {
             video_streaming: VideoStreaming::new(),
             csdb_browser: CsdbBrowser::new(),
         };
+        app.video_streaming
+            .set_stream_control_method(settings.connection.stream_control_method);
 
         // Check for updates on startup
         let version_check_cmd =
@@ -866,6 +869,7 @@ impl Application for Ultimate64Browser {
                     } else {
                         Some(self.password_input.clone())
                     },
+                    stream_control_method: self.settings.connection.stream_control_method,
                 };
                 self.settings.connection = conn_settings;
                 if let Err(e) = self.settings.save() {
@@ -904,7 +908,14 @@ impl Application for Ultimate64Browser {
                 ));
                 Command::none()
             }
-
+            Message::StreamControlMethodChanged(method) => {
+                self.settings.connection.stream_control_method = method;
+                self.video_streaming.set_stream_control_method(method);
+                if let Err(e) = self.settings.save() {
+                    log::error!("Failed to save settings: {}", e);
+                }
+                Command::none()
+            }
             Message::RefreshStatus => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -1011,6 +1022,9 @@ impl Application for Ultimate64Browser {
             }
 
             Message::Streaming(msg) => {
+                self.video_streaming
+                    .set_stream_control_method(self.settings.connection.stream_control_method);
+
                 self.video_streaming
                     .set_api_password(self.settings.connection.password.clone());
                 // Handle screenshot result for user message
@@ -1650,6 +1664,18 @@ impl Ultimate64Browser {
                 .on_input(Message::PasswordInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
+            Space::with_height(10),
+            text("Stream Control Method:").size(14),
+            row![
+                pick_list(
+                    &StreamControlMethod::ALL[..],
+                    Some(self.settings.connection.stream_control_method),
+                    Message::StreamControlMethodChanged,
+                )
+                .width(Length::Fixed(250.0)),
+            ]
+            .spacing(10),
+            text("Controls how video/audio streaming communicates with the Ultimate64").size(11),
             Space::with_height(15),
             row![
                 tooltip(

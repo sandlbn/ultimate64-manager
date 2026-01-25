@@ -10,6 +10,7 @@ use iced::{
     },
 };
 
+use crate::settings::StreamControlMethod;
 use crate::stream_control::{get_local_ip, send_stop_command, send_stream_command};
 use crate::video_scaling::{
     C64_PALETTE, apply_crt_effect, apply_scanlines, integer_scale, scale2x,
@@ -230,6 +231,7 @@ pub struct VideoStreaming {
     // API password for REST API fallback
     pub api_password: Option<String>,
     scale_mode_shared: Arc<std::sync::atomic::AtomicU8>, // For thread to read
+    pub stream_control_method: StreamControlMethod, // Stream control method for communicating with Ultimate64
 }
 
 impl Default for VideoStreaming {
@@ -266,6 +268,7 @@ impl VideoStreaming {
             ultimate_host: None,
             api_password: None,
             scale_mode_shared: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            stream_control_method: StreamControlMethod::default(),
         }
     }
 
@@ -279,6 +282,10 @@ impl VideoStreaming {
         self.api_password = password;
     }
 
+    /// Set the stream control method
+    pub fn set_stream_control_method(&mut self, method: StreamControlMethod) {
+        self.stream_control_method = method;
+    }
     pub fn update(
         &mut self,
         message: StreamingMessage,
@@ -1206,19 +1213,31 @@ impl VideoStreaming {
 
                 let password = self.api_password.clone();
 
-                let _ = send_stop_command(ultimate_ip, 0x20, password.as_deref());
-                let _ = send_stop_command(ultimate_ip, 0x21, password.as_deref());
+                let method = self.stream_control_method;
 
-                if let Err(e) =
-                    send_stream_command(ultimate_ip, &my_ip, port, 0x20, password.as_deref())
-                {
+                let _ = send_stop_command(ultimate_ip, 0x20, password.as_deref(), method);
+                let _ = send_stop_command(ultimate_ip, 0x21, password.as_deref(), method);
+
+                if let Err(e) = send_stream_command(
+                    ultimate_ip,
+                    &my_ip,
+                    port,
+                    0x20,
+                    password.as_deref(),
+                    method,
+                ) {
                     log::error!("Failed to send video start command: {}", e);
                 }
 
                 let audio_port = port + 1;
-                if let Err(e) =
-                    send_stream_command(ultimate_ip, &my_ip, audio_port, 0x21, password.as_deref())
-                {
+                if let Err(e) = send_stream_command(
+                    ultimate_ip,
+                    &my_ip,
+                    audio_port,
+                    0x21,
+                    password.as_deref(),
+                    method,
+                ) {
                     log::error!("Failed to send audio start command: {}", e);
                 }
             } else {
@@ -1920,9 +1939,10 @@ impl VideoStreaming {
 
             // Run in thread with timeout
             let (tx, rx) = std::sync::mpsc::channel();
+            let method = self.stream_control_method;
             std::thread::spawn(move || {
-                let _ = send_stop_command(&ip, 0x20, password.as_deref()); // Stop video
-                let _ = send_stop_command(&ip, 0x21, password.as_deref()); // Stop audio
+                let _ = send_stop_command(&ip, 0x20, password.as_deref(), method); // Stop video
+                let _ = send_stop_command(&ip, 0x21, password.as_deref(), method); // Stop audio
                 let _ = tx.send(());
             });
 
