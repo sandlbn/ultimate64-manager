@@ -1,0 +1,1149 @@
+//! CSDb Browser UI component for Ultimate64 Manager
+//!
+//! Provides a UI for:
+//! - Browsing latest releases from CSDb
+//! - Searching for releases
+//! - Viewing release details and files
+//! - Downloading and running files on Ultimate64
+
+use iced::{
+    Command, Element, Length,
+    widget::{
+        Column, Space, button, column, container, horizontal_rule, horizontal_space, pick_list,
+        row, scrollable, text, text_input, tooltip,
+    },
+};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use ultimate64::Rest;
+
+use crate::csdb::{
+    CsdbClient, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory, SearchResult,
+    get_runnable_files,
+};
+
+/// Timeout for CSDb operations
+const CSDB_TIMEOUT_SECS: u64 = 30;
+
+#[derive(Debug, Clone)]
+pub enum CsdbBrowserMessage {
+    // Search
+    SearchInputChanged(String),
+    SearchCategoryChanged(SearchCategory),
+    SearchSubmit,
+    SearchCompleted(Result<Vec<SearchResult>, String>),
+
+    // Latest releases
+    RefreshLatest,
+    LatestLoaded(Result<Vec<LatestRelease>, String>),
+
+    // Release selection
+    SelectRelease(String), // release URL
+    ReleaseDetailsLoaded(Result<ReleaseDetails, String>),
+    CloseReleaseDetails,
+
+    // File operations
+    SelectFile(usize), // file index
+    DownloadFile(usize),
+    DownloadCompleted(Result<PathBuf, String>),
+    RunFile(usize),
+    RunFileCompleted(Result<String, String>),
+
+    // Disk mounting
+    DriveSelected(DriveOption),
+    MountFile(usize, MountMode),
+    MountCompleted(Result<String, String>),
+
+    // Filter
+    FilterChanged(FileFilter),
+
+    // Navigation
+    BackToList,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveOption {
+    A,
+    B,
+}
+
+impl std::fmt::Display for DriveOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DriveOption::A => write!(f, "Drive A (8)"),
+            DriveOption::B => write!(f, "Drive B (9)"),
+        }
+    }
+}
+
+impl DriveOption {
+    pub fn to_drive_string(&self) -> String {
+        match self {
+            DriveOption::A => "a".to_string(),
+            DriveOption::B => "b".to_string(),
+        }
+    }
+
+    pub fn device_number(&self) -> &'static str {
+        match self {
+            DriveOption::A => "8",
+            DriveOption::B => "9",
+        }
+    }
+
+    pub fn all() -> Vec<DriveOption> {
+        vec![DriveOption::A, DriveOption::B]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl std::fmt::Display for MountMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MountMode::ReadOnly => write!(f, "RO"),
+            MountMode::ReadWrite => write!(f, "RW"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFilter {
+    All,
+    Runnable, // PRG, D64, CRT, SID
+    Disk,     // D64, D71, D81, G64
+    Program,  // PRG, CRT
+    Music,    // SID
+}
+
+impl std::fmt::Display for FileFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileFilter::All => write!(f, "All Files"),
+            FileFilter::Runnable => write!(f, "Runnable"),
+            FileFilter::Disk => write!(f, "Disk Images"),
+            FileFilter::Program => write!(f, "Programs"),
+            FileFilter::Music => write!(f, "Music (SID)"),
+        }
+    }
+}
+
+impl FileFilter {
+    fn all() -> Vec<FileFilter> {
+        vec![
+            FileFilter::All,
+            FileFilter::Runnable,
+            FileFilter::Disk,
+            FileFilter::Program,
+            FileFilter::Music,
+        ]
+    }
+
+    fn matches(&self, ext: &str) -> bool {
+        match self {
+            FileFilter::All => true,
+            FileFilter::Runnable => {
+                matches!(ext, "prg" | "d64" | "d71" | "d81" | "g64" | "crt" | "sid")
+            }
+            FileFilter::Disk => matches!(ext, "d64" | "d71" | "d81" | "g64" | "g71"),
+            FileFilter::Program => matches!(ext, "prg" | "crt"),
+            FileFilter::Music => ext == "sid",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ViewState {
+    LatestReleases,
+    SearchResults,
+    ReleaseDetails,
+}
+
+pub struct CsdbBrowser {
+    // View state
+    view_state: ViewState,
+
+    // Search
+    search_input: String,
+    search_category: SearchCategory,
+    search_results: Vec<SearchResult>,
+
+    // Latest releases
+    latest_releases: Vec<LatestRelease>,
+
+    // Current release details
+    current_release: Option<ReleaseDetails>,
+    selected_file_index: Option<usize>,
+
+    // Drive selection for mounting
+    selected_drive: DriveOption,
+
+    // Filter
+    file_filter: FileFilter,
+
+    // Status
+    status_message: Option<String>,
+    is_loading: bool,
+
+    // Download directory
+    download_dir: PathBuf,
+}
+
+impl CsdbBrowser {
+    pub fn new() -> Self {
+        let download_dir = dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
+            .unwrap_or_else(|| PathBuf::from("."));
+
+        Self {
+            view_state: ViewState::LatestReleases,
+            search_input: String::new(),
+            search_category: SearchCategory::default(),
+            search_results: Vec::new(),
+            latest_releases: Vec::new(),
+            current_release: None,
+            selected_file_index: None,
+            selected_drive: DriveOption::A,
+            file_filter: FileFilter::Runnable,
+            status_message: None,
+            is_loading: false,
+            download_dir,
+        }
+    }
+
+    pub fn update(
+        &mut self,
+        message: CsdbBrowserMessage,
+        connection: Option<Arc<Mutex<Rest>>>,
+    ) -> Command<CsdbBrowserMessage> {
+        match message {
+            CsdbBrowserMessage::SearchInputChanged(value) => {
+                self.search_input = value;
+                Command::none()
+            }
+
+            CsdbBrowserMessage::SearchCategoryChanged(category) => {
+                self.search_category = category;
+                Command::none()
+            }
+
+            CsdbBrowserMessage::SearchSubmit => {
+                if self.search_input.trim().is_empty() {
+                    self.status_message = Some("Please enter a search term".to_string());
+                    return Command::none();
+                }
+
+                self.is_loading = true;
+                self.status_message = Some(format!("Searching for '{}'...", self.search_input));
+                let term = self.search_input.clone();
+                let category = self.search_category;
+
+                Command::perform(
+                    async move {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
+                            async {
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+                                client
+                                    .search(&term, category, 50)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                        )
+                        .await
+                        .map_err(|_| "Search timed out".to_string())?
+                    },
+                    CsdbBrowserMessage::SearchCompleted,
+                )
+            }
+
+            CsdbBrowserMessage::SearchCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(results) => {
+                        let count = results.len();
+                        self.search_results = results;
+                        self.view_state = ViewState::SearchResults;
+                        self.status_message = Some(format!("Found {} release(s)", count));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Search failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::RefreshLatest => {
+                self.is_loading = true;
+                self.status_message = Some("Loading latest releases...".to_string());
+
+                Command::perform(
+                    async move {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
+                            async {
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+                                client
+                                    .get_latest_releases(50)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                        )
+                        .await
+                        .map_err(|_| "Loading timed out".to_string())?
+                    },
+                    CsdbBrowserMessage::LatestLoaded,
+                )
+            }
+
+            CsdbBrowserMessage::LatestLoaded(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(releases) => {
+                        let count = releases.len();
+                        self.latest_releases = releases;
+                        self.view_state = ViewState::LatestReleases;
+                        self.status_message = Some(format!("Loaded {} release(s)", count));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed to load: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::SelectRelease(release_url) => {
+                self.is_loading = true;
+                self.status_message = Some("Loading release details...".to_string());
+
+                Command::perform(
+                    async move {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
+                            async {
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+                                client
+                                    .get_release_details(&release_url)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                        )
+                        .await
+                        .map_err(|_| "Loading timed out".to_string())?
+                    },
+                    CsdbBrowserMessage::ReleaseDetailsLoaded,
+                )
+            }
+
+            CsdbBrowserMessage::ReleaseDetailsLoaded(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(details) => {
+                        let file_count = details.files.len();
+                        let runnable_count = get_runnable_files(&details.files).len();
+                        self.current_release = Some(details);
+                        self.view_state = ViewState::ReleaseDetails;
+                        self.selected_file_index = None;
+                        self.status_message = Some(format!(
+                            "{} file(s), {} runnable",
+                            file_count, runnable_count
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed to load release: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::CloseReleaseDetails => {
+                self.current_release = None;
+                self.selected_file_index = None;
+                // Go back to previous view
+                if !self.search_results.is_empty() {
+                    self.view_state = ViewState::SearchResults;
+                } else {
+                    self.view_state = ViewState::LatestReleases;
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::SelectFile(index) => {
+                self.selected_file_index = Some(index);
+                Command::none()
+            }
+
+            CsdbBrowserMessage::DownloadFile(index) => {
+                if let Some(release) = &self.current_release {
+                    if let Some(file) = release.files.iter().find(|f| f.index == index) {
+                        self.is_loading = true;
+                        self.status_message = Some(format!("Downloading {}...", file.filename));
+
+                        let file = file.clone();
+                        let out_dir = self.download_dir.clone();
+
+                        return Command::perform(
+                            async move {
+                                tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+                                    let client = CsdbClient::new().map_err(|e| e.to_string())?;
+                                    client
+                                        .download_file(&file, &out_dir)
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                })
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                            },
+                            CsdbBrowserMessage::DownloadCompleted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::DownloadCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(path) => {
+                        self.status_message = Some(format!("Downloaded: {}", path.display()));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Download failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::RunFile(index) => {
+                if connection.is_none() {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    return Command::none();
+                }
+
+                if let Some(release) = &self.current_release {
+                    if let Some(file) = release.files.iter().find(|f| f.index == index) {
+                        self.is_loading = true;
+                        self.status_message = Some(format!("Running {}...", file.filename));
+
+                        let file = file.clone();
+                        let conn = connection.unwrap();
+                        let drive = self.selected_drive.to_drive_string();
+                        let device_num = self.selected_drive.device_number().to_string();
+
+                        return Command::perform(
+                            async move {
+                                // First download the file
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+
+                                let (filename, data) = client
+                                    .download_file_bytes(&file)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+
+                                // Determine file type and run
+                                let ext = file.ext.to_lowercase();
+
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(15),
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+
+                                        match ext.as_str() {
+                                            "prg" => conn
+                                                .run_prg(&data)
+                                                .map(|_| format!("Running: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "crt" => conn
+                                                .run_crt(&data)
+                                                .map(|_| format!("Running cartridge: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "sid" => conn
+                                                .sid_play(&data, None)
+                                                .map(|_| format!("Playing: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "d64" | "d71" | "d81" | "g64" => {
+                                                // For disk images, we need to save to temp and mount
+                                                let temp_dir = std::env::temp_dir();
+                                                let temp_path = temp_dir.join(&filename);
+                                                std::fs::write(&temp_path, &data).map_err(|e| {
+                                                    format!("Failed to write temp file: {}", e)
+                                                })?;
+
+                                                // Mount and run
+                                                conn.mount_disk_image(
+                                                    &temp_path,
+                                                    drive,
+                                                    ultimate64::drives::MountMode::ReadOnly,
+                                                    false,
+                                                )
+                                                .map_err(|e| format!("Mount failed: {}", e))?;
+
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(500),
+                                                );
+                                                conn.reset()
+                                                    .map_err(|e| format!("Reset failed: {}", e))?;
+                                                std::thread::sleep(std::time::Duration::from_secs(
+                                                    3,
+                                                ));
+                                                conn.type_text(&format!(
+                                                    "load \"*\",{},1\n",
+                                                    device_num
+                                                ))
+                                                .map_err(|e| format!("Type failed: {}", e))?;
+                                                std::thread::sleep(std::time::Duration::from_secs(
+                                                    5,
+                                                ));
+                                                conn.type_text("run\n")
+                                                    .map_err(|e| format!("Type failed: {}", e))?;
+
+                                                Ok(format!("Running disk: {}", filename))
+                                            }
+                                            _ => Err(format!("Unsupported file type: {}", ext)),
+                                        }
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "Operation timed out".to_string())?
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            CsdbBrowserMessage::RunFileCompleted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::RunFileCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Run failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::DriveSelected(drive) => {
+                self.selected_drive = drive;
+                Command::none()
+            }
+
+            CsdbBrowserMessage::MountFile(index, mount_mode) => {
+                if connection.is_none() {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    return Command::none();
+                }
+
+                if let Some(release) = &self.current_release {
+                    if let Some(file) = release.files.iter().find(|f| f.index == index) {
+                        // Only allow mounting disk images
+                        if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
+                            self.status_message =
+                                Some("Only disk images can be mounted".to_string());
+                            return Command::none();
+                        }
+
+                        self.is_loading = true;
+                        let drive_str = self.selected_drive.to_drive_string();
+                        self.status_message = Some(format!(
+                            "Mounting {} to Drive {}...",
+                            file.filename,
+                            self.selected_drive.device_number()
+                        ));
+
+                        let file = file.clone();
+                        let conn = connection.unwrap();
+                        let drive = drive_str;
+                        let mode = match mount_mode {
+                            MountMode::ReadOnly => ultimate64::drives::MountMode::ReadOnly,
+                            MountMode::ReadWrite => ultimate64::drives::MountMode::ReadWrite,
+                        };
+
+                        return Command::perform(
+                            async move {
+                                // First download the file
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+
+                                let (filename, data) = client
+                                    .download_file_bytes(&file)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+
+                                // Save to temp and mount
+                                let temp_dir = std::env::temp_dir();
+                                let temp_path = temp_dir.join(&filename);
+
+                                tokio::fs::write(&temp_path, &data)
+                                    .await
+                                    .map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(10),
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+                                        conn.mount_disk_image(&temp_path, drive, mode, false)
+                                            .map(|_| format!("Mounted: {}", filename))
+                                            .map_err(|e| format!("Mount failed: {}", e))
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| "Mount timed out".to_string())?
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            CsdbBrowserMessage::MountCompleted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::MountCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Mount failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::FilterChanged(filter) => {
+                self.file_filter = filter;
+                Command::none()
+            }
+
+            CsdbBrowserMessage::BackToList => {
+                self.current_release = None;
+                self.selected_file_index = None;
+                if !self.search_results.is_empty() {
+                    self.view_state = ViewState::SearchResults;
+                } else {
+                    self.view_state = ViewState::LatestReleases;
+                }
+                Command::none()
+            }
+        }
+    }
+
+    pub fn view(&self, font_size: u32, is_connected: bool) -> Element<'_, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+
+        // Search bar at top
+        let search_bar = row![
+            text_input("Search CSDb...", &self.search_input)
+                .on_input(CsdbBrowserMessage::SearchInputChanged)
+                .on_submit(CsdbBrowserMessage::SearchSubmit)
+                .padding(8)
+                .size(normal)
+                .width(Length::Fill),
+            pick_list(
+                SearchCategory::all_categories(),
+                Some(self.search_category),
+                CsdbBrowserMessage::SearchCategoryChanged,
+            )
+            .text_size(normal)
+            .width(Length::Fixed(100.0)),
+            tooltip(
+                button(text("Search").size(normal))
+                    .on_press(CsdbBrowserMessage::SearchSubmit)
+                    .padding([8, 16]),
+                "Search CSDb",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+            Space::with_width(10),
+            tooltip(
+                button(text("Latest").size(normal))
+                    .on_press(CsdbBrowserMessage::RefreshLatest)
+                    .padding([8, 16]),
+                "Load latest releases from CSDb",
+                tooltip::Position::Bottom,
+            )
+            .style(iced::theme::Container::Box),
+        ]
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
+
+        // Main content based on view state
+        let content: Element<'_, CsdbBrowserMessage> = match &self.view_state {
+            ViewState::LatestReleases => {
+                self.view_releases_list(&self.latest_releases, "Latest Releases", font_size)
+            }
+            ViewState::SearchResults => self.view_search_results(font_size),
+            ViewState::ReleaseDetails => self.view_release_details(font_size, is_connected),
+        };
+
+        // Status bar
+        let status = if self.is_loading {
+            text(self.status_message.as_deref().unwrap_or("Loading...")).size(small)
+        } else if let Some(msg) = &self.status_message {
+            text(msg).size(small)
+        } else {
+            text("Ready").size(small)
+        };
+
+        let connection_status = if is_connected {
+            text("● Connected")
+                .size(small)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.2, 0.8, 0.2,
+                )))
+        } else {
+            text("○ Not connected")
+                .size(small)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.8, 0.5, 0.2,
+                )))
+        };
+
+        let status_bar = row![status, horizontal_space(), connection_status,]
+            .spacing(10)
+            .align_items(iced::Alignment::Center);
+
+        column![
+            search_bar,
+            horizontal_rule(1),
+            content,
+            horizontal_rule(1),
+            status_bar,
+        ]
+        .spacing(5)
+        .padding(5)
+        .into()
+    }
+
+    fn view_releases_list<'a>(
+        &'a self,
+        releases: &'a [impl ReleaseItem],
+        title: &'a str,
+        font_size: u32,
+    ) -> Element<'a, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+
+        if releases.is_empty() {
+            return container(
+                column![
+                    text(title).size(normal + 2),
+                    Space::with_height(20),
+                    text("No releases loaded. Click 'Latest' to load recent releases.")
+                        .size(normal),
+                ]
+                .spacing(10)
+                .align_items(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .padding(20)
+            .into();
+        }
+
+        let header = row![
+            text(title).size(normal + 2),
+            horizontal_space(),
+            text(format!("{} release(s)", releases.len())).size(small),
+        ]
+        .align_items(iced::Alignment::Center);
+
+        let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+        for release in releases {
+            items.push(self.view_release_item(release, font_size));
+            items.push(horizontal_rule(1).into());
+        }
+
+        let list = scrollable(
+            Column::with_children(items)
+                .spacing(0)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
+
+        column![header, horizontal_rule(1), list,].spacing(5).into()
+    }
+
+    fn view_search_results(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+
+        if self.search_results.is_empty() {
+            return container(
+                column![
+                    text("Search Results").size(normal + 2),
+                    Space::with_height(20),
+                    text("No results found. Try a different search term.").size(normal),
+                ]
+                .spacing(10)
+                .align_items(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x()
+            .padding(20)
+            .into();
+        }
+
+        let header = row![
+            text(format!("Search Results: '{}'", self.search_input)).size(normal + 2),
+            horizontal_space(),
+            text(format!("{} result(s)", self.search_results.len())).size(small),
+        ]
+        .align_items(iced::Alignment::Center);
+
+        let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+        for result in &self.search_results {
+            items.push(self.view_release_item(result, font_size));
+            items.push(horizontal_rule(1).into());
+        }
+
+        let list = scrollable(
+            Column::with_children(items)
+                .spacing(0)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
+
+        column![header, horizontal_rule(1), list,].spacing(5).into()
+    }
+
+    fn view_release_item<'a>(
+        &'a self,
+        release: &'a impl ReleaseItem,
+        font_size: u32,
+    ) -> Element<'a, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+
+        let title = release.title();
+        let url = release.url();
+        let id = release.id().unwrap_or_default();
+
+        let title_display = if title.len() > 50 {
+            format!("{}...", &title[..47])
+        } else {
+            title.to_string()
+        };
+
+        row![
+            text(format!("[{}]", id))
+                .size(small)
+                .width(Length::Fixed(70.0)),
+            tooltip(
+                button(text(&title_display).size(normal))
+                    .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
+                    .padding([4, 8])
+                    .width(Length::Fill)
+                    .style(iced::theme::Button::Text),
+                text(title).size(normal),
+                tooltip::Position::Top,
+            )
+            .style(iced::theme::Container::Box),
+            tooltip(
+                button(text("View").size(small))
+                    .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
+                    .padding([4, 10]),
+                "View release details and files",
+                tooltip::Position::Left,
+            )
+            .style(iced::theme::Container::Box),
+        ]
+        .spacing(5)
+        .align_items(iced::Alignment::Center)
+        .padding([4, 0])
+        .into()
+    }
+
+    fn view_release_details(
+        &self,
+        font_size: u32,
+        is_connected: bool,
+    ) -> Element<'_, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
+        let release = match &self.current_release {
+            Some(r) => r,
+            None => {
+                return container(text("No release selected").size(normal))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x()
+                    .center_y()
+                    .into();
+            }
+        };
+
+        // Header with back button and title
+        let header = row![
+            tooltip(
+                button(text("← Back").size(normal))
+                    .on_press(CsdbBrowserMessage::BackToList)
+                    .padding([6, 12]),
+                "Back to list",
+                tooltip::Position::Right,
+            )
+            .style(iced::theme::Container::Box),
+            Space::with_width(10),
+            text(&release.title).size(normal + 2),
+            horizontal_space(),
+            text(format!("ID: {}", release.release_id)).size(small),
+        ]
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
+
+        // Release info
+        let mut info_items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+
+        if let Some(group) = &release.group {
+            info_items.push(text(format!("Group: {}", group)).size(small).into());
+        }
+        if let Some(rtype) = &release.release_type {
+            info_items.push(text(format!("Type: {}", rtype)).size(small).into());
+        }
+        if let Some(date) = &release.release_date {
+            info_items.push(text(format!("Date: {}", date)).size(small).into());
+        }
+        if let Some(platform) = &release.platform {
+            info_items.push(text(format!("Platform: {}", platform)).size(small).into());
+        }
+
+        let info_row = row(info_items).spacing(20);
+
+        // Filter and drive selector
+        let filter_row = row![
+            text("Filter:").size(small),
+            pick_list(
+                FileFilter::all(),
+                Some(self.file_filter),
+                CsdbBrowserMessage::FilterChanged,
+            )
+            .text_size(normal)
+            .width(Length::Fixed(130.0)),
+            Space::with_width(20),
+            text("Mount to:").size(small),
+            pick_list(
+                DriveOption::all(),
+                Some(self.selected_drive),
+                CsdbBrowserMessage::DriveSelected,
+            )
+            .text_size(normal)
+            .width(Length::Fixed(110.0)),
+            horizontal_space(),
+            text(format!("{} file(s)", release.files.len())).size(small),
+        ]
+        .spacing(10)
+        .align_items(iced::Alignment::Center);
+
+        // File list
+        let filtered_files: Vec<&ReleaseFile> = release
+            .files
+            .iter()
+            .filter(|f| self.file_filter.matches(&f.ext))
+            .collect();
+
+        let mut file_items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+
+        if filtered_files.is_empty() {
+            file_items.push(
+                container(text("No files match the current filter").size(normal))
+                    .padding(20)
+                    .into(),
+            );
+        } else {
+            for file in filtered_files {
+                let is_selected = self.selected_file_index == Some(file.index);
+                let is_runnable = matches!(
+                    file.ext.as_str(),
+                    "prg" | "crt" | "sid" | "d64" | "d71" | "d81" | "g64"
+                );
+                let is_disk_image = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+
+                let filename_display = if file.filename.len() > 35 {
+                    format!("{}...", &file.filename[..32])
+                } else {
+                    file.filename.clone()
+                };
+
+                let ext_color = match file.ext.as_str() {
+                    "prg" => iced::Color::from_rgb(0.5, 0.8, 0.5),
+                    "d64" | "d71" | "d81" | "g64" => iced::Color::from_rgb(0.5, 0.7, 0.9),
+                    "crt" => iced::Color::from_rgb(0.9, 0.7, 0.5),
+                    "sid" => iced::Color::from_rgb(0.8, 0.5, 0.8),
+                    "zip" => iced::Color::from_rgb(0.7, 0.7, 0.5),
+                    _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
+                };
+
+                let mut file_row = row![
+                    text(format!("{:02}.", file.index))
+                        .size(tiny)
+                        .width(Length::Fixed(30.0)),
+                    tooltip(
+                        button(text(&filename_display).size(normal))
+                            .on_press(CsdbBrowserMessage::SelectFile(file.index))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(if is_selected {
+                                iced::theme::Button::Primary
+                            } else {
+                                iced::theme::Button::Text
+                            }),
+                        text(&file.filename).size(normal),
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box),
+                    text(file.ext.to_uppercase())
+                        .size(tiny)
+                        .width(Length::Fixed(40.0))
+                        .style(iced::theme::Text::Color(ext_color)),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center);
+
+                // Download button (always available)
+                file_row = file_row.push(
+                    tooltip(
+                        button(text("↓").size(small))
+                            .on_press(CsdbBrowserMessage::DownloadFile(file.index))
+                            .padding([4, 8]),
+                        "Download file",
+                        tooltip::Position::Left,
+                    )
+                    .style(iced::theme::Container::Box),
+                );
+
+                // Mount buttons for disk images (when connected)
+                if is_disk_image && is_connected {
+                    let drive_label = self.selected_drive.device_number();
+
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text(format!("{}:RO", drive_label)).size(tiny))
+                                .on_press(CsdbBrowserMessage::MountFile(
+                                    file.index,
+                                    MountMode::ReadOnly,
+                                ))
+                                .padding([4, 6]),
+                            text(format!("Mount as Drive {} (Read Only)", drive_label))
+                                .size(normal),
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text(format!("{}:RW", drive_label)).size(tiny))
+                                .on_press(CsdbBrowserMessage::MountFile(
+                                    file.index,
+                                    MountMode::ReadWrite,
+                                ))
+                                .padding([4, 6]),
+                            text(format!("Mount as Drive {} (Read/Write)", drive_label))
+                                .size(normal),
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+                }
+
+                // Run button for runnable files (when connected)
+                if is_runnable && is_connected {
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text("▶").size(small))
+                                .on_press(CsdbBrowserMessage::RunFile(file.index))
+                                .padding([4, 8]),
+                            if is_disk_image {
+                                "Mount, reset, and run (LOAD\"*\",8,1 + RUN)"
+                            } else {
+                                "Run on Ultimate64"
+                            },
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+                }
+
+                file_items.push(file_row.padding([2, 0]).into());
+                file_items.push(horizontal_rule(1).into());
+            }
+        }
+
+        let file_list = scrollable(
+            Column::with_children(file_items)
+                .spacing(0)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
+
+        column![
+            header,
+            horizontal_rule(1),
+            info_row,
+            horizontal_rule(1),
+            filter_row,
+            horizontal_rule(1),
+            file_list,
+        ]
+        .spacing(5)
+        .into()
+    }
+}
+
+// Trait to abstract over LatestRelease and SearchResult
+trait ReleaseItem {
+    fn title(&self) -> &str;
+    fn url(&self) -> &str;
+    fn id(&self) -> Option<&str>;
+}
+
+impl ReleaseItem for LatestRelease {
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn url(&self) -> &str {
+        &self.release_url
+    }
+
+    fn id(&self) -> Option<&str> {
+        Some(&self.release_id)
+    }
+}
+
+impl ReleaseItem for SearchResult {
+    fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn url(&self) -> &str {
+        &self.release_url
+    }
+
+    fn id(&self) -> Option<&str> {
+        self.release_id.as_deref()
+    }
+}
+
+impl Default for CsdbBrowser {
+    fn default() -> Self {
+        Self::new()
+    }
+}

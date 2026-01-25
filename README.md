@@ -43,7 +43,14 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Configuration Editor** – Edit Ultimate configuration settings
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC and menus
-
+- **CSDb Browser** – Search and browse releases from CSDb.dk
+  - Search by category (All, Releases, Groups, SIDs)
+  - Browse latest releases
+  - View release details and file listings
+  - Run PRG, CRT, SID, and disk images directly
+  - Mount disk images with drive/mode selection
+  - Download files to local storage
+  
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
