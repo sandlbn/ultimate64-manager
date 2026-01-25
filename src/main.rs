@@ -19,6 +19,8 @@ use version_check::{NewVersionInfo, VersionCheckMessage};
 mod api;
 mod config_editor;
 mod config_presets;
+mod csdb;
+mod csdb_browser;
 mod dir_preview;
 mod disk_image;
 mod file_browser;
@@ -36,6 +38,7 @@ mod version_check;
 mod video_scaling;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
+use csdb_browser::{CsdbBrowser, CsdbBrowserMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
@@ -186,6 +189,8 @@ pub enum Message {
     // Version check
     VersionCheck(VersionCheckMessage),
     OpenReleasePage,
+    // CSDb Browser
+    CsdbBrowser(CsdbBrowserMessage),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +200,7 @@ pub enum Tab {
     VideoViewer,
     MemoryEditor,
     Configuration,
+    CsdbBrowser,
     Settings,
 }
 
@@ -206,6 +212,7 @@ impl std::fmt::Display for Tab {
             Tab::VideoViewer => write!(f, "Video Viewer"),
             Tab::MemoryEditor => write!(f, "Memory Editor"),
             Tab::Configuration => write!(f, "Configuration"),
+            Tab::CsdbBrowser => write!(f, "CSDb"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -260,6 +267,7 @@ pub struct Ultimate64Browser {
     video_streaming: VideoStreaming,
     // Update notification
     new_version: Option<NewVersionInfo>,
+    csdb_browser: CsdbBrowser,
 }
 
 impl Application for Ultimate64Browser {
@@ -314,6 +322,7 @@ impl Application for Ultimate64Browser {
             },
             user_message: None,
             video_streaming: VideoStreaming::new(),
+            csdb_browser: CsdbBrowser::new(),
         };
 
         // Check for updates on startup
@@ -907,7 +916,10 @@ impl Application for Ultimate64Browser {
                     Command::none()
                 }
             }
-
+            Message::CsdbBrowser(msg) => self
+                .csdb_browser
+                .update(msg, self.connection.clone())
+                .map(Message::CsdbBrowser),
             Message::RefreshAfterConnect => {
                 // Refresh both status and remote browser after connection
                 let status_cmd = if let Some(conn) = &self.connection {
@@ -1368,6 +1380,7 @@ impl Application for Ultimate64Browser {
                 self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
                 self.tab_button("MEMORY", Tab::MemoryEditor),
                 self.tab_button("CONFIG", Tab::Configuration),
+                self.tab_button("CSDB", Tab::CsdbBrowser),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -1390,6 +1403,10 @@ impl Application for Ultimate64Browser {
                 .config_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::ConfigEditor),
+            Tab::CsdbBrowser => self
+                .csdb_browser
+                .view(self.settings.preferences.font_size, self.status.connected)
+                .map(Message::CsdbBrowser),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)
