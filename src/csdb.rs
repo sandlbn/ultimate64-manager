@@ -5,16 +5,19 @@
 //! - Get latest releases
 //! - List downloadable files for a release
 //! - Download files
+//! - Extract ZIP archives
 
 use anyhow::{Context, Result};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::io::{Cursor, Read};
 use std::path::PathBuf;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
 use url::Url;
+use zip::ZipArchive;
 
 // -----------------------------------------------------------------------------
 // Data structures
@@ -258,6 +261,28 @@ pub struct ReleaseDetails {
     pub release_date: Option<String>,
     pub platform: Option<String>,
     pub files: Vec<ReleaseFile>,
+}
+
+// -----------------------------------------------------------------------------
+// ZIP extraction structures
+// -----------------------------------------------------------------------------
+
+/// Represents an extracted ZIP archive
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedZip {
+    pub source_filename: String,
+    pub extract_dir: PathBuf,
+    pub files: Vec<ExtractedFile>,
+}
+
+/// Represents a file extracted from a ZIP archive
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedFile {
+    pub index: usize,
+    pub filename: String,
+    pub path: PathBuf,
+    pub ext: String,
+    pub size: u64,
 }
 
 // -----------------------------------------------------------------------------
@@ -806,6 +831,104 @@ impl Default for CsdbClient {
 }
 
 // -----------------------------------------------------------------------------
+// ZIP extraction functions
+// -----------------------------------------------------------------------------
+
+/// Extract a ZIP file from bytes to a temporary directory
+pub fn extract_zip(zip_data: &[u8], source_filename: &str) -> Result<ExtractedZip> {
+    let reader = Cursor::new(zip_data);
+    let mut archive = ZipArchive::new(reader).context("Failed to open ZIP archive")?;
+
+    // Create temp directory for extraction with unique name
+    let temp_dir = std::env::temp_dir().join(format!(
+        "csdb_extract_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+
+    std::fs::create_dir_all(&temp_dir).context("Failed to create temp directory")?;
+
+    let mut files = Vec::new();
+
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).context("Failed to read ZIP entry")?;
+
+        if file.is_dir() {
+            continue;
+        }
+
+        let filename = file.name().to_string();
+
+        // Skip directories, hidden files, and macOS metadata
+        if filename.ends_with('/')
+            || filename.starts_with('.')
+            || filename.contains("/__MACOSX")
+            || filename.contains("\\_MACOSX")
+        {
+            continue;
+        }
+
+        // Extract just the filename (strip path)
+        let clean_filename = filename.rsplit('/').next().unwrap_or(&filename).to_string();
+        if clean_filename.is_empty() || clean_filename.starts_with('.') {
+            continue;
+        }
+
+        let out_path = temp_dir.join(&clean_filename);
+
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .context("Failed to read ZIP entry contents")?;
+
+        let size = contents.len() as u64;
+
+        std::fs::write(&out_path, &contents)
+            .with_context(|| format!("Failed to write {:?}", out_path))?;
+
+        let ext = get_ext(&clean_filename);
+
+        files.push(ExtractedFile {
+            index: files.len() + 1,
+            filename: clean_filename,
+            path: out_path,
+            ext,
+            size,
+        });
+    }
+
+    // Re-index to ensure sequential indices
+    for (i, f) in files.iter_mut().enumerate() {
+        f.index = i + 1;
+    }
+
+    Ok(ExtractedZip {
+        source_filename: source_filename.to_string(),
+        extract_dir: temp_dir,
+        files,
+    })
+}
+
+/// Get runnable files from extracted ZIP
+pub fn get_runnable_extracted_files(files: &[ExtractedFile]) -> Vec<&ExtractedFile> {
+    files
+        .iter()
+        .filter(|f| {
+            matches!(
+                f.ext.as_str(),
+                "prg" | "d64" | "d71" | "d81" | "g64" | "crt" | "sid"
+            )
+        })
+        .collect()
+}
+
+/// Check if a file extension indicates a ZIP archive
+pub fn is_zip_file(ext: &str) -> bool {
+    ext == "zip"
+}
+
+// -----------------------------------------------------------------------------
 // Internal candidate structure for parsing
 // -----------------------------------------------------------------------------
 
@@ -957,5 +1080,8 @@ pub fn filter_files_by_ext(files: &[ReleaseFile], extensions: &[&str]) -> Vec<Re
 
 /// Get runnable files (PRG, D64, CRT, SID, etc.)
 pub fn get_runnable_files(files: &[ReleaseFile]) -> Vec<ReleaseFile> {
-    filter_files_by_ext(files, &["prg", "d64", "d71", "d81", "g64", "crt", "sid"])
+    filter_files_by_ext(
+        files,
+        &["prg", "d64", "d71", "d81", "g64", "crt", "sid", "zip"],
+    )
 }
