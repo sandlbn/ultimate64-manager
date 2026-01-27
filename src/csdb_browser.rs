@@ -5,6 +5,7 @@
 //! - Searching for releases
 //! - Viewing release details and files
 //! - Downloading and running files on Ultimate64
+//! - Extracting and browsing ZIP archives
 
 use iced::{
     Command, Element, Length,
@@ -19,8 +20,9 @@ use tokio::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::csdb::{
-    CsdbClient, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory, SearchResult,
-    TopListCategory, TopListEntry, get_runnable_files,
+    CsdbClient, ExtractedZip, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory,
+    SearchResult, TopListCategory, TopListEntry, extract_zip, get_runnable_extracted_files,
+    get_runnable_files, is_zip_file,
 };
 
 /// Timeout for CSDb operations
@@ -54,6 +56,16 @@ pub enum CsdbBrowserMessage {
     DownloadCompleted(Result<PathBuf, String>),
     RunFile(usize),
     RunFileCompleted(Result<String, String>),
+
+    // ZIP operations
+    ExtractZip(usize), // file index of the ZIP file
+    ZipExtracted(Result<ExtractedZip, String>),
+    SelectExtractedFile(usize), // index within extracted files
+    RunExtractedFile(usize),    // run file from extracted ZIP
+    RunExtractedFileCompleted(Result<String, String>),
+    MountExtractedFile(usize, MountMode), // mount disk image from extracted ZIP
+    MountExtractedFileCompleted(Result<String, String>),
+    CloseZipView,
 
     // Disk mounting
     DriveSelected(DriveOption),
@@ -124,6 +136,7 @@ pub enum FileFilter {
     Disk,     // D64, D71, D81, G64
     Program,  // PRG, CRT
     Music,    // SID
+    Archive,  // ZIP
 }
 
 impl std::fmt::Display for FileFilter {
@@ -134,6 +147,7 @@ impl std::fmt::Display for FileFilter {
             FileFilter::Disk => write!(f, "Disk Images"),
             FileFilter::Program => write!(f, "Programs"),
             FileFilter::Music => write!(f, "Music (SID)"),
+            FileFilter::Archive => write!(f, "Archives"),
         }
     }
 }
@@ -146,6 +160,7 @@ impl FileFilter {
             FileFilter::Disk,
             FileFilter::Program,
             FileFilter::Music,
+            FileFilter::Archive,
         ]
     }
 
@@ -153,11 +168,15 @@ impl FileFilter {
         match self {
             FileFilter::All => true,
             FileFilter::Runnable => {
-                matches!(ext, "prg" | "d64" | "d71" | "d81" | "g64" | "crt" | "sid")
+                matches!(
+                    ext,
+                    "prg" | "d64" | "d71" | "d81" | "g64" | "crt" | "sid" | "zip"
+                )
             }
             FileFilter::Disk => matches!(ext, "d64" | "d71" | "d81" | "g64" | "g71"),
             FileFilter::Program => matches!(ext, "prg" | "crt"),
             FileFilter::Music => ext == "sid",
+            FileFilter::Archive => ext == "zip",
         }
     }
 }
@@ -168,6 +187,7 @@ pub enum ViewState {
     SearchResults,
     TopList,
     ReleaseDetails,
+    ZipContents, // New state for browsing ZIP contents
 }
 
 pub struct CsdbBrowser {
@@ -189,6 +209,10 @@ pub struct CsdbBrowser {
     // Current release details
     current_release: Option<ReleaseDetails>,
     selected_file_index: Option<usize>,
+
+    // ZIP extraction
+    extracted_zip: Option<ExtractedZip>,
+    selected_extracted_file_index: Option<usize>,
 
     // Drive selection for mounting
     selected_drive: DriveOption,
@@ -220,6 +244,8 @@ impl CsdbBrowser {
             top_list_entries: Vec::new(),
             current_release: None,
             selected_file_index: None,
+            extracted_zip: None,
+            selected_extracted_file_index: None,
             selected_drive: DriveOption::A,
             file_filter: FileFilter::Runnable,
             status_message: None,
@@ -422,6 +448,8 @@ impl CsdbBrowser {
             CsdbBrowserMessage::CloseReleaseDetails => {
                 self.current_release = None;
                 self.selected_file_index = None;
+                self.extracted_zip = None;
+                self.selected_extracted_file_index = None;
                 // Go back to previous view
                 if !self.search_results.is_empty() {
                     self.view_state = ViewState::SearchResults;
@@ -699,6 +727,260 @@ impl CsdbBrowser {
                 Command::none()
             }
 
+            // ZIP extraction messages
+            CsdbBrowserMessage::ExtractZip(index) => {
+                if let Some(release) = &self.current_release {
+                    if let Some(file) = release.files.iter().find(|f| f.index == index) {
+                        if !is_zip_file(&file.ext) {
+                            self.status_message = Some("Not a ZIP file".to_string());
+                            return Command::none();
+                        }
+
+                        self.is_loading = true;
+                        self.status_message = Some(format!("Extracting {}...", file.filename));
+
+                        let file = file.clone();
+
+                        return Command::perform(
+                            async move {
+                                // Download the ZIP file
+                                let client = CsdbClient::new().map_err(|e| e.to_string())?;
+
+                                let (filename, data) = tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(120),
+                                    client.download_file_bytes(&file),
+                                )
+                                .await
+                                .map_err(|_| "Download timed out".to_string())?
+                                .map_err(|e| e.to_string())?;
+
+                                // Extract the ZIP (blocking operation)
+                                tokio::task::spawn_blocking(move || {
+                                    extract_zip(&data, &filename).map_err(|e| e.to_string())
+                                })
+                                .await
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            CsdbBrowserMessage::ZipExtracted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::ZipExtracted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(extracted) => {
+                        let file_count = extracted.files.len();
+                        let runnable_count = get_runnable_extracted_files(&extracted.files).len();
+                        self.status_message = Some(format!(
+                            "Extracted {} file(s), {} runnable",
+                            file_count, runnable_count
+                        ));
+                        self.extracted_zip = Some(extracted);
+                        self.selected_extracted_file_index = None;
+                        self.view_state = ViewState::ZipContents;
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Extraction failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::SelectExtractedFile(index) => {
+                self.selected_extracted_file_index = Some(index);
+                Command::none()
+            }
+
+            CsdbBrowserMessage::RunExtractedFile(index) => {
+                if connection.is_none() {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    return Command::none();
+                }
+
+                if let Some(extracted) = &self.extracted_zip {
+                    if let Some(file) = extracted.files.iter().find(|f| f.index == index) {
+                        self.is_loading = true;
+                        self.status_message = Some(format!("Running {}...", file.filename));
+
+                        let file_path = file.path.clone();
+                        let filename = file.filename.clone();
+                        let ext = file.ext.clone();
+                        let conn = connection.unwrap();
+                        let drive = self.selected_drive.to_drive_string();
+                        let device_num = self.selected_drive.device_number().to_string();
+                        let is_disk = matches!(ext.as_str(), "d64" | "d71" | "d81" | "g64");
+
+                        return Command::perform(
+                            async move {
+                                // Read file from extracted location
+                                let data = tokio::fs::read(&file_path)
+                                    .await
+                                    .map_err(|e| format!("Failed to read file: {}", e))?;
+
+                                // Use longer timeout for disk images
+                                let run_timeout = if is_disk { 30 } else { 15 };
+
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(run_timeout),
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+
+                                        match ext.as_str() {
+                                            "prg" => conn
+                                                .run_prg(&data)
+                                                .map(|_| format!("Running: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "crt" => conn
+                                                .run_crt(&data)
+                                                .map(|_| format!("Running cartridge: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "sid" => conn
+                                                .sid_play(&data, None)
+                                                .map(|_| format!("Playing: {}", filename))
+                                                .map_err(|e| e.to_string()),
+                                            "d64" | "d71" | "d81" | "g64" => {
+                                                // Mount and run
+                                                conn.mount_disk_image(
+                                                    &file_path,
+                                                    drive,
+                                                    ultimate64::drives::MountMode::ReadOnly,
+                                                    false,
+                                                )
+                                                .map_err(|e| format!("Mount failed: {}", e))?;
+
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(500),
+                                                );
+                                                conn.reset()
+                                                    .map_err(|e| format!("Reset failed: {}", e))?;
+                                                std::thread::sleep(std::time::Duration::from_secs(
+                                                    3,
+                                                ));
+                                                conn.type_text(&format!(
+                                                    "load \"*\",{},1\n",
+                                                    device_num
+                                                ))
+                                                .map_err(|e| format!("Type failed: {}", e))?;
+                                                std::thread::sleep(std::time::Duration::from_secs(
+                                                    5,
+                                                ));
+                                                conn.type_text("run\n")
+                                                    .map_err(|e| format!("Type failed: {}", e))?;
+
+                                                Ok(format!("Running disk: {}", filename))
+                                            }
+                                            _ => Err(format!("Unsupported file type: {}", ext)),
+                                        }
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| {
+                                    "Run timed out - device may be busy or offline".to_string()
+                                })?
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            CsdbBrowserMessage::RunExtractedFileCompleted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::RunExtractedFileCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Run failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::MountExtractedFile(index, mount_mode) => {
+                if connection.is_none() {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    return Command::none();
+                }
+
+                if let Some(extracted) = &self.extracted_zip {
+                    if let Some(file) = extracted.files.iter().find(|f| f.index == index) {
+                        // Only allow mounting disk images
+                        if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
+                            self.status_message =
+                                Some("Only disk images can be mounted".to_string());
+                            return Command::none();
+                        }
+
+                        self.is_loading = true;
+                        let drive_str = self.selected_drive.to_drive_string();
+                        self.status_message = Some(format!(
+                            "Mounting {} to Drive {}...",
+                            file.filename,
+                            self.selected_drive.device_number()
+                        ));
+
+                        let file_path = file.path.clone();
+                        let filename = file.filename.clone();
+                        let conn = connection.unwrap();
+                        let drive = drive_str;
+                        let mode = match mount_mode {
+                            MountMode::ReadOnly => ultimate64::drives::MountMode::ReadOnly,
+                            MountMode::ReadWrite => ultimate64::drives::MountMode::ReadWrite,
+                        };
+
+                        return Command::perform(
+                            async move {
+                                tokio::time::timeout(
+                                    tokio::time::Duration::from_secs(15),
+                                    tokio::task::spawn_blocking(move || {
+                                        let conn = conn.blocking_lock();
+                                        conn.mount_disk_image(&file_path, drive, mode, false)
+                                            .map(|_| format!("Mounted: {}", filename))
+                                            .map_err(|e| format!("Mount failed: {}", e))
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| {
+                                    "Mount timed out - device may be busy or offline".to_string()
+                                })?
+                                .map_err(|e| format!("Task error: {}", e))?
+                            },
+                            CsdbBrowserMessage::MountExtractedFileCompleted,
+                        );
+                    }
+                }
+                self.status_message = Some("No file selected".to_string());
+                Command::none()
+            }
+
+            CsdbBrowserMessage::MountExtractedFileCompleted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Mount failed: {}", e));
+                    }
+                }
+                Command::none()
+            }
+
+            CsdbBrowserMessage::CloseZipView => {
+                self.extracted_zip = None;
+                self.selected_extracted_file_index = None;
+                self.view_state = ViewState::ReleaseDetails;
+                Command::none()
+            }
+
             CsdbBrowserMessage::FilterChanged(filter) => {
                 self.file_filter = filter;
                 Command::none()
@@ -707,6 +989,8 @@ impl CsdbBrowser {
             CsdbBrowserMessage::BackToList => {
                 self.current_release = None;
                 self.selected_file_index = None;
+                self.extracted_zip = None;
+                self.selected_extracted_file_index = None;
                 if !self.search_results.is_empty() {
                     self.view_state = ViewState::SearchResults;
                 } else if !self.top_list_entries.is_empty() {
@@ -783,6 +1067,7 @@ impl CsdbBrowser {
             ViewState::SearchResults => self.view_search_results(font_size),
             ViewState::TopList => self.view_top_list(font_size),
             ViewState::ReleaseDetails => self.view_release_details(font_size, is_connected),
+            ViewState::ZipContents => self.view_zip_contents(font_size, is_connected),
         };
 
         // Status bar
@@ -1216,6 +1501,7 @@ impl CsdbBrowser {
                     "prg" | "crt" | "sid" | "d64" | "d71" | "d81" | "g64"
                 );
                 let is_disk_image = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+                let is_zip = is_zip_file(&file.ext);
 
                 let filename_display = if file.filename.len() > 35 {
                     format!("{}...", &file.filename[..32])
@@ -1228,7 +1514,7 @@ impl CsdbBrowser {
                     "d64" | "d71" | "d81" | "g64" => iced::Color::from_rgb(0.5, 0.7, 0.9),
                     "crt" => iced::Color::from_rgb(0.9, 0.7, 0.5),
                     "sid" => iced::Color::from_rgb(0.8, 0.5, 0.8),
-                    "zip" => iced::Color::from_rgb(0.7, 0.7, 0.5),
+                    "zip" => iced::Color::from_rgb(0.9, 0.9, 0.5),
                     _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
                 };
 
@@ -1269,6 +1555,20 @@ impl CsdbBrowser {
                     )
                     .style(iced::theme::Container::Box),
                 );
+
+                // Extract button for ZIP files
+                if is_zip {
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text("📦").size(small))
+                                .on_press(CsdbBrowserMessage::ExtractZip(file.index))
+                                .padding([4, 8]),
+                            "Extract ZIP and browse contents",
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+                }
 
                 // Mount buttons for disk images (when connected)
                 if is_disk_image && is_connected {
@@ -1341,6 +1641,212 @@ impl CsdbBrowser {
             info_row,
             horizontal_rule(1),
             filter_row,
+            horizontal_rule(1),
+            file_list,
+        ]
+        .spacing(5)
+        .into()
+    }
+
+    /// View for browsing extracted ZIP contents
+    fn view_zip_contents(
+        &self,
+        font_size: u32,
+        is_connected: bool,
+    ) -> Element<'_, CsdbBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) as u16;
+        let normal = font_size as u16;
+        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+
+        let extracted = match &self.extracted_zip {
+            Some(e) => e,
+            None => {
+                return container(text("No ZIP extracted").size(normal))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x()
+                    .center_y()
+                    .into();
+            }
+        };
+
+        // Header with back button and ZIP filename
+        let header = row![
+            tooltip(
+                button(text("← Back").size(normal))
+                    .on_press(CsdbBrowserMessage::CloseZipView)
+                    .padding([6, 12]),
+                "Back to release",
+                tooltip::Position::Right,
+            )
+            .style(iced::theme::Container::Box),
+            Space::with_width(10),
+            text(format!("📦 {}", extracted.source_filename)).size(normal + 2),
+            horizontal_space(),
+            text(format!("{} file(s)", extracted.files.len())).size(small),
+        ]
+        .spacing(5)
+        .align_items(iced::Alignment::Center);
+
+        // Drive selector row
+        let drive_row = row![
+            text("Mount to:").size(small),
+            pick_list(
+                DriveOption::all(),
+                Some(self.selected_drive),
+                CsdbBrowserMessage::DriveSelected,
+            )
+            .text_size(normal)
+            .width(Length::Fixed(110.0)),
+            horizontal_space(),
+            text(format!("Extracted to: {}", extracted.extract_dir.display()))
+                .size(tiny)
+                .style(iced::theme::Text::Color(iced::Color::from_rgb(
+                    0.5, 0.5, 0.6
+                ))),
+        ]
+        .spacing(10)
+        .align_items(iced::Alignment::Center);
+
+        // File list
+        let mut file_items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
+
+        if extracted.files.is_empty() {
+            file_items.push(
+                container(text("No files in archive").size(normal))
+                    .padding(20)
+                    .into(),
+            );
+        } else {
+            for file in &extracted.files {
+                let is_selected = self.selected_extracted_file_index == Some(file.index);
+                let is_runnable = matches!(
+                    file.ext.as_str(),
+                    "prg" | "crt" | "sid" | "d64" | "d71" | "d81" | "g64"
+                );
+                let is_disk_image = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+
+                let filename_display = if file.filename.len() > 40 {
+                    format!("{}...", &file.filename[..37])
+                } else {
+                    file.filename.clone()
+                };
+
+                let ext_color = match file.ext.as_str() {
+                    "prg" => iced::Color::from_rgb(0.5, 0.8, 0.5),
+                    "d64" | "d71" | "d81" | "g64" => iced::Color::from_rgb(0.5, 0.7, 0.9),
+                    "crt" => iced::Color::from_rgb(0.9, 0.7, 0.5),
+                    "sid" => iced::Color::from_rgb(0.8, 0.5, 0.8),
+                    _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
+                };
+
+                // Format file size
+                let size_str = if file.size >= 1024 * 1024 {
+                    format!("{:.1} MB", file.size as f64 / (1024.0 * 1024.0))
+                } else if file.size >= 1024 {
+                    format!("{:.1} KB", file.size as f64 / 1024.0)
+                } else {
+                    format!("{} B", file.size)
+                };
+
+                let mut file_row = row![
+                    text(format!("{:02}.", file.index))
+                        .size(tiny)
+                        .width(Length::Fixed(30.0)),
+                    tooltip(
+                        button(text(&filename_display).size(normal))
+                            .on_press(CsdbBrowserMessage::SelectExtractedFile(file.index))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(if is_selected {
+                                iced::theme::Button::Primary
+                            } else {
+                                iced::theme::Button::Text
+                            }),
+                        text(&file.filename).size(normal),
+                        tooltip::Position::Top,
+                    )
+                    .style(iced::theme::Container::Box),
+                    text(file.ext.to_uppercase())
+                        .size(tiny)
+                        .width(Length::Fixed(40.0))
+                        .style(iced::theme::Text::Color(ext_color)),
+                    text(&size_str).size(tiny).width(Length::Fixed(70.0)).style(
+                        iced::theme::Text::Color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                    ),
+                ]
+                .spacing(5)
+                .align_items(iced::Alignment::Center);
+
+                // Mount buttons for disk images (when connected)
+                if is_disk_image && is_connected {
+                    let drive_label = self.selected_drive.device_number();
+
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text(format!("{}:RO", drive_label)).size(tiny))
+                                .on_press(CsdbBrowserMessage::MountExtractedFile(
+                                    file.index,
+                                    MountMode::ReadOnly,
+                                ))
+                                .padding([4, 6]),
+                            text(format!("Mount as Drive {} (Read Only)", drive_label))
+                                .size(normal),
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text(format!("{}:RW", drive_label)).size(tiny))
+                                .on_press(CsdbBrowserMessage::MountExtractedFile(
+                                    file.index,
+                                    MountMode::ReadWrite,
+                                ))
+                                .padding([4, 6]),
+                            text(format!("Mount as Drive {} (Read/Write)", drive_label))
+                                .size(normal),
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+                }
+
+                // Run button for runnable files (when connected)
+                if is_runnable && is_connected {
+                    file_row = file_row.push(
+                        tooltip(
+                            button(text("▶").size(small))
+                                .on_press(CsdbBrowserMessage::RunExtractedFile(file.index))
+                                .padding([4, 8]),
+                            if is_disk_image {
+                                "Mount, reset, and run (LOAD\"*\",8,1 + RUN)"
+                            } else {
+                                "Run on Ultimate64"
+                            },
+                            tooltip::Position::Left,
+                        )
+                        .style(iced::theme::Container::Box),
+                    );
+                }
+
+                file_items.push(file_row.padding([2, 0]).into());
+                file_items.push(horizontal_rule(1).into());
+            }
+        }
+
+        let file_list = scrollable(
+            Column::with_children(file_items)
+                .spacing(0)
+                .padding([0, 12, 0, 0]),
+        )
+        .height(Length::Fill);
+
+        column![
+            header,
+            horizontal_rule(1),
+            drive_row,
             horizontal_rule(1),
             file_list,
         ]
