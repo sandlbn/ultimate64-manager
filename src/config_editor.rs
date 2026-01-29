@@ -1,9 +1,9 @@
 use crate::config_presets::{self, ConfigPreset};
 use iced::{
-    Task, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, pick_list, row, scrollable,
-        slider, text, text_input, toggler, tooltip, rule,
+        Column, Space, button, column, container, pick_list, row, rule, scrollable, slider, text,
+        text_input, toggler, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -838,34 +838,35 @@ impl ConfigEditor {
         // === BOTTOM: Status bar ===
         let pending_count: usize = self.pending_changes.values().map(|v| v.len()).sum();
 
-        let status_bar =
-            container(
-                row![
-                    if let Some(err) = &self.error_message {
-                        text(err).size(normal).color(iced::Color::from_rgb(0.9, 0.3, 0.3))
-                    } else if let Some(status) = &self.status_message {
-                        text(status).size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                    Space::new().width(Length::Fill),
-                    text(format!("{} items", self.current_items.len())).size(normal),
-                    Space::new().width(10),
-                    if pending_count > 0 {
-                        text(format!("{} pending", pending_count)).size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                    Space::new().width(10),
-                    if self.is_loading {
-                        text("Loading...").size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .padding([5, 10]);
+        let status_bar = container(
+            row![
+                if let Some(err) = &self.error_message {
+                    text(err)
+                        .size(normal)
+                        .color(iced::Color::from_rgb(0.9, 0.3, 0.3))
+                } else if let Some(status) = &self.status_message {
+                    text(status).size(normal)
+                } else {
+                    text("").size(normal)
+                },
+                Space::new().width(Length::Fill),
+                text(format!("{} items", self.current_items.len())).size(normal),
+                Space::new().width(10),
+                if pending_count > 0 {
+                    text(format!("{} pending", pending_count)).size(normal)
+                } else {
+                    text("").size(normal)
+                },
+                Space::new().width(10),
+                if self.is_loading {
+                    text("Loading...").size(normal)
+                } else {
+                    text("").size(normal)
+                },
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([5, 10]);
 
         column![
             text("CONFIGURATION EDITOR").size(header),
@@ -879,7 +880,11 @@ impl ConfigEditor {
         .into()
     }
 
-    fn view_option<'a>(&'a self, opt: &'a ConfigOption, font_size: u32) -> Element<'a, ConfigEditorMessage> {
+    fn view_option<'a>(
+        &'a self,
+        opt: &'a ConfigOption,
+        font_size: u32,
+    ) -> Element<'a, ConfigEditorMessage> {
         let small = (font_size.saturating_sub(2)).max(8);
         let normal = font_size;
 
@@ -975,9 +980,9 @@ impl ConfigEditor {
                     Space::new().width(10),
                     text(format!("{}{}", current_value, unit)).size(normal),
                     Space::new().width(10),
-                    text(format!("[{} - {}]", min, max)).size(small).color(
-                        iced::Color::from_rgb(0.5, 0.5, 0.5)
-                    ),
+                    text(format!("[{} - {}]", min, max))
+                        .size(small)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center)

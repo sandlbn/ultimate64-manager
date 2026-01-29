@@ -1,8 +1,7 @@
 use iced::{
-    Task, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, row, scrollable, text,
-        text_input, tooltip, rule,
+        Column, Space, button, column, container, row, rule, scrollable, text, text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -485,9 +484,9 @@ impl RemoteBrowser {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) ;
-        let normal = font_size ;
-        let tiny = (font_size.saturating_sub(3)).max(7) ;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         // Path display
         let display_path = if self.current_path.len() > 35 {
@@ -894,9 +893,9 @@ impl RemoteBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) ;
-        let normal = font_size ;
-        let tiny = (font_size.saturating_sub(3)).max(7) ;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         // Header with disk name and close button
         let header = row![
@@ -990,9 +989,9 @@ impl RemoteBrowser {
         content: &'a ContentPreview,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) ;
-        let normal = font_size ;
-        let tiny = (font_size.saturating_sub(3)).max(7) ;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         match content {
             ContentPreview::Text {

@@ -1,9 +1,9 @@
 use crate::mod_info;
 use iced::{
-    Task, Element, Length, Subscription,
+    Element, Length, Subscription, Task,
     widget::{
-        Column, Space, button, column, container, progress_bar, row, scrollable,
-        text, text_input, tooltip, rule,
+        Column, Space, button, column, container, progress_bar, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use rand::seq::SliceRandom;
@@ -1243,12 +1243,10 @@ impl MusicPlayer {
                 .align_y(iced::Alignment::Center),
             row![transport, Space::new().width(20), modes].align_y(iced::Alignment::Center),
             // Progress bar
-            container(
-                progress_bar(
-                    0.0..=self.current_song_duration as f32,
-                    self.elapsed_seconds as f32
-                )
-            )
+            container(progress_bar(
+                0.0..=self.current_song_duration as f32,
+                self.elapsed_seconds as f32
+            ))
             .width(Length::Fill)
             .height(Length::Fixed(8.0))
             .padding([5, 0]),
@@ -1678,7 +1676,8 @@ impl MusicPlayer {
         .padding([5, 10]);
 
         // === Main Layout ===
-        let main_content = row![browser_pane, rule::vertical(1), playlist_pane].height(Length::Fill);
+        let main_content =
+            row![browser_pane, rule::vertical(1), playlist_pane].height(Length::Fill);
 
         column![
             text("MUSIC PLAYER").size(header),

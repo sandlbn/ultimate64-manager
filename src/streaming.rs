@@ -1,12 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::widget::image::FilterMethod;
 use iced::{
-    Task, Element, Length, Subscription,
+    Element, Length, Subscription, Task,
     event::{self, Event},
     keyboard::{self, Key, Modifiers},
     widget::{
         Column, Space, button, checkbox, column, container, image as iced_image, mouse_area, row,
-        scrollable, text, text_input, tooltip, rule,
+        rule, scrollable, text, text_input, tooltip,
     },
 };
 
@@ -97,6 +97,7 @@ pub enum StreamingMessage {
     FrameUpdate,
     TakeScreenshot,
     ScreenshotComplete(Result<String, String>),
+    OpenScreenshot(String),
     CommandInputChanged(String),
     SendCommand,
     CommandSent(Result<String, String>),
@@ -202,12 +203,19 @@ impl ScaleMode {
     }
 }
 
+/// Combined frame data and dimensions - must be updated atomically to prevent display corruption
+#[derive(Clone)]
+pub struct ScaledFrame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Scaled RGBA for display
-    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA for screenshots
-    pub frame_dimensions: Arc<Mutex<(u32, u32)>>,  // Current scaled dimensions
-    pub scaled_buffer: Option<Vec<u8>>,            // Scaled frame for display
+    pub frame_buffer: Arc<Mutex<Option<ScaledFrame>>>, // Scaled RGBA + dimensions for display
+    pub current_handle: Option<iced::widget::image::Handle>, // Cached image handle for display
+    pub current_dimensions: (u32, u32),                // Dimensions of current handle
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
     audio_stream_handle: Option<thread::JoinHandle<()>>, // Audio playback thread
@@ -245,9 +253,8 @@ impl VideoStreaming {
         Self {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
-            image_buffer: Arc::new(Mutex::new(None)),
-            frame_dimensions: Arc::new(Mutex::new((VIC_WIDTH * 2, VIC_HEIGHT * 2))),
-            scaled_buffer: None,
+            current_handle: None,
+            current_dimensions: (VIC_WIDTH * 2, VIC_HEIGHT * 2),
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
             audio_stream_handle: None,
@@ -301,30 +308,36 @@ impl VideoStreaming {
                 Task::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Frame is already scaled in the receive thread, just copy to display buffer
+                // Create the image Handle here, only once per frame update
+                // This avoids creating new Handles on every view() call
                 if let Ok(fb) = self.frame_buffer.lock() {
-                    if let Some(data) = &*fb {
-                        self.scaled_buffer = Some(data.clone());
+                    if let Some(frame) = &*fb {
+                        self.current_handle = Some(iced::widget::image::Handle::from_rgba(
+                            frame.width,
+                            frame.height,
+                            frame.data.clone(),
+                        ));
+                        self.current_dimensions = (frame.width, frame.height);
                     }
                 }
                 Task::none()
             }
             StreamingMessage::TakeScreenshot => {
-                // Take screenshot from the existing image buffer
+                // Take screenshot from the existing scaled frame buffer
                 if !self.is_streaming {
                     return Task::none();
                 }
 
-                // Get current frame from buffer
-                let rgba_data = if let Ok(img_guard) = self.image_buffer.lock() {
-                    img_guard.clone()
+                // Get current scaled frame from buffer (includes dimensions)
+                let frame_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
+                    fb_guard.clone()
                 } else {
                     None
                 };
 
-                if let Some(data) = rgba_data {
+                if let Some(frame) = frame_data {
                     Task::perform(
-                        save_screenshot_to_pictures(data),
+                        save_screenshot_to_pictures(frame.data, frame.width, frame.height),
                         StreamingMessage::ScreenshotComplete,
                     )
                 } else {
@@ -336,6 +349,13 @@ impl VideoStreaming {
             }
             StreamingMessage::ScreenshotComplete(_result) => {
                 // Handled by main app for user message display
+                Task::none()
+            }
+            StreamingMessage::OpenScreenshot(path) => {
+                // Open the screenshot file in default viewer
+                if let Err(e) = open::that(&path) {
+                    log::warn!("Failed to open screenshot: {}", e);
+                }
                 Task::none()
             }
             StreamingMessage::CommandInputChanged(value) => {
@@ -599,30 +619,26 @@ impl VideoStreaming {
 
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
-        // Image dimensions based on scale mode
-        // In view() and view_fullscreen(), replace the fixed dimensions:
-        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
-            *dims
-        } else {
-            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
-        };
-
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use scaled buffer if available and not in Nearest mode
-            let frame_data = self.scaled_buffer.clone();
+            // Use cached handle - created once in FrameUpdate, not on every view()
+            if let Some(ref handle) = self.current_handle {
+                let w = self.current_dimensions.0 as f32;
+                let h = self.current_dimensions.1 as f32;
 
-            if let Some(rgba_data) = frame_data {
-                let handle =
-                    iced::widget::image::Handle::from_rgba(img_width, img_height, rgba_data);
-
-                mouse_area(
-                    iced_image(handle)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
+                let video_image = mouse_area(
+                    iced_image(handle.clone())
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(h))
+                        .filter_method(FilterMethod::Nearest),
                 )
-                .on_press(StreamingMessage::VideoClicked)
-                .into()
+                .on_press(StreamingMessage::VideoClicked);
+
+                container(video_image)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
             } else {
                 text("Waiting for frames...")
                     .size(20)
@@ -690,34 +706,21 @@ impl VideoStreaming {
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
-        // Image dimensions for the handle (based on scale mode processing)
-        // In view() and view_fullscreen(), replace the fixed dimensions:
-        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
-            *dims
-        } else {
-            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
-        };
-
         // === LEFT SIDE: Video display (fluid scaling) ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use scaled buffer if available, otherwise fall back to image buffer
-            let frame_data = self.scaled_buffer.clone();
+            // Use cached handle - created once in FrameUpdate, not on every view()
+            if let Some(ref handle) = self.current_handle {
+                let w = self.current_dimensions.0 as f32;
+                let h = self.current_dimensions.1 as f32;
 
-            if let Some(rgba_data) = frame_data {
-                // Create an image handle from RGBA data
-                let handle =
-                    iced::widget::image::Handle::from_rgba(img_width, img_height, rgba_data);
-
-                // Wrap image in mouse_area for double-click fullscreen
-                // Use Length::Fill with ContentFit::Contain for fluid scaling
                 let video_image = mouse_area(
-                    iced_image(handle)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain)
+                    iced_image(handle.clone())
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(h))
                         .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
+
                 let scale_label = match self.scale_mode {
                     ScaleMode::Int2x => "2x",
                     ScaleMode::Int3x => "3x",
@@ -746,11 +749,17 @@ impl VideoStreaming {
             } else {
                 // Image not decoded yet, show raw frame info
                 if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(frame_data) = &*frame_guard {
+                    if let Some(frame) = &*frame_guard {
                         container(
                             column![
                                 text("RECEIVING FRAMES").size(16),
-                                text(format!("{} bytes", frame_data.len())).size(12),
+                                text(format!(
+                                    "{} bytes ({}x{})",
+                                    frame.data.len(),
+                                    frame.width,
+                                    frame.height
+                                ))
+                                .size(12),
                                 text(format!(
                                     "Video: {} | Audio: {}",
                                     video_packets, audio_packets
@@ -1151,8 +1160,6 @@ impl VideoStreaming {
 
         // Clone what we need BEFORE the closure
         let frame_buffer = self.frame_buffer.clone();
-        let image_buffer = self.image_buffer.clone();
-        let frame_dimensions = self.frame_dimensions.clone();
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
         let scale_mode_shared = self.scale_mode_shared.clone();
@@ -1339,44 +1346,46 @@ impl VideoStreaming {
 
                         // Frame complete - apply scaling and store
                         if is_frame_end {
-                            // Store raw frame for screenshots
-                            if let Ok(mut img) = image_buffer.lock() {
-                                *img = Some(rgba_frame.clone());
-                            }
+                            // Clone the frame BEFORE scaling - this prevents new packets
+                            // from corrupting the frame while we're scaling it
+                            let frame_snapshot = rgba_frame.clone();
 
-                            // Get current scale mode and apply scaling
+                            // Get current scale mode and apply scaling to the snapshot
                             let current_mode =
                                 ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
 
                             let (scaled, dims) = match current_mode {
                                 ScaleMode::Int2x => (
-                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Int3x => (
-                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 3),
-                                    (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+                                    // WORKAROUND: Use 2x to avoid strobing with large textures
+                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Scale2x => (
-                                    scale2x(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    scale2x(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Scanlines => (
-                                    apply_scanlines(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    apply_scanlines(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::CRT => (
-                                    apply_crt_effect(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    apply_crt_effect(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
-                            }; // Store scaled frame for display
-                            if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(scaled);
-                            }
+                            };
 
-                            // Store dimensions
-                            if let Ok(mut d) = frame_dimensions.lock() {
-                                *d = dims;
+                            // Store scaled frame with dimensions atomically
+                            // This prevents display corruption from dimension/data mismatch
+                            if let Ok(mut fb) = frame_buffer.lock() {
+                                *fb = Some(ScaledFrame {
+                                    data: scaled,
+                                    width: dims.0,
+                                    height: dims.1,
+                                });
                             }
                         }
                     }
@@ -2001,12 +2010,10 @@ impl VideoStreaming {
 
         self.is_streaming = false;
 
-        // Clear frame buffers
+        // Clear frame buffers and handle
+        self.current_handle = None;
         if let Ok(mut frame) = self.frame_buffer.lock() {
             *frame = None;
-        }
-        if let Ok(mut img) = self.image_buffer.lock() {
-            *img = None;
         }
 
         log::info!("All streams stopped");
@@ -2022,7 +2029,11 @@ impl Drop for VideoStreaming {
 }
 
 /// Save screenshot from existing RGBA buffer to user's Pictures folder
-pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, String> {
+pub async fn save_screenshot_to_pictures(
+    rgba_data: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let timestamp = SystemTime::now()
@@ -2043,8 +2054,8 @@ pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, S
     let filename = format!("u64_screenshot_{}.png", timestamp);
     let path = screenshot_dir.join(&filename);
 
-    // Create image and save
-    let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
+    // Create image and save using provided dimensions
+    let img = image::RgbaImage::from_raw(width, height, rgba_data)
         .ok_or_else(|| "Failed to create image from frame data".to_string())?;
 
     img.save(&path)

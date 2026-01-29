@@ -1,8 +1,8 @@
 use iced::{
-    Task, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Row, Space, button, column, container,
-        pick_list, row, scrollable, text, text_input, tooltip, rule,
+        Column, Row, Space, button, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::sync::Arc;
@@ -1001,13 +1001,21 @@ impl MemoryEditor {
                 };
 
                 let byte_widget = if is_editing {
-                    container(text(byte_text.clone()).size(mono_font).color(iced::Color::BLACK))
-                        .style(editing_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(mono_font)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(editing_style)
+                    .width(Length::Fixed(width))
                 } else if is_match {
-                    container(text(byte_text.clone()).size(mono_font).color(iced::Color::BLACK))
-                        .style(highlight_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(mono_font)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(highlight_style)
+                    .width(Length::Fixed(width))
                 } else {
                     container(text(byte_text.clone()).size(mono_font)).width(Length::Fixed(width))
                 };

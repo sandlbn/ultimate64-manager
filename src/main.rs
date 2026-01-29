@@ -5,8 +5,8 @@
 use iced::{
     Element, Length, Subscription, Task, Theme,
     widget::{
-        Space, button, column, container, pick_list, row,
-        scrollable, text, text_input, tooltip, rule,
+        Space, button, column, container, pick_list, row, rule, scrollable, text, text_input,
+        tooltip,
     },
 };
 use std::path::PathBuf;
@@ -78,17 +78,21 @@ pub fn main() -> iced::Result {
     // Load window icon
     let icon = load_window_icon();
 
-    iced::application(Ultimate64Browser::new, Ultimate64Browser::update, Ultimate64Browser::view)
-        .title(Ultimate64Browser::title)
-        .subscription(Ultimate64Browser::subscription)
-        .theme(Ultimate64Browser::theme)
-        .window_size(iced::Size::new(1200.0, 800.0))
-        .window(iced::window::Settings {
-            min_size: Some(iced::Size::new(800.0, 600.0)),
-            icon: icon,
-            ..Default::default()
-        })
-        .run()
+    iced::application(
+        Ultimate64Browser::new,
+        Ultimate64Browser::update,
+        Ultimate64Browser::view,
+    )
+    .title(Ultimate64Browser::title)
+    .subscription(Ultimate64Browser::subscription)
+    .theme(Ultimate64Browser::theme)
+    .window_size(iced::Size::new(1200.0, 800.0))
+    .window(iced::window::Settings {
+        min_size: Some(iced::Size::new(800.0, 600.0)),
+        icon: icon,
+        ..Default::default()
+    })
+    .run()
 }
 
 fn load_window_icon() -> Option<iced::window::Icon> {
@@ -1053,7 +1057,7 @@ impl Ultimate64Browser {
 
                     return iced::window::oldest()
                         .and_then(move |id| iced::window::set_mode(id, mode))
-                        .map(|_| Message::RefreshStatus);
+                        .map(|_: ()| Message::RefreshStatus);
                 }
 
                 // Handle keyboard command - intercept before passing to streaming
@@ -1125,7 +1129,7 @@ impl Ultimate64Browser {
                     self.video_streaming.is_fullscreen = false;
                     return iced::window::oldest()
                         .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed))
-                        .map(|_| Message::RefreshStatus);
+                        .map(|_: ()| Message::RefreshStatus);
                 }
                 Task::none()
             }
@@ -1450,7 +1454,7 @@ impl Ultimate64Browser {
     fn subscription(&self) -> Subscription<Message> {
         use iced::event::{self, Event};
         use iced::keyboard::{self, Key};
-        
+
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
         let keyboard_sub = event::listen_with(|event, _status, _id| {
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {

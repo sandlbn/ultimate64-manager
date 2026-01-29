@@ -1,8 +1,8 @@
 use iced::{
     Element, Length, Task,
     widget::{
-        Column, Space, button, checkbox, column, container, pick_list, row,
-        scrollable, text, text_input, tooltip, rule,
+        Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::collections::HashSet;

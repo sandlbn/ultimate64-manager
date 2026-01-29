@@ -8,10 +8,10 @@
 //! - Extracting and browsing ZIP archives
 
 use iced::{
-    Task, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, pick_list,
-        row, scrollable, text, text_input, tooltip, rule,
+        Column, Space, button, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::path::PathBuf;
@@ -1152,7 +1152,9 @@ impl CsdbBrowser {
         )
         .height(Length::Fill);
 
-        column![header, rule::horizontal(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_search_results(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
@@ -1196,7 +1198,9 @@ impl CsdbBrowser {
         )
         .height(Length::Fill);
 
-        column![header, rule::horizontal(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_top_list(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
@@ -1300,7 +1304,9 @@ impl CsdbBrowser {
         )
         .height(Length::Fill);
 
-        column![header, rule::horizontal(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_release_item<'a>(
