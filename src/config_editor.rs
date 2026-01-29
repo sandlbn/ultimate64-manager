@@ -1,9 +1,9 @@
 use crate::config_presets::{self, ConfigPreset};
 use iced::{
-    Command, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, horizontal_rule, pick_list, row, scrollable,
-        slider, text, text_input, toggler, tooltip, vertical_rule,
+        Column, Space, button, column, container, pick_list, row, rule, scrollable, slider, text,
+        text_input, toggler, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -131,20 +131,20 @@ impl ConfigEditor {
         _connection: Option<Arc<Mutex<Rest>>>,
         host_url: Option<String>,
         password: Option<String>,
-    ) -> Command<ConfigEditorMessage> {
+    ) -> Task<ConfigEditorMessage> {
         match message {
             ConfigEditorMessage::LoadCategories => {
                 if let Some(host) = host_url {
                     self.is_loading = true;
                     self.status_message = Some("Loading categories...".to_string());
                     self.error_message = None;
-                    Command::perform(
+                    Task::perform(
                         fetch_categories(host, password),
                         ConfigEditorMessage::CategoriesLoaded,
                     )
                 } else {
                     self.error_message = Some("Not connected to Ultimate64".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -168,7 +168,7 @@ impl ConfigEditor {
                         self.status_message = None;
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SelectCategory(category) => {
@@ -182,13 +182,13 @@ impl ConfigEditor {
                     self.is_loading = true;
                     self.status_message = Some(format!("Loading {}...", category));
                     self.error_message = None;
-                    Command::perform(
+                    Task::perform(
                         fetch_category_items(host, category, password),
                         ConfigEditorMessage::CategoryItemsLoaded,
                     )
                 } else {
                     self.error_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -221,17 +221,17 @@ impl ConfigEditor {
                         self.original_values.clear();
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::LoadItemDetails(category, item_name) => {
                 if let Some(host) = host_url {
-                    Command::perform(
+                    Task::perform(
                         fetch_item_details(host, category, item_name, password),
                         ConfigEditorMessage::ItemDetailsLoaded,
                     )
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -263,7 +263,7 @@ impl ConfigEditor {
                         item.details = Some(details);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::StringValueChanged(category, name, value) => {
@@ -271,7 +271,7 @@ impl ConfigEditor {
                 if let Some(opt) = self.current_items.get_mut(&name) {
                     opt.current_value = serde_json::Value::String(value);
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::EnumValueChanged(category, name, value) => {
@@ -279,7 +279,7 @@ impl ConfigEditor {
                 if let Some(opt) = self.current_items.get_mut(&name) {
                     opt.current_value = serde_json::Value::String(value);
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::IntValueChanged(category, name, value) => {
@@ -287,7 +287,7 @@ impl ConfigEditor {
                 if let Some(opt) = self.current_items.get_mut(&name) {
                     opt.current_value = serde_json::json!(value);
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::BoolValueChanged(category, name, value) => {
@@ -300,27 +300,27 @@ impl ConfigEditor {
                 if let Some(opt) = self.current_items.get_mut(&name) {
                     opt.current_value = serde_json::Value::String(str_value.to_string());
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SaveAllChanges => {
                 if let Some(host) = host_url {
                     if self.pending_changes.is_empty() {
                         self.status_message = Some("No changes to save".to_string());
-                        return Command::none();
+                        return Task::none();
                     }
 
                     self.is_loading = true;
                     self.status_message = Some("Saving changes...".to_string());
 
                     let changes = self.pending_changes.clone();
-                    Command::perform(
+                    Task::perform(
                         save_batch_changes(host, changes, password),
                         ConfigEditorMessage::SaveComplete,
                     )
                 } else {
                     self.error_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -341,20 +341,20 @@ impl ConfigEditor {
                         self.error_message = Some(format!("Save failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SaveToFlash => {
                 if let Some(host) = host_url {
                     self.is_loading = true;
                     self.status_message = Some("Saving to flash...".to_string());
-                    Command::perform(
+                    Task::perform(
                         flash_operation(host, "save_to_flash", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
                     self.error_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -362,13 +362,13 @@ impl ConfigEditor {
                 if let Some(host) = host_url.clone() {
                     self.is_loading = true;
                     self.status_message = Some("Loading from flash...".to_string());
-                    Command::perform(
+                    Task::perform(
                         flash_operation(host, "load_from_flash", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
                     self.error_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -376,13 +376,13 @@ impl ConfigEditor {
                 if let Some(host) = host_url {
                     self.is_loading = true;
                     self.status_message = Some("Resetting to defaults...".to_string());
-                    Command::perform(
+                    Task::perform(
                         flash_operation(host, "reset_to_default", password),
                         ConfigEditorMessage::FlashOperationComplete,
                     )
                 } else {
                     self.error_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -407,7 +407,7 @@ impl ConfigEditor {
                         password,
                     );
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::RevertChanges => {
@@ -419,7 +419,7 @@ impl ConfigEditor {
                 self.pending_changes.clear();
                 self.has_unsaved_changes = false;
                 self.status_message = Some("Changes reverted".to_string());
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::RefreshCategory => {
@@ -433,12 +433,12 @@ impl ConfigEditor {
                         password,
                     );
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SearchChanged(filter) => {
                 self.search_filter = filter;
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SavePreset => {
@@ -446,14 +446,14 @@ impl ConfigEditor {
                 if self.selected_category.is_none() || self.current_items.is_empty() {
                     self.error_message =
                         Some("No category selected or no items to save".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 let category = self.selected_category.clone().unwrap_or_default();
                 let default_name =
                     format!("{}_preset.json", category.to_lowercase().replace(' ', "_"));
 
-                Command::perform(
+                Task::perform(
                     async move {
                         rfd::AsyncFileDialog::new()
                             .set_title("Save Configuration Preset")
@@ -484,13 +484,13 @@ impl ConfigEditor {
                         );
 
                         self.status_message = Some("Saving preset...".to_string());
-                        return Command::perform(
+                        return Task::perform(
                             config_presets::save_preset_async(preset, path),
                             ConfigEditorMessage::SavePresetComplete,
                         );
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::SavePresetComplete(result) => {
@@ -503,10 +503,10 @@ impl ConfigEditor {
                         self.error_message = Some(format!("Save preset failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
-            ConfigEditorMessage::LoadPreset => Command::perform(
+            ConfigEditorMessage::LoadPreset => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .set_title("Load Configuration Preset")
@@ -521,12 +521,12 @@ impl ConfigEditor {
             ConfigEditorMessage::LoadPresetFileSelected(path) => {
                 if let Some(path) = path {
                     self.status_message = Some("Loading preset...".to_string());
-                    return Command::perform(
+                    return Task::perform(
                         config_presets::load_preset_async(path),
                         ConfigEditorMessage::LoadPresetComplete,
                     );
                 }
-                Command::none()
+                Task::none()
             }
 
             ConfigEditorMessage::LoadPresetComplete(result) => {
@@ -556,7 +556,7 @@ impl ConfigEditor {
                         self.error_message = Some(format!("Load preset failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -577,10 +577,10 @@ impl ConfigEditor {
     }
 
     pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, ConfigEditorMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let large = (font_size + 2) as u16;
-        let header = (font_size + 4) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let large = font_size + 2;
+        let header = font_size + 4;
 
         // === LEFT PANE: Category list ===
         let category_header = container(
@@ -594,7 +594,7 @@ impl ConfigEditor {
                         "Fetch configuration categories from Ultimate64",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5),
             ]
@@ -627,14 +627,14 @@ impl ConfigEditor {
                         cat.clone()
                     };
 
-                    button(text(&label).size(normal))
+                    button(text(label).size(normal))
                         .on_press(ConfigEditorMessage::SelectCategory(cat.clone()))
                         .padding([6, 10])
                         .width(Length::Fill)
                         .style(if is_selected {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Text
+                            button::text
                         })
                         .into()
                 })
@@ -643,7 +643,7 @@ impl ConfigEditor {
             scrollable(
                 Column::with_children(items)
                     .spacing(2)
-                    .padding([5, 15, 5, 5]),
+                    .padding(iced::Padding::new(5.0).right(15.0)),
             )
             .height(Length::Fill)
             .into()
@@ -652,7 +652,7 @@ impl ConfigEditor {
         // Flash operations
         let flash_controls = container(
             column![
-                horizontal_rule(1),
+                rule::horizontal(1),
                 text("FLASH MEMORY").size(small),
                 tooltip(
                     button(text("Save to Flash").size(small))
@@ -662,7 +662,7 @@ impl ConfigEditor {
                     "Save current configuration to flash memory\n(persists across reboots)",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Load from Flash").size(small))
                         .on_press(ConfigEditorMessage::LoadFromFlash)
@@ -671,7 +671,7 @@ impl ConfigEditor {
                     "Load configuration from flash memory\n(discards current settings)",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Reset to Default").size(small))
                         .on_press(ConfigEditorMessage::ResetToDefault)
@@ -680,7 +680,7 @@ impl ConfigEditor {
                     "Reset all settings to factory defaults",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5),
         )
@@ -689,7 +689,7 @@ impl ConfigEditor {
         // Preset controls
         let preset_controls = container(
             column![
-                horizontal_rule(1),
+                rule::horizontal(1),
                 text("PRESETS").size(small),
                 tooltip(
                     button(text("Save Preset").size(small))
@@ -699,7 +699,7 @@ impl ConfigEditor {
                     "Save current category settings to a JSON file",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Load Preset").size(small))
                         .on_press(ConfigEditorMessage::LoadPreset)
@@ -708,7 +708,7 @@ impl ConfigEditor {
                     "Load settings from a JSON preset file",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5),
         )
@@ -717,7 +717,7 @@ impl ConfigEditor {
         let left_pane = container(
             column![
                 category_header,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 category_list,
                 flash_controls,
                 preset_controls,
@@ -737,32 +737,30 @@ impl ConfigEditor {
                             .unwrap_or("Select a category")
                     )
                     .size(large),
-                    Space::with_width(Length::Fill),
+                    Space::new().width(Length::Fill),
                     if self.has_unsaved_changes {
                         text("* Modified")
                             .size(small)
-                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                0.9, 0.7, 0.0,
-                            )))
+                            .color(iced::Color::from_rgb(0.9, 0.7, 0.0))
                     } else {
                         text("").size(small)
                     },
                 ]
-                .align_items(iced::Alignment::Center),
+                .align_y(iced::Alignment::Center),
                 row![
                     tooltip(
                         button(text("Apply All").size(small))
                             .on_press(ConfigEditorMessage::SaveAllChanges)
                             .padding([4, 10])
                             .style(if self.has_unsaved_changes {
-                                iced::theme::Button::Primary
+                                button::primary
                             } else {
-                                iced::theme::Button::Secondary
+                                button::secondary
                             }),
                         "Send all pending changes to Ultimate64",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Revert").size(small))
                             .on_press(ConfigEditorMessage::RevertChanges)
@@ -770,7 +768,7 @@ impl ConfigEditor {
                         "Discard all pending changes",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Refresh").size(small))
                             .on_press(ConfigEditorMessage::RefreshCategory)
@@ -778,16 +776,16 @@ impl ConfigEditor {
                         "Reload current category from Ultimate64",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
-                    Space::with_width(10),
+                    .style(container::bordered_box),
+                    Space::new().width(10),
                     text("Filter:").size(small),
                     text_input("filter...", &self.search_filter)
                         .on_input(ConfigEditorMessage::SearchChanged)
-                        .size(normal)
+                        .size(normal as f32)
                         .width(Length::Fixed(120.0)),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center),
+                .align_y(iced::Alignment::Center),
             ]
             .spacing(5),
         )
@@ -802,7 +800,7 @@ impl ConfigEditor {
                 text("Select a category from the left").size(normal)
             })
             .padding(20)
-            .center_x()
+            .center_x(Length::Fill)
             .into()
         } else {
             let mut sorted_items: Vec<_> = self.current_items.values().collect();
@@ -824,14 +822,14 @@ impl ConfigEditor {
             scrollable(
                 Column::with_children(items)
                     .spacing(8)
-                    .padding([10, 15, 10, 10]),
+                    .padding(iced::Padding::new(10.0).right(15.0)),
             )
             .height(Length::Fill)
             .into()
         };
 
         let right_pane = container(
-            column![options_header, horizontal_rule(1), options_list]
+            column![options_header, rule::horizontal(1), options_list]
                 .spacing(0)
                 .height(Length::Fill),
         )
@@ -840,42 +838,41 @@ impl ConfigEditor {
         // === BOTTOM: Status bar ===
         let pending_count: usize = self.pending_changes.values().map(|v| v.len()).sum();
 
-        let status_bar =
-            container(
-                row![
-                    if let Some(err) = &self.error_message {
-                        text(err).size(normal).style(iced::theme::Text::Color(
-                            iced::Color::from_rgb(0.9, 0.3, 0.3),
-                        ))
-                    } else if let Some(status) = &self.status_message {
-                        text(status).size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                    Space::with_width(Length::Fill),
-                    text(format!("{} items", self.current_items.len())).size(normal),
-                    Space::with_width(10),
-                    if pending_count > 0 {
-                        text(format!("{} pending", pending_count)).size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                    Space::with_width(10),
-                    if self.is_loading {
-                        text("Loading...").size(normal)
-                    } else {
-                        text("").size(normal)
-                    },
-                ]
-                .align_items(iced::Alignment::Center),
-            )
-            .padding([5, 10]);
+        let status_bar = container(
+            row![
+                if let Some(err) = &self.error_message {
+                    text(err)
+                        .size(normal)
+                        .color(iced::Color::from_rgb(0.9, 0.3, 0.3))
+                } else if let Some(status) = &self.status_message {
+                    text(status).size(normal)
+                } else {
+                    text("").size(normal)
+                },
+                Space::new().width(Length::Fill),
+                text(format!("{} items", self.current_items.len())).size(normal),
+                Space::new().width(10),
+                if pending_count > 0 {
+                    text(format!("{} pending", pending_count)).size(normal)
+                } else {
+                    text("").size(normal)
+                },
+                Space::new().width(10),
+                if self.is_loading {
+                    text("Loading...").size(normal)
+                } else {
+                    text("").size(normal)
+                },
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .padding([5, 10]);
 
         column![
             text("CONFIGURATION EDITOR").size(header),
-            horizontal_rule(1),
-            row![left_pane, vertical_rule(1), right_pane].height(Length::Fill),
-            horizontal_rule(1),
+            rule::horizontal(1),
+            row![left_pane, rule::vertical(1), right_pane].height(Length::Fill),
+            rule::horizontal(1),
             status_bar,
         ]
         .spacing(5)
@@ -883,34 +880,34 @@ impl ConfigEditor {
         .into()
     }
 
-    fn view_option(&self, opt: &ConfigOption, font_size: u32) -> Element<'_, ConfigEditorMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
+    fn view_option<'a>(
+        &'a self,
+        opt: &'a ConfigOption,
+        font_size: u32,
+    ) -> Element<'a, ConfigEditorMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
 
         let is_modified = self.is_item_modified(&opt.category, &opt.name);
 
         let name_row = row![
             text(&opt.name).size(normal),
-            Space::with_width(5),
+            Space::new().width(5),
             if is_modified {
                 text("*")
                     .size(normal)
-                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.9, 0.7, 0.0,
-                    )))
+                    .color(iced::Color::from_rgb(0.9, 0.7, 0.0))
             } else {
                 text("").size(normal)
             },
         ]
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let default_text = if let Some(details) = &opt.details {
             if let Some(default) = &details.default {
                 text(format!("Default: {}", format_value(default)))
                     .size(small)
-                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.1, 0.1, 0.1,
-                    )))
+                    .color(iced::Color::from_rgb(0.1, 0.1, 0.1))
             } else {
                 text("").size(small)
             }
@@ -938,7 +935,7 @@ impl ConfigEditor {
                         .on_input(move |v| {
                             ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
                         })
-                        .size(normal)
+                        .size(normal as f32)
                         .width(Length::Fixed(250.0))
                         .into()
                 } else {
@@ -980,15 +977,15 @@ impl ConfigEditor {
                     })
                     .step(1.0)
                     .width(Length::Fixed(150.0)),
-                    Space::with_width(10),
+                    Space::new().width(10),
                     text(format!("{}{}", current_value, unit)).size(normal),
-                    Space::with_width(10),
-                    text(format!("[{} - {}]", min, max)).size(small).style(
-                        iced::theme::Text::Color(iced::Color::from_rgb(0.5, 0.5, 0.5))
-                    ),
+                    Space::new().width(10),
+                    text(format!("[{} - {}]", min, max))
+                        .size(small)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
                 .into()
             }
 
@@ -1002,15 +999,16 @@ impl ConfigEditor {
                 let n = name.clone();
 
                 row![
-                    toggler(String::new(), current_value, move |v| {
-                        ConfigEditorMessage::BoolValueChanged(cat.clone(), n.clone(), v)
-                    })
-                    .size(18),
-                    Space::with_width(10),
+                    toggler(current_value)
+                        .on_toggle(move |v| {
+                            ConfigEditorMessage::BoolValueChanged(cat.clone(), n.clone(), v)
+                        })
+                        .size(18),
+                    Space::new().width(10),
                     text(if current_value { "Yes" } else { "No" }).size(normal),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
                 .into()
             }
 
@@ -1023,7 +1021,7 @@ impl ConfigEditor {
                     .on_input(move |v| {
                         ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
                     })
-                    .size(normal)
+                    .size(normal as f32)
                     .width(Length::Fixed(250.0))
                     .into()
             }
@@ -1032,7 +1030,7 @@ impl ConfigEditor {
         container(column![name_row, default_text, control,].spacing(3))
             .padding([8, 10])
             .width(Length::Fill)
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
             .into()
     }
 }

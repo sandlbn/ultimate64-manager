@@ -1,4 +1,4 @@
-use iced::Command;
+use iced::Task;
 use serde::Deserialize;
 
 /// GitHub release info
@@ -22,10 +22,9 @@ pub enum VersionCheckMessage {
 }
 
 /// Check GitHub for new version
-pub fn check_for_updates(current_version: &str) -> Command<VersionCheckMessage> {
+pub fn check_for_updates(current_version: &str) -> Task<VersionCheckMessage> {
     let current = current_version.to_string();
-
-    Command::perform(
+    Task::perform(
         async move { check_github_release(&current).await },
         VersionCheckMessage::CheckComplete,
     )
@@ -78,14 +77,12 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     for i in 0..latest_parts.len().max(current_parts.len()) {
         let l = latest_parts.get(i).copied().unwrap_or(0);
         let c = current_parts.get(i).copied().unwrap_or(0);
-
         if l > c {
             return true;
         } else if l < c {
             return false;
         }
     }
-
     false
 }
 

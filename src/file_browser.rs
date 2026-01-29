@@ -1,8 +1,8 @@
 use iced::{
-    Command, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, checkbox, column, container, horizontal_rule, pick_list, row,
-        scrollable, text, text_input, tooltip,
+        Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::collections::HashSet;
@@ -137,9 +137,9 @@ impl FileBrowser {
         &mut self,
         message: FileBrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
-    ) -> Command<FileBrowserMessage> {
+    ) -> Task<FileBrowserMessage> {
         match message {
-            FileBrowserMessage::SelectDirectory => Command::perform(
+            FileBrowserMessage::SelectDirectory => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .pick_folder()
@@ -159,7 +159,7 @@ impl FileBrowser {
                 self.current_directory = path;
                 self.checked_files.clear();
                 self.status_message = None;
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::FileSelected(path) => {
                 if path.is_dir() {
@@ -169,7 +169,7 @@ impl FileBrowser {
                 } else {
                     self.selected_file = Some(path);
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::NavigateToPath(path) => {
                 if path.is_dir() {
@@ -177,7 +177,7 @@ impl FileBrowser {
                     self.current_directory = path;
                     self.checked_files.clear();
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::MountDisk(path, drive, mode) => {
                 if let Some(conn) = connection {
@@ -185,13 +185,13 @@ impl FileBrowser {
                         "Mounting {}...",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    Command::perform(
+                    Task::perform(
                         mount_disk_async(conn, path, drive, mode),
                         FileBrowserMessage::MountCompleted,
                     )
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
             FileBrowserMessage::MountCompleted(result) => {
@@ -205,7 +205,7 @@ impl FileBrowser {
                         log::error!("Mount failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::RunDisk(path, drive) => {
                 if let Some(conn) = connection {
@@ -213,13 +213,13 @@ impl FileBrowser {
                         "Running {}...",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    Command::perform(
+                    Task::perform(
                         run_disk_async(conn, path, drive),
                         FileBrowserMessage::RunDiskCompleted,
                     )
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
             FileBrowserMessage::RunDiskCompleted(result) => {
@@ -233,7 +233,7 @@ impl FileBrowser {
                         log::error!("Run failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::LoadAndRun(path) => {
                 if let Some(conn) = connection {
@@ -241,13 +241,13 @@ impl FileBrowser {
                         "Loading {}...",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    Command::perform(
+                    Task::perform(
                         load_and_run_async(conn, path),
                         FileBrowserMessage::LoadCompleted,
                     )
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
             FileBrowserMessage::LoadCompleted(result) => {
@@ -260,12 +260,12 @@ impl FileBrowser {
                         log::error!("Load failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::RefreshFiles => {
                 self.load_directory(&self.current_directory.clone());
                 self.status_message = None;
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::NavigateUp => {
                 if let Some(parent) = self.current_directory.parent() {
@@ -273,11 +273,11 @@ impl FileBrowser {
                     self.load_directory(&parent_path);
                     self.current_directory = parent_path;
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::DriveSelected(drive) => {
                 self.selected_drive = drive;
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::ToggleFileCheck(path, checked) => {
                 if checked {
@@ -285,27 +285,27 @@ impl FileBrowser {
                 } else {
                     self.checked_files.remove(&path);
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::SelectAll => {
                 for file in &self.files {
                     self.checked_files.insert(file.path.clone());
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::SelectNone => {
                 self.checked_files.clear();
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::FilterChanged(value) => {
                 self.filter = value;
-                Command::none()
+                Task::none()
             }
             // Disk info popup messages
             FileBrowserMessage::ShowDiskInfo(path) => {
                 self.disk_info_loading = true;
                 self.disk_info_path = Some(path.clone());
-                Command::perform(
+                Task::perform(
                     async move { load_disk_info_async(path).await },
                     FileBrowserMessage::DiskInfoLoaded,
                 )
@@ -321,18 +321,18 @@ impl FileBrowser {
                         self.disk_info_path = None;
                     }
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::CloseDiskInfo => {
                 self.disk_info_popup = None;
                 self.disk_info_path = None;
-                Command::none()
+                Task::none()
             }
             // Content preview popup messages (text/image files)
             FileBrowserMessage::ShowContentPreview(path) => {
                 self.content_preview_loading = true;
                 self.content_preview_path = Some(path.clone());
-                Command::perform(
+                Task::perform(
                     async move { load_content_preview_async(path).await },
                     FileBrowserMessage::ContentPreviewLoaded,
                 )
@@ -348,12 +348,12 @@ impl FileBrowser {
                         self.content_preview_path = None;
                     }
                 }
-                Command::none()
+                Task::none()
             }
             FileBrowserMessage::CloseContentPreview => {
                 self.content_preview = None;
                 self.content_preview_path = None;
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -375,9 +375,9 @@ impl FileBrowser {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         // Current path display (truncated if too long)
         let path_str = self.current_directory.to_string_lossy();
@@ -396,7 +396,7 @@ impl FileBrowser {
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("Browse").size(normal))
                     .on_press(FileBrowserMessage::SelectDirectory)
@@ -404,17 +404,17 @@ impl FileBrowser {
                 "Choose a different folder",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(Length::Fill),
+            .style(container::bordered_box),
+            Space::new().width(Length::Fill),
             text("Filter:").size(small),
             text_input("filter...", &self.filter)
                 .on_input(FileBrowserMessage::FilterChanged)
-                .size(normal)
+                .size(normal as f32)
                 .padding(4)
                 .width(Length::Fixed(100.0)),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Path display
         let path_display = text(display_path).size(normal);
@@ -434,8 +434,8 @@ impl FileBrowser {
                 "Select target drive for mounting disks",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(10),
+            .style(container::bordered_box),
+            Space::new().width(10),
             tooltip(
                 button(text("All").size(tiny))
                     .on_press(FileBrowserMessage::SelectAll)
@@ -443,7 +443,7 @@ impl FileBrowser {
                 "Select all files",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("None").size(tiny))
                     .on_press(FileBrowserMessage::SelectNone)
@@ -451,12 +451,12 @@ impl FileBrowser {
                 "Deselect all files",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(Length::Fill),
+            .style(container::bordered_box),
+            Space::new().width(Length::Fill),
             text(format!("{} files", self.files.len())).size(small),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Checked count
         let checked_count = self.checked_files.len();
@@ -521,7 +521,7 @@ impl FileBrowser {
             for (i, entry) in filtered_files.iter().enumerate() {
                 if i > 0 {
                     // Add divider between rows
-                    file_list.push(horizontal_rule(1).into());
+                    file_list.push(rule::horizontal(1).into());
                 }
                 file_list.push(self.view_file_entry(*entry, font_size));
             }
@@ -529,7 +529,7 @@ impl FileBrowser {
             let scrollable_list = scrollable(
                 Column::with_children(file_list)
                     .spacing(0)
-                    .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
+                    .padding(iced::Padding::ZERO.right(12)), // Right padding for scrollbar clearance
             )
             .height(Length::Fill);
 
@@ -552,17 +552,17 @@ impl FileBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         // Header with disk name and close button
         let header = row![
             text(format!("{} - ", disk_info.kind)).size(small),
             text(format!("\"{}\"", disk_info.name)).size(normal),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             text(format!("{} {}", disk_info.disk_id, disk_info.dos_type)).size(small),
-            Space::with_width(10),
+            Space::new().width(10),
             tooltip(
                 button(text("Close").size(small))
                     .on_press(FileBrowserMessage::CloseDiskInfo)
@@ -570,10 +570,10 @@ impl FileBrowser {
                 "Close directory listing",
                 tooltip::Position::Left,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Directory listing
         let mut listing_items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
@@ -601,10 +601,10 @@ impl FileBrowser {
                     closed_indicator, entry.file_type, lock_indicator
                 ))
                 .size(tiny)
-                .style(iced::theme::Text::Color(type_color)),
+                .color(type_color),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center);
 
             listing_items.push(entry_row.into());
         }
@@ -612,7 +612,7 @@ impl FileBrowser {
         // Footer with blocks free
         let footer = row![
             text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(small),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             text(format!("{} files", disk_info.entries.len())).size(tiny),
         ]
         .spacing(10);
@@ -621,7 +621,7 @@ impl FileBrowser {
         let listing = scrollable(
             Column::with_children(listing_items)
                 .spacing(2)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
@@ -629,9 +629,9 @@ impl FileBrowser {
         container(
             column![
                 header,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 listing,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 footer,
             ]
             .spacing(5)
@@ -639,18 +639,18 @@ impl FileBrowser {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(iced::theme::Container::Box)
+        .style(container::bordered_box)
         .into()
     }
 
-    fn view_content_preview_popup(
-        &self,
-        content: &ContentPreview,
+    fn view_content_preview_popup<'a>(
+        &'a self,
+        content: &'a ContentPreview,
         font_size: u32,
-    ) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+    ) -> Element<'a, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         match content {
             ContentPreview::Text {
@@ -668,10 +668,10 @@ impl FileBrowser {
                 // Header with filename and close button
                 let header = row![
                     text("TEXT - ").size(small),
-                    text(&display_name).size(normal),
-                    Space::with_width(Length::Fill),
+                    text(display_name.clone()).size(normal),
+                    Space::new().width(Length::Fill),
                     text(format!("{} lines", line_count)).size(small),
-                    Space::with_width(10),
+                    Space::new().width(10),
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
@@ -679,10 +679,10 @@ impl FileBrowser {
                         "Close text preview",
                         tooltip::Position::Left,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Text content with line numbers
                 let mut text_lines: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
@@ -691,9 +691,7 @@ impl FileBrowser {
                         text(format!("{:>4}", i + 1))
                             .size(tiny)
                             .width(Length::Fixed(35.0))
-                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                0.5, 0.5, 0.5
-                            ))),
+                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                         text(line).size(tiny),
                     ]
                     .spacing(10);
@@ -704,19 +702,19 @@ impl FileBrowser {
                 let text_content = scrollable(
                     Column::with_children(text_lines)
                         .spacing(2)
-                        .padding([0, 12, 0, 0]),
+                        .padding(iced::Padding::ZERO.right(12)),
                 )
                 .height(Length::Fill);
 
                 // Popup container
                 container(
-                    column![header, horizontal_rule(1), text_content,]
+                    column![header, rule::horizontal(1), text_content,]
                         .spacing(5)
                         .padding(10),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(iced::theme::Container::Box)
+                .style(container::bordered_box)
                 .into()
             }
             ContentPreview::Image {
@@ -735,10 +733,10 @@ impl FileBrowser {
                 // Header with filename and close button
                 let header = row![
                     text("IMAGE - ").size(small),
-                    text(&display_name).size(normal),
-                    Space::with_width(Length::Fill),
+                    text(display_name.clone()).size(normal),
+                    Space::new().width(Length::Fill),
                     text(format!("{}x{}", width, height)).size(small),
-                    Space::with_width(10),
+                    Space::new().width(10),
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
@@ -746,13 +744,13 @@ impl FileBrowser {
                         "Close image preview",
                         tooltip::Position::Left,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Image display using iced's image widget
-                let image_handle = iced::widget::image::Handle::from_memory(data.clone());
+                let image_handle = iced::widget::image::Handle::from_bytes(data.clone());
                 let image_widget = iced::widget::image(image_handle)
                     .width(Length::Fill)
                     .height(Length::Fill);
@@ -761,19 +759,19 @@ impl FileBrowser {
                 container(
                     column![
                         header,
-                        horizontal_rule(1),
+                        rule::horizontal(1),
                         container(image_widget)
                             .width(Length::Fill)
                             .height(Length::Fill)
-                            .center_x()
-                            .center_y(),
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill),
                     ]
                     .spacing(5)
                     .padding(10),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(iced::theme::Container::Box)
+                .style(container::bordered_box)
                 .into()
             }
         }
@@ -784,9 +782,9 @@ impl FileBrowser {
         entry: &FileEntry,
         font_size: u32,
     ) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         let is_checked = self.checked_files.contains(&entry.path);
 
@@ -834,7 +832,7 @@ impl FileBrowser {
                 "Open folder",
                 tooltip::Position::Top,
             )
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
             .into()
         } else {
             match entry.extension.as_deref() {
@@ -861,7 +859,7 @@ impl FileBrowser {
                                 "Show disk directory listing",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         );
                     }
 
@@ -878,7 +876,7 @@ impl FileBrowser {
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
@@ -893,7 +891,7 @@ impl FileBrowser {
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
@@ -908,7 +906,7 @@ impl FileBrowser {
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         );
 
                     buttons.into()
@@ -920,7 +918,7 @@ impl FileBrowser {
                     "Load and run on Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box)
+                .style(container::bordered_box)
                 .into(),
                 _ => {
                     // Check for text, image, or PDF preview
@@ -934,7 +932,7 @@ impl FileBrowser {
                             "View text content",
                             tooltip::Position::Top,
                         )
-                        .style(iced::theme::Container::Box)
+                        .style(container::bordered_box)
                         .into()
                     } else if is_image_file {
                         tooltip(
@@ -946,7 +944,7 @@ impl FileBrowser {
                             "View image",
                             tooltip::Position::Top,
                         )
-                        .style(iced::theme::Container::Box)
+                        .style(container::bordered_box)
                         .into()
                     } else if is_pdf_file {
                         tooltip(
@@ -958,10 +956,10 @@ impl FileBrowser {
                             "View PDF",
                             tooltip::Position::Top,
                         )
-                        .style(iced::theme::Container::Box)
+                        .style(container::bordered_box)
                         .into()
                     } else {
-                        Space::with_width(0).into()
+                        Space::new().width(0).into()
                     }
                 }
             }
@@ -969,7 +967,7 @@ impl FileBrowser {
 
         // Build the row: [checkbox] [name...] [type] [action]
         let path_clone = entry.path.clone();
-        let checkbox_element: Element<'_, FileBrowserMessage> = checkbox("", is_checked)
+        let checkbox_element: Element<'_, FileBrowserMessage> = checkbox(is_checked)
             .on_toggle(move |checked| {
                 FileBrowserMessage::ToggleFileCheck(path_clone.clone(), checked)
             })
@@ -977,19 +975,19 @@ impl FileBrowser {
             .into();
 
         // Wrap filename in tooltip if truncated to show full name
-        let filename_button = button(text(&display_name).size(normal))
+        let filename_button = button(text(display_name.clone()).size(normal))
             .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
             .padding([4, 6])
             .width(Length::Fill)
-            .style(iced::theme::Button::Text);
+            .style(button::text);
 
         let filename_element: Element<'_, FileBrowserMessage> = if entry.name.len() > max_name_len {
             tooltip(
                 filename_button,
-                text(&entry.name).size(normal),
+                text(entry.name.clone()).size(normal),
                 tooltip::Position::Top,
             )
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
             .into()
         } else {
             filename_button.into()
@@ -1006,7 +1004,7 @@ impl FileBrowser {
             action_button,
         ]
         .spacing(4)
-        .align_items(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
         .padding([2, 4]);
 
         file_row.into()

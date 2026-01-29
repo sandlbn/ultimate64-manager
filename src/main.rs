@@ -3,10 +3,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
-    Application, Command, Element, Length, Settings, Subscription, Theme, executor,
+    Element, Length, Subscription, Task, Theme,
     widget::{
-        Space, button, column, container, horizontal_rule, horizontal_space, pick_list, row,
-        scrollable, text, text_input, tooltip,
+        Space, button, column, container, pick_list, row, rule, scrollable, text, text_input,
+        tooltip,
     },
 };
 use std::path::PathBuf;
@@ -78,15 +78,21 @@ pub fn main() -> iced::Result {
     // Load window icon
     let icon = load_window_icon();
 
-    Ultimate64Browser::run(Settings {
-        window: iced::window::Settings {
-            size: iced::Size::new(1200.0, 800.0),
-            min_size: Some(iced::Size::new(800.0, 600.0)),
-            icon: icon,
-            ..Default::default()
-        },
+    iced::application(
+        Ultimate64Browser::new,
+        Ultimate64Browser::update,
+        Ultimate64Browser::view,
+    )
+    .title(Ultimate64Browser::title)
+    .subscription(Ultimate64Browser::subscription)
+    .theme(Ultimate64Browser::theme)
+    .window_size(iced::Size::new(1200.0, 800.0))
+    .window(iced::window::Settings {
+        min_size: Some(iced::Size::new(800.0, 600.0)),
+        icon: icon,
         ..Default::default()
     })
+    .run()
 }
 
 fn load_window_icon() -> Option<iced::window::Icon> {
@@ -271,13 +277,8 @@ pub struct Ultimate64Browser {
     csdb_browser: CsdbBrowser,
 }
 
-impl Application for Ultimate64Browser {
-    type Message = Message;
-    type Theme = Theme;
-    type Executor = executor::Default;
-    type Flags = ();
-
-    fn new(_flags: ()) -> (Self, Command<Message>) {
+impl Ultimate64Browser {
+    fn new() -> (Self, Task<Message>) {
         log::info!("Initializing application...");
 
         let settings = match AppSettings::load() {
@@ -341,8 +342,8 @@ impl Application for Ultimate64Browser {
             app.establish_connection();
             return (
                 app,
-                Command::batch(vec![
-                    Command::perform(
+                Task::batch(vec![
+                    Task::perform(
                         async {
                             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                         },
@@ -356,6 +357,7 @@ impl Application for Ultimate64Browser {
         log::info!("No host configured, waiting for user input");
         (app, version_check_cmd)
     }
+
     fn title(&self) -> String {
         let connection_status = if self.status.connected {
             format!(" - Connected to {}", self.settings.connection.host)
@@ -375,16 +377,17 @@ impl Application for Ultimate64Browser {
                 primary: iced::Color::from_rgb(0.45, 0.52, 0.85),    // Lighter blue
                 success: iced::Color::from_rgb(0.3, 0.7, 0.3),       // Green
                 danger: iced::Color::from_rgb(0.8, 0.3, 0.3),        // Red
+                warning: iced::Color::from_rgb(0.9, 0.7, 0.2),       // Yellow/Orange
             },
         )
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
-                Command::none()
+                Task::none()
             }
             Message::MemoryEditor(msg) => self
                 .memory_editor
@@ -418,7 +421,7 @@ impl Application for Ultimate64Browser {
                 }
 
                 if should_refresh {
-                    commands.push(Command::perform(
+                    commands.push(Task::perform(
                         async {
                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                         },
@@ -426,7 +429,7 @@ impl Application for Ultimate64Browser {
                     ));
                 }
 
-                Command::batch(commands)
+                Task::batch(commands)
             }
 
             Message::RemoteBrowser(msg) => {
@@ -460,7 +463,7 @@ impl Application for Ultimate64Browser {
 
                 if should_stop_music {
                     log::info!("Stopping music player - running file from Ultimate64");
-                    Command::batch(vec![
+                    Task::batch(vec![
                         cmd,
                         self.music_player
                             .update(MusicPlayerMessage::Stop, self.connection.clone())
@@ -472,7 +475,7 @@ impl Application for Ultimate64Browser {
             }
             Message::ActivePaneChanged(pane) => {
                 self.active_pane = pane;
-                Command::none()
+                Task::none()
             }
 
             Message::CopyLocalToRemote => {
@@ -483,7 +486,7 @@ impl Application for Ultimate64Browser {
                     self.user_message = Some(UserMessage::Error(
                         "No files selected. Use checkboxes to select files.".to_string(),
                     ));
-                    return Command::none();
+                    return Task::none();
                 }
 
                 // Separate files and directories
@@ -501,13 +504,13 @@ impl Application for Ultimate64Browser {
                 if files_to_copy.is_empty() && dirs_to_copy.is_empty() {
                     self.user_message =
                         Some(UserMessage::Error("No valid items selected.".to_string()));
-                    return Command::none();
+                    return Task::none();
                 }
 
                 let remote_dest = self.remote_browser.get_current_path().to_string();
 
                 // Build commands for each operation
-                let mut commands: Vec<Command<Message>> = Vec::new();
+                let mut commands: Vec<Task<Message>> = Vec::new();
 
                 // Handle directories via RemoteBrowser's UploadDirectory
                 for dir_path in dirs_to_copy {
@@ -541,7 +544,7 @@ impl Application for Ultimate64Browser {
                             commands.len()
                         )));
 
-                        commands.push(Command::perform(
+                        commands.push(Task::perform(
                             async move {
                                 tokio::task::spawn_blocking(move || {
                                     use std::io::Cursor;
@@ -617,7 +620,7 @@ impl Application for Ultimate64Browser {
                         self.user_message = Some(UserMessage::Error(
                             "Not connected to Ultimate64".to_string(),
                         ));
-                        return Command::none();
+                        return Task::none();
                     }
                 } else {
                     // Only directories being uploaded
@@ -631,10 +634,10 @@ impl Application for Ultimate64Browser {
                     self.user_message = Some(UserMessage::Error(
                         "Not connected to Ultimate64".to_string(),
                     ));
-                    return Command::none();
+                    return Task::none();
                 }
 
-                return Command::batch(commands);
+                return Task::batch(commands);
             }
             Message::CopyRemoteToLocal => {
                 // Copy selected remote file to local directory
@@ -651,7 +654,7 @@ impl Application for Ultimate64Browser {
                         self.user_message =
                             Some(UserMessage::Info("Downloading file via FTP...".to_string()));
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 tokio::task::spawn_blocking(move || {
                                     use std::io::Read;
@@ -720,7 +723,7 @@ impl Application for Ultimate64Browser {
                         "No file selected in remote pane".to_string(),
                     ));
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::CopyComplete(result) => {
@@ -730,7 +733,7 @@ impl Application for Ultimate64Browser {
                         // Clear checked files after successful copy
                         self.left_browser.clear_checked();
                         // Refresh both browsers
-                        return Command::batch(vec![
+                        return Task::batch(vec![
                             self.left_browser
                                 .update(FileBrowserMessage::RefreshFiles, self.connection.clone())
                                 .map(Message::LeftBrowser),
@@ -743,7 +746,7 @@ impl Application for Ultimate64Browser {
                         self.user_message = Some(UserMessage::Error(e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
             Message::VersionCheck(msg) => {
                 match msg {
@@ -760,14 +763,14 @@ impl Application for Ultimate64Browser {
                         }
                     },
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::OpenReleasePage => {
                 if let Some(info) = &self.new_version {
                     let _ = open::that(&info.download_url);
                 }
-                Command::none()
+                Task::none()
             }
             Message::MusicPlayer(msg) => {
                 // Check if we need to pause or resume the machine
@@ -783,7 +786,7 @@ impl Application for Ultimate64Browser {
                     // Also send PauseMachine command
                     if let Some(host) = &self.host_url {
                         let url = format!("{}/v1/machine:pause", host);
-                        let pause_cmd = Command::perform(
+                        let pause_cmd = Task::perform(
                             async move {
                                 let client = reqwest::Client::builder()
                                     .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
@@ -798,7 +801,7 @@ impl Application for Ultimate64Browser {
                             },
                             Message::MachineCommandCompleted,
                         );
-                        return Command::batch([cmd, pause_cmd]);
+                        return Task::batch([cmd, pause_cmd]);
                     }
                     return cmd;
                 }
@@ -814,7 +817,7 @@ impl Application for Ultimate64Browser {
                         // Also send ResumeMachine command
                         if let Some(host) = &self.host_url {
                             let url = format!("{}/v1/machine:resume", host);
-                            let resume_cmd = Command::perform(
+                            let resume_cmd = Task::perform(
                                 async move {
                                     let client = reqwest::Client::builder()
                                         .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
@@ -829,7 +832,7 @@ impl Application for Ultimate64Browser {
                                 },
                                 Message::MachineCommandCompleted,
                             );
-                            return Command::batch([cmd, resume_cmd]);
+                            return Task::batch([cmd, resume_cmd]);
                         }
                         return cmd;
                     }
@@ -852,12 +855,12 @@ impl Application for Ultimate64Browser {
 
             Message::HostInputChanged(value) => {
                 self.host_input = value;
-                Command::none()
+                Task::none()
             }
 
             Message::PasswordInputChanged(value) => {
                 self.password_input = value;
-                Command::none()
+                Task::none()
             }
 
             Message::ConnectPressed => {
@@ -877,7 +880,7 @@ impl Application for Ultimate64Browser {
                 }
                 self.establish_connection();
                 // Trigger status refresh and remote browser refresh after a short delay
-                Command::perform(
+                Task::perform(
                     async {
                         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     },
@@ -906,7 +909,7 @@ impl Application for Ultimate64Browser {
                 self.user_message = Some(UserMessage::Info(
                     "Disconnected from Ultimate64".to_string(),
                 ));
-                Command::none()
+                Task::none()
             }
             Message::StreamControlMethodChanged(method) => {
                 self.settings.connection.stream_control_method = method;
@@ -914,17 +917,17 @@ impl Application for Ultimate64Browser {
                 if let Err(e) = self.settings.save() {
                     log::error!("Failed to save settings: {}", e);
                 }
-                Command::none()
+                Task::none()
             }
             Message::RefreshStatus => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { fetch_status(conn).await },
                         Message::StatusUpdated,
                     )
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
             Message::CsdbBrowser(msg) => self
@@ -935,12 +938,12 @@ impl Application for Ultimate64Browser {
                 // Refresh both status and remote browser after connection
                 let status_cmd = if let Some(conn) = &self.connection {
                     let conn = conn.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { fetch_status(conn).await },
                         Message::StatusUpdated,
                     )
                 } else {
-                    Command::none()
+                    Task::none()
                 };
 
                 let browser_cmd = self
@@ -948,7 +951,7 @@ impl Application for Ultimate64Browser {
                     .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
                     .map(Message::RemoteBrowser);
 
-                Command::batch(vec![status_cmd, browser_cmd])
+                Task::batch(vec![status_cmd, browser_cmd])
             }
 
             Message::StatusUpdated(result) => {
@@ -977,12 +980,12 @@ impl Application for Ultimate64Browser {
                             Some(UserMessage::Error(format!("Connection failed: {}", e)));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::TemplateSelected(template) => {
                 self.selected_template = Some(template);
-                Command::none()
+                Task::none()
             }
 
             Message::ExecuteTemplate => {
@@ -990,7 +993,7 @@ impl Application for Ultimate64Browser {
                     if let Some(conn) = &self.connection {
                         let conn = conn.clone();
                         let commands = template.commands.clone();
-                        return Command::perform(
+                        return Task::perform(
                             async move { execute_template_commands(conn, commands).await },
                             |result| match result {
                                 Ok(_) => Message::RefreshStatus,
@@ -1001,24 +1004,24 @@ impl Application for Ultimate64Browser {
                         self.user_message = Some(UserMessage::Error("Not connected".to_string()));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::ShowError(error) => {
                 log::error!("Error: {}", error);
                 self.user_message = Some(UserMessage::Error(error));
-                Command::none()
+                Task::none()
             }
 
             Message::ShowInfo(info) => {
                 log::info!("Info: {}", info);
                 self.user_message = Some(UserMessage::Info(info));
-                Command::none()
+                Task::none()
             }
 
             Message::DismissMessage => {
                 self.user_message = None;
-                Command::none()
+                Task::none()
             }
 
             Message::Streaming(msg) => {
@@ -1052,7 +1055,9 @@ impl Application for Ultimate64Browser {
                         iced::window::Mode::Windowed
                     };
 
-                    return iced::window::change_mode(iced::window::Id::MAIN, mode);
+                    return iced::window::oldest()
+                        .and_then(move |id| iced::window::set_mode(id, mode))
+                        .map(|_: ()| Message::RefreshStatus);
                 }
 
                 // Handle keyboard command - intercept before passing to streaming
@@ -1068,7 +1073,7 @@ impl Application for Ultimate64Browser {
                                 .push(format!("> {}", command));
                             self.video_streaming.command_input.clear();
 
-                            return Command::perform(
+                            return Task::perform(
                                 async move {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
@@ -1110,7 +1115,7 @@ impl Application for Ultimate64Browser {
                             self.video_streaming.command_input.clear();
                         }
                     }
-                    return Command::none();
+                    return Task::none();
                 }
 
                 self.video_streaming
@@ -1122,18 +1127,17 @@ impl Application for Ultimate64Browser {
                 // Only exit fullscreen if currently in fullscreen mode
                 if self.video_streaming.is_fullscreen {
                     self.video_streaming.is_fullscreen = false;
-                    return iced::window::change_mode(
-                        iced::window::Id::MAIN,
-                        iced::window::Mode::Windowed,
-                    );
+                    return iced::window::oldest()
+                        .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed))
+                        .map(|_: ()| Message::RefreshStatus);
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
-                    Command::perform(
+                    Task::perform(
                         async move {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
@@ -1158,14 +1162,14 @@ impl Application for Ultimate64Browser {
                     )
                 } else {
                     self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Command::none()
+                    Task::none()
                 }
             }
 
             Message::RebootMachine => {
                 if let Some(host) = &self.host_url {
                     let url = format!("{}/v1/machine:reboot", host);
-                    Command::perform(
+                    Task::perform(
                         async move {
                             let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
@@ -1182,14 +1186,14 @@ impl Application for Ultimate64Browser {
                     )
                 } else {
                     self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Command::none()
+                    Task::none()
                 }
             }
 
             Message::PauseMachine => {
                 if let Some(host) = &self.host_url {
                     let url = format!("{}/v1/machine:pause", host);
-                    Command::perform(
+                    Task::perform(
                         async move {
                             let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
@@ -1206,14 +1210,14 @@ impl Application for Ultimate64Browser {
                     )
                 } else {
                     self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Command::none()
+                    Task::none()
                 }
             }
 
             Message::ResumeMachine => {
                 if let Some(host) = &self.host_url {
                     let url = format!("{}/v1/machine:resume", host);
-                    Command::perform(
+                    Task::perform(
                         async move {
                             let client = reqwest::Client::builder()
                                 .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
@@ -1230,14 +1234,14 @@ impl Application for Ultimate64Browser {
                     )
                 } else {
                     self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Command::none()
+                    Task::none()
                 }
             }
 
             Message::PoweroffMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
-                    Command::perform(
+                    Task::perform(
                         async move {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
@@ -1262,7 +1266,7 @@ impl Application for Ultimate64Browser {
                     )
                 } else {
                     self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -1275,7 +1279,7 @@ impl Application for Ultimate64Browser {
                         self.user_message = Some(UserMessage::Error(e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::DefaultSongDurationChanged(value) => {
@@ -1289,7 +1293,7 @@ impl Application for Ultimate64Browser {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::FontSizeChanged(value) => {
@@ -1303,11 +1307,11 @@ impl Application for Ultimate64Browser {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // Starting directory settings
-            Message::BrowseFileBrowserStartDir => Command::perform(
+            Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .pick_folder()
@@ -1327,7 +1331,7 @@ impl Application for Ultimate64Browser {
                         "File Browser start directory set (restart app to apply)".to_string(),
                     ));
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::ClearFileBrowserStartDir => {
@@ -1338,10 +1342,10 @@ impl Application for Ultimate64Browser {
                 self.user_message = Some(UserMessage::Info(
                     "File Browser start directory cleared".to_string(),
                 ));
-                Command::none()
+                Task::none()
             }
 
-            Message::BrowseMusicPlayerStartDir => Command::perform(
+            Message::BrowseMusicPlayerStartDir => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .pick_folder()
@@ -1361,7 +1365,7 @@ impl Application for Ultimate64Browser {
                         "Music Player start directory set (restart app to apply)".to_string(),
                     ));
                 }
-                Command::none()
+                Task::none()
             }
 
             Message::ClearMusicPlayerStartDir => {
@@ -1372,7 +1376,7 @@ impl Application for Ultimate64Browser {
                 self.user_message = Some(UserMessage::Info(
                     "Music Player start directory cleared".to_string(),
                 ));
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -1432,11 +1436,11 @@ impl Application for Ultimate64Browser {
 
         let main_content = column![
             connection_bar,
-            horizontal_rule(1),
+            rule::horizontal(1),
             tabs,
-            horizontal_rule(1),
+            rule::horizontal(1),
             content,
-            horizontal_rule(1),
+            rule::horizontal(1),
             status_bar
         ]
         .spacing(0);
@@ -1448,14 +1452,22 @@ impl Application for Ultimate64Browser {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        use iced::keyboard;
+        use iced::event::{self, Event};
+        use iced::keyboard::{self, Key};
+
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
-        let keyboard_sub = keyboard::on_key_press(|key, modifiers| match key {
-            keyboard::Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
-            keyboard::Key::Character(c) if c.as_str() == "f" && modifiers.alt() => Some(
-                Message::Streaming(streaming::StreamingMessage::ToggleFullscreen),
-            ),
-            _ => None,
+        let keyboard_sub = event::listen_with(|event, _status, _id| {
+            if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+                match key {
+                    Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
+                    Key::Character(ref c) if c.as_str() == "f" && modifiers.alt() => Some(
+                        Message::Streaming(streaming::StreamingMessage::ToggleFullscreen),
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         });
 
         Subscription::batch([
@@ -1464,31 +1476,25 @@ impl Application for Ultimate64Browser {
             keyboard_sub,
         ])
     }
-}
 
-impl Ultimate64Browser {
-    fn tab_button(&self, label: &str, tab: Tab) -> Element<'_, Message> {
+    fn tab_button<'a>(&self, label: &'a str, tab: Tab) -> Element<'a, Message> {
         let is_active = self.active_tab == tab;
         button(text(label).size(14))
             .on_press(Message::TabSelected(tab))
             .padding([8, 16])
             .style(if is_active {
-                iced::theme::Button::Primary
+                button::primary
             } else {
-                iced::theme::Button::Secondary
+                button::secondary
             })
             .into()
     }
 
     fn view_connection_bar(&self) -> Element<'_, Message> {
         let status_indicator = if self.status.connected {
-            text("● CONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
-                0.2, 0.8, 0.2,
-            )))
+            text("● CONNECTED").color(iced::Color::from_rgb(0.2, 0.8, 0.2))
         } else {
-            text("○ DISCONNECTED").style(iced::theme::Text::Color(iced::Color::from_rgb(
-                0.8, 0.2, 0.2,
-            )))
+            text("○ DISCONNECTED").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
         };
 
         let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(12);
@@ -1498,19 +1504,17 @@ impl Ultimate64Browser {
             row![
                 text(format!("🎉 {} available!", info.version))
                     .size(12)
-                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.3, 0.8, 0.3
-                    ))),
+                    .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
                 button(text("Download").size(11))
                     .on_press(Message::OpenReleasePage)
                     .padding([2, 8])
-                    .style(iced::theme::Button::Primary),
+                    .style(button::primary),
             ]
             .spacing(8)
-            .align_items(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
             .into()
         } else {
-            Space::new(Length::Shrink, Length::Shrink).into()
+            Space::new().into()
         };
 
         container(
@@ -1518,15 +1522,16 @@ impl Ultimate64Browser {
                 status_indicator,
                 text(" | ").size(12),
                 device_text,
-                horizontal_space(),
+                Space::new().width(Length::Fill),
                 update_notification,
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         )
         .padding([8, 15])
         .into()
     }
+
     fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Left pane - Local files
         let left_header = row![
@@ -1538,11 +1543,11 @@ impl Ultimate64Browser {
             }
         ]
         .padding(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let left_pane = container(column![
             left_header,
-            horizontal_rule(1),
+            rule::horizontal(1),
             self.left_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::LeftBrowser),
@@ -1561,8 +1566,8 @@ impl Ultimate64Browser {
                     "Upload checked files to Ultimate64",
                     tooltip::Position::Right,
                 )
-                .style(iced::theme::Container::Box),
-                Space::with_height(10),
+                .style(container::bordered_box),
+                Space::new().height(10),
                 tooltip(
                     button(text("<<").size(14))
                         .on_press(Message::CopyRemoteToLocal)
@@ -1570,12 +1575,12 @@ impl Ultimate64Browser {
                     "Download selected file from Ultimate64",
                     tooltip::Position::Left,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
-            .align_items(iced::Alignment::Center),
+            .align_x(iced::Alignment::Center),
         )
         .padding([20, 5])
-        .center_y();
+        .center_y(Length::Shrink);
 
         // Right pane - Ultimate64 files
         let connection_indicator = if self.status.connected { "*" } else { "" };
@@ -1590,14 +1595,14 @@ impl Ultimate64Browser {
                 "Refresh remote file listing",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .padding(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let right_pane = container(column![
             right_header,
-            horizontal_rule(1),
+            rule::horizontal(1),
             self.remote_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::RemoteBrowser),
@@ -1628,16 +1633,16 @@ impl Ultimate64Browser {
                     "Run the selected template commands",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         )
         .padding(10);
 
         column![
             row![left_pane, copy_buttons, right_pane].height(Length::Fill),
-            horizontal_rule(1),
+            rule::horizontal(1),
             template_section,
         ]
         .into()
@@ -1652,19 +1657,19 @@ impl Ultimate64Browser {
     fn view_settings(&self) -> Element<'_, Message> {
         let connection_section = column![
             text("CONNECTION SETTINGS").size(18),
-            Space::with_height(10),
+            Space::new().height(10),
             text("Ultimate64 IP Address:").size(14),
             text_input("192.168.1.64", &self.host_input)
                 .on_input(Message::HostInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
-            Space::with_height(10),
+            Space::new().height(10),
             text("Password (optional):").size(14),
             text_input("Enter password...", &self.password_input)
                 .on_input(Message::PasswordInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
-            Space::with_height(10),
+            Space::new().height(10),
             text("Stream Control Method:").size(14),
             row![
                 pick_list(
@@ -1676,7 +1681,7 @@ impl Ultimate64Browser {
             ]
             .spacing(10),
             text("Controls how video/audio streaming communicates with the Ultimate64").size(11),
-            Space::with_height(15),
+            Space::new().height(15),
             row![
                 tooltip(
                     button(text("Connect"))
@@ -1685,7 +1690,7 @@ impl Ultimate64Browser {
                     "Connect to Ultimate64 and save settings",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Disconnect"))
                         .on_press(Message::DisconnectPressed)
@@ -1693,7 +1698,7 @@ impl Ultimate64Browser {
                     "Disconnect from Ultimate64",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Test Connection"))
                         .on_press(Message::RefreshStatus)
@@ -1701,25 +1706,22 @@ impl Ultimate64Browser {
                     "Test connection and refresh status",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(10),
         ];
 
         let status_section = column![
-            Space::with_height(20),
-            horizontal_rule(1),
-            Space::with_height(10),
+            Space::new().height(20),
+            rule::horizontal(1),
+            Space::new().height(10),
             text("CONNECTION STATUS").size(18),
-            Space::with_height(10),
+            Space::new().height(10),
             if self.status.connected {
-                text(format!("Connected to {}", self.settings.connection.host)).style(
-                    iced::theme::Text::Color(iced::Color::from_rgb(0.2, 0.8, 0.2)),
-                )
+                text(format!("Connected to {}", self.settings.connection.host))
+                    .color(iced::Color::from_rgb(0.2, 0.8, 0.2))
             } else {
-                text("Not connected").style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.8, 0.2, 0.2,
-                )))
+                text("Not connected").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
             },
             if let Some(info) = &self.status.device_info {
                 text(format!("Device: {}", info)).size(14)
@@ -1746,14 +1748,14 @@ impl Ultimate64Browser {
             .unwrap_or_else(|| "(home directory)".to_string());
 
         let starting_dirs_section = column![
-            Space::with_height(20),
-            horizontal_rule(1),
-            Space::with_height(10),
+            Space::new().height(20),
+            rule::horizontal(1),
+            Space::new().height(10),
             text("STARTING DIRECTORIES").size(18),
-            Space::with_height(10),
+            Space::new().height(10),
             text("File Browser tab starting directory:").size(14),
             row![
-                text(&file_browser_start_dir_display)
+                text(file_browser_start_dir_display.clone())
                     .size(12)
                     .width(Length::Fixed(400.0)),
                 tooltip(
@@ -1763,7 +1765,7 @@ impl Ultimate64Browser {
                     "Select starting directory for File Browser",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Clear").size(11))
                         .on_press(Message::ClearFileBrowserStartDir)
@@ -1771,14 +1773,14 @@ impl Ultimate64Browser {
                     "Reset to home directory",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
-            Space::with_height(10),
+            .align_y(iced::Alignment::Center),
+            Space::new().height(10),
             text("Music Player tab starting directory:").size(14),
             row![
-                text(&music_player_start_dir_display)
+                text(music_player_start_dir_display.clone())
                     .size(12)
                     .width(Length::Fixed(400.0)),
                 tooltip(
@@ -1788,7 +1790,7 @@ impl Ultimate64Browser {
                     "Select starting directory for Music Player",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Clear").size(11))
                         .on_press(Message::ClearMusicPlayerStartDir)
@@ -1796,19 +1798,19 @@ impl Ultimate64Browser {
                     "Reset to home directory",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
             text("(Changes take effect on next application restart)").size(11),
         ];
 
         let music_section = column![
-            Space::with_height(20),
-            horizontal_rule(1),
-            Space::with_height(10),
+            Space::new().height(20),
+            rule::horizontal(1),
+            Space::new().height(10),
             text("MUSIC PLAYER SETTINGS").size(18),
-            Space::with_height(10),
+            Space::new().height(10),
             row![
                 text("Default song duration (seconds):").size(14),
                 text_input(
@@ -1821,15 +1823,15 @@ impl Ultimate64Browser {
                 text("(used when song length is unknown)").size(11),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         ];
 
         let ui_section = column![
-            Space::with_height(20),
-            horizontal_rule(1),
-            Space::with_height(10),
+            Space::new().height(20),
+            rule::horizontal(1),
+            Space::new().height(10),
             text("UI SETTINGS").size(18),
-            Space::with_height(10),
+            Space::new().height(10),
             row![
                 text("Font size:").size(14),
                 text_input("12", &self.font_size_input)
@@ -1839,13 +1841,13 @@ impl Ultimate64Browser {
                 text("(8-24, applies to File Browser and Music Player)").size(11),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         ];
 
         let debug_section = column![
-            Space::with_height(20),
-            horizontal_rule(1),
-            Space::with_height(10),
+            Space::new().height(20),
+            rule::horizontal(1),
+            Space::new().height(10),
             text("DEBUG INFO").size(18),
             text(format!("Platform: {}", std::env::consts::OS)).size(12),
             text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
@@ -1885,22 +1887,52 @@ impl Ultimate64Browser {
             } else {
                 iced::Color::from_rgb(0.0, 0.5, 0.0)
             };
-            row![
-                text(format!("{}{}", prefix, message))
-                    .size(12)
-                    .style(iced::theme::Text::Color(color)),
-                tooltip(
-                    button(text("X").size(10))
-                        .on_press(Message::DismissMessage)
-                        .padding([2, 6]),
-                    "Dismiss message",
-                    tooltip::Position::Top,
-                )
-                .style(iced::theme::Container::Box),
-            ]
-            .spacing(10)
-            .align_items(iced::Alignment::Center)
-            .into()
+
+            // Check if this is a screenshot message - make path clickable
+            if message.starts_with("Screenshot saved: ") {
+                let path = message
+                    .strip_prefix("Screenshot saved: ")
+                    .unwrap_or(message);
+                row![
+                    text("Screenshot saved: ").size(12).color(color),
+                    button(
+                        text(path)
+                            .size(12)
+                            .color(iced::Color::from_rgb(0.3, 0.6, 1.0))
+                    )
+                    .style(button::text)
+                    .on_press(Message::Streaming(StreamingMessage::OpenScreenshot(
+                        path.to_string()
+                    )))
+                    .padding(0),
+                    tooltip(
+                        button(text("X").size(10))
+                            .on_press(Message::DismissMessage)
+                            .padding([2, 6]),
+                        "Dismiss message",
+                        tooltip::Position::Top,
+                    )
+                    .style(container::bordered_box),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                row![
+                    text(format!("{}{}", prefix, message)).size(12).color(color),
+                    tooltip(
+                        button(text("X").size(10))
+                            .on_press(Message::DismissMessage)
+                            .padding([2, 6]),
+                        "Dismiss message",
+                        tooltip::Position::Top,
+                    )
+                    .style(container::bordered_box),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
         } else {
             text(video_status).size(12).into()
         };
@@ -1908,7 +1940,7 @@ impl Ultimate64Browser {
         container(
             row![
                 status_text,
-                horizontal_space(),
+                Space::new().width(Length::Fill),
                 tooltip(
                     button(text("PAUSE").size(11))
                         .on_press(Message::PauseMachine)
@@ -1916,7 +1948,7 @@ impl Ultimate64Browser {
                     "Pause the C64 CPU",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("RESUME").size(11))
                         .on_press(Message::ResumeMachine)
@@ -1924,7 +1956,7 @@ impl Ultimate64Browser {
                     "Resume the C64 CPU",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 text("|").size(12),
                 tooltip(
                     button(text("RESET").size(11))
@@ -1933,7 +1965,7 @@ impl Ultimate64Browser {
                     "Reset the C64 (soft reset)",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("REBOOT").size(11))
                         .on_press(Message::RebootMachine)
@@ -1941,7 +1973,7 @@ impl Ultimate64Browser {
                     "Reboot the Ultimate64 device",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("POWER OFF").size(11))
                         .on_press(Message::PoweroffMachine)
@@ -1949,10 +1981,10 @@ impl Ultimate64Browser {
                     "Power off the Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(6)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         )
         .padding([8, 15])
         .into()
@@ -2149,6 +2181,7 @@ async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, S
         Err(_) => Err("Connection timed out - device may be offline".to_string()),
     }
 }
+
 impl Drop for Ultimate64Browser {
     fn drop(&mut self) {
         log::info!("Application dropping, cleaning up...");

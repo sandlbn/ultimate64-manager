@@ -1,12 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::widget::image::FilterMethod;
 use iced::{
-    Command, Element, Length, Subscription,
+    Element, Length, Subscription, Task,
     event::{self, Event},
     keyboard::{self, Key, Modifiers},
     widget::{
         Column, Space, button, checkbox, column, container, image as iced_image, mouse_area, row,
-        scrollable, text, text_input, tooltip,
+        rule, scrollable, text, text_input, tooltip,
     },
 };
 
@@ -97,6 +97,7 @@ pub enum StreamingMessage {
     FrameUpdate,
     TakeScreenshot,
     ScreenshotComplete(Result<String, String>),
+    OpenScreenshot(String),
     CommandInputChanged(String),
     SendCommand,
     CommandSent(Result<String, String>),
@@ -202,12 +203,19 @@ impl ScaleMode {
     }
 }
 
+/// Combined frame data and dimensions - must be updated atomically to prevent display corruption
+#[derive(Clone)]
+pub struct ScaledFrame {
+    pub data: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Scaled RGBA for display
-    pub image_buffer: Arc<Mutex<Option<Vec<u8>>>>, // Raw RGBA for screenshots
-    pub frame_dimensions: Arc<Mutex<(u32, u32)>>,  // Current scaled dimensions
-    pub scaled_buffer: Option<Vec<u8>>,            // Scaled frame for display
+    pub frame_buffer: Arc<Mutex<Option<ScaledFrame>>>, // Scaled RGBA + dimensions for display
+    pub current_handle: Option<iced::widget::image::Handle>, // Cached image handle for display
+    pub current_dimensions: (u32, u32),                // Dimensions of current handle
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
     audio_stream_handle: Option<thread::JoinHandle<()>>, // Audio playback thread
@@ -245,9 +253,8 @@ impl VideoStreaming {
         Self {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
-            image_buffer: Arc::new(Mutex::new(None)),
-            frame_dimensions: Arc::new(Mutex::new((VIC_WIDTH * 2, VIC_HEIGHT * 2))),
-            scaled_buffer: None,
+            current_handle: None,
+            current_dimensions: (VIC_WIDTH * 2, VIC_HEIGHT * 2),
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
             audio_stream_handle: None,
@@ -290,45 +297,51 @@ impl VideoStreaming {
         &mut self,
         message: StreamingMessage,
         connection: Option<Arc<TokioMutex<Rest>>>,
-    ) -> Command<StreamingMessage> {
+    ) -> Task<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {
                 self.start_stream();
-                Command::none()
+                Task::none()
             }
             StreamingMessage::StopStream => {
                 self.stop_stream();
-                Command::none()
+                Task::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Frame is already scaled in the receive thread, just copy to display buffer
+                // Create the image Handle here, only once per frame update
+                // This avoids creating new Handles on every view() call
                 if let Ok(fb) = self.frame_buffer.lock() {
-                    if let Some(data) = &*fb {
-                        self.scaled_buffer = Some(data.clone());
+                    if let Some(frame) = &*fb {
+                        self.current_handle = Some(iced::widget::image::Handle::from_rgba(
+                            frame.width,
+                            frame.height,
+                            frame.data.clone(),
+                        ));
+                        self.current_dimensions = (frame.width, frame.height);
                     }
                 }
-                Command::none()
+                Task::none()
             }
             StreamingMessage::TakeScreenshot => {
-                // Take screenshot from the existing image buffer
+                // Take screenshot from the existing scaled frame buffer
                 if !self.is_streaming {
-                    return Command::none();
+                    return Task::none();
                 }
 
-                // Get current frame from buffer
-                let rgba_data = if let Ok(img_guard) = self.image_buffer.lock() {
-                    img_guard.clone()
+                // Get current scaled frame from buffer (includes dimensions)
+                let frame_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
+                    fb_guard.clone()
                 } else {
                     None
                 };
 
-                if let Some(data) = rgba_data {
-                    Command::perform(
-                        save_screenshot_to_pictures(data),
+                if let Some(frame) = frame_data {
+                    Task::perform(
+                        save_screenshot_to_pictures(frame.data, frame.width, frame.height),
                         StreamingMessage::ScreenshotComplete,
                     )
                 } else {
-                    Command::perform(
+                    Task::perform(
                         async { Err("No frame available".to_string()) },
                         StreamingMessage::ScreenshotComplete,
                     )
@@ -336,42 +349,49 @@ impl VideoStreaming {
             }
             StreamingMessage::ScreenshotComplete(_result) => {
                 // Handled by main app for user message display
-                Command::none()
+                Task::none()
+            }
+            StreamingMessage::OpenScreenshot(path) => {
+                // Open the screenshot file in default viewer
+                if let Err(e) = open::that(&path) {
+                    log::warn!("Failed to open screenshot: {}", e);
+                }
+                Task::none()
             }
             StreamingMessage::CommandInputChanged(value) => {
                 self.command_input = value;
-                Command::none()
+                Task::none()
             }
             StreamingMessage::SendCommand => {
                 // Handled by main.rs which has access to the Rest connection
-                Command::none()
+                Task::none()
             }
             StreamingMessage::CommandSent(result) => {
                 match result {
                     Ok(msg) => self.command_history.push(msg),
                     Err(e) => self.command_history.push(format!("Error: {}", e)),
                 }
-                Command::none()
+                Task::none()
             }
             StreamingMessage::StreamModeChanged(mode) => {
                 self.stream_mode = mode;
-                Command::none()
+                Task::none()
             }
             StreamingMessage::ScaleModeChanged(mode) => {
                 self.scale_mode = mode;
                 self.scale_mode_shared
                     .store(mode.to_u8(), Ordering::Relaxed);
-                Command::none()
+                Task::none()
             }
             StreamingMessage::PortChanged(port) => {
                 self.listen_port = port;
-                Command::none()
+                Task::none()
             }
             StreamingMessage::AudioToggled(enabled) => {
                 self.audio_enabled = enabled;
-                Command::none()
+                Task::none()
             }
-            StreamingMessage::ToggleFullscreen => Command::none(),
+            StreamingMessage::ToggleFullscreen => Task::none(),
             StreamingMessage::VideoClicked => {
                 // Check for double-click (within 300ms)
                 let now = std::time::Instant::now();
@@ -379,11 +399,11 @@ impl VideoStreaming {
                     if now.duration_since(last_time).as_millis() < 300 {
                         // Double-click detected
                         self.last_click_time = None;
-                        return Command::perform(async {}, |_| StreamingMessage::ToggleFullscreen);
+                        return Task::perform(async {}, |_| StreamingMessage::ToggleFullscreen);
                     }
                 }
                 self.last_click_time = Some(now);
-                Command::none()
+                Task::none()
             }
 
             // ==================== Keyboard Control Messages ====================
@@ -393,12 +413,12 @@ impl VideoStreaming {
                     "Keyboard capture: {}",
                     if enabled { "ENABLED" } else { "DISABLED" }
                 );
-                Command::none()
+                Task::none()
             }
 
             StreamingMessage::KeyPressed(key, modifiers) => {
                 if !self.keyboard_enabled || !self.is_streaming {
-                    return Command::none();
+                    return Task::none();
                 }
 
                 // Rate limit: minimum 30ms between key sends to avoid flooding API
@@ -407,7 +427,7 @@ impl VideoStreaming {
                 if let Some(last) = self.last_key_time {
                     if now.duration_since(last).as_millis() < MIN_KEY_INTERVAL_MS as u128 {
                         // Too fast, skip this key event
-                        return Command::none();
+                        return Task::none();
                     }
                 }
                 self.last_key_time = Some(now);
@@ -530,7 +550,7 @@ impl VideoStreaming {
                     log::debug!("KEYBOARD: {:?} -> PETSCII {} (0x{:02X})", key, code, code);
 
                     if let Some(conn) = connection {
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // Use timeout to prevent hangs
                                 let result = tokio::time::timeout(
@@ -570,20 +590,20 @@ impl VideoStreaming {
                 } else {
                     log::trace!("KEYBOARD: Key {:?} not mapped", key);
                 }
-                Command::none()
+                Task::none()
             }
 
             StreamingMessage::KeyReleased(_key) => {
                 // For keyboard buffer approach, we don't need to do anything on release
                 // The character was already sent to the buffer on key press
-                Command::none()
+                Task::none()
             }
 
             StreamingMessage::KeySent(result) => {
                 if let Err(e) = result {
                     log::error!("Failed to send key to C64: {}", e);
                 }
-                Command::none()
+                Task::none()
             }
 
             StreamingMessage::UltimateHostChanged(host) => {
@@ -592,47 +612,42 @@ impl VideoStreaming {
                 } else {
                     self.ultimate_host = Some(host);
                 }
-                Command::none()
+                Task::none()
             }
         }
     }
 
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
-        // Image dimensions based on scale mode
-        // In view() and view_fullscreen(), replace the fixed dimensions:
-        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
-            *dims
-        } else {
-            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
-        };
-
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use scaled buffer if available and not in Nearest mode
-            let frame_data = self.scaled_buffer.clone();
-
-            if let Some(rgba_data) = frame_data {
-                let handle =
-                    iced::widget::image::Handle::from_pixels(img_width, img_height, rgba_data);
-
-                mouse_area(
-                    iced_image(handle)
+            // Use cached handle - created once in FrameUpdate, not on every view()
+            if let Some(ref handle) = self.current_handle {
+                // In fullscreen, fill the screen and let ContentFit::Contain handle aspect ratio
+                let video_image = mouse_area(
+                    iced_image(handle.clone())
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain),
+                        .content_fit(iced::ContentFit::Contain)
+                        .filter_method(FilterMethod::Nearest),
                 )
-                .on_press(StreamingMessage::VideoClicked)
-                .into()
+                .on_press(StreamingMessage::VideoClicked);
+
+                container(video_image)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
             } else {
                 text("Waiting for frames...")
                     .size(20)
-                    .style(iced::theme::Text::Color(iced::Color::WHITE))
+                    .color(iced::Color::WHITE)
                     .into()
             }
         } else {
             text("Stream not active - press ESC to exit")
                 .size(20)
-                .style(iced::theme::Text::Color(iced::Color::WHITE))
+                .color(iced::Color::WHITE)
                 .into()
         };
 
@@ -648,9 +663,9 @@ impl VideoStreaming {
         .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
         .padding([6, 12])
         .style(if self.keyboard_enabled {
-            iced::theme::Button::Primary
+            button::primary
         } else {
-            iced::theme::Button::Secondary
+            button::secondary
         });
 
         let exit_hint = container(
@@ -663,7 +678,7 @@ impl VideoStreaming {
             .spacing(10),
         )
         .width(Length::Fill)
-        .center_x()
+        .center_x(Length::Fill)
         .padding(10);
 
         // Black background container with centered video
@@ -672,12 +687,16 @@ impl VideoStreaming {
             container(video_content)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .center_x()
-                .center_y(),
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
         ])
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(iced::theme::Container::Custom(Box::new(BlackBackground)))
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::BLACK)),
+            text_color: Some(iced::Color::WHITE),
+            ..Default::default()
+        })
         .into()
     }
 
@@ -686,34 +705,21 @@ impl VideoStreaming {
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
-        // Image dimensions for the handle (based on scale mode processing)
-        // In view() and view_fullscreen(), replace the fixed dimensions:
-        let (img_width, img_height) = if let Ok(dims) = self.frame_dimensions.lock() {
-            *dims
-        } else {
-            (VIC_WIDTH * 2, VIC_HEIGHT * 2) // fallback
-        };
-
         // === LEFT SIDE: Video display (fluid scaling) ===
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use scaled buffer if available, otherwise fall back to image buffer
-            let frame_data = self.scaled_buffer.clone();
+            // Use cached handle - created once in FrameUpdate, not on every view()
+            if let Some(ref handle) = self.current_handle {
+                let w = self.current_dimensions.0 as f32;
+                let h = self.current_dimensions.1 as f32;
 
-            if let Some(rgba_data) = frame_data {
-                // Create an image handle from RGBA data
-                let handle =
-                    iced::widget::image::Handle::from_pixels(img_width, img_height, rgba_data);
-
-                // Wrap image in mouse_area for double-click fullscreen
-                // Use Length::Fill with ContentFit::Contain for fluid scaling
                 let video_image = mouse_area(
-                    iced_image(handle)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain)
+                    iced_image(handle.clone())
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(h))
                         .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
+
                 let scale_label = match self.scale_mode {
                     ScaleMode::Int2x => "2x",
                     ScaleMode::Int3x => "3x",
@@ -726,8 +732,8 @@ impl VideoStreaming {
                     container(video_image)
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .center_x()
-                        .center_y(),
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill),
                     text(format!(
                         "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
                         VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
@@ -735,18 +741,24 @@ impl VideoStreaming {
                     .size(10),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center)
+                .align_x(iced::Alignment::Center)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
             } else {
                 // Image not decoded yet, show raw frame info
                 if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(frame_data) = &*frame_guard {
+                    if let Some(frame) = &*frame_guard {
                         container(
                             column![
                                 text("RECEIVING FRAMES").size(16),
-                                text(format!("{} bytes", frame_data.len())).size(12),
+                                text(format!(
+                                    "{} bytes ({}x{})",
+                                    frame.data.len(),
+                                    frame.width,
+                                    frame.height
+                                ))
+                                .size(12),
                                 text(format!(
                                     "Video: {} | Audio: {}",
                                     video_packets, audio_packets
@@ -754,12 +766,12 @@ impl VideoStreaming {
                                 .size(12),
                             ]
                             .spacing(5)
-                            .align_items(iced::Alignment::Center),
+                            .align_x(iced::Alignment::Center),
                         )
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .center_x()
-                        .center_y()
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
                         .into()
                     } else {
                         container(
@@ -772,20 +784,20 @@ impl VideoStreaming {
                                 .size(12),
                             ]
                             .spacing(5)
-                            .align_items(iced::Alignment::Center),
+                            .align_x(iced::Alignment::Center),
                         )
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .center_x()
-                        .center_y()
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
                         .into()
                     }
                 } else {
                     container(text("Waiting for frames...").size(14))
                         .width(Length::Fill)
                         .height(Length::Fill)
-                        .center_x()
-                        .center_y()
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill)
                         .into()
                 }
             }
@@ -802,17 +814,17 @@ impl VideoStreaming {
             container(
                 column![
                     text("VIDEO STREAM INACTIVE").size(16),
-                    Space::with_height(10),
-                    text(&status_info).size(11),
-                    Space::with_height(5),
+                    Space::new().height(10),
+                    text(status_info.clone()).size(11),
+                    Space::new().height(5),
                     text("Click START to begin streaming").size(11),
                 ]
-                .align_items(iced::Alignment::Center),
+                .align_x(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x()
-            .center_y()
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
             .into()
         };
 
@@ -827,30 +839,30 @@ impl VideoStreaming {
                         .on_press(StreamingMessage::StreamModeChanged(StreamMode::Unicast))
                         .padding([4, 8])
                         .style(if self.stream_mode == StreamMode::Unicast {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "Direct UDP connection (requires Ethernet, WiFi not supported)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Multicast").size(11))
                         .on_press(StreamingMessage::StreamModeChanged(StreamMode::Multicast))
                         .padding([4, 8])
                         .style(if self.stream_mode == StreamMode::Multicast {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "Multicast 239.0.1.64 (requires wired LAN)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5),
-            Space::with_height(5),
+            Space::new().height(5),
             row![
                 text("Port:").size(11),
                 tooltip(
@@ -861,10 +873,10 @@ impl VideoStreaming {
                     "Video port (audio uses port+1)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(5);
 
@@ -877,40 +889,40 @@ impl VideoStreaming {
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Int2x {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "Integer 2x (sharp pixels)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("3x").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int3x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Int3x {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "Integer 3x (sharp pixels)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Smooth").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scale2x {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "Scale2x edge smoothing",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(3),
             row![
@@ -919,27 +931,27 @@ impl VideoStreaming {
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scanlines {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "CRT scanlines",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("CRT").size(10))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::CRT))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::CRT {
-                            iced::theme::Button::Primary
+                            button::primary
                         } else {
-                            iced::theme::Button::Secondary
+                            button::secondary
                         }),
                     "CRT shadow mask + scanlines",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(3),
         ]
@@ -966,21 +978,21 @@ impl VideoStreaming {
                 .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
                 .padding([6, 10])
                 .style(if self.keyboard_enabled {
-                    iced::theme::Button::Primary
+                    button::primary
                 } else {
-                    iced::theme::Button::Secondary
+                    button::secondary
                 }),
                 "Enable keyboard input to C64 (type in video window)",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
         } else {
             tooltip(
                 button(text("⌨ Disabled").size(11)).padding([6, 10]),
                 "Start streaming first",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
         };
 
         let stream_controls = column![
@@ -994,7 +1006,7 @@ impl VideoStreaming {
                         "Stop video stream",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                 } else {
                     tooltip(
                         button(text("START").size(11))
@@ -1003,7 +1015,7 @@ impl VideoStreaming {
                         "Start video stream",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                 },
                 tooltip(
                     screenshot_button,
@@ -1014,27 +1026,28 @@ impl VideoStreaming {
                     },
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
             row![
                 tooltip(
-                    checkbox("Audio", self.audio_enabled)
+                    checkbox(self.audio_enabled)
+                        .label("Audio")
                         .on_toggle(StreamingMessage::AudioToggled)
                         .size(16)
                         .text_size(11),
                     "Enable audio streaming (port+1)",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 keyboard_button,
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_x(iced::Alignment::Center);
 
         // Command prompt section
         let command_history_items: Vec<Element<'_, StreamingMessage>> = self
@@ -1056,7 +1069,7 @@ impl VideoStreaming {
                     .size(11),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
             button(text("Send").size(11))
                 .on_press(StreamingMessage::SendCommand)
                 .padding([4, 12])
@@ -1070,11 +1083,11 @@ impl VideoStreaming {
         let right_panel = container(
             column![
                 mode_section,
-                iced::widget::horizontal_rule(1),
+                rule::horizontal(1),
                 scale_section,
-                iced::widget::horizontal_rule(1),
+                rule::horizontal(1),
                 stream_controls,
-                iced::widget::horizontal_rule(1),
+                rule::horizontal(1),
                 command_section,
             ]
             .spacing(10)
@@ -1088,9 +1101,9 @@ impl VideoStreaming {
             container(video_display)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .center_x()
-                .center_y(),
-            iced::widget::vertical_rule(1),
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+            rule::vertical(1),
             right_panel,
         ]
         .spacing(10)
@@ -1098,7 +1111,7 @@ impl VideoStreaming {
 
         column![
             text("VIC VIDEO STREAM").size(20),
-            iced::widget::horizontal_rule(1),
+            rule::horizontal(1),
             main_content,
         ]
         .spacing(10)
@@ -1118,7 +1131,7 @@ impl VideoStreaming {
 
         // Keyboard events subscription - only when enabled and streaming
         if self.keyboard_enabled && self.is_streaming {
-            subscriptions.push(event::listen_with(|event, _status| match event {
+            subscriptions.push(event::listen_with(|event, _status, _id| match event {
                 Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     Some(StreamingMessage::KeyPressed(key, modifiers))
                 }
@@ -1146,8 +1159,6 @@ impl VideoStreaming {
 
         // Clone what we need BEFORE the closure
         let frame_buffer = self.frame_buffer.clone();
-        let image_buffer = self.image_buffer.clone();
-        let frame_dimensions = self.frame_dimensions.clone();
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
         let scale_mode_shared = self.scale_mode_shared.clone();
@@ -1334,44 +1345,46 @@ impl VideoStreaming {
 
                         // Frame complete - apply scaling and store
                         if is_frame_end {
-                            // Store raw frame for screenshots
-                            if let Ok(mut img) = image_buffer.lock() {
-                                *img = Some(rgba_frame.clone());
-                            }
+                            // Clone the frame BEFORE scaling - this prevents new packets
+                            // from corrupting the frame while we're scaling it
+                            let frame_snapshot = rgba_frame.clone();
 
-                            // Get current scale mode and apply scaling
+                            // Get current scale mode and apply scaling to the snapshot
                             let current_mode =
                                 ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
 
                             let (scaled, dims) = match current_mode {
                                 ScaleMode::Int2x => (
-                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Int3x => (
-                                    integer_scale(&rgba_frame, VIC_WIDTH, VIC_HEIGHT, 3),
-                                    (VIC_WIDTH * 3, VIC_HEIGHT * 3),
+                                    // WORKAROUND: Use 2x to avoid strobing with large textures
+                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
+                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Scale2x => (
-                                    scale2x(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    scale2x(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Scanlines => (
-                                    apply_scanlines(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    apply_scanlines(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::CRT => (
-                                    apply_crt_effect(&rgba_frame, VIC_WIDTH, VIC_HEIGHT),
+                                    apply_crt_effect(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
-                            }; // Store scaled frame for display
-                            if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(scaled);
-                            }
+                            };
 
-                            // Store dimensions
-                            if let Ok(mut d) = frame_dimensions.lock() {
-                                *d = dims;
+                            // Store scaled frame with dimensions atomically
+                            // This prevents display corruption from dimension/data mismatch
+                            if let Ok(mut fb) = frame_buffer.lock() {
+                                *fb = Some(ScaledFrame {
+                                    data: scaled,
+                                    width: dims.0,
+                                    height: dims.1,
+                                });
                             }
                         }
                     }
@@ -1996,12 +2009,10 @@ impl VideoStreaming {
 
         self.is_streaming = false;
 
-        // Clear frame buffers
+        // Clear frame buffers and handle
+        self.current_handle = None;
         if let Ok(mut frame) = self.frame_buffer.lock() {
             *frame = None;
-        }
-        if let Ok(mut img) = self.image_buffer.lock() {
-            *img = None;
         }
 
         log::info!("All streams stopped");
@@ -2016,23 +2027,12 @@ impl Drop for VideoStreaming {
     }
 }
 
-// Custom style for black background in fullscreen mode
-struct BlackBackground;
-
-impl iced::widget::container::StyleSheet for BlackBackground {
-    type Style = iced::Theme;
-
-    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
-        iced::widget::container::Appearance {
-            background: Some(iced::Background::Color(iced::Color::BLACK)),
-            text_color: Some(iced::Color::WHITE),
-            ..Default::default()
-        }
-    }
-}
-
 /// Save screenshot from existing RGBA buffer to user's Pictures folder
-pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, String> {
+pub async fn save_screenshot_to_pictures(
+    rgba_data: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<String, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let timestamp = SystemTime::now()
@@ -2053,8 +2053,8 @@ pub async fn save_screenshot_to_pictures(rgba_data: Vec<u8>) -> Result<String, S
     let filename = format!("u64_screenshot_{}.png", timestamp);
     let path = screenshot_dir.join(&filename);
 
-    // Create image and save
-    let img = image::RgbaImage::from_raw(VIC_WIDTH, VIC_HEIGHT, rgba_data)
+    // Create image and save using provided dimensions
+    let img = image::RgbaImage::from_raw(width, height, rgba_data)
         .ok_or_else(|| "Failed to create image from frame data".to_string())?;
 
     img.save(&path)

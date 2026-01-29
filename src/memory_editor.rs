@@ -1,8 +1,8 @@
 use iced::{
-    Command, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Row, Space, button, column, container, horizontal_rule, horizontal_space,
-        pick_list, row, scrollable, text, text_input, tooltip,
+        Column, Row, Space, button, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::sync::Arc;
@@ -254,7 +254,7 @@ impl MemoryEditor {
         &mut self,
         message: MemoryEditorMessage,
         connection: Option<Arc<TokioMutex<Rest>>>,
-    ) -> Command<MemoryEditorMessage> {
+    ) -> Task<MemoryEditorMessage> {
         match message {
             MemoryEditorMessage::AddressInputChanged(value) => {
                 // Only allow hex characters
@@ -268,7 +268,7 @@ impl MemoryEditor {
                 if let Ok(addr) = u16::from_str_radix(&self.address_input, 16) {
                     self.current_address = addr;
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::LengthInputChanged(value) => {
@@ -285,7 +285,7 @@ impl MemoryEditor {
                         self.display_length = len;
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::LocationSelected(location) => {
@@ -300,7 +300,7 @@ impl MemoryEditor {
                 if connection.is_some() {
                     return self.update(MemoryEditorMessage::ReadMemory, connection);
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::ReadMemory => {
@@ -310,13 +310,13 @@ impl MemoryEditor {
                     let address = self.current_address;
                     let length = self.display_length;
 
-                    Command::perform(
+                    Task::perform(
                         async move { read_memory_async(conn, address, length).await },
                         MemoryEditorMessage::ReadMemoryComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -336,7 +336,7 @@ impl MemoryEditor {
                         self.status_message = Some(format!("Read failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::ByteClicked(offset) => {
@@ -350,14 +350,14 @@ impl MemoryEditor {
                         });
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteByteValueChanged(value) => {
                 if let Some(edit) = &mut self.editing_byte {
                     edit.new_value_input = value.chars().filter(|c| c.is_ascii_digit()).collect();
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteByteConfirm => {
@@ -371,7 +371,7 @@ impl MemoryEditor {
                         self.status_message =
                             Some(format!("Writing ${:02X} to ${:04X}...", value, address));
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 write_byte_async(conn, address, new_value)
                                     .await
@@ -385,12 +385,12 @@ impl MemoryEditor {
                     }
                 }
                 self.editing_byte = None;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteByteCancel => {
                 self.editing_byte = None;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteByteComplete(result) => {
@@ -417,17 +417,17 @@ impl MemoryEditor {
                     }
                 }
                 self.editing_byte = None;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::DisplayModeChanged(mode) => {
                 self.display_mode = mode;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::SearchInputChanged(value) => {
                 self.search_input = value;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::PerformSearch => {
@@ -444,13 +444,13 @@ impl MemoryEditor {
                         self.search_matches = matches;
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::ClearSearch => {
                 self.search_input.clear();
                 self.search_matches.clear();
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::ClearMemoryView => {
@@ -458,14 +458,14 @@ impl MemoryEditor {
                 self.search_matches.clear();
                 self.editing_byte = None;
                 self.status_message = None;
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::RefreshMemory => {
                 if self.memory_data.is_some() {
                     return self.update(MemoryEditorMessage::ReadMemory, connection);
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::FillValueChanged(value) => {
@@ -475,7 +475,7 @@ impl MemoryEditor {
                     .take(2)
                     .collect();
                 self.fill_value_input = filtered.to_uppercase();
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::FillMemory => {
@@ -487,13 +487,13 @@ impl MemoryEditor {
                         self.status_message =
                             Some(format!("Filling {} bytes with ${:02X}...", length, value));
 
-                        return Command::perform(
+                        return Task::perform(
                             async move { fill_memory_async(conn, address, length, value).await },
                             MemoryEditorMessage::FillComplete,
                         );
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::FillComplete(result) => {
@@ -508,7 +508,7 @@ impl MemoryEditor {
                         self.status_message = Some(format!("Fill failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // Save dump to file
@@ -516,7 +516,7 @@ impl MemoryEditor {
                 if self.memory_data.is_none() {
                     self.status_message =
                         Some("No memory data to save. Read memory first.".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 let default_name = format!(
@@ -526,7 +526,7 @@ impl MemoryEditor {
                         .wrapping_add(self.display_length.saturating_sub(1))
                 );
 
-                Command::perform(
+                Task::perform(
                     async move {
                         rfd::AsyncFileDialog::new()
                             .set_file_name(&default_name)
@@ -545,7 +545,7 @@ impl MemoryEditor {
                     if let Some(data) = &self.memory_data {
                         let data = data.clone();
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // Write binary data
                                 std::fs::write(&path, &data)
@@ -561,7 +561,7 @@ impl MemoryEditor {
                         );
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::SaveDumpComplete(result) => {
@@ -573,11 +573,11 @@ impl MemoryEditor {
                         self.status_message = Some(e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // Load dump from file
-            MemoryEditorMessage::LoadDump => Command::perform(
+            MemoryEditorMessage::LoadDump => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .add_filter("Binary dump", &["bin"])
@@ -591,14 +591,14 @@ impl MemoryEditor {
 
             MemoryEditorMessage::LoadDumpPathSelected(path) => {
                 if let Some(path) = path {
-                    return Command::perform(
+                    return Task::perform(
                         async move {
                             std::fs::read(&path).map_err(|e| format!("Failed to read file: {}", e))
                         },
                         MemoryEditorMessage::LoadDumpComplete,
                     );
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::LoadDumpComplete(result) => {
@@ -615,7 +615,7 @@ impl MemoryEditor {
                         self.status_message = Some(e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteDumpToDevice => {
@@ -626,14 +626,14 @@ impl MemoryEditor {
                     self.status_message =
                         Some(format!("Writing {} bytes to ${:04X}...", len, address));
 
-                    return Command::perform(
+                    return Task::perform(
                         async move { write_memory_async(conn, address, data).await },
                         MemoryEditorMessage::WriteDumpComplete,
                     );
                 } else {
                     self.status_message = Some("No data to write or not connected".to_string());
                 }
-                Command::none()
+                Task::none()
             }
 
             MemoryEditorMessage::WriteDumpComplete(result) => {
@@ -648,7 +648,7 @@ impl MemoryEditor {
                         self.status_message = Some(format!("Write failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
         }
     }
@@ -709,17 +709,17 @@ impl MemoryEditor {
     pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, MemoryEditorMessage> {
         let content: Element<'_, MemoryEditorMessage> = if !is_connected {
             column![
-                Space::with_height(Length::Fill),
-                text("Please connect to your Ultimate64 device first.").size(font_size as u16),
-                Space::with_height(Length::Fill),
+                Space::new().height(Length::Fill),
+                text("Please connect to your Ultimate64 device first.").size(font_size),
+                Space::new().height(Length::Fill),
             ]
-            .align_items(iced::Alignment::Center)
+            .align_x(iced::Alignment::Center)
             .width(Length::Fill)
             .into()
         } else {
             column![
                 self.view_controls(font_size),
-                horizontal_rule(1),
+                rule::horizontal(1),
                 if self.memory_data.is_some() {
                     self.view_memory_display(font_size)
                 } else {
@@ -738,7 +738,7 @@ impl MemoryEditor {
     }
 
     fn view_controls(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let small_font = (font_size as u16).saturating_sub(2);
+        let small_font = font_size.saturating_sub(2);
 
         // Address input
         let address_input = row![
@@ -749,7 +749,7 @@ impl MemoryEditor {
                 .size(small_font),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Length input
         let length_input = row![
@@ -761,7 +761,7 @@ impl MemoryEditor {
             text("bytes").size(small_font),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Read button
         let read_btn = button(text("Read").size(small_font))
@@ -785,15 +785,15 @@ impl MemoryEditor {
         // First row: address, length, read button, quick location
         let first_row = row![
             address_input,
-            Space::with_width(Length::Fixed(20.0)),
+            Space::new().width(Length::Fixed(20.0)),
             length_input,
-            Space::with_width(Length::Fixed(10.0)),
+            Space::new().width(Length::Fixed(10.0)),
             read_btn,
-            Space::with_width(Length::Fixed(20.0)),
+            Space::new().width(Length::Fixed(20.0)),
             location_picker,
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Search input
         let search_row = row![
@@ -815,7 +815,7 @@ impl MemoryEditor {
             button(text("Clear").size(small_font))
                 .on_press(MemoryEditorMessage::ClearSearch)
                 .padding([5, 10]),
-            Space::with_width(Length::Fixed(20.0)),
+            Space::new().width(Length::Fixed(20.0)),
             text("Display:").size(small_font),
             pick_list(
                 vec![
@@ -831,7 +831,7 @@ impl MemoryEditor {
             .width(Length::Fixed(80.0)),
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Fill memory row
         let fill_row = row![
@@ -847,7 +847,7 @@ impl MemoryEditor {
                     Some(MemoryEditorMessage::FillMemory)
                 })
                 .padding([5, 10]),
-            Space::with_width(Length::Fixed(20.0)),
+            Space::new().width(Length::Fixed(20.0)),
             // Save/Load dump buttons
             button(text("Save Dump...").size(small_font))
                 .on_press_maybe(if self.is_loading || self.memory_data.is_none() {
@@ -865,7 +865,7 @@ impl MemoryEditor {
                 .padding([5, 10]),
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Status row with optional "Write to Device" button
         let status_row: Element<'_, MemoryEditorMessage> = if self.pending_load_data.is_some() {
@@ -879,10 +879,8 @@ impl MemoryEditor {
                     self.current_address
                 ))
                 .size(small_font)
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.3, 0.8, 0.3
-                ))),
-                Space::with_width(Length::Fixed(10.0)),
+                .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
+                Space::new().width(Length::Fixed(10.0)),
                 button(text("Write to Device").size(small_font))
                     .on_press_maybe(if self.is_loading {
                         None
@@ -890,11 +888,11 @@ impl MemoryEditor {
                         Some(MemoryEditorMessage::WriteDumpToDevice)
                     })
                     .padding([5, 15])
-                    .style(iced::theme::Button::Primary),
-                horizontal_space(),
+                    .style(button::primary),
+                Space::new().width(Length::Fill),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
             .into()
         } else {
             row![
@@ -903,10 +901,10 @@ impl MemoryEditor {
                 } else {
                     text("").size(small_font)
                 },
-                horizontal_space(),
+                Space::new().width(Length::Fill),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center)
             .into()
         };
 
@@ -916,11 +914,11 @@ impl MemoryEditor {
     }
 
     fn view_memory_display(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let small_font = (font_size as u16).saturating_sub(2);
-        let mono_font = (font_size as u16).saturating_sub(3);
+        let small_font = font_size.saturating_sub(2);
+        let mono_font = font_size.saturating_sub(3);
 
         let Some(data) = &self.memory_data else {
-            return Space::new(Length::Fill, Length::Fill).into();
+            return Space::new().width(Length::Fill).height(Length::Fill).into();
         };
 
         // Header bar
@@ -931,7 +929,7 @@ impl MemoryEditor {
                 data.len()
             ))
             .size(small_font),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             button(text("Refresh").size(small_font))
                 .on_press(MemoryEditorMessage::RefreshMemory)
                 .padding([5, 10]),
@@ -940,7 +938,7 @@ impl MemoryEditor {
                 .padding([5, 10]),
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Build hex display rows
         let mut rows: Vec<Element<'_, MemoryEditorMessage>> = Vec::new();
@@ -956,7 +954,7 @@ impl MemoryEditor {
                     .width(Length::Fixed(24.0)),
             );
         }
-        header_row = header_row.push(Space::with_width(Length::Fixed(10.0)));
+        header_row = header_row.push(Space::new().width(Length::Fixed(10.0)));
         header_row = header_row.push(text("ASCII").size(mono_font));
         rows.push(header_row.spacing(2).into());
 
@@ -969,9 +967,7 @@ impl MemoryEditor {
                 text(format!("{:04X}", row_address))
                     .size(mono_font)
                     .width(Length::Fixed(50.0))
-                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                        0.4, 0.5, 0.9,
-                    ))),
+                    .color(iced::Color::from_rgb(0.4, 0.5, 0.9)),
             );
 
             // Hex bytes
@@ -1006,26 +1002,22 @@ impl MemoryEditor {
 
                 let byte_widget = if is_editing {
                     container(
-                        text(&byte_text)
+                        text(byte_text.clone())
                             .size(mono_font)
-                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                0.0, 0.0, 0.0,
-                            ))),
+                            .color(iced::Color::BLACK),
                     )
-                    .style(iced::theme::Container::Custom(Box::new(EditingStyle)))
+                    .style(editing_style)
                     .width(Length::Fixed(width))
                 } else if is_match {
                     container(
-                        text(&byte_text)
+                        text(byte_text.clone())
                             .size(mono_font)
-                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                0.0, 0.0, 0.0,
-                            ))),
+                            .color(iced::Color::BLACK),
                     )
-                    .style(iced::theme::Container::Custom(Box::new(HighlightStyle)))
+                    .style(highlight_style)
                     .width(Length::Fixed(width))
                 } else {
-                    container(text(&byte_text).size(mono_font)).width(Length::Fixed(width))
+                    container(text(byte_text.clone()).size(mono_font)).width(Length::Fixed(width))
                 };
 
                 let tooltip_text = format!(
@@ -1043,28 +1035,30 @@ impl MemoryEditor {
                     button(byte_widget)
                         .on_press(MemoryEditorMessage::ByteClicked(offset))
                         .padding(0)
-                        .style(iced::theme::Button::Text),
+                        .style(button::text),
                     container(text(tooltip_text).size(small_font))
                         .padding(6)
-                        .style(iced::theme::Container::Custom(Box::new(TooltipStyle))),
+                        .style(tooltip_style),
                     tooltip::Position::Bottom,
                 ));
             }
 
             // Pad remaining columns if less than 16 bytes
             for _ in chunk.len()..16 {
-                data_row = data_row.push(Space::with_width(Length::Fixed(24.0)));
+                data_row = data_row.push(Space::new().width(Length::Fixed(24.0)));
             }
 
             // ASCII representation
-            data_row = data_row.push(Space::with_width(Length::Fixed(10.0)));
+            data_row = data_row.push(Space::new().width(Length::Fixed(10.0)));
             let ascii: String = chunk
                 .iter()
                 .map(|&b| if b >= 32 && b <= 126 { b as char } else { '.' })
                 .collect();
-            data_row = data_row.push(text(ascii).size(mono_font).style(iced::theme::Text::Color(
-                iced::Color::from_rgb(0.6, 0.6, 0.6),
-            )));
+            data_row = data_row.push(
+                text(ascii)
+                    .size(mono_font)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+            );
 
             rows.push(data_row.spacing(2).into());
         }
@@ -1079,8 +1073,8 @@ impl MemoryEditor {
             let address = self.current_address.wrapping_add(edit.offset as u16);
             let dialog = container(
                 column![
-                    text(format!("Edit byte at ${:04X}", address)).size(font_size as u16),
-                    horizontal_rule(1),
+                    text(format!("Edit byte at ${:04X}", address)).size(font_size),
+                    rule::horizontal(1),
                     row![
                         text("Current:").size(small_font),
                         text(format!(
@@ -1118,22 +1112,25 @@ impl MemoryEditor {
                 .spacing(10)
                 .padding(15),
             )
-            .style(iced::theme::Container::Box)
+            .style(container::bordered_box)
             .width(Length::Fixed(300.0));
 
             column![
                 header,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 container(column![
                     memory_content,
-                    container(dialog).width(Length::Fill).center_x().padding(20),
+                    container(dialog)
+                        .width(Length::Fill)
+                        .center_x(Length::Fill)
+                        .padding(20),
                 ])
                 .height(Length::Fill),
             ]
             .spacing(5)
             .into()
         } else {
-            column![header, horizontal_rule(1), memory_content]
+            column![header, rule::horizontal(1), memory_content]
                 .spacing(5)
                 .into()
         };
@@ -1142,15 +1139,13 @@ impl MemoryEditor {
     }
 
     fn view_quick_locations(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let small_font = (font_size as u16).saturating_sub(2);
+        let small_font = font_size.saturating_sub(2);
 
-        let title = text("Common C64 Memory Locations").size((font_size as u16) + 2);
+        let title = text("Common C64 Memory Locations").size(font_size + 2);
 
         let subtitle = text("Click a location to view its contents")
             .size(small_font)
-            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                0.6, 0.6, 0.6,
-            )));
+            .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
 
         // Create location cards in a grid-like layout
         let mut rows: Vec<Element<'_, MemoryEditorMessage>> = Vec::new();
@@ -1162,18 +1157,19 @@ impl MemoryEditor {
                 let card = button(
                     container(
                         column![
-                            text(location.name).size(small_font),
+                            text(location.name)
+                                .size(small_font)
+                                .color(iced::Color::BLACK),
                             text(location.description)
                                 .size(small_font.saturating_sub(2))
-                                .style(iced::theme::Text::Color(iced::Color::BLACK)),
+                                .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             row![
                                 text(format!("${:04X}", location.address))
                                     .size(small_font)
-                                    .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                        0.4, 0.5, 0.9
-                                    ))),
+                                    .color(iced::Color::from_rgb(0.2, 0.3, 0.7)),
                                 text(format!("{} bytes", location.length))
-                                    .size(small_font.saturating_sub(2)),
+                                    .size(small_font.saturating_sub(2))
+                                    .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             ]
                             .spacing(10),
                         ]
@@ -1183,7 +1179,7 @@ impl MemoryEditor {
                     .width(Length::Fill),
                 )
                 .on_press(MemoryEditorMessage::LocationSelected(location.clone()))
-                .style(iced::theme::Button::Secondary)
+                .style(button::secondary)
                 .width(Length::Fill);
 
                 row_items = row_items.push(card);
@@ -1191,7 +1187,7 @@ impl MemoryEditor {
 
             // Pad with empty space if less than 3 items in row
             for _ in chunk.len()..3 {
-                row_items = row_items.push(Space::with_width(Length::Fill));
+                row_items = row_items.push(Space::new().width(Length::Fill));
             }
 
             rows.push(row_items.width(Length::Fill).into());
@@ -1213,56 +1209,44 @@ impl MemoryEditor {
     }
 }
 
-// Custom container styles
-struct HighlightStyle;
-impl iced::widget::container::StyleSheet for HighlightStyle {
-    type Style = iced::Theme;
-
-    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
-        iced::widget::container::Appearance {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(
-                1.0, 1.0, 0.0,
-            ))),
-            border: iced::Border::default(),
-            text_color: Some(iced::Color::BLACK),
-            shadow: iced::Shadow::default(),
-        }
+// Custom container style functions for iced 0.14
+fn highlight_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            1.0, 1.0, 0.0,
+        ))),
+        border: iced::Border::default(),
+        text_color: Some(iced::Color::BLACK),
+        shadow: iced::Shadow::default(),
+        snap: false,
     }
 }
 
-struct EditingStyle;
-impl iced::widget::container::StyleSheet for EditingStyle {
-    type Style = iced::Theme;
-
-    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
-        iced::widget::container::Appearance {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(
-                0.3, 0.8, 0.3,
-            ))),
-            border: iced::Border::default(),
-            text_color: Some(iced::Color::BLACK),
-            shadow: iced::Shadow::default(),
-        }
+fn editing_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            0.3, 0.8, 0.3,
+        ))),
+        border: iced::Border::default(),
+        text_color: Some(iced::Color::BLACK),
+        shadow: iced::Shadow::default(),
+        snap: false,
     }
 }
 
-struct TooltipStyle;
-impl iced::widget::container::StyleSheet for TooltipStyle {
-    type Style = iced::Theme;
-
-    fn appearance(&self, _style: &Self::Style) -> iced::widget::container::Appearance {
-        iced::widget::container::Appearance {
-            background: Some(iced::Background::Color(iced::Color::from_rgb(
-                0.2, 0.2, 0.25,
-            ))),
-            border: iced::Border {
-                color: iced::Color::from_rgb(0.4, 0.4, 0.5),
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            text_color: Some(iced::Color::WHITE),
-            shadow: iced::Shadow::default(),
-        }
+fn tooltip_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb(
+            0.2, 0.2, 0.25,
+        ))),
+        border: iced::Border {
+            color: iced::Color::from_rgb(0.4, 0.4, 0.5),
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        text_color: Some(iced::Color::WHITE),
+        shadow: iced::Shadow::default(),
+        snap: false,
     }
 }
 

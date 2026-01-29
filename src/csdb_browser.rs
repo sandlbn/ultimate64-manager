@@ -8,10 +8,10 @@
 //! - Extracting and browsing ZIP archives
 
 use iced::{
-    Command, Element, Length,
+    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, horizontal_rule, horizontal_space, pick_list,
-        row, scrollable, text, text_input, tooltip,
+        Column, Space, button, column, container, pick_list, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use std::path::PathBuf;
@@ -258,22 +258,22 @@ impl CsdbBrowser {
         &mut self,
         message: CsdbBrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
-    ) -> Command<CsdbBrowserMessage> {
+    ) -> Task<CsdbBrowserMessage> {
         match message {
             CsdbBrowserMessage::SearchInputChanged(value) => {
                 self.search_input = value;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::SearchCategoryChanged(category) => {
                 self.search_category = category;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::SearchSubmit => {
                 if self.search_input.trim().is_empty() {
                     self.status_message = Some("Please enter a search term".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 self.is_loading = true;
@@ -281,7 +281,7 @@ impl CsdbBrowser {
                 let term = self.search_input.clone();
                 let category = self.search_category;
 
-                Command::perform(
+                Task::perform(
                     async move {
                         tokio::time::timeout(
                             tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
@@ -313,14 +313,14 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Search failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::RefreshLatest => {
                 self.is_loading = true;
                 self.status_message = Some("Loading latest releases...".to_string());
 
-                Command::perform(
+                Task::perform(
                     async move {
                         tokio::time::timeout(
                             tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
@@ -352,12 +352,12 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Failed to load: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::TopListCategoryChanged(category) => {
                 self.top_list_category = category;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::LoadTopList => {
@@ -366,7 +366,7 @@ impl CsdbBrowser {
                     Some(format!("Loading {} top list...", self.top_list_category));
                 let category = self.top_list_category;
 
-                Command::perform(
+                Task::perform(
                     async move {
                         tokio::time::timeout(
                             tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
@@ -398,14 +398,14 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Failed to load top list: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::SelectRelease(release_url) => {
                 self.is_loading = true;
                 self.status_message = Some("Loading release details...".to_string());
 
-                Command::perform(
+                Task::perform(
                     async move {
                         tokio::time::timeout(
                             tokio::time::Duration::from_secs(CSDB_TIMEOUT_SECS),
@@ -442,7 +442,7 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Failed to load release: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::CloseReleaseDetails => {
@@ -456,12 +456,12 @@ impl CsdbBrowser {
                 } else {
                     self.view_state = ViewState::LatestReleases;
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::SelectFile(index) => {
                 self.selected_file_index = Some(index);
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::DownloadFile(index) => {
@@ -473,7 +473,7 @@ impl CsdbBrowser {
                         let file = file.clone();
                         let out_dir = self.download_dir.clone();
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 tokio::time::timeout(
                                     tokio::time::Duration::from_secs(120), // 2 minutes for large files
@@ -494,7 +494,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::DownloadCompleted(result) => {
@@ -507,13 +507,13 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Download failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::RunFile(index) => {
                 if connection.is_none() {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 if let Some(release) = &self.current_release {
@@ -527,7 +527,7 @@ impl CsdbBrowser {
                         let device_num = self.selected_drive.device_number().to_string();
                         let is_disk = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
@@ -617,7 +617,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::RunFileCompleted(result) => {
@@ -630,18 +630,18 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Run failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::DriveSelected(drive) => {
                 self.selected_drive = drive;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::MountFile(index, mount_mode) => {
                 if connection.is_none() {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 if let Some(release) = &self.current_release {
@@ -650,7 +650,7 @@ impl CsdbBrowser {
                         if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
                             self.status_message =
                                 Some("Only disk images can be mounted".to_string());
-                            return Command::none();
+                            return Task::none();
                         }
 
                         self.is_loading = true;
@@ -669,7 +669,7 @@ impl CsdbBrowser {
                             MountMode::ReadWrite => ultimate64::drives::MountMode::ReadWrite,
                         };
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // First download the file (separate timeout)
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
@@ -711,7 +711,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::MountCompleted(result) => {
@@ -724,7 +724,7 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Mount failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // ZIP extraction messages
@@ -733,7 +733,7 @@ impl CsdbBrowser {
                     if let Some(file) = release.files.iter().find(|f| f.index == index) {
                         if !is_zip_file(&file.ext) {
                             self.status_message = Some("Not a ZIP file".to_string());
-                            return Command::none();
+                            return Task::none();
                         }
 
                         self.is_loading = true;
@@ -741,7 +741,7 @@ impl CsdbBrowser {
 
                         let file = file.clone();
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // Download the ZIP file
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
@@ -766,7 +766,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::ZipExtracted(result) => {
@@ -787,18 +787,18 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Extraction failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::SelectExtractedFile(index) => {
                 self.selected_extracted_file_index = Some(index);
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::RunExtractedFile(index) => {
                 if connection.is_none() {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 if let Some(extracted) = &self.extracted_zip {
@@ -814,7 +814,7 @@ impl CsdbBrowser {
                         let device_num = self.selected_drive.device_number().to_string();
                         let is_disk = matches!(ext.as_str(), "d64" | "d71" | "d81" | "g64");
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 // Read file from extracted location
                                 let data = tokio::fs::read(&file_path)
@@ -888,7 +888,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::RunExtractedFileCompleted(result) => {
@@ -901,13 +901,13 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Run failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::MountExtractedFile(index, mount_mode) => {
                 if connection.is_none() {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
-                    return Command::none();
+                    return Task::none();
                 }
 
                 if let Some(extracted) = &self.extracted_zip {
@@ -916,7 +916,7 @@ impl CsdbBrowser {
                         if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
                             self.status_message =
                                 Some("Only disk images can be mounted".to_string());
-                            return Command::none();
+                            return Task::none();
                         }
 
                         self.is_loading = true;
@@ -936,7 +936,7 @@ impl CsdbBrowser {
                             MountMode::ReadWrite => ultimate64::drives::MountMode::ReadWrite,
                         };
 
-                        return Command::perform(
+                        return Task::perform(
                             async move {
                                 tokio::time::timeout(
                                     tokio::time::Duration::from_secs(15),
@@ -958,7 +958,7 @@ impl CsdbBrowser {
                     }
                 }
                 self.status_message = Some("No file selected".to_string());
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::MountExtractedFileCompleted(result) => {
@@ -971,19 +971,19 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Mount failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::CloseZipView => {
                 self.extracted_zip = None;
                 self.selected_extracted_file_index = None;
                 self.view_state = ViewState::ReleaseDetails;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::FilterChanged(filter) => {
                 self.file_filter = filter;
-                Command::none()
+                Task::none()
             }
 
             CsdbBrowserMessage::BackToList => {
@@ -998,14 +998,14 @@ impl CsdbBrowser {
                 } else {
                     self.view_state = ViewState::LatestReleases;
                 }
-                Command::none()
+                Task::none()
             }
         }
     }
 
     pub fn view(&self, font_size: u32, is_connected: bool) -> Element<'_, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
 
         // Search bar at top
         let search_bar = row![
@@ -1029,8 +1029,8 @@ impl CsdbBrowser {
                 "Search CSDb",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(15),
+            .style(container::bordered_box),
+            Space::new().width(15),
             tooltip(
                 button(text("Latest").size(normal))
                     .on_press(CsdbBrowserMessage::RefreshLatest)
@@ -1038,8 +1038,8 @@ impl CsdbBrowser {
                 "Load latest releases",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(15),
+            .style(container::bordered_box),
+            Space::new().width(15),
             pick_list(
                 TopListCategory::all_categories(),
                 Some(self.top_list_category),
@@ -1054,10 +1054,10 @@ impl CsdbBrowser {
                 "Load top rated releases",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Main content based on view state
         let content: Element<'_, CsdbBrowserMessage> = match &self.view_state {
@@ -1082,26 +1082,22 @@ impl CsdbBrowser {
         let connection_status = if is_connected {
             text("● Connected")
                 .size(small)
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.2, 0.8, 0.2,
-                )))
+                .color(iced::Color::from_rgb(0.2, 0.8, 0.2))
         } else {
             text("○ Not connected")
                 .size(small)
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.8, 0.5, 0.2,
-                )))
+                .color(iced::Color::from_rgb(0.8, 0.5, 0.2))
         };
 
-        let status_bar = row![status, horizontal_space(), connection_status,]
+        let status_bar = row![status, Space::new().width(Length::Fill), connection_status,]
             .spacing(10)
-            .align_items(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center);
 
         column![
             search_bar,
-            horizontal_rule(1),
+            rule::horizontal(1),
             content,
-            horizontal_rule(1),
+            rule::horizontal(1),
             status_bar,
         ]
         .spacing(5)
@@ -1115,122 +1111,126 @@ impl CsdbBrowser {
         title: &'a str,
         font_size: u32,
     ) -> Element<'a, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
 
         if releases.is_empty() {
             return container(
                 column![
                     text(title).size(normal + 2),
-                    Space::with_height(20),
+                    Space::new().height(20),
                     text("No releases loaded. Click 'Latest' to load recent releases.")
                         .size(normal),
                 ]
                 .spacing(10)
-                .align_items(iced::Alignment::Center),
+                .align_x(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x()
+            .center_x(Length::Fill)
             .padding(20)
             .into();
         }
 
         let header = row![
             text(title).size(normal + 2),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("{} release(s)", releases.len())).size(small),
         ]
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
         for release in releases {
             items.push(self.view_release_item(release, font_size));
-            items.push(horizontal_rule(1).into());
+            items.push(rule::horizontal(1).into());
         }
 
         let list = scrollable(
             Column::with_children(items)
                 .spacing(0)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
-        column![header, horizontal_rule(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_search_results(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
 
         if self.search_results.is_empty() {
             return container(
                 column![
                     text("Search Results").size(normal + 2),
-                    Space::with_height(20),
+                    Space::new().height(20),
                     text("No results found. Try a different search term.").size(normal),
                 ]
                 .spacing(10)
-                .align_items(iced::Alignment::Center),
+                .align_x(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x()
+            .center_x(Length::Fill)
             .padding(20)
             .into();
         }
 
         let header = row![
             text(format!("Search Results: '{}'", self.search_input)).size(normal + 2),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("{} result(s)", self.search_results.len())).size(small),
         ]
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
         for result in &self.search_results {
             items.push(self.view_release_item(result, font_size));
-            items.push(horizontal_rule(1).into());
+            items.push(rule::horizontal(1).into());
         }
 
         let list = scrollable(
             Column::with_children(items)
                 .spacing(0)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
-        column![header, horizontal_rule(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_top_list(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         if self.top_list_entries.is_empty() {
             return container(
                 column![
                     text("Top List").size(normal + 2),
-                    Space::with_height(20),
+                    Space::new().height(20),
                     text("No entries loaded. Select a category and click 'Top List'.").size(normal),
                 ]
                 .spacing(10)
-                .align_items(iced::Alignment::Center),
+                .align_x(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x()
+            .center_x(Length::Fill)
             .padding(20)
             .into();
         }
 
         let header = row![
             text(format!("Top List: {}", self.top_list_category)).size(normal + 2),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("{} entries", self.top_list_entries.len())).size(small),
         ]
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         let mut items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
         for entry in &self.top_list_entries {
@@ -1257,20 +1257,20 @@ impl CsdbBrowser {
                 text(format!("#{:<3}", rank))
                     .size(small)
                     .width(Length::Fixed(45.0))
-                    .style(iced::theme::Text::Color(rank_color)),
+                    .color(rank_color),
                 tooltip(
-                    button(text(&title_display).size(normal))
+                    button(text(title_display.clone()).size(normal))
                         .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
                         .padding([4, 8])
                         .width(Length::Fill)
-                        .style(iced::theme::Button::Text),
+                        .style(button::text),
                     text(title).size(normal),
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center);
 
             // Show author if available
             if let Some(author) = &entry.author {
@@ -1278,9 +1278,7 @@ impl CsdbBrowser {
                     text(format!("by {}", author))
                         .size(tiny)
                         .width(Length::Fixed(120.0))
-                        .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                            0.6, 0.7, 0.8,
-                        ))),
+                        .color(iced::Color::from_rgb(0.6, 0.7, 0.8)),
                 );
             }
 
@@ -1292,21 +1290,23 @@ impl CsdbBrowser {
                     "View release details",
                     tooltip::Position::Left,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             );
 
             items.push(entry_row.padding([4, 0]).into());
-            items.push(horizontal_rule(1).into());
+            items.push(rule::horizontal(1).into());
         }
 
         let list = scrollable(
             Column::with_children(items)
                 .spacing(0)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
-        column![header, horizontal_rule(1), list,].spacing(5).into()
+        column![header, rule::horizontal(1), list,]
+            .spacing(5)
+            .into()
     }
 
     fn view_release_item<'a>(
@@ -1314,9 +1314,9 @@ impl CsdbBrowser {
         release: &'a impl ReleaseItem,
         font_size: u32,
     ) -> Element<'a, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         let title = release.title();
         let url = release.url();
@@ -1324,14 +1324,14 @@ impl CsdbBrowser {
         let rtype = release.release_type();
         let group = release.group();
 
-        let title_display = if title.len() > 30 {
+        let title_display: String = if title.len() > 30 {
             format!("{}...", &title[..27])
         } else {
             title.to_string()
         };
 
         // Type column
-        let type_display = rtype
+        let type_display: String = rtype
             .map(|t| {
                 if t.len() > 16 {
                     format!("{}...", &t[..13])
@@ -1342,7 +1342,7 @@ impl CsdbBrowser {
             .unwrap_or_default();
 
         // Group column
-        let group_display = group
+        let group_display: String = group
             .map(|g| {
                 if g.len() > 18 {
                     format!("{}...", &g[..15])
@@ -1356,31 +1356,25 @@ impl CsdbBrowser {
             text(format!("[{}]", id))
                 .size(tiny)
                 .width(Length::Fixed(70.0))
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.5, 0.5, 0.6
-                ))),
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
             tooltip(
-                button(text(&title_display).size(normal))
+                button(text(title_display).size(normal))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
                     .padding([4, 8])
                     .width(Length::Fixed(250.0))
-                    .style(iced::theme::Button::Text),
-                text(title).size(normal),
+                    .style(button::text),
+                text(title.to_string()).size(normal),
                 tooltip::Position::Top,
             )
-            .style(iced::theme::Container::Box),
-            text(&type_display)
+            .style(container::bordered_box),
+            text(type_display)
                 .size(tiny)
                 .width(Length::Fixed(130.0))
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.6, 0.8, 0.6
-                ))),
-            text(&group_display)
+                .color(iced::Color::from_rgb(0.6, 0.8, 0.6)),
+            text(group_display)
                 .size(tiny)
                 .width(Length::Fill)
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.5, 0.7, 0.9
-                ))),
+                .color(iced::Color::from_rgb(0.5, 0.7, 0.9)),
             tooltip(
                 button(text("View").size(small))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
@@ -1388,10 +1382,10 @@ impl CsdbBrowser {
                 "View release details and files",
                 tooltip::Position::Left,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center)
+        .align_y(iced::Alignment::Center)
         .padding([4, 0])
         .into()
     }
@@ -1401,9 +1395,9 @@ impl CsdbBrowser {
         font_size: u32,
         is_connected: bool,
     ) -> Element<'_, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         let release = match &self.current_release {
             Some(r) => r,
@@ -1411,8 +1405,8 @@ impl CsdbBrowser {
                 return container(text("No release selected").size(normal))
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .center_x()
-                    .center_y()
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
                     .into();
             }
         };
@@ -1426,14 +1420,14 @@ impl CsdbBrowser {
                 "Back to list",
                 tooltip::Position::Right,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(10),
+            .style(container::bordered_box),
+            Space::new().width(10),
             text(&release.title).size(normal + 2),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("ID: {}", release.release_id)).size(small),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Release info
         let mut info_items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
@@ -1463,7 +1457,7 @@ impl CsdbBrowser {
             )
             .text_size(normal)
             .width(Length::Fixed(130.0)),
-            Space::with_width(20),
+            Space::new().width(20),
             text("Mount to:").size(small),
             pick_list(
                 DriveOption::all(),
@@ -1472,11 +1466,11 @@ impl CsdbBrowser {
             )
             .text_size(normal)
             .width(Length::Fixed(110.0)),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("{} file(s)", release.files.len())).size(small),
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // File list
         let filtered_files: Vec<&ReleaseFile> = release
@@ -1523,26 +1517,26 @@ impl CsdbBrowser {
                         .size(tiny)
                         .width(Length::Fixed(30.0)),
                     tooltip(
-                        button(text(&filename_display).size(normal))
+                        button(text(filename_display.clone()).size(normal))
                             .on_press(CsdbBrowserMessage::SelectFile(file.index))
                             .padding([4, 8])
                             .width(Length::Fill)
                             .style(if is_selected {
-                                iced::theme::Button::Primary
+                                button::primary
                             } else {
-                                iced::theme::Button::Text
+                                button::text
                             }),
                         text(&file.filename).size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     text(file.ext.to_uppercase())
                         .size(tiny)
                         .width(Length::Fixed(40.0))
-                        .style(iced::theme::Text::Color(ext_color)),
+                        .color(ext_color),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Download button (always available)
                 file_row = file_row.push(
@@ -1553,7 +1547,7 @@ impl CsdbBrowser {
                         "Download file",
                         tooltip::Position::Left,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 );
 
                 // Extract button for ZIP files
@@ -1566,7 +1560,7 @@ impl CsdbBrowser {
                             "Extract ZIP and browse contents",
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
                 }
 
@@ -1586,7 +1580,7 @@ impl CsdbBrowser {
                                 .size(normal),
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
 
                     file_row = file_row.push(
@@ -1601,7 +1595,7 @@ impl CsdbBrowser {
                                 .size(normal),
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
                 }
 
@@ -1619,29 +1613,29 @@ impl CsdbBrowser {
                             },
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
                 }
 
                 file_items.push(file_row.padding([2, 0]).into());
-                file_items.push(horizontal_rule(1).into());
+                file_items.push(rule::horizontal(1).into());
             }
         }
 
         let file_list = scrollable(
             Column::with_children(file_items)
                 .spacing(0)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
         column![
             header,
-            horizontal_rule(1),
+            rule::horizontal(1),
             info_row,
-            horizontal_rule(1),
+            rule::horizontal(1),
             filter_row,
-            horizontal_rule(1),
+            rule::horizontal(1),
             file_list,
         ]
         .spacing(5)
@@ -1654,9 +1648,9 @@ impl CsdbBrowser {
         font_size: u32,
         is_connected: bool,
     ) -> Element<'_, CsdbBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         let extracted = match &self.extracted_zip {
             Some(e) => e,
@@ -1664,8 +1658,8 @@ impl CsdbBrowser {
                 return container(text("No ZIP extracted").size(normal))
                     .width(Length::Fill)
                     .height(Length::Fill)
-                    .center_x()
-                    .center_y()
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
                     .into();
             }
         };
@@ -1679,14 +1673,14 @@ impl CsdbBrowser {
                 "Back to release",
                 tooltip::Position::Right,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(10),
+            .style(container::bordered_box),
+            Space::new().width(10),
             text(format!("📦 {}", extracted.source_filename)).size(normal + 2),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("{} file(s)", extracted.files.len())).size(small),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Drive selector row
         let drive_row = row![
@@ -1698,15 +1692,13 @@ impl CsdbBrowser {
             )
             .text_size(normal)
             .width(Length::Fixed(110.0)),
-            horizontal_space(),
+            Space::new().width(Length::Fill),
             text(format!("Extracted to: {}", extracted.extract_dir.display()))
                 .size(tiny)
-                .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                    0.5, 0.5, 0.6
-                ))),
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
         ]
         .spacing(10)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // File list
         let mut file_items: Vec<Element<'_, CsdbBrowserMessage>> = Vec::new();
@@ -1754,29 +1746,30 @@ impl CsdbBrowser {
                         .size(tiny)
                         .width(Length::Fixed(30.0)),
                     tooltip(
-                        button(text(&filename_display).size(normal))
+                        button(text(filename_display.clone()).size(normal))
                             .on_press(CsdbBrowserMessage::SelectExtractedFile(file.index))
                             .padding([4, 8])
                             .width(Length::Fill)
                             .style(if is_selected {
-                                iced::theme::Button::Primary
+                                button::primary
                             } else {
-                                iced::theme::Button::Text
+                                button::text
                             }),
                         text(&file.filename).size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     text(file.ext.to_uppercase())
                         .size(tiny)
                         .width(Length::Fixed(40.0))
-                        .style(iced::theme::Text::Color(ext_color)),
-                    text(&size_str).size(tiny).width(Length::Fixed(70.0)).style(
-                        iced::theme::Text::Color(iced::Color::from_rgb(0.6, 0.6, 0.6))
-                    ),
+                        .color(ext_color),
+                    text(size_str.clone())
+                        .size(tiny)
+                        .width(Length::Fixed(70.0))
+                        .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Mount buttons for disk images (when connected)
                 if is_disk_image && is_connected {
@@ -1794,7 +1787,7 @@ impl CsdbBrowser {
                                 .size(normal),
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
 
                     file_row = file_row.push(
@@ -1809,7 +1802,7 @@ impl CsdbBrowser {
                                 .size(normal),
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
                 }
 
@@ -1827,27 +1820,27 @@ impl CsdbBrowser {
                             },
                             tooltip::Position::Left,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     );
                 }
 
                 file_items.push(file_row.padding([2, 0]).into());
-                file_items.push(horizontal_rule(1).into());
+                file_items.push(rule::horizontal(1).into());
             }
         }
 
         let file_list = scrollable(
             Column::with_children(file_items)
                 .spacing(0)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
         column![
             header,
-            horizontal_rule(1),
+            rule::horizontal(1),
             drive_row,
-            horizontal_rule(1),
+            rule::horizontal(1),
             file_list,
         ]
         .spacing(5)

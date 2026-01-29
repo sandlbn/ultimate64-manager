@@ -7,7 +7,7 @@ authors = ["Marcin Spoczynski"]
 license = "MIT"
 
 [dependencies]
-iced = { version = "0.12.1", features = ["tokio", "image", "canvas"] }
+iced = { version = "0.14.0", features = ["tokio", "image", "canvas"] }
 tokio = { version = "1", features = ["full"] }
 ultimate64 = "0.5.5"
 anyhow = "1.0"
