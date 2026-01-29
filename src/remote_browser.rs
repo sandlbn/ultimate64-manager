@@ -1,8 +1,8 @@
 use iced::{
-    Command, Element, Length,
+    Task, Element, Length,
     widget::{
-        Column, Space, button, column, container, horizontal_rule, row, scrollable, text,
-        text_input, tooltip,
+        Column, Space, button, column, container, row, scrollable, text,
+        text_input, tooltip, rule,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -133,7 +133,7 @@ impl RemoteBrowser {
         &mut self,
         message: RemoteBrowserMessage,
         _connection: Option<Arc<Mutex<Rest>>>,
-    ) -> Command<RemoteBrowserMessage> {
+    ) -> Task<RemoteBrowserMessage> {
         match message {
             RemoteBrowserMessage::RefreshFiles => {
                 if let Some(host) = &self.host_address {
@@ -142,14 +142,14 @@ impl RemoteBrowser {
                     let path = self.current_path.clone();
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         fetch_files_ftp(host, path, password),
                         RemoteBrowserMessage::FilesLoaded,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
                     self.is_connected = false;
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -165,7 +165,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("{}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::FileSelected(path) => {
@@ -179,7 +179,7 @@ impl RemoteBrowser {
                         self.selected_file = Some(path);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::NavigateUp => {
@@ -192,7 +192,7 @@ impl RemoteBrowser {
                     }
                     return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::NavigateToPath(path) => {
@@ -205,13 +205,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Downloading...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         download_file_ftp(host, remote_path, password),
                         RemoteBrowserMessage::DownloadComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -224,7 +224,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("Download failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::UploadFile(local_path, remote_dest) => {
@@ -232,13 +232,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Uploading...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         upload_file_ftp(host, local_path, remote_dest, password),
                         RemoteBrowserMessage::UploadComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -252,7 +252,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("Upload failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::UploadDirectory(local_path, remote_dest) => {
@@ -260,13 +260,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Uploading directory...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         upload_directory_ftp(host, local_path, remote_dest, password),
                         RemoteBrowserMessage::UploadDirectoryComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -280,7 +280,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("Directory upload failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::RunPrg(path) => {
@@ -288,13 +288,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Running PRG...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::run_prg(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -303,13 +303,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Running CRT...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::run_crt(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -318,13 +318,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Playing SID...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::sidplay(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -333,13 +333,13 @@ impl RemoteBrowser {
                     self.status_message = Some("Playing MOD...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::modplay(&host, &path, password).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -352,7 +352,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("Failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::MountDisk(path, drive, mode) => {
@@ -361,13 +361,13 @@ impl RemoteBrowser {
                         Some(format!("Mounting to drive {}...", drive.to_uppercase()));
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::mount_disk(&host, &path, &drive, &mode, password).await },
                         RemoteBrowserMessage::MountComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -380,7 +380,7 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("Mount failed: {}", e));
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::RunDisk(path, drive) => {
@@ -390,19 +390,19 @@ impl RemoteBrowser {
                     let host = host.clone();
                     let password = self.password.clone();
                     let conn = _connection.clone();
-                    Command::perform(
+                    Task::perform(
                         async move { api::run_disk(&host, &path, &drive, password, conn).await },
                         RemoteBrowserMessage::MountComplete, // Reuse MountComplete for result
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
             RemoteBrowserMessage::FilterChanged(value) => {
                 self.filter = value;
-                Command::none()
+                Task::none()
             }
 
             // Disk info popup messages
@@ -412,13 +412,13 @@ impl RemoteBrowser {
                     self.disk_info_path = Some(path.clone());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         load_remote_disk_info(host, path, password),
                         RemoteBrowserMessage::DiskInfoLoaded,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -433,13 +433,13 @@ impl RemoteBrowser {
                         self.disk_info_path = None;
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::CloseDiskInfo => {
                 self.disk_info_popup = None;
                 self.disk_info_path = None;
-                Command::none()
+                Task::none()
             }
 
             // Content preview popup messages (text/image files)
@@ -452,13 +452,13 @@ impl RemoteBrowser {
                     self.content_preview_path = Some(path.clone());
                     let host = host.clone();
                     let password = self.password.clone();
-                    Command::perform(
+                    Task::perform(
                         load_remote_content_preview(host, path, password),
                         RemoteBrowserMessage::ContentPreviewLoaded,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -473,21 +473,21 @@ impl RemoteBrowser {
                         self.content_preview_path = None;
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             RemoteBrowserMessage::CloseContentPreview => {
                 self.content_preview = None;
                 self.content_preview_path = None;
-                Command::none()
+                Task::none()
             }
         }
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8) ;
+        let normal = font_size ;
+        let tiny = (font_size.saturating_sub(3)).max(7) ;
 
         // Path display
         let display_path = if self.current_path.len() > 35 {
@@ -505,8 +505,8 @@ impl RemoteBrowser {
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
-            Space::with_width(Length::Fill),
+            .style(container::bordered_box),
+            Space::new().width(Length::Fill),
             text("Filter:").size(small),
             text_input("filter...", &self.filter)
                 .on_input(RemoteBrowserMessage::FilterChanged)
@@ -515,7 +515,7 @@ impl RemoteBrowser {
                 .width(Length::Fixed(100.0)),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Quick navigation to common paths
         let quick_nav = row![
@@ -526,7 +526,7 @@ impl RemoteBrowser {
                 "Root directory",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("Usb0").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/Usb0".to_string()))
@@ -534,7 +534,7 @@ impl RemoteBrowser {
                 "USB Drive 0",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("Usb1").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/Usb1".to_string()))
@@ -542,7 +542,7 @@ impl RemoteBrowser {
                 "USB Drive 1",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("SD").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
@@ -550,7 +550,7 @@ impl RemoteBrowser {
                 "SD Card",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(3);
 
@@ -571,7 +571,7 @@ impl RemoteBrowser {
                 .padding(5)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_items(iced::Alignment::Center)
+                .align_x(iced::Alignment::Center)
                 .into();
         }
         // Show loading panel while downloading content for preview
@@ -582,20 +582,20 @@ impl RemoteBrowser {
                     text(self.content_preview_path.as_deref().unwrap_or("")).size(small),
                 ]
                 .spacing(10)
-                .align_items(iced::Alignment::Center),
+                .align_x(iced::Alignment::Center),
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .style(iced::theme::Container::Box);
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(container::bordered_box);
 
             return column![nav_buttons, quick_nav, path_display, status, loading_panel,]
                 .spacing(5)
                 .padding(5)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_items(iced::Alignment::Center)
+                .align_x(iced::Alignment::Center)
                 .into();
         }
         // If content preview popup is open, show it instead of the file list
@@ -607,7 +607,7 @@ impl RemoteBrowser {
                 .padding(5)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_items(iced::Alignment::Center)
+                .align_x(iced::Alignment::Center)
                 .into();
         }
 
@@ -638,7 +638,7 @@ impl RemoteBrowser {
             for (i, entry) in filtered_files.iter().enumerate() {
                 if i > 0 {
                     // Add divider between rows
-                    items.push(horizontal_rule(1).into());
+                    items.push(rule::horizontal(1).into());
                 }
 
                 // File type label
@@ -677,7 +677,7 @@ impl RemoteBrowser {
                         "Open folder",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if ext.ends_with(".prg") {
                     tooltip(
@@ -687,7 +687,7 @@ impl RemoteBrowser {
                         "Load and run PRG file",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if ext.ends_with(".crt") {
                     tooltip(
@@ -697,7 +697,7 @@ impl RemoteBrowser {
                         "Load cartridge image",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if ext.ends_with(".sid") {
                     tooltip(
@@ -707,7 +707,7 @@ impl RemoteBrowser {
                         "Play SID music",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m") {
                     tooltip(
@@ -717,7 +717,7 @@ impl RemoteBrowser {
                         "Play MOD/tracker music",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if ext.ends_with(".d64")
                     || ext.ends_with(".g64")
@@ -740,7 +740,7 @@ impl RemoteBrowser {
                                 "Show disk directory listing",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         );
                     }
 
@@ -756,7 +756,7 @@ impl RemoteBrowser {
                                 "Mount, reset & LOAD\"*\",8,1",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
@@ -770,7 +770,7 @@ impl RemoteBrowser {
                                 "Mount to Drive A (Read/Write)",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
@@ -784,7 +784,7 @@ impl RemoteBrowser {
                                 "Mount to Drive A (Read Only)",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
@@ -798,7 +798,7 @@ impl RemoteBrowser {
                                 "Mount to Drive B (Read/Write)",
                                 tooltip::Position::Top,
                             )
-                            .style(iced::theme::Container::Box),
+                            .style(container::bordered_box),
                         );
 
                     buttons.into()
@@ -810,7 +810,7 @@ impl RemoteBrowser {
                         "View text content",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if is_image_file {
                     tooltip(
@@ -820,7 +820,7 @@ impl RemoteBrowser {
                         "View image",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else if is_pdf_file {
                     tooltip(
@@ -830,19 +830,19 @@ impl RemoteBrowser {
                         "View PDF",
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else {
-                    iced::widget::Space::with_width(0).into()
+                    iced::widget::Space::new().width(0).into()
                 };
 
                 // Wrap filename in tooltip if truncated to show full name
                 let is_truncated = entry.name.len() > max_name_len;
-                let filename_button = button(text(&display_name).size(normal))
+                let filename_button = button(text(display_name.clone()).size(normal))
                     .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
                     .padding([4, 6])
                     .width(Length::Fill)
-                    .style(iced::theme::Button::Text);
+                    .style(button::text);
 
                 let filename_element: Element<'_, RemoteBrowserMessage> = if is_truncated {
                     tooltip(
@@ -850,7 +850,7 @@ impl RemoteBrowser {
                         text(&entry.name).size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(iced::theme::Container::Box)
+                    .style(container::bordered_box)
                     .into()
                 } else {
                     filename_button.into()
@@ -865,7 +865,7 @@ impl RemoteBrowser {
                     action_button,
                 ]
                 .spacing(4)
-                .align_items(iced::Alignment::Center)
+                .align_y(iced::Alignment::Center)
                 .padding([2, 4]);
 
                 items.push(file_row.into());
@@ -874,7 +874,7 @@ impl RemoteBrowser {
             scrollable(
                 Column::with_children(items)
                     .spacing(0)
-                    .padding([0, 12, 0, 0]), // Right padding for scrollbar clearance
+                    .padding(iced::Padding::ZERO.right(12)), // Right padding for scrollbar clearance
             )
             .height(Length::Fill)
             .into()
@@ -885,7 +885,7 @@ impl RemoteBrowser {
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_items(iced::Alignment::Center)
+            .align_x(iced::Alignment::Center)
             .into()
     }
 
@@ -894,17 +894,17 @@ impl RemoteBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+        let small = (font_size.saturating_sub(2)).max(8) ;
+        let normal = font_size ;
+        let tiny = (font_size.saturating_sub(3)).max(7) ;
 
         // Header with disk name and close button
         let header = row![
             text(format!("{} - ", disk_info.kind)).size(small),
             text(format!("\"{}\"", disk_info.name)).size(normal),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             text(format!("{} {}", disk_info.disk_id, disk_info.dos_type)).size(small),
-            Space::with_width(10),
+            Space::new().width(10),
             tooltip(
                 button(text("Close").size(small))
                     .on_press(RemoteBrowserMessage::CloseDiskInfo)
@@ -912,10 +912,10 @@ impl RemoteBrowser {
                 "Close directory listing",
                 tooltip::Position::Left,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Directory listing
         let mut listing_items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
@@ -943,10 +943,10 @@ impl RemoteBrowser {
                     closed_indicator, entry.file_type, lock_indicator
                 ))
                 .size(tiny)
-                .style(iced::theme::Text::Color(type_color)),
+                .color(type_color),
             ]
             .spacing(5)
-            .align_items(iced::Alignment::Center);
+            .align_y(iced::Alignment::Center);
 
             listing_items.push(entry_row.into());
         }
@@ -954,7 +954,7 @@ impl RemoteBrowser {
         // Footer with blocks free
         let footer = row![
             text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(small),
-            Space::with_width(Length::Fill),
+            Space::new().width(Length::Fill),
             text(format!("{} files", disk_info.entries.len())).size(tiny),
         ]
         .spacing(10);
@@ -963,7 +963,7 @@ impl RemoteBrowser {
         let listing = scrollable(
             Column::with_children(listing_items)
                 .spacing(2)
-                .padding([0, 12, 0, 0]),
+                .padding(iced::Padding::ZERO.right(12)),
         )
         .height(Length::Fill);
 
@@ -971,9 +971,9 @@ impl RemoteBrowser {
         container(
             column![
                 header,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 listing,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 footer,
             ]
             .spacing(5)
@@ -981,18 +981,18 @@ impl RemoteBrowser {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(iced::theme::Container::Box)
+        .style(container::bordered_box)
         .into()
     }
 
-    fn view_content_preview_popup(
-        &self,
-        content: &ContentPreview,
+    fn view_content_preview_popup<'a>(
+        &'a self,
+        content: &'a ContentPreview,
         font_size: u32,
-    ) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+    ) -> Element<'a, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8) ;
+        let normal = font_size ;
+        let tiny = (font_size.saturating_sub(3)).max(7) ;
 
         match content {
             ContentPreview::Text {
@@ -1010,10 +1010,10 @@ impl RemoteBrowser {
                 // Header with filename and close button
                 let header = row![
                     text("TEXT - ").size(small),
-                    text(&display_name).size(normal),
-                    Space::with_width(Length::Fill),
+                    text(display_name.clone()).size(normal),
+                    Space::new().width(Length::Fill),
                     text(format!("{} lines", line_count)).size(small),
-                    Space::with_width(10),
+                    Space::new().width(10),
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(RemoteBrowserMessage::CloseContentPreview)
@@ -1021,10 +1021,10 @@ impl RemoteBrowser {
                         "Close text preview",
                         tooltip::Position::Left,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Text content with line numbers
                 let mut text_lines: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
@@ -1033,9 +1033,7 @@ impl RemoteBrowser {
                         text(format!("{:>4}", i + 1))
                             .size(tiny)
                             .width(Length::Fixed(35.0))
-                            .style(iced::theme::Text::Color(iced::Color::from_rgb(
-                                0.5, 0.5, 0.5
-                            ))),
+                            .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                         text(line).size(tiny),
                     ]
                     .spacing(10);
@@ -1046,19 +1044,19 @@ impl RemoteBrowser {
                 let text_content = scrollable(
                     Column::with_children(text_lines)
                         .spacing(2)
-                        .padding([0, 12, 0, 0]),
+                        .padding(iced::Padding::ZERO.right(12)),
                 )
                 .height(Length::Fill);
 
                 // Popup container
                 container(
-                    column![header, horizontal_rule(1), text_content,]
+                    column![header, rule::horizontal(1), text_content,]
                         .spacing(5)
                         .padding(10),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(iced::theme::Container::Box)
+                .style(container::bordered_box)
                 .into()
             }
             ContentPreview::Image {
@@ -1077,10 +1075,10 @@ impl RemoteBrowser {
                 // Header with filename and close button
                 let header = row![
                     text("IMAGE - ").size(small),
-                    text(&display_name).size(normal),
-                    Space::with_width(Length::Fill),
+                    text(display_name.clone()).size(normal),
+                    Space::new().width(Length::Fill),
                     text(format!("{}x{}", width, height)).size(small),
-                    Space::with_width(10),
+                    Space::new().width(10),
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(RemoteBrowserMessage::CloseContentPreview)
@@ -1088,13 +1086,13 @@ impl RemoteBrowser {
                         "Close image preview",
                         tooltip::Position::Left,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center);
+                .align_y(iced::Alignment::Center);
 
                 // Image display using iced's image widget
-                let image_handle = iced::widget::image::Handle::from_memory(data.clone());
+                let image_handle = iced::widget::image::Handle::from_bytes(data.clone());
                 let image_widget = iced::widget::image(image_handle)
                     .width(Length::Fill)
                     .height(Length::Fill);
@@ -1103,19 +1101,19 @@ impl RemoteBrowser {
                 container(
                     column![
                         header,
-                        horizontal_rule(1),
+                        rule::horizontal(1),
                         container(image_widget)
                             .width(Length::Fill)
                             .height(Length::Fill)
-                            .center_x()
-                            .center_y(),
+                            .center_x(Length::Fill)
+                            .center_y(Length::Fill),
                     ]
                     .spacing(5)
                     .padding(10),
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(iced::theme::Container::Box)
+                .style(container::bordered_box)
                 .into()
             }
         }
@@ -1370,7 +1368,9 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
     }
 
     None
-} // Download file via FTP with longer timeout for previews
+}
+
+// Download file via FTP with longer timeout for previews
 async fn download_file_ftp_preview(
     host: String,
     remote_path: String,
@@ -1442,6 +1442,7 @@ async fn download_file_ftp_preview(
         Err(_) => Err("Download timed out - file may be too large".to_string()),
     }
 }
+
 // Download file via FTP
 async fn download_file_ftp(
     host: String,
@@ -1781,10 +1782,11 @@ async fn load_remote_disk_info(
         .await
         .map_err(|e| format!("Task error: {}", e))?
 }
+
 fn is_remote_pdf_file(name: &str) -> bool {
     name.to_lowercase().ends_with(".pdf")
 }
-/// Download a remote file via FTP and create a content preview
+
 /// Download a remote file via FTP and create a content preview
 async fn load_remote_content_preview(
     host: String,

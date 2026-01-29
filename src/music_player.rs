@@ -1,9 +1,9 @@
 use crate::mod_info;
 use iced::{
-    Command, Element, Length, Subscription,
+    Task, Element, Length, Subscription,
     widget::{
-        Column, Space, button, column, container, horizontal_rule, progress_bar, row, scrollable,
-        text, text_input, tooltip, vertical_rule,
+        Column, Space, button, column, container, progress_bar, row, scrollable,
+        text, text_input, tooltip, rule,
     },
 };
 use rand::seq::SliceRandom;
@@ -270,7 +270,7 @@ impl MusicPlayer {
         &mut self,
         message: MusicPlayerMessage,
         connection: Option<Arc<Mutex<Rest>>>,
-    ) -> Command<MusicPlayerMessage> {
+    ) -> Task<MusicPlayerMessage> {
         match message {
             // === Playback Controls ===
             MusicPlayerMessage::Play => {
@@ -291,7 +291,7 @@ impl MusicPlayer {
                             };
                             self.status_message = format!("Playing: {}", now_playing);
 
-                            return Command::none();
+                            return Task::none();
                         }
                     }
                 }
@@ -321,7 +321,7 @@ impl MusicPlayer {
                             let path = entry.path.clone();
                             let subsong = self.current_subsong;
                             let file_type = entry.file_type.clone();
-                            return Command::perform(
+                            return Task::perform(
                                 play_music_file(conn, path, Some(subsong), file_type),
                                 MusicPlayerMessage::PlaybackCompleted,
                             );
@@ -333,14 +333,14 @@ impl MusicPlayer {
                     self.elapsed_seconds = 0;
                     return self.update(MusicPlayerMessage::Play, connection);
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::Pause => {
                 self.playback_state = PlaybackState::Paused;
                 self.status_message = "Paused".to_string();
                 // Note: main.rs intercepts this and calls the machine pause API
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::Stop => {
@@ -351,7 +351,7 @@ impl MusicPlayer {
 
                 // Reset the Commodore to stop SID playback
                 if let Some(conn) = connection {
-                    return Command::perform(
+                    return Task::perform(
                         async move {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
@@ -378,7 +378,7 @@ impl MusicPlayer {
                         },
                     );
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::NextSubsong => {
@@ -407,7 +407,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::PreviousSubsong => {
@@ -436,7 +436,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::NextFile => {
@@ -448,7 +448,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::PreviousFile => {
@@ -460,7 +460,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::ToggleShuffle => {
@@ -468,16 +468,16 @@ impl MusicPlayer {
                 if self.shuffle_enabled {
                     self.generate_shuffle_order();
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::ToggleRepeat => {
                 self.repeat_enabled = !self.repeat_enabled;
-                Command::none()
+                Task::none()
             }
 
             // === File Browser ===
-            MusicPlayerMessage::SelectDirectory => Command::perform(
+            MusicPlayerMessage::SelectDirectory => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .pick_folder()
@@ -497,14 +497,14 @@ impl MusicPlayer {
                 self.browser_directory = path.clone();
                 self.browser_selected = None;
                 self.load_browser_entries(&path);
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::NavigateToDirectory(path) => {
                 self.browser_directory = path.clone();
                 self.browser_selected = None;
                 self.load_browser_entries(&path);
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::NavigateUp => {
@@ -514,18 +514,18 @@ impl MusicPlayer {
                     self.browser_selected = None;
                     self.load_browser_entries(&parent);
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::RefreshBrowser => {
                 self.browser_selected = None;
                 self.load_browser_entries(&self.browser_directory.clone());
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::BrowserFilterChanged(value) => {
                 self.browser_filter = value;
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::BrowserItemClicked(index) => {
@@ -551,7 +551,7 @@ impl MusicPlayer {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // === Playlist Management ===
@@ -564,7 +564,7 @@ impl MusicPlayer {
                         self.status_message = format!("Added: {}", name);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::AddAndPlay(index) => {
@@ -585,7 +585,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::AddAllToPlaylist => {
@@ -614,7 +614,7 @@ impl MusicPlayer {
                 } else {
                     self.status_message = "No music files in current directory".to_string();
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::RemoveFromPlaylist(index) => {
@@ -632,7 +632,7 @@ impl MusicPlayer {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::ClearPlaylist => {
@@ -641,12 +641,12 @@ impl MusicPlayer {
                 self.playlist_selected = None;
                 self.playback_state = PlaybackState::Stopped;
                 self.status_message = "Playlist cleared".to_string();
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::PlaylistItemSelected(index) => {
                 self.playlist_selected = Some(index);
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::PlaylistItemDoubleClick(index) => {
@@ -671,7 +671,7 @@ impl MusicPlayer {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::MovePlaylistItemDown(index) => {
@@ -688,13 +688,13 @@ impl MusicPlayer {
                         }
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // === Playlist Save/Load ===
             MusicPlayerMessage::PlaylistNameChanged(name) => {
                 self.playlist_name = name;
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::SavePlaylist => {
@@ -703,14 +703,14 @@ impl MusicPlayer {
                     entries: self.playlist.clone(),
                 };
 
-                Command::perform(
+                Task::perform(
                     save_playlist_async(playlist),
                     MusicPlayerMessage::PlaylistSaved,
                 )
             }
 
             MusicPlayerMessage::LoadPlaylist => {
-                Command::perform(load_playlist_async(), MusicPlayerMessage::PlaylistLoaded)
+                Task::perform(load_playlist_async(), MusicPlayerMessage::PlaylistLoaded)
             }
 
             MusicPlayerMessage::PlaylistSaved(result) => {
@@ -722,7 +722,7 @@ impl MusicPlayer {
                         self.status_message = format!("Save failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::PlaylistLoaded(result) => {
@@ -763,13 +763,13 @@ impl MusicPlayer {
                         self.status_message = format!("Load failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // === Song Length Database ===
             MusicPlayerMessage::DownloadSongLengths => {
                 self.song_lengths_status = "Downloading song lengths database...".to_string();
-                Command::perform(
+                Task::perform(
                     download_song_lengths_async(),
                     MusicPlayerMessage::SongLengthsDownloaded,
                 )
@@ -780,7 +780,7 @@ impl MusicPlayer {
                     Ok(path) => {
                         self.song_lengths_status = format!("Downloaded to: {}", path);
                         // Now load the file
-                        return Command::perform(
+                        return Task::perform(
                             parse_song_lengths_async(PathBuf::from(path)),
                             MusicPlayerMessage::SongLengthsLoaded,
                         );
@@ -789,12 +789,12 @@ impl MusicPlayer {
                         self.song_lengths_status = format!("Download failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::LoadSongLengthsFromFile => {
                 self.song_lengths_status = "Select song lengths file...".to_string();
-                Command::perform(
+                Task::perform(
                     async {
                         if let Some(handle) = rfd::AsyncFileDialog::new()
                             .add_filter("MD5 Files", &["md5", "txt"])
@@ -850,23 +850,23 @@ impl MusicPlayer {
                         self.song_lengths_status = format!("Load failed: {}", e);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::SongLengthProgress(msg) => {
                 self.song_lengths_status = msg;
-                Command::none()
+                Task::none()
             }
 
             // === Playback ===
             MusicPlayerMessage::PlayFile(path, song_num) => {
                 if let Some(conn) = connection {
-                    Command::perform(
+                    Task::perform(
                         play_music_file(conn, path, song_num, MusicFileType::Sid),
                         MusicPlayerMessage::PlaybackCompleted,
                     )
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
 
@@ -875,7 +875,7 @@ impl MusicPlayer {
                     self.status_message = format!("Playback error: {}", e);
                     log::error!("Playback failed: {}", e);
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::SetSongNumber(num) => {
@@ -901,7 +901,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::Play, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             // === Timer ===
@@ -914,7 +914,7 @@ impl MusicPlayer {
                         return self.update(MusicPlayerMessage::SongEnded, connection);
                     }
                 }
-                Command::none()
+                Task::none()
             }
 
             MusicPlayerMessage::SongEnded => {
@@ -959,7 +959,7 @@ impl MusicPlayer {
                     if was_mod {
                         if let Some(conn) = connection {
                             let conn_clone = conn.clone();
-                            return Command::perform(
+                            return Task::perform(
                                 async move {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(2),
@@ -999,7 +999,7 @@ impl MusicPlayer {
                         if was_mod {
                             if let Some(conn) = connection {
                                 let conn_clone = conn.clone();
-                                return Command::perform(
+                                return Task::perform(
                                     async move {
                                         let result = tokio::time::timeout(
                                             tokio::time::Duration::from_secs(2),
@@ -1034,7 +1034,7 @@ impl MusicPlayer {
 
                         // Reset the C64 to stop MOD/SID playback
                         if let Some(conn) = connection {
-                            return Command::perform(
+                            return Task::perform(
                                 async move {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(2),
@@ -1060,7 +1060,7 @@ impl MusicPlayer {
                             );
                         }
 
-                        Command::none()
+                        Task::none()
                     }
                 }
             }
@@ -1068,10 +1068,10 @@ impl MusicPlayer {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, MusicPlayerMessage> {
-        let small = (font_size.saturating_sub(2)).max(8) as u16;
-        let normal = font_size as u16;
-        let large = (font_size + 2) as u16;
-        let header = (font_size + 4) as u16;
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let large = font_size + 2;
+        let header = font_size + 4;
 
         // === TOP: Now playing info ===
         let now_playing_text = if let Some(idx) = self.current_playing {
@@ -1097,7 +1097,7 @@ impl MusicPlayer {
             "No track selected".to_string()
         };
 
-        let now_playing = text(&now_playing_text).size(large);
+        let now_playing = text(now_playing_text.clone()).size(large);
 
         // Time display
         let remaining = self
@@ -1124,7 +1124,7 @@ impl MusicPlayer {
                 "Previous file in playlist",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             // Subsong navigation
             tooltip(
                 button(text("<<").size(normal))
@@ -1133,7 +1133,7 @@ impl MusicPlayer {
                 "Previous subsong within current file",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(
                     text(if self.playback_state == PlaybackState::Playing {
@@ -1156,7 +1156,7 @@ impl MusicPlayer {
                 },
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(text("Stop").size(normal))
                     .on_press(MusicPlayerMessage::Stop)
@@ -1164,7 +1164,7 @@ impl MusicPlayer {
                 "Stop playback and reset to beginning",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             // Subsong navigation
             tooltip(
                 button(text(">>").size(normal))
@@ -1173,7 +1173,7 @@ impl MusicPlayer {
                 "Next subsong within current file",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             // File navigation
             tooltip(
                 button(text(">|").size(normal))
@@ -1182,7 +1182,7 @@ impl MusicPlayer {
                 "Next file in playlist",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             // Subsong indicator
             text(format!(
                 "Tune {}/{}",
@@ -1191,7 +1191,7 @@ impl MusicPlayer {
             .size(normal),
         ]
         .spacing(5)
-        .align_items(iced::Alignment::Center);
+        .align_y(iced::Alignment::Center);
 
         // Mode toggles
         let modes = row![
@@ -1207,14 +1207,14 @@ impl MusicPlayer {
                 .on_press(MusicPlayerMessage::ToggleShuffle)
                 .padding([3, 6])
                 .style(if self.shuffle_enabled {
-                    iced::theme::Button::Primary
+                    button::primary
                 } else {
-                    iced::theme::Button::Secondary
+                    button::secondary
                 }),
                 "Randomize playlist order",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
             tooltip(
                 button(
                     text(if self.repeat_enabled {
@@ -1227,30 +1227,30 @@ impl MusicPlayer {
                 .on_press(MusicPlayerMessage::ToggleRepeat)
                 .padding([3, 6])
                 .style(if self.repeat_enabled {
-                    iced::theme::Button::Primary
+                    button::primary
                 } else {
-                    iced::theme::Button::Secondary
+                    button::secondary
                 }),
                 "Repeat playlist when finished",
                 tooltip::Position::Bottom,
             )
-            .style(iced::theme::Container::Box),
+            .style(container::bordered_box),
         ]
         .spacing(5);
 
         let top_bar = column![
-            row![now_playing, Space::with_width(Length::Fill), time_display]
-                .align_items(iced::Alignment::Center),
-            row![transport, Space::with_width(20), modes].align_items(iced::Alignment::Center),
+            row![now_playing, Space::new().width(Length::Fill), time_display]
+                .align_y(iced::Alignment::Center),
+            row![transport, Space::new().width(20), modes].align_y(iced::Alignment::Center),
             // Progress bar
             container(
                 progress_bar(
                     0.0..=self.current_song_duration as f32,
                     self.elapsed_seconds as f32
                 )
-                .height(8)
             )
             .width(Length::Fill)
+            .height(Length::Fixed(8.0))
             .padding([5, 0]),
         ]
         .spacing(8)
@@ -1277,7 +1277,7 @@ impl MusicPlayer {
                         "Select a directory to browse",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Up").size(small))
                             .on_press(MusicPlayerMessage::NavigateUp)
@@ -1285,7 +1285,7 @@ impl MusicPlayer {
                         "Go to parent directory",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Refresh").size(small))
                             .on_press(MusicPlayerMessage::RefreshBrowser)
@@ -1293,7 +1293,7 @@ impl MusicPlayer {
                         "Refresh current directory listing",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Add All").size(small))
                             .on_press(MusicPlayerMessage::AddAllToPlaylist)
@@ -1301,8 +1301,8 @@ impl MusicPlayer {
                         "Add all music files from current directory to playlist",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
-                    Space::with_width(Length::Fill),
+                    .style(container::bordered_box),
+                    Space::new().width(Length::Fill),
                     text("Filter:").size(small),
                     text_input("filter...", &self.browser_filter)
                         .on_input(MusicPlayerMessage::BrowserFilterChanged)
@@ -1311,8 +1311,8 @@ impl MusicPlayer {
                         .width(Length::Fixed(100.0)),
                 ]
                 .spacing(5)
-                .align_items(iced::Alignment::Center),
-                text(&dir_display).size(small),
+                .align_y(iced::Alignment::Center),
+                text(dir_display.clone()).size(small),
                 text(format!("{} music files", music_file_count)).size(small),
             ]
             .spacing(5),
@@ -1351,7 +1351,7 @@ impl MusicPlayer {
                                     .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                     .padding([6, 8])
                                     .width(Length::Fill)
-                                    .style(iced::theme::Button::Text),
+                                    .style(button::text),
                             ]
                             .into()
                         }
@@ -1380,9 +1380,9 @@ impl MusicPlayer {
                             .padding([6, 8])
                             .width(Length::Fill)
                             .style(if is_selected {
-                                iced::theme::Button::Primary
+                                button::primary
                             } else {
-                                iced::theme::Button::Text
+                                button::text
                             });
 
                             let file_element: Element<'_, MusicPlayerMessage> = if is_truncated {
@@ -1391,7 +1391,7 @@ impl MusicPlayer {
                                     text(&entry.name).size(normal),
                                     tooltip::Position::Top,
                                 )
-                                .style(iced::theme::Container::Box)
+                                .style(container::bordered_box)
                                 .into()
                             } else {
                                 file_button.into()
@@ -1406,7 +1406,7 @@ impl MusicPlayer {
                                     "Add to playlist and play immediately",
                                     tooltip::Position::Bottom,
                                 )
-                                .style(iced::theme::Container::Box),
+                                .style(container::bordered_box),
                                 tooltip(
                                     button(text("+").size(small))
                                         .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
@@ -1414,10 +1414,10 @@ impl MusicPlayer {
                                     "Add to playlist",
                                     tooltip::Position::Bottom,
                                 )
-                                .style(iced::theme::Container::Box),
+                                .style(container::bordered_box),
                             ]
                             .spacing(4)
-                            .align_items(iced::Alignment::Center)
+                            .align_y(iced::Alignment::Center)
                             .into()
                         }
                     }
@@ -1427,14 +1427,14 @@ impl MusicPlayer {
             scrollable(
                 Column::with_children(items)
                     .spacing(2)
-                    .padding([5, 15, 5, 5]), // Extra right padding for scrollbar
+                    .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
             )
             .height(Length::Fill)
             .into()
         };
 
         let browser_pane = container(
-            column![browser_header, horizontal_rule(1), browser_list]
+            column![browser_header, rule::horizontal(1), browser_list]
                 .spacing(0)
                 .height(Length::Fill),
         )
@@ -1456,7 +1456,7 @@ impl MusicPlayer {
                         "Save playlist to a JSON file",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Load").size(small))
                             .on_press(MusicPlayerMessage::LoadPlaylist)
@@ -1464,7 +1464,7 @@ impl MusicPlayer {
                         "Load playlist from a JSON file",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                     tooltip(
                         button(text("Clear").size(small))
                             .on_press(MusicPlayerMessage::ClearPlaylist)
@@ -1472,7 +1472,7 @@ impl MusicPlayer {
                         "Remove all items from playlist",
                         tooltip::Position::Bottom,
                     )
-                    .style(iced::theme::Container::Box),
+                    .style(container::bordered_box),
                 ]
                 .spacing(5),
                 text(format!(
@@ -1541,7 +1541,7 @@ impl MusicPlayer {
                     let name = truncate_string(&display_name, max_name_len);
                     let is_truncated = display_name.chars().count() > max_name_len;
 
-                    let tiny = (font_size.saturating_sub(3)).max(7) as u16;
+                    let tiny = (font_size.saturating_sub(3)).max(7);
 
                     let playlist_button = button(
                         text(format!(
@@ -1554,18 +1554,18 @@ impl MusicPlayer {
                     .padding([6, 8])
                     .width(Length::Fill)
                     .style(if is_selected || is_playing {
-                        iced::theme::Button::Primary
+                        button::primary
                     } else {
-                        iced::theme::Button::Text
+                        button::text
                     });
 
                     let playlist_element: Element<'_, MusicPlayerMessage> = if is_truncated {
                         tooltip(
                             playlist_button,
-                            text(&display_name).size(small),
+                            text(display_name.clone()).size(small),
                             tooltip::Position::Top,
                         )
-                        .style(iced::theme::Container::Box)
+                        .style(container::bordered_box)
                         .into()
                     } else {
                         playlist_button.into()
@@ -1580,7 +1580,7 @@ impl MusicPlayer {
                             "Move up in playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                         tooltip(
                             button(text("v").size(tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
@@ -1588,7 +1588,7 @@ impl MusicPlayer {
                             "Move down in playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                         tooltip(
                             button(text("X").size(tiny))
                                 .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
@@ -1596,10 +1596,10 @@ impl MusicPlayer {
                             "Remove from playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(iced::theme::Container::Box),
+                        .style(container::bordered_box),
                     ]
                     .spacing(2)
-                    .align_items(iced::Alignment::Center)
+                    .align_y(iced::Alignment::Center)
                     .into()
                 })
                 .collect();
@@ -1607,7 +1607,7 @@ impl MusicPlayer {
             scrollable(
                 Column::with_children(items)
                     .spacing(2)
-                    .padding([5, 15, 5, 5]), // Extra right padding for scrollbar
+                    .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
             )
             .height(Length::Fill)
             .into()
@@ -1623,7 +1623,7 @@ impl MusicPlayer {
                     "Start playing the selected track",
                     tooltip::Position::Bottom,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
             ]
         } else {
             row![]
@@ -1633,7 +1633,7 @@ impl MusicPlayer {
         let playlist_pane = container(
             column![
                 playlist_header,
-                horizontal_rule(1),
+                rule::horizontal(1),
                 playlist_list,
                 playlist_controls,
             ]
@@ -1659,7 +1659,7 @@ impl MusicPlayer {
                     "Download song length database from HVSC\n(High Voltage SID Collection)",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
+                .style(container::bordered_box),
                 tooltip(
                     button(text("Load File").size(small))
                         .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
@@ -1667,26 +1667,26 @@ impl MusicPlayer {
                     "Load song length database from local file",
                     tooltip::Position::Top,
                 )
-                .style(iced::theme::Container::Box),
-                text(&db_status).size(small),
-                Space::with_width(Length::Fill),
+                .style(container::bordered_box),
+                text(db_status.clone()).size(small),
+                Space::new().width(Length::Fill),
                 text(&self.status_message).size(small),
             ]
             .spacing(10)
-            .align_items(iced::Alignment::Center),
+            .align_y(iced::Alignment::Center),
         )
         .padding([5, 10]);
 
         // === Main Layout ===
-        let main_content = row![browser_pane, vertical_rule(1), playlist_pane].height(Length::Fill);
+        let main_content = row![browser_pane, rule::vertical(1), playlist_pane].height(Length::Fill);
 
         column![
             text("MUSIC PLAYER").size(header),
-            horizontal_rule(1),
+            rule::horizontal(1),
             top_bar,
-            horizontal_rule(1),
+            rule::horizontal(1),
             main_content,
-            horizontal_rule(1),
+            rule::horizontal(1),
             db_controls,
         ]
         .spacing(5)
