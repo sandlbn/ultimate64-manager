@@ -23,6 +23,9 @@ use zip::ZipArchive;
 // Data structures
 // -----------------------------------------------------------------------------
 
+/// Default delay between requests in milliseconds (1.5 seconds)
+const REQUEST_DELAY_MS: u64 = 1500;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchCategory {
     #[default]
@@ -291,16 +294,56 @@ pub struct ExtractedFile {
 
 pub struct CsdbClient {
     client: Client,
+    last_request: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl CsdbClient {
     pub fn new() -> Result<Self> {
+        use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"));
+        headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.5"));
+        headers.insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+
         let client = Client::builder()
-            .user_agent("Ultimate64Manager/0.3")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .default_headers(headers)
             .build()
             .context("Failed to create HTTP client")?;
 
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            last_request: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Enforce rate limiting by waiting if necessary before making a request
+    async fn rate_limit(&self) {
+        let delay_needed = {
+            let mut last = self.last_request.lock().unwrap();
+            let now = std::time::Instant::now();
+            let delay = if let Some(last_time) = *last {
+                let elapsed = now.duration_since(last_time);
+                let min_delay = std::time::Duration::from_millis(REQUEST_DELAY_MS);
+                if elapsed < min_delay {
+                    Some(min_delay - elapsed)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            *last = Some(now);
+            delay
+        };
+
+        if let Some(delay) = delay_needed {
+            tokio::time::sleep(delay).await;
+            // Update timestamp after sleeping
+            let mut last = self.last_request.lock().unwrap();
+            *last = Some(std::time::Instant::now());
+        }
     }
 
     /// Search for releases on CSDb
@@ -310,6 +353,8 @@ impl CsdbClient {
         category: SearchCategory,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        self.rate_limit().await;
+
         let encoded_term = urlencoding::encode(term);
         let url = format!(
             "https://csdb.dk/search/?seinsel={}&search={}&all=1",
@@ -367,6 +412,8 @@ impl CsdbClient {
 
     /// Get latest releases from CSDb homepage
     pub async fn get_latest_releases(&self, limit: usize) -> Result<Vec<LatestRelease>> {
+        self.rate_limit().await;
+
         let url = "https://csdb.dk/";
         let html = self.http_get(url).await?;
 
@@ -385,6 +432,8 @@ impl CsdbClient {
         category: TopListCategory,
         limit: usize,
     ) -> Result<Vec<TopListEntry>> {
+        self.rate_limit().await;
+
         let encoded_subtype = urlencoding::encode(category.as_param());
         let url = format!(
             "https://csdb.dk/toplist.php?type=release&subtype={}",
@@ -403,6 +452,8 @@ impl CsdbClient {
 
     /// Get details and files for a specific release
     pub async fn get_release_details(&self, release_url: &str) -> Result<ReleaseDetails> {
+        self.rate_limit().await;
+
         let html = self.http_get(release_url).await?;
 
         // Extract release ID from URL
@@ -445,6 +496,8 @@ impl CsdbClient {
 
     /// Download a file to the specified directory
     pub async fn download_file(&self, file: &ReleaseFile, out_dir: &PathBuf) -> Result<PathBuf> {
+        self.rate_limit().await;
+
         fs::create_dir_all(out_dir)
             .await
             .with_context(|| format!("Failed to create directory {:?}", out_dir))?;
@@ -488,6 +541,8 @@ impl CsdbClient {
 
     /// Download file and return bytes directly (for running without saving)
     pub async fn download_file_bytes(&self, file: &ReleaseFile) -> Result<(String, Vec<u8>)> {
+        self.rate_limit().await;
+
         // Use final_url which is already resolved (avoids double resolution and handles pre-extracted URLs)
         let download_url = if file.final_url.starts_with("http") {
             file.final_url.clone()
@@ -538,6 +593,8 @@ impl CsdbClient {
     }
 
     async fn resolve_final_url(&self, url: &str) -> Result<String> {
+        self.rate_limit().await;
+
         let response = self
             .client
             .get(url)
