@@ -1887,20 +1887,52 @@ impl Ultimate64Browser {
             } else {
                 iced::Color::from_rgb(0.0, 0.5, 0.0)
             };
-            row![
-                text(format!("{}{}", prefix, message)).size(12).color(color),
-                tooltip(
-                    button(text("X").size(10))
-                        .on_press(Message::DismissMessage)
-                        .padding([2, 6]),
-                    "Dismiss message",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center)
-            .into()
+
+            // Check if this is a screenshot message - make path clickable
+            if message.starts_with("Screenshot saved: ") {
+                let path = message
+                    .strip_prefix("Screenshot saved: ")
+                    .unwrap_or(message);
+                row![
+                    text("Screenshot saved: ").size(12).color(color),
+                    button(
+                        text(path)
+                            .size(12)
+                            .color(iced::Color::from_rgb(0.3, 0.6, 1.0))
+                    )
+                    .style(button::text)
+                    .on_press(Message::Streaming(StreamingMessage::OpenScreenshot(
+                        path.to_string()
+                    )))
+                    .padding(0),
+                    tooltip(
+                        button(text("X").size(10))
+                            .on_press(Message::DismissMessage)
+                            .padding([2, 6]),
+                        "Dismiss message",
+                        tooltip::Position::Top,
+                    )
+                    .style(container::bordered_box),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                row![
+                    text(format!("{}{}", prefix, message)).size(12).color(color),
+                    tooltip(
+                        button(text("X").size(10))
+                            .on_press(Message::DismissMessage)
+                            .padding([2, 6]),
+                        "Dismiss message",
+                        tooltip::Position::Top,
+                    )
+                    .style(container::bordered_box),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center)
+                .into()
+            }
         } else {
             text(video_status).size(12).into()
         };
