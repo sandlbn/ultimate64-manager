@@ -1157,16 +1157,19 @@ impl MemoryEditor {
                 let card = button(
                     container(
                         column![
-                            text(location.name).size(small_font),
+                            text(location.name)
+                                .size(small_font)
+                                .color(iced::Color::BLACK),
                             text(location.description)
                                 .size(small_font.saturating_sub(2))
-                                .color(iced::Color::BLACK),
+                                .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             row![
                                 text(format!("${:04X}", location.address))
                                     .size(small_font)
-                                    .color(iced::Color::from_rgb(0.4, 0.5, 0.9)),
+                                    .color(iced::Color::from_rgb(0.2, 0.3, 0.7)),
                                 text(format!("{} bytes", location.length))
-                                    .size(small_font.saturating_sub(2)),
+                                    .size(small_font.saturating_sub(2))
+                                    .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             ]
                             .spacing(10),
                         ]
