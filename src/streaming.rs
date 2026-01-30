@@ -709,13 +709,11 @@ impl VideoStreaming {
         let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use cached handle - created once in FrameUpdate, not on every view()
             if let Some(ref handle) = self.current_handle {
-                let w = self.current_dimensions.0 as f32;
-                let h = self.current_dimensions.1 as f32;
-
                 let video_image = mouse_area(
                     iced_image(handle.clone())
-                        .width(Length::Fixed(w))
-                        .height(Length::Fixed(h))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain)
                         .filter_method(FilterMethod::Nearest),
                 )
                 .on_press(StreamingMessage::VideoClicked);
