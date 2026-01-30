@@ -957,7 +957,7 @@ impl Ultimate64Browser {
             Message::StatusUpdated(result) => {
                 match result {
                     Ok(status) => {
-                        log::info!(
+                        log::debug!(
                             "Status: Connected={}, Device={:?}, Disks={}",
                             status.connected,
                             status.device_info,
@@ -974,10 +974,19 @@ impl Ultimate64Browser {
                     }
                     Err(e) => {
                         log::error!("Status update failed: {}", e);
+                        // Only show error if we were previously connected (lost connection)
+                        if self.status.connected {
+                            self.user_message =
+                                Some(UserMessage::Error(format!("Connection lost: {}", e)));
+                            // Stop streaming if connection is lost
+                            if self.video_streaming.is_streaming {
+                                let _ = self
+                                    .video_streaming
+                                    .update(StreamingMessage::StopStream, None);
+                            }
+                        }
                         self.status.connected = false;
                         self.status.device_info = None;
-                        self.user_message =
-                            Some(UserMessage::Error(format!("Connection failed: {}", e)));
                     }
                 }
                 Task::none()
@@ -1454,6 +1463,7 @@ impl Ultimate64Browser {
     fn subscription(&self) -> Subscription<Message> {
         use iced::event::{self, Event};
         use iced::keyboard::{self, Key};
+        use std::time::Duration;
 
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
         let keyboard_sub = event::listen_with(|event, _status, _id| {
@@ -1470,10 +1480,18 @@ impl Ultimate64Browser {
             }
         });
 
+        // Periodic connection check every 60 seconds (only when connected)
+        let status_check = if self.status.connected {
+            iced::time::every(Duration::from_secs(60)).map(|_| Message::RefreshStatus)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
             keyboard_sub,
+            status_check,
         ])
     }
 
