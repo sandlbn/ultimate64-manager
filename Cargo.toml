@@ -40,6 +40,7 @@ winapi = { version = "0.3", features = ["winuser"] }
 # Windows-specific build dependencies
 [target.'cfg(target_os = "windows")'.build-dependencies]
 winres = "0.1"
+windows = "0.62.2"
 
 # AppImage configuration (cargo appimage)
 [package.metadata.appimage]
