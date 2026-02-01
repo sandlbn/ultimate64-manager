@@ -8,6 +8,7 @@ use iced::{
         Space, button, column, container, pick_list, row, rule, scrollable, text, text_input,
         tooltip,
     },
+    window,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -52,7 +53,6 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn main() -> iced::Result {
     // Force OpenGL backend on Linux for better compatibility with multi-GPU systems
     // Users can override with WGPU_BACKEND=vulkan if needed
-
     #[cfg(target_os = "linux")]
     if std::env::var("WGPU_BACKEND").is_err() {
         // SAFETY: This is executed at program startup before any threads
@@ -62,6 +62,7 @@ pub fn main() -> iced::Result {
             std::env::set_var("WGPU_BACKEND", "gl");
         }
     }
+
     // Initialize logger - show info level by default, debug if RUST_LOG is set
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
@@ -75,10 +76,7 @@ pub fn main() -> iced::Result {
     log::info!("Platform: {}", std::env::consts::OS);
     log::info!("Arch: {}", std::env::consts::ARCH);
 
-    // Load window icon
-    let icon = load_window_icon();
-
-    iced::application(
+    iced::daemon(
         Ultimate64Browser::new,
         Ultimate64Browser::update,
         Ultimate64Browser::view,
@@ -86,12 +84,6 @@ pub fn main() -> iced::Result {
     .title(Ultimate64Browser::title)
     .subscription(Ultimate64Browser::subscription)
     .theme(Ultimate64Browser::theme)
-    .window_size(iced::Size::new(1200.0, 800.0))
-    .window(iced::window::Settings {
-        min_size: Some(iced::Size::new(800.0, 600.0)),
-        icon: icon,
-        ..Default::default()
-    })
     .run()
 }
 
@@ -198,6 +190,11 @@ pub enum Message {
     OpenReleasePage,
     // CSDb Browser
     CsdbBrowser(CsdbBrowserMessage),
+    // Separate streaming window management
+    OpenStreamingWindow,
+    StreamingWindowOpened(iced::window::Id),
+    WindowClosed(iced::window::Id),
+    CloseStreamingWindow,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,6 +272,9 @@ pub struct Ultimate64Browser {
     // Update notification
     new_version: Option<NewVersionInfo>,
     csdb_browser: CsdbBrowser,
+    // Separate streaming window
+    streaming_window_id: Option<window::Id>,
+    main_window_id: Option<window::Id>,
 }
 
 impl Ultimate64Browser {
@@ -299,6 +299,17 @@ impl Ultimate64Browser {
 
         // Create file browser with configured starting directory
         let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
+
+        // Load window icon
+        let icon = load_window_icon();
+
+        // Open main window
+        let (main_window_id, open_main_window) = iced::window::open(iced::window::Settings {
+            size: iced::Size::new(1200.0, 800.0),
+            min_size: Some(iced::Size::new(800.0, 600.0)),
+            icon: icon,
+            ..Default::default()
+        });
 
         let mut app = Self {
             active_tab: Tab::DualPaneBrowser,
@@ -325,6 +336,8 @@ impl Ultimate64Browser {
             user_message: None,
             video_streaming: VideoStreaming::new(),
             csdb_browser: CsdbBrowser::new(),
+            main_window_id: Some(main_window_id),
+            streaming_window_id: None,
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -333,6 +346,12 @@ impl Ultimate64Browser {
         let version_check_cmd =
             version_check::check_for_updates(APP_VERSION).map(Message::VersionCheck);
 
+        // Build init tasks
+        let mut init_tasks = vec![
+            open_main_window.map(|_| Message::RefreshStatus),
+            version_check_cmd,
+        ];
+
         // Auto-connect if host is configured
         if !settings.connection.host.is_empty() {
             log::info!(
@@ -340,34 +359,36 @@ impl Ultimate64Browser {
                 settings.connection.host
             );
             app.establish_connection();
-            return (
-                app,
-                Task::batch(vec![
-                    Task::perform(
-                        async {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                        },
-                        |_| Message::RefreshStatus,
-                    ),
-                    version_check_cmd,
-                ]),
-            );
+            init_tasks.push(Task::perform(
+                async {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                },
+                |_| Message::RefreshStatus,
+            ));
+        } else {
+            log::info!("No host configured, waiting for user input");
         }
 
-        log::info!("No host configured, waiting for user input");
-        (app, version_check_cmd)
+        (app, Task::batch(init_tasks))
     }
 
-    fn title(&self) -> String {
-        let connection_status = if self.status.connected {
-            format!(" - Connected to {}", self.settings.connection.host)
-        } else {
-            " - Disconnected".to_string()
-        };
-        format!("Ultimate64 Manager v{}{}", APP_VERSION, connection_status)
+    fn title(&self, window_id: iced::window::Id) -> String {
+        if Some(window_id) == self.streaming_window_id {
+            return "Ultimate64 Video Stream".to_string();
+        }
+        if Some(window_id) == self.main_window_id {
+            // Main window title
+            let connection_status = if self.status.connected {
+                format!(" - Connected to {}", self.settings.connection.host)
+            } else {
+                " - Disconnected".to_string()
+            };
+            return format!("Ultimate64 Manager v{}{}", APP_VERSION, connection_status);
+        }
+        // Fallback
+        "Ultimate64 Manager".to_string()
     }
-
-    fn theme(&self) -> Theme {
+    fn theme(&self, _window_id: iced::window::Id) -> Theme {
         // Custom dark theme with lighter blue (like the reference screenshot)
         Theme::custom(
             "Ultimate64 Dark".to_string(),
@@ -387,6 +408,13 @@ impl Ultimate64Browser {
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
+                Task::none()
+            }
+            Message::CloseStreamingWindow => {
+                if let Some(id) = self.streaming_window_id {
+                    self.streaming_window_id = None;
+                    return iced::window::close(id);
+                }
                 Task::none()
             }
             Message::MemoryEditor(msg) => self
@@ -1040,7 +1068,9 @@ impl Ultimate64Browser {
                 self.video_streaming
                     .set_api_password(self.settings.connection.password.clone());
                 // Handle screenshot result for user message
-
+                if let StreamingMessage::OpenInSeparateWindow = msg {
+                    return Task::perform(async {}, |_| Message::OpenStreamingWindow);
+                }
                 if let StreamingMessage::ScreenshotComplete(ref result) = msg {
                     match result {
                         Ok(path) => {
@@ -1064,9 +1094,20 @@ impl Ultimate64Browser {
                         iced::window::Mode::Windowed
                     };
 
-                    return iced::window::oldest()
-                        .and_then(move |id| iced::window::set_mode(id, mode))
-                        .map(|_: ()| Message::RefreshStatus);
+                    // Determine which window to make fullscreen
+                    if let Some(streaming_id) = self.streaming_window_id {
+                        return window::set_mode(streaming_id, mode)
+                            .map(|_: ()| Message::RefreshStatus);
+                    } else {
+                        return iced::window::oldest()
+                            .and_then(move |id| iced::window::set_mode(id, mode))
+                            .map(|_: ()| Message::RefreshStatus);
+                    }
+                }
+
+                // Handle open in new window request
+                if let StreamingMessage::OpenInSeparateWindow = msg {
+                    return Task::done(Message::OpenStreamingWindow);
                 }
 
                 // Handle keyboard command - intercept before passing to streaming
@@ -1136,13 +1177,66 @@ impl Ultimate64Browser {
                 // Only exit fullscreen if currently in fullscreen mode
                 if self.video_streaming.is_fullscreen {
                     self.video_streaming.is_fullscreen = false;
-                    return iced::window::oldest()
-                        .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed))
-                        .map(|_: ()| Message::RefreshStatus);
+                    // Exit fullscreen on the appropriate window
+                    if let Some(streaming_id) = self.streaming_window_id {
+                        return window::set_mode(streaming_id, iced::window::Mode::Windowed)
+                            .map(|_: ()| Message::RefreshStatus);
+                    } else {
+                        return iced::window::oldest()
+                            .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed))
+                            .map(|_: ()| Message::RefreshStatus);
+                    }
                 }
                 Task::none()
             }
 
+            Message::OpenStreamingWindow => {
+                if self.streaming_window_id.is_some() {
+                    // Window already open
+                    return Task::none();
+                }
+                let settings = iced::window::Settings {
+                    size: iced::Size::new(800.0, 600.0),
+                    min_size: Some(iced::Size::new(400.0, 300.0)),
+                    decorations: true,
+                    ..Default::default()
+                };
+                // Destructure the tuple - open() returns (Id, Task<Id>)
+                let (id, open_task) = iced::window::open(settings);
+                self.streaming_window_id = Some(id);
+                open_task.map(move |_| Message::StreamingWindowOpened(id))
+            }
+
+            Message::StreamingWindowOpened(id) => {
+                log::info!("Streaming window opened: {:?}", id);
+                // ID already stored in OpenStreamingWindow handler
+                Task::none()
+            }
+
+            Message::WindowClosed(id) => {
+                if self.streaming_window_id == Some(id) {
+                    // Streaming window was closed
+                    log::info!("Streaming window closed: {:?}", id);
+                    self.streaming_window_id = None;
+                    Task::none()
+                } else if self.main_window_id == Some(id) {
+                    // Main window was closed - exit the application
+                    log::info!("Main window closed: {:?}", id);
+                    // Stop streaming if active
+                    if self.video_streaming.is_streaming {
+                        self.video_streaming
+                            .stop_signal
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Close any remaining windows and exit
+                    if let Some(streaming_id) = self.streaming_window_id {
+                        return iced::window::close(streaming_id);
+                    }
+                    iced::exit()
+                } else {
+                    Task::none()
+                }
+            }
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -1390,8 +1484,16 @@ impl Ultimate64Browser {
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        // If video is in fullscreen mode, show only the fullscreen view
+    fn view(&self, window_id: window::Id) -> Element<'_, Message> {
+        // Check if this is the streaming window
+        if Some(window_id) == self.streaming_window_id {
+            return self
+                .video_streaming
+                .view_separate_window()
+                .map(Message::Streaming);
+        }
+
+        // If video is in fullscreen mode in main window, show only the fullscreen view
         if self.video_streaming.is_fullscreen {
             return self
                 .video_streaming
@@ -1421,7 +1523,29 @@ impl Ultimate64Browser {
         let content = container(match self.active_tab {
             Tab::DualPaneBrowser => self.view_dual_pane_browser(),
             Tab::MusicPlayer => self.view_music_player(),
-            Tab::VideoViewer => self.video_streaming.view().map(Message::Streaming),
+            Tab::VideoViewer => {
+                if self.streaming_window_id.is_some() {
+                    // Streaming is shown in separate window - show placeholder
+                    container(
+                        column![
+                            text("Video is displayed in separate window").size(16),
+                            Space::new(),
+                            button(text("Close Separate Window").size(12))
+                                .on_press(Message::CloseStreamingWindow)
+                                .padding([8, 16]),
+                        ]
+                        .align_x(iced::Alignment::Center)
+                        .spacing(10),
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+                } else {
+                    self.video_streaming.view().map(Message::Streaming)
+                }
+            }
             Tab::MemoryEditor => self
                 .memory_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
@@ -1480,6 +1604,15 @@ impl Ultimate64Browser {
             }
         });
 
+        // Window close event listener for streaming window
+        let window_events = iced::event::listen_with(|event, _status, id| {
+            if let iced::Event::Window(iced::window::Event::Closed) = event {
+                Some(Message::WindowClosed(id))
+            } else {
+                None
+            }
+        });
+
         // Periodic connection check every 60 seconds (only when connected)
         let status_check = if self.status.connected {
             iced::time::every(Duration::from_secs(60)).map(|_| Message::RefreshStatus)
@@ -1491,6 +1624,7 @@ impl Ultimate64Browser {
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
             keyboard_sub,
+            window_events,
             status_check,
         ])
     }
