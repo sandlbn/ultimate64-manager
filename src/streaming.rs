@@ -114,6 +114,8 @@ pub enum StreamingMessage {
     KeySent(Result<(), String>), // Result of sending key to C64
     // Ultimate64 host configuration
     UltimateHostChanged(String), // Set the host for stream control
+    // Separate window support
+    OpenInSeparateWindow, // Open streaming in a separate window
 }
 
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
@@ -614,6 +616,11 @@ impl VideoStreaming {
                 }
                 Task::none()
             }
+
+            StreamingMessage::OpenInSeparateWindow => {
+                // Handled by main.rs which manages window creation
+                Task::none()
+            }
         }
     }
 
@@ -684,6 +691,84 @@ impl VideoStreaming {
         // Black background container with centered video
         container(column![
             exit_hint,
+            container(video_content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::BLACK)),
+            text_color: Some(iced::Color::WHITE),
+            ..Default::default()
+        })
+        .into()
+    }
+
+    /// Separate window view - similar to fullscreen but for dedicated streaming window
+    pub fn view_separate_window(&self) -> Element<'_, StreamingMessage> {
+        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
+            // Use cached handle - created once in FrameUpdate, not on every view()
+            if let Some(ref handle) = self.current_handle {
+                let video_image = mouse_area(
+                    iced_image(handle.clone())
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .content_fit(iced::ContentFit::Contain)
+                        .filter_method(FilterMethod::Nearest),
+                )
+                .on_press(StreamingMessage::VideoClicked);
+
+                container(video_image)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .into()
+            } else {
+                text("Waiting for frames...")
+                    .size(20)
+                    .color(iced::Color::WHITE)
+                    .into()
+            }
+        } else {
+            text("Stream not active")
+                .size(20)
+                .color(iced::Color::WHITE)
+                .into()
+        };
+
+        // Controls at the top with keyboard toggle
+        let keyboard_btn = button(
+            text(if self.keyboard_enabled {
+                "⌨ Enabled"
+            } else {
+                "⌨ Disabled"
+            })
+            .size(12),
+        )
+        .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
+        .padding([6, 12])
+        .style(if self.keyboard_enabled {
+            button::primary
+        } else {
+            button::secondary
+        });
+
+        let fullscreen_btn = button(text("Fullscreen").size(12))
+            .on_press(StreamingMessage::ToggleFullscreen)
+            .padding([6, 12]);
+
+        let controls = container(row![keyboard_btn, fullscreen_btn,].spacing(10))
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .padding(10);
+
+        // Black background container with centered video
+        container(column![
+            controls,
             container(video_content)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -993,6 +1078,16 @@ impl VideoStreaming {
             .style(container::bordered_box)
         };
 
+        // Separate window button
+        let separate_window_button = tooltip(
+            button(text("⧉").size(11))
+                .on_press(StreamingMessage::OpenInSeparateWindow)
+                .padding([6, 10]),
+            "Open video in separate window",
+            tooltip::Position::Bottom,
+        )
+        .style(container::bordered_box);
+
         let stream_controls = column![
             text("Stream Control").size(12),
             row![
@@ -1025,6 +1120,7 @@ impl VideoStreaming {
                     tooltip::Position::Bottom,
                 )
                 .style(container::bordered_box),
+                separate_window_button,
             ]
             .spacing(5)
             .align_y(iced::Alignment::Center),
