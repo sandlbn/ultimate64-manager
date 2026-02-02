@@ -30,6 +30,7 @@ mod mod_info;
 mod music_player;
 mod pdf_preview;
 mod petscii;
+mod profiles;
 mod remote_browser;
 mod settings;
 mod stream_control;
@@ -43,6 +44,7 @@ use csdb_browser::{CsdbBrowser, CsdbBrowserMessage};
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
+use profiles::ProfileManager;
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings, StreamControlMethod};
 use streaming::{StreamingMessage, VideoStreaming};
@@ -195,6 +197,14 @@ pub enum Message {
     StreamingWindowOpened(iced::window::Id),
     WindowClosed(iced::window::Id),
     CloseStreamingWindow,
+    // Profile management
+    ProfileSelected(String),
+    NewProfileNameChanged(String),
+    CreateProfile,
+    DuplicateProfile,
+    DeleteProfile,
+    RenameProfile,
+    RenameProfileNameChanged(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,12 +285,28 @@ pub struct Ultimate64Browser {
     // Separate streaming window
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
+
+    // Profile management
+    profile_manager: ProfileManager,
+    new_profile_name: String,
+    rename_profile_name: String,
 }
 
 impl Ultimate64Browser {
     fn new() -> (Self, Task<Message>) {
         log::info!("Initializing application...");
 
+        let profile_manager = ProfileManager::load();
+        let settings = profile_manager.active_settings().clone();
+        log::info!("Active profile: {}", profile_manager.active_profile);
+
+        // Create music player with configured starting directory
+        let mut music_player =
+            MusicPlayer::new(settings.default_paths.music_player_start_dir.clone());
+        music_player.set_default_song_duration(settings.preferences.default_song_duration);
+
+        // Create file browser with configured starting directory
+        let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
         let settings = match AppSettings::load() {
             Ok(s) => {
                 log::info!("Loaded settings from config file");
@@ -291,15 +317,6 @@ impl Ultimate64Browser {
                 AppSettings::default()
             }
         };
-
-        // Create music player with configured starting directory
-        let mut music_player =
-            MusicPlayer::new(settings.default_paths.music_player_start_dir.clone());
-        music_player.set_default_song_duration(settings.preferences.default_song_duration);
-
-        // Create file browser with configured starting directory
-        let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
-
         // Load window icon
         let icon = load_window_icon();
 
@@ -338,6 +355,9 @@ impl Ultimate64Browser {
             csdb_browser: CsdbBrowser::new(),
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
+            profile_manager,
+            new_profile_name: String::new(),
+            rename_profile_name: String::new(),
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -902,9 +922,10 @@ impl Ultimate64Browser {
                     },
                     stream_control_method: self.settings.connection.stream_control_method,
                 };
-                self.settings.connection = conn_settings;
-                if let Err(e) = self.settings.save() {
-                    log::warn!("Could not save settings: {}", e);
+                self.profile_manager.active_settings_mut().connection = conn_settings;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::warn!("Could not save profiles: {}", e);
                 }
                 self.establish_connection();
                 // Trigger status refresh and remote browser refresh after a short delay
@@ -940,10 +961,14 @@ impl Ultimate64Browser {
                 Task::none()
             }
             Message::StreamControlMethodChanged(method) => {
-                self.settings.connection.stream_control_method = method;
+                self.profile_manager
+                    .active_settings_mut()
+                    .connection
+                    .stream_control_method = method;
+                self.settings = self.profile_manager.active_settings().clone();
                 self.video_streaming.set_stream_control_method(method);
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 Task::none()
             }
@@ -957,6 +982,117 @@ impl Ultimate64Browser {
                 } else {
                     Task::none()
                 }
+            }
+            Message::ProfileSelected(name) => {
+                if self.profile_manager.switch_profile(&name) {
+                    self.settings = self.profile_manager.active_settings().clone();
+                    self.host_input = self.settings.connection.host.clone();
+                    self.password_input = self
+                        .settings
+                        .connection
+                        .password
+                        .clone()
+                        .unwrap_or_default();
+                    self.font_size_input = self.settings.preferences.font_size.to_string();
+                    self.video_streaming
+                        .set_stream_control_method(self.settings.connection.stream_control_method);
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
+                    }
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Switched to profile: {}", name)));
+                    // Disconnect when switching profiles
+                    return Task::done(Message::DisconnectPressed);
+                }
+                Task::none()
+            }
+
+            Message::NewProfileNameChanged(name) => {
+                self.new_profile_name = name;
+                Task::none()
+            }
+
+            Message::CreateProfile => {
+                let name = self.new_profile_name.trim().to_string();
+                if name.is_empty() {
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name cannot be empty".to_string(),
+                    ));
+                } else if self.profile_manager.add_profile(name.clone()) {
+                    self.new_profile_name.clear();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
+                    }
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Created profile: {}", name)));
+                } else {
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name already exists".to_string(),
+                    ));
+                }
+                Task::none()
+            }
+
+            Message::DuplicateProfile => {
+                let new_name = format!("{} (copy)", self.profile_manager.active_profile);
+                if self.profile_manager.duplicate_profile(
+                    &self.profile_manager.active_profile.clone(),
+                    new_name.clone(),
+                ) {
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
+                    }
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Duplicated to: {}", new_name)));
+                }
+                Task::none()
+            }
+
+            Message::DeleteProfile => {
+                let name = self.profile_manager.active_profile.clone();
+                if self.profile_manager.delete_profile(&name) {
+                    self.settings = self.profile_manager.active_settings().clone();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
+                    }
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Deleted profile: {}", name)));
+                } else {
+                    self.user_message = Some(UserMessage::Error(
+                        "Cannot delete active or last profile".to_string(),
+                    ));
+                }
+                Task::none()
+            }
+
+            Message::RenameProfileNameChanged(name) => {
+                self.rename_profile_name = name;
+                Task::none()
+            }
+
+            Message::RenameProfile => {
+                let new_name = self.rename_profile_name.trim().to_string();
+                let old_name = self.profile_manager.active_profile.clone();
+                if new_name.is_empty() {
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name cannot be empty".to_string(),
+                    ));
+                } else if self
+                    .profile_manager
+                    .rename_profile(&old_name, new_name.clone())
+                {
+                    self.rename_profile_name.clear();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
+                    }
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Renamed to: {}", new_name)));
+                } else {
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name already exists".to_string(),
+                    ));
+                }
+                Task::none()
             }
             Message::CsdbBrowser(msg) => self
                 .csdb_browser
@@ -1384,15 +1520,17 @@ impl Ultimate64Browser {
                 }
                 Task::none()
             }
-
             Message::DefaultSongDurationChanged(value) => {
                 if let Ok(duration) = value.parse::<u32>() {
                     if duration > 0 && duration <= 3600 {
-                        self.settings.preferences.default_song_duration = duration;
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .default_song_duration = duration;
+                        self.settings = self.profile_manager.active_settings().clone();
                         self.music_player.set_default_song_duration(duration);
-                        // Save settings
-                        if let Err(e) = self.settings.save() {
-                            log::error!("Failed to save settings: {}", e);
+                        if let Err(e) = self.profile_manager.save() {
+                            log::error!("Failed to save profiles: {}", e);
                         }
                     }
                 }
@@ -1403,16 +1541,18 @@ impl Ultimate64Browser {
                 self.font_size_input = value.clone();
                 if let Ok(size) = value.parse::<u32>() {
                     if size >= 8 && size <= 24 {
-                        self.settings.preferences.font_size = size;
-                        // Save settings
-                        if let Err(e) = self.settings.save() {
-                            log::error!("Failed to save settings: {}", e);
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .font_size = size;
+                        self.settings = self.profile_manager.active_settings().clone();
+                        if let Err(e) = self.profile_manager.save() {
+                            log::error!("Failed to save profiles: {}", e);
                         }
                     }
                 }
                 Task::none()
             }
-
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -1426,9 +1566,13 @@ impl Ultimate64Browser {
 
             Message::FileBrowserStartDirSelected(path) => {
                 if let Some(p) = path {
-                    self.settings.default_paths.file_browser_start_dir = Some(p);
-                    if let Err(e) = self.settings.save() {
-                        log::error!("Failed to save settings: {}", e);
+                    self.profile_manager
+                        .active_settings_mut()
+                        .default_paths
+                        .file_browser_start_dir = Some(p);
+                    self.settings = self.profile_manager.active_settings().clone();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
                     }
                     self.user_message = Some(UserMessage::Info(
                         "File Browser start directory set (restart app to apply)".to_string(),
@@ -1438,9 +1582,13 @@ impl Ultimate64Browser {
             }
 
             Message::ClearFileBrowserStartDir => {
-                self.settings.default_paths.file_browser_start_dir = None;
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                self.profile_manager
+                    .active_settings_mut()
+                    .default_paths
+                    .file_browser_start_dir = None;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 self.user_message = Some(UserMessage::Info(
                     "File Browser start directory cleared".to_string(),
@@ -1460,9 +1608,13 @@ impl Ultimate64Browser {
 
             Message::MusicPlayerStartDirSelected(path) => {
                 if let Some(p) = path {
-                    self.settings.default_paths.music_player_start_dir = Some(p);
-                    if let Err(e) = self.settings.save() {
-                        log::error!("Failed to save settings: {}", e);
+                    self.profile_manager
+                        .active_settings_mut()
+                        .default_paths
+                        .music_player_start_dir = Some(p);
+                    self.settings = self.profile_manager.active_settings().clone();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
                     }
                     self.user_message = Some(UserMessage::Info(
                         "Music Player start directory set (restart app to apply)".to_string(),
@@ -1472,9 +1624,13 @@ impl Ultimate64Browser {
             }
 
             Message::ClearMusicPlayerStartDir => {
-                self.settings.default_paths.music_player_start_dir = None;
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                self.profile_manager
+                    .active_settings_mut()
+                    .default_paths
+                    .music_player_start_dir = None;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 self.user_message = Some(UserMessage::Info(
                     "Music Player start directory cleared".to_string(),
@@ -1807,6 +1963,55 @@ impl Ultimate64Browser {
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
+        // Profile management section
+        let profile_names = self.profile_manager.profile_names();
+        let profile_section = column![
+            text("CONFIGURATION PROFILES").size(18),
+            Space::new().height(10),
+            row![
+                text("Active Profile:").size(14),
+                pick_list(
+                    profile_names,
+                    Some(self.profile_manager.active_profile.clone()),
+                    Message::ProfileSelected,
+                )
+                .width(Length::Fixed(200.0)),
+                tooltip(
+                    button(text("Duplicate").size(11))
+                        .on_press(Message::DuplicateProfile)
+                        .padding([4, 10]),
+                    "Create a copy of current profile",
+                    tooltip::Position::Bottom,
+                )
+                .style(container::bordered_box),
+                tooltip(
+                    button(text("Delete").size(11))
+                        .on_press(Message::DeleteProfile)
+                        .padding([4, 10]),
+                    "Delete current profile (cannot delete last profile)",
+                    tooltip::Position::Bottom,
+                )
+                .style(container::bordered_box),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+            Space::new().height(10),
+            row![
+                text("New Profile:").size(14),
+                text_input("Profile name...", &self.new_profile_name)
+                    .on_input(Message::NewProfileNameChanged)
+                    .on_submit(Message::CreateProfile)
+                    .padding(8)
+                    .width(Length::Fixed(200.0)),
+                button(text("Create").size(11))
+                    .on_press(Message::CreateProfile)
+                    .padding([4, 10]),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
+            text("Use profiles to store different configurations for different machines").size(11),
+        ];
+
         let connection_section = column![
             text("CONNECTION SETTINGS").size(18),
             Space::new().height(10),
@@ -2003,10 +2208,24 @@ impl Ultimate64Browser {
             text("DEBUG INFO").size(18),
             text(format!("Platform: {}", std::env::consts::OS)).size(12),
             text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
+            text(format!(
+                "Active profile: {}",
+                self.profile_manager.active_profile
+            ))
+            .size(12),
+            text(format!(
+                "Total profiles: {}",
+                self.profile_manager.profiles.len()
+            ))
+            .size(12),
         ];
 
         scrollable(container(
             column![
+                profile_section,
+                Space::new().height(20),
+                rule::horizontal(1),
+                Space::new().height(10),
                 connection_section,
                 status_section,
                 starting_dirs_section,

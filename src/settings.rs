@@ -133,13 +133,4 @@ impl AppSettings {
             Ok(Self::default())
         }
     }
-
-    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let config_file = Self::config_path()?;
-        log::debug!("Saving settings to: {:?}", config_file);
-        let contents = serde_json::to_string_pretty(self)?;
-        fs::write(&config_file, contents)?;
-        log::info!("Settings saved successfully");
-        Ok(())
-    }
 }
