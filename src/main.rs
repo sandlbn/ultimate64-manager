@@ -23,6 +23,7 @@ mod config_presets;
 mod csdb;
 mod csdb_browser;
 mod dir_preview;
+mod discovery;
 mod disk_image;
 mod file_browser;
 mod memory_editor;
@@ -41,6 +42,7 @@ mod video_scaling;
 
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use csdb_browser::{CsdbBrowser, CsdbBrowserMessage};
+use discovery::DiscoveredDevice;
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
@@ -205,6 +207,10 @@ pub enum Message {
     DeleteProfile,
     RenameProfile,
     RenameProfileNameChanged(String),
+    // Discovery
+    StartDiscovery,
+    DiscoveryComplete(Vec<discovery::DiscoveredDevice>),
+    SelectDiscoveredDevice(discovery::DiscoveredDevice),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +296,9 @@ pub struct Ultimate64Browser {
     profile_manager: ProfileManager,
     new_profile_name: String,
     rename_profile_name: String,
+    // Device discovery
+    is_discovering: bool,
+    discovered_devices: Vec<DiscoveredDevice>,
 }
 
 impl Ultimate64Browser {
@@ -358,6 +367,8 @@ impl Ultimate64Browser {
             profile_manager,
             new_profile_name: String::new(),
             rename_profile_name: String::new(),
+            is_discovering: false,
+            discovered_devices: Vec::new(),
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -425,6 +436,42 @@ impl Ultimate64Browser {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::StartDiscovery => {
+                if self.is_discovering {
+                    return Task::none();
+                }
+                self.is_discovering = true;
+                self.discovered_devices.clear();
+                self.user_message = Some(UserMessage::Info("Scanning network...".to_string()));
+
+                Task::perform(discovery::discover_devices(), Message::DiscoveryComplete)
+            }
+
+            Message::DiscoveryComplete(devices) => {
+                self.is_discovering = false;
+                self.discovered_devices = devices.clone();
+
+                if devices.is_empty() {
+                    self.user_message = Some(UserMessage::Info(
+                        "No Ultimate devices found on network".to_string(),
+                    ));
+                } else {
+                    self.user_message = Some(UserMessage::Info(format!(
+                        "Found {} device(s)",
+                        devices.len()
+                    )));
+                }
+                Task::none()
+            }
+
+            Message::SelectDiscoveredDevice(device) => {
+                self.host_input = device.ip.clone();
+                self.user_message = Some(UserMessage::Info(format!(
+                    "Selected: {} ({})",
+                    device.product, device.ip
+                )));
+                Task::none()
+            }
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
@@ -2011,15 +2058,61 @@ impl Ultimate64Browser {
             .align_y(iced::Alignment::Center),
             text("Use profiles to store different configurations for different machines").size(11),
         ];
+        // Discovery button
+        // Discovery button
+        let discovery_button: Element<'_, Message> = if self.is_discovering {
+            button(text("Scanning...").size(11)).padding([4, 10]).into()
+        } else {
+            tooltip(
+                button(text("🔍 Find Devices").size(11))
+                    .on_press(Message::StartDiscovery)
+                    .padding([4, 10]),
+                "Scan local network for Ultimate64 devices",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box)
+            .into()
+        };
 
+        // List of discovered devices
+        // List of discovered devices
+        let discovered_list: Element<'_, Message> = if self.discovered_devices.is_empty() {
+            if self.is_discovering {
+                text("Scanning network...").size(11).into()
+            } else {
+                text("").size(1).into()
+            }
+        } else {
+            column(
+                self.discovered_devices
+                    .iter()
+                    .map(|d| {
+                        let device = d.clone();
+                        let label = format!("{} - {} ({})", d.ip, d.product, d.firmware);
+                        button(text(label).size(11))
+                            .on_press(Message::SelectDiscoveredDevice(device))
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(button::secondary)
+                            .into()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .spacing(2)
+            .width(Length::Fixed(400.0))
+            .into()
+        };
         let connection_section = column![
             text("CONNECTION SETTINGS").size(18),
             Space::new().height(10),
-            text("Ultimate64 IP Address:").size(14),
+            row![text("Ultimate64 IP Address:").size(14), discovery_button,]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
             text_input("192.168.1.64", &self.host_input)
                 .on_input(Message::HostInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
+            discovered_list,
             Space::new().height(10),
             text("Password (optional):").size(14),
             text_input("Enter password...", &self.password_input)
@@ -2067,7 +2160,6 @@ impl Ultimate64Browser {
             ]
             .spacing(10),
         ];
-
         let status_section = column![
             Space::new().height(20),
             rule::horizontal(1),
