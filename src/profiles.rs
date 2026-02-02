@@ -98,15 +98,16 @@ impl ProfileManager {
             .unwrap_or_else(|| &self.profiles[0].settings)
     }
 
-pub fn active_settings_mut(&mut self) -> &mut AppSettings {
+    pub fn active_settings_mut(&mut self) -> &mut AppSettings {
         let name = self.active_profile.clone();
-        
+
         // Find the index first to avoid borrow issues
-        let index = self.profiles
+        let index = self
+            .profiles
             .iter()
             .position(|p| p.name == name)
             .unwrap_or(0);
-        
+
         &mut self.profiles[index].settings
     }
 

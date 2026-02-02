@@ -922,9 +922,10 @@ impl Ultimate64Browser {
                     },
                     stream_control_method: self.settings.connection.stream_control_method,
                 };
-                self.settings.connection = conn_settings;
-                if let Err(e) = self.settings.save() {
-                    log::warn!("Could not save settings: {}", e);
+                self.profile_manager.active_settings_mut().connection = conn_settings;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::warn!("Could not save profiles: {}", e);
                 }
                 self.establish_connection();
                 // Trigger status refresh and remote browser refresh after a short delay
@@ -960,10 +961,14 @@ impl Ultimate64Browser {
                 Task::none()
             }
             Message::StreamControlMethodChanged(method) => {
-                self.settings.connection.stream_control_method = method;
+                self.profile_manager
+                    .active_settings_mut()
+                    .connection
+                    .stream_control_method = method;
+                self.settings = self.profile_manager.active_settings().clone();
                 self.video_streaming.set_stream_control_method(method);
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 Task::none()
             }
@@ -982,13 +987,20 @@ impl Ultimate64Browser {
                 if self.profile_manager.switch_profile(&name) {
                     self.settings = self.profile_manager.active_settings().clone();
                     self.host_input = self.settings.connection.host.clone();
-                    self.password_input = self.settings.connection.password.clone().unwrap_or_default();
+                    self.password_input = self
+                        .settings
+                        .connection
+                        .password
+                        .clone()
+                        .unwrap_or_default();
                     self.font_size_input = self.settings.preferences.font_size.to_string();
-                    self.video_streaming.set_stream_control_method(self.settings.connection.stream_control_method);
+                    self.video_streaming
+                        .set_stream_control_method(self.settings.connection.stream_control_method);
                     if let Err(e) = self.profile_manager.save() {
                         log::error!("Failed to save profiles: {}", e);
                     }
-                    self.user_message = Some(UserMessage::Info(format!("Switched to profile: {}", name)));
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Switched to profile: {}", name)));
                     // Disconnect when switching profiles
                     return Task::done(Message::DisconnectPressed);
                 }
@@ -1003,26 +1015,35 @@ impl Ultimate64Browser {
             Message::CreateProfile => {
                 let name = self.new_profile_name.trim().to_string();
                 if name.is_empty() {
-                    self.user_message = Some(UserMessage::Error("Profile name cannot be empty".to_string()));
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name cannot be empty".to_string(),
+                    ));
                 } else if self.profile_manager.add_profile(name.clone()) {
                     self.new_profile_name.clear();
                     if let Err(e) = self.profile_manager.save() {
                         log::error!("Failed to save profiles: {}", e);
                     }
-                    self.user_message = Some(UserMessage::Info(format!("Created profile: {}", name)));
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Created profile: {}", name)));
                 } else {
-                    self.user_message = Some(UserMessage::Error("Profile name already exists".to_string()));
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name already exists".to_string(),
+                    ));
                 }
                 Task::none()
             }
 
             Message::DuplicateProfile => {
                 let new_name = format!("{} (copy)", self.profile_manager.active_profile);
-                if self.profile_manager.duplicate_profile(&self.profile_manager.active_profile.clone(), new_name.clone()) {
+                if self.profile_manager.duplicate_profile(
+                    &self.profile_manager.active_profile.clone(),
+                    new_name.clone(),
+                ) {
                     if let Err(e) = self.profile_manager.save() {
                         log::error!("Failed to save profiles: {}", e);
                     }
-                    self.user_message = Some(UserMessage::Info(format!("Duplicated to: {}", new_name)));
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Duplicated to: {}", new_name)));
                 }
                 Task::none()
             }
@@ -1034,9 +1055,12 @@ impl Ultimate64Browser {
                     if let Err(e) = self.profile_manager.save() {
                         log::error!("Failed to save profiles: {}", e);
                     }
-                    self.user_message = Some(UserMessage::Info(format!("Deleted profile: {}", name)));
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Deleted profile: {}", name)));
                 } else {
-                    self.user_message = Some(UserMessage::Error("Cannot delete active or last profile".to_string()));
+                    self.user_message = Some(UserMessage::Error(
+                        "Cannot delete active or last profile".to_string(),
+                    ));
                 }
                 Task::none()
             }
@@ -1050,15 +1074,23 @@ impl Ultimate64Browser {
                 let new_name = self.rename_profile_name.trim().to_string();
                 let old_name = self.profile_manager.active_profile.clone();
                 if new_name.is_empty() {
-                    self.user_message = Some(UserMessage::Error("Profile name cannot be empty".to_string()));
-                } else if self.profile_manager.rename_profile(&old_name, new_name.clone()) {
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name cannot be empty".to_string(),
+                    ));
+                } else if self
+                    .profile_manager
+                    .rename_profile(&old_name, new_name.clone())
+                {
                     self.rename_profile_name.clear();
                     if let Err(e) = self.profile_manager.save() {
                         log::error!("Failed to save profiles: {}", e);
                     }
-                    self.user_message = Some(UserMessage::Info(format!("Renamed to: {}", new_name)));
+                    self.user_message =
+                        Some(UserMessage::Info(format!("Renamed to: {}", new_name)));
                 } else {
-                    self.user_message = Some(UserMessage::Error("Profile name already exists".to_string()));
+                    self.user_message = Some(UserMessage::Error(
+                        "Profile name already exists".to_string(),
+                    ));
                 }
                 Task::none()
             }
@@ -1488,15 +1520,17 @@ impl Ultimate64Browser {
                 }
                 Task::none()
             }
-
             Message::DefaultSongDurationChanged(value) => {
                 if let Ok(duration) = value.parse::<u32>() {
                     if duration > 0 && duration <= 3600 {
-                        self.settings.preferences.default_song_duration = duration;
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .default_song_duration = duration;
+                        self.settings = self.profile_manager.active_settings().clone();
                         self.music_player.set_default_song_duration(duration);
-                        // Save settings
-                        if let Err(e) = self.settings.save() {
-                            log::error!("Failed to save settings: {}", e);
+                        if let Err(e) = self.profile_manager.save() {
+                            log::error!("Failed to save profiles: {}", e);
                         }
                     }
                 }
@@ -1507,16 +1541,18 @@ impl Ultimate64Browser {
                 self.font_size_input = value.clone();
                 if let Ok(size) = value.parse::<u32>() {
                     if size >= 8 && size <= 24 {
-                        self.settings.preferences.font_size = size;
-                        // Save settings
-                        if let Err(e) = self.settings.save() {
-                            log::error!("Failed to save settings: {}", e);
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .font_size = size;
+                        self.settings = self.profile_manager.active_settings().clone();
+                        if let Err(e) = self.profile_manager.save() {
+                            log::error!("Failed to save profiles: {}", e);
                         }
                     }
                 }
                 Task::none()
             }
-
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -1530,9 +1566,13 @@ impl Ultimate64Browser {
 
             Message::FileBrowserStartDirSelected(path) => {
                 if let Some(p) = path {
-                    self.settings.default_paths.file_browser_start_dir = Some(p);
-                    if let Err(e) = self.settings.save() {
-                        log::error!("Failed to save settings: {}", e);
+                    self.profile_manager
+                        .active_settings_mut()
+                        .default_paths
+                        .file_browser_start_dir = Some(p);
+                    self.settings = self.profile_manager.active_settings().clone();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
                     }
                     self.user_message = Some(UserMessage::Info(
                         "File Browser start directory set (restart app to apply)".to_string(),
@@ -1542,9 +1582,13 @@ impl Ultimate64Browser {
             }
 
             Message::ClearFileBrowserStartDir => {
-                self.settings.default_paths.file_browser_start_dir = None;
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                self.profile_manager
+                    .active_settings_mut()
+                    .default_paths
+                    .file_browser_start_dir = None;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 self.user_message = Some(UserMessage::Info(
                     "File Browser start directory cleared".to_string(),
@@ -1564,9 +1608,13 @@ impl Ultimate64Browser {
 
             Message::MusicPlayerStartDirSelected(path) => {
                 if let Some(p) = path {
-                    self.settings.default_paths.music_player_start_dir = Some(p);
-                    if let Err(e) = self.settings.save() {
-                        log::error!("Failed to save settings: {}", e);
+                    self.profile_manager
+                        .active_settings_mut()
+                        .default_paths
+                        .music_player_start_dir = Some(p);
+                    self.settings = self.profile_manager.active_settings().clone();
+                    if let Err(e) = self.profile_manager.save() {
+                        log::error!("Failed to save profiles: {}", e);
                     }
                     self.user_message = Some(UserMessage::Info(
                         "Music Player start directory set (restart app to apply)".to_string(),
@@ -1576,9 +1624,13 @@ impl Ultimate64Browser {
             }
 
             Message::ClearMusicPlayerStartDir => {
-                self.settings.default_paths.music_player_start_dir = None;
-                if let Err(e) = self.settings.save() {
-                    log::error!("Failed to save settings: {}", e);
+                self.profile_manager
+                    .active_settings_mut()
+                    .default_paths
+                    .music_player_start_dir = None;
+                self.settings = self.profile_manager.active_settings().clone();
+                if let Err(e) = self.profile_manager.save() {
+                    log::error!("Failed to save profiles: {}", e);
                 }
                 self.user_message = Some(UserMessage::Info(
                     "Music Player start directory cleared".to_string(),
@@ -1910,7 +1962,7 @@ impl Ultimate64Browser {
             .map(Message::MusicPlayer)
     }
 
-fn view_settings(&self) -> Element<'_, Message> {
+    fn view_settings(&self) -> Element<'_, Message> {
         // Profile management section
         let profile_names = self.profile_manager.profile_names();
         let profile_section = column![
@@ -2156,8 +2208,16 @@ fn view_settings(&self) -> Element<'_, Message> {
             text("DEBUG INFO").size(18),
             text(format!("Platform: {}", std::env::consts::OS)).size(12),
             text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
-            text(format!("Active profile: {}", self.profile_manager.active_profile)).size(12),
-            text(format!("Total profiles: {}", self.profile_manager.profiles.len())).size(12),
+            text(format!(
+                "Active profile: {}",
+                self.profile_manager.active_profile
+            ))
+            .size(12),
+            text(format!(
+                "Total profiles: {}",
+                self.profile_manager.profiles.len()
+            ))
+            .size(12),
         ];
 
         scrollable(container(
