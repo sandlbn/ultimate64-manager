@@ -390,7 +390,7 @@ impl FileBrowser {
         // Navigation buttons with filter
         let nav_buttons = row![
             tooltip(
-                button(text("Up").size(normal))
+                button(text("⬆ Up").size(normal))
                     .on_press(FileBrowserMessage::NavigateUp)
                     .padding([4, 8]),
                 "Go to parent folder",
@@ -398,7 +398,7 @@ impl FileBrowser {
             )
             .style(container::bordered_box),
             tooltip(
-                button(text("Browse").size(normal))
+                button(text("🔍 Browse").size(normal))
                     .on_press(FileBrowserMessage::SelectDirectory)
                     .padding([4, 8]),
                 "Choose a different folder",
@@ -437,7 +437,7 @@ impl FileBrowser {
             .style(container::bordered_box),
             Space::new().width(10),
             tooltip(
-                button(text("All").size(tiny))
+                button(text("✔ All").size(tiny))
                     .on_press(FileBrowserMessage::SelectAll)
                     .padding([2, 6]),
                 "Select all files",
@@ -445,7 +445,7 @@ impl FileBrowser {
             )
             .style(container::bordered_box),
             tooltip(
-                button(text("None").size(tiny))
+                button(text("✖ None").size(tiny))
                     .on_press(FileBrowserMessage::SelectNone)
                     .padding([2, 6]),
                 "Deselect all files",

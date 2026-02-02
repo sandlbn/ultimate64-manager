@@ -1915,7 +1915,7 @@ impl Ultimate64Browser {
         let copy_buttons = container(
             column![
                 tooltip(
-                    button(text(">>").size(14))
+                    button(text("📄 →").size(14))
                         .on_press(Message::CopyLocalToRemote)
                         .padding([8, 12]),
                     "Upload checked files to Ultimate64",
@@ -1924,7 +1924,7 @@ impl Ultimate64Browser {
                 .style(container::bordered_box),
                 Space::new().height(10),
                 tooltip(
-                    button(text("<<").size(14))
+                    button(text("📄 ←").size(14))
                         .on_press(Message::CopyRemoteToLocal)
                         .padding([8, 12]),
                     "Download selected file from Ultimate64",
@@ -1944,7 +1944,7 @@ impl Ultimate64Browser {
                 .size(12)
                 .width(Length::Fill),
             tooltip(
-                button(text("Refresh").size(10))
+                button(text("⟳ Refresh").size(10))
                     .on_press(Message::RemoteBrowser(RemoteBrowserMessage::RefreshFiles))
                     .padding([2, 6]),
                 "Refresh remote file listing",

@@ -1137,9 +1137,9 @@ impl MusicPlayer {
             tooltip(
                 button(
                     text(if self.playback_state == PlaybackState::Playing {
-                        "Pause"
+                        "‖"
                     } else {
-                        "Play"
+                        "▶"
                     })
                     .size(normal)
                 )
@@ -1158,7 +1158,7 @@ impl MusicPlayer {
             )
             .style(container::bordered_box),
             tooltip(
-                button(text("Stop").size(normal))
+                button(text("■").size(normal))
                     .on_press(MusicPlayerMessage::Stop)
                     .padding([4, 8]),
                 "Stop playback and reset to beginning",
@@ -1198,9 +1198,9 @@ impl MusicPlayer {
             tooltip(
                 button(
                     text(if self.shuffle_enabled {
-                        "Shuffle: ON"
+                        "↭ Shuffle: ON"
                     } else {
-                        "Shuffle"
+                        "↭ Shuffle"
                     })
                     .size(small)
                 )
@@ -1218,9 +1218,9 @@ impl MusicPlayer {
             tooltip(
                 button(
                     text(if self.repeat_enabled {
-                        "Repeat: ON"
+                        "⟳ Repeat: ON"
                     } else {
-                        "Repeat"
+                        "⟳ Repeat"
                     })
                     .size(small)
                 )
@@ -1242,15 +1242,14 @@ impl MusicPlayer {
             row![now_playing, Space::new().width(Length::Fill), time_display]
                 .align_y(iced::Alignment::Center),
             row![transport, Space::new().width(20), modes].align_y(iced::Alignment::Center),
-            // Progress bar
+            // Progress bar - dimensions on the widget itself
+// Progress bar
             container(progress_bar(
                 0.0..=self.current_song_duration as f32,
-                self.elapsed_seconds as f32
+                self.elapsed_seconds as f32,
             ))
             .width(Length::Fill)
-            .height(Length::Fixed(8.0))
-            .padding([5, 0]),
-        ]
+            .height(Length::Fixed(8.0)),        ]
         .spacing(8)
         .padding(10);
 
