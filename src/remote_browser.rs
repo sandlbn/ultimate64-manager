@@ -498,7 +498,7 @@ impl RemoteBrowser {
         // Navigation buttons with filter
         let nav_buttons = row![
             tooltip(
-                button(text("Up").size(normal))
+                button(text("⬆ Up").size(normal))
                     .on_press(RemoteBrowserMessage::NavigateUp)
                     .padding([4, 8]),
                 "Go to parent folder",

@@ -1040,11 +1040,11 @@ impl VideoStreaming {
         ]
         .spacing(5); // Stream controls with keyboard toggle
         let screenshot_button = if self.is_streaming {
-            button(text("Screenshot").size(11))
+            button(text("📸").size(11))
                 .on_press(StreamingMessage::TakeScreenshot)
                 .padding([6, 10])
         } else {
-            button(text("Screenshot").size(11)).padding([6, 10])
+            button(text("📸").size(11)).padding([6, 10])
         };
 
         // Keyboard toggle button
@@ -1052,9 +1052,9 @@ impl VideoStreaming {
             tooltip(
                 button(
                     text(if self.keyboard_enabled {
-                        "⌨ Enabled"
+                        "⌨️ Enabled"
                     } else {
-                        "⌨ Disabled"
+                        "⌨️ Disabled"
                     })
                     .size(11),
                 )
@@ -1093,7 +1093,7 @@ impl VideoStreaming {
             row![
                 if self.is_streaming {
                     tooltip(
-                        button(text("STOP").size(11))
+                        button(text("■ STOP").size(11))
                             .on_press(StreamingMessage::StopStream)
                             .padding([6, 14]),
                         "Stop video stream",
@@ -1102,7 +1102,7 @@ impl VideoStreaming {
                     .style(container::bordered_box)
                 } else {
                     tooltip(
-                        button(text("START").size(11))
+                        button(text("▶ LIVE").size(11))
                             .on_press(StreamingMessage::StartStream)
                             .padding([6, 14]),
                         "Start video stream",
@@ -1127,7 +1127,7 @@ impl VideoStreaming {
             row![
                 tooltip(
                     checkbox(self.audio_enabled)
-                        .label("Audio")
+                        .label("🔊 Audio")
                         .on_toggle(StreamingMessage::AudioToggled)
                         .size(16)
                         .text_size(11),
