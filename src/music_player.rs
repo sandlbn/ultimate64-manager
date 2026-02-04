@@ -1243,13 +1243,14 @@ impl MusicPlayer {
                 .align_y(iced::Alignment::Center),
             row![transport, Space::new().width(20), modes].align_y(iced::Alignment::Center),
             // Progress bar - dimensions on the widget itself
-// Progress bar
+            // Progress bar
             container(progress_bar(
                 0.0..=self.current_song_duration as f32,
                 self.elapsed_seconds as f32,
             ))
             .width(Length::Fill)
-            .height(Length::Fixed(8.0)),        ]
+            .height(Length::Fixed(8.0)),
+        ]
         .spacing(8)
         .padding(10);
 
