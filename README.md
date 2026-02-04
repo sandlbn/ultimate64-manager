@@ -41,6 +41,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Fill memory ranges
   - Click-to-edit bytes
 - **Configuration Editor** – Edit Ultimate configuration settings
+- **Device Discovery** – Automatic network discovery of Ultimate devices
+- **Configuration Profiles** – Save and load configuration profiles
+- **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC and menus
 - **CSDb Browser** – Search and browse releases from CSDb.dk
