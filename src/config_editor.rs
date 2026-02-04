@@ -87,6 +87,16 @@ pub enum ConfigEditorMessage {
     LoadPreset,
     LoadPresetFileSelected(Option<std::path::PathBuf>),
     LoadPresetComplete(Result<ConfigPreset, String>),
+
+    // Full backup operations
+    SaveAllConfig,
+    AllConfigFetched(Result<ConfigPreset, String>),
+    SaveAllConfigFileSelected(Option<std::path::PathBuf>),
+    SaveAllConfigComplete(Result<String, String>),
+    LoadAllConfig,
+    LoadAllConfigFileSelected(Option<std::path::PathBuf>),
+    LoadAllConfigLoaded(Result<ConfigPreset, String>),
+    ApplyAllConfigComplete(Result<String, String>),
 }
 
 pub struct ConfigEditor {
@@ -107,6 +117,9 @@ pub struct ConfigEditor {
     status_message: Option<String>,
     error_message: Option<String>,
     search_filter: String,
+
+    // Temporary storage for full backup before file dialog
+    pending_all_config: Option<ConfigPreset>,
 }
 
 impl ConfigEditor {
@@ -122,6 +135,7 @@ impl ConfigEditor {
             status_message: Some("Click 'Load' to fetch configuration".to_string()),
             error_message: None,
             search_filter: String::new(),
+            pending_all_config: None,
         }
     }
 
@@ -558,6 +572,161 @@ impl ConfigEditor {
                 }
                 Task::none()
             }
+
+            ConfigEditorMessage::SaveAllConfig => {
+                if self.categories.is_empty() {
+                    self.error_message =
+                        Some("No categories loaded. Click 'Load' first.".to_string());
+                    return Task::none();
+                }
+                if let Some(host) = host_url {
+                    self.is_loading = true;
+                    self.status_message = Some("Fetching all configuration...".to_string());
+                    self.error_message = None;
+                    let categories = self.categories.clone();
+                    Task::perform(
+                        fetch_all_config(host, categories, password),
+                        ConfigEditorMessage::AllConfigFetched,
+                    )
+                } else {
+                    self.error_message = Some("Not connected to Ultimate64".to_string());
+                    Task::none()
+                }
+            }
+
+            ConfigEditorMessage::AllConfigFetched(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(preset) => {
+                        self.status_message = Some(format!(
+                            "Fetched {} categories ({} settings), select save location...",
+                            preset.settings.len(),
+                            preset.setting_count()
+                        ));
+                        self.error_message = None;
+                        self.pending_all_config = Some(preset);
+                        Task::perform(
+                            async {
+                                rfd::AsyncFileDialog::new()
+                                    .set_title("Save Full Configuration Backup")
+                                    .set_file_name("ultimate64_full_config.json")
+                                    .add_filter("JSON files", &["json"])
+                                    .save_file()
+                                    .await
+                                    .map(|handle| handle.path().to_path_buf())
+                            },
+                            ConfigEditorMessage::SaveAllConfigFileSelected,
+                        )
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to fetch config: {}", e));
+                        Task::none()
+                    }
+                }
+            }
+
+            ConfigEditorMessage::SaveAllConfigFileSelected(path) => {
+                if let Some(path) = path {
+                    if let Some(preset) = self.pending_all_config.take() {
+                        self.status_message = Some("Saving full configuration...".to_string());
+                        return Task::perform(
+                            config_presets::save_preset_async(preset, path),
+                            ConfigEditorMessage::SaveAllConfigComplete,
+                        );
+                    }
+                }
+                self.pending_all_config = None;
+                Task::none()
+            }
+
+            ConfigEditorMessage::SaveAllConfigComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Save failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
+            ConfigEditorMessage::LoadAllConfig => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Load Full Configuration Backup")
+                        .add_filter("JSON files", &["json"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                ConfigEditorMessage::LoadAllConfigFileSelected,
+            ),
+
+            ConfigEditorMessage::LoadAllConfigFileSelected(path) => {
+                if let Some(path) = path {
+                    self.status_message = Some("Loading configuration file...".to_string());
+                    return Task::perform(
+                        config_presets::load_preset_async(path),
+                        ConfigEditorMessage::LoadAllConfigLoaded,
+                    );
+                }
+                Task::none()
+            }
+
+            ConfigEditorMessage::LoadAllConfigLoaded(result) => {
+                match result {
+                    Ok(preset) => {
+                        if let Some(host) = host_url {
+                            let total_items: usize =
+                                preset.settings.values().map(|v| v.len()).sum();
+                            let total_categories = preset.settings.len();
+                            self.is_loading = true;
+                            self.status_message = Some(format!(
+                                "Restoring {} settings across {} categories...",
+                                total_items, total_categories
+                            ));
+                            self.error_message = None;
+                            Task::perform(
+                                apply_all_config(host, preset.settings, password),
+                                ConfigEditorMessage::ApplyAllConfigComplete,
+                            )
+                        } else {
+                            self.error_message =
+                                Some("Not connected to Ultimate64".to_string());
+                            Task::none()
+                        }
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Load failed: {}", e));
+                        Task::none()
+                    }
+                }
+            }
+
+            ConfigEditorMessage::ApplyAllConfigComplete(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        self.error_message = None;
+                        // Refresh current category view if one is selected
+                        if let Some(category) = self.selected_category.clone() {
+                            return self.update(
+                                ConfigEditorMessage::SelectCategory(category),
+                                _connection,
+                                host_url,
+                                password,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Restore failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -714,6 +883,34 @@ impl ConfigEditor {
         )
         .padding(10);
 
+        // Full backup controls
+        let backup_controls = container(
+            column![
+                rule::horizontal(1),
+                text("FULL BACKUP").size(small),
+                tooltip(
+                    button(text("Save All Config").size(small))
+                        .on_press(ConfigEditorMessage::SaveAllConfig)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Save all configuration categories to a JSON file",
+                    tooltip::Position::Right,
+                )
+                .style(container::bordered_box),
+                tooltip(
+                    button(text("Restore All Config").size(small))
+                        .on_press(ConfigEditorMessage::LoadAllConfig)
+                        .padding([4, 8])
+                        .width(Length::Fill),
+                    "Restore all configuration from a JSON backup file",
+                    tooltip::Position::Right,
+                )
+                .style(container::bordered_box),
+            ]
+            .spacing(5),
+        )
+        .padding(10);
+
         let left_pane = container(
             column![
                 category_header,
@@ -721,6 +918,7 @@ impl ConfigEditor {
                 category_list,
                 flash_controls,
                 preset_controls,
+                backup_controls,
             ]
             .spacing(0)
             .height(Length::Fill),
@@ -1429,19 +1627,41 @@ async fn save_batch_changes(
     }
 
     let response = request
-        .json(&serde_json::Value::Object(body))
+        .json(&serde_json::Value::Object(body.clone()))
         .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .await;
 
-    let status = response.status();
-    let response_text = response.text().await.unwrap_or_default();
+    match response {
+        Ok(response) => {
+            let status = response.status();
+            let response_text = response.text().await.unwrap_or_default();
 
-    if status.is_success() {
-        let total_items: usize = changes.values().map(|v| v.len()).sum();
-        Ok(format!("Saved {} setting(s)", total_items))
-    } else {
-        Err(format!("Save failed: {} - {}", status, response_text))
+            if status.is_success() {
+                let total_items: usize = changes.values().map(|v| v.len()).sum();
+                Ok(format!("Saved {} setting(s)", total_items))
+            } else {
+                Err(format!("Save failed: {} - {}", status, response_text))
+            }
+        }
+        Err(e) => {
+            let err_msg = format!("Request failed: {}", e);
+            // Network-related categories cause the device to reconfigure its
+            // network stack, which drops the TCP connection. The settings are
+            // applied before the connection resets, so treat this as success.
+            let has_network_category = changes.keys().any(|c| is_network_related_category(c));
+            if has_network_category && is_connection_reset_error(&err_msg) {
+                let total_items: usize = changes.values().map(|v| v.len()).sum();
+                log::info!(
+                    "Connection reset after saving network settings - settings were likely applied"
+                );
+                Ok(format!(
+                    "Saved {} setting(s) (connection reset - normal for network settings)",
+                    total_items
+                ))
+            } else {
+                Err(err_msg)
+            }
+        }
     }
 }
 
@@ -1484,4 +1704,158 @@ async fn flash_operation(
         let text = response.text().await.unwrap_or_default();
         Err(format!("Flash operation failed: {} - {}", status, text))
     }
+}
+
+async fn fetch_all_config(
+    host: String,
+    categories: Vec<String>,
+    password: Option<String>,
+) -> Result<ConfigPreset, String> {
+    log::info!(
+        "Fetching full configuration backup ({} categories)",
+        categories.len()
+    );
+
+    let mut preset = ConfigPreset::new();
+    preset.name = Some("Full Configuration Backup".to_string());
+    preset.description = Some(format!(
+        "Complete backup of {} categories",
+        categories.len()
+    ));
+
+    for (i, category) in categories.iter().enumerate() {
+        log::info!(
+            "Fetching category {}/{}: '{}'",
+            i + 1,
+            categories.len(),
+            category
+        );
+        match fetch_category_items(host.clone(), category.clone(), password.clone()).await {
+            Ok((_cat, items)) => {
+                for item in items {
+                    preset.add_setting(&item.category, &item.name, item.current_value);
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to fetch category '{}': {}", category, e);
+                return Err(format!("Failed to fetch category '{}': {}", category, e));
+            }
+        }
+        // Delay after each request to give the device time to recover
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+
+    log::info!(
+        "Full config backup complete: {} categories, {} total settings",
+        preset.settings.len(),
+        preset.setting_count()
+    );
+    Ok(preset)
+}
+
+async fn apply_all_config(
+    host: String,
+    settings: HashMap<String, HashMap<String, serde_json::Value>>,
+    password: Option<String>,
+) -> Result<String, String> {
+    let total_categories = settings.len();
+    let mut total_items = 0;
+
+    // Apply one category at a time with delays to avoid overwhelming the device
+    let categories: Vec<_> = settings.keys().cloned().collect();
+    for (i, category) in categories.iter().enumerate() {
+        let items = settings.get(category).unwrap();
+        log::info!(
+            "Restoring category {}/{}: '{}' ({} settings)",
+            i + 1,
+            categories.len(),
+            category,
+            items.len()
+        );
+        let mut single = HashMap::new();
+        single.insert(category.clone(), items.clone());
+        total_items += items.len();
+
+        // Retry with increasing backoff to handle transient connection drops
+        // (e.g. device reconfiguring network after Ethernet/WiFi settings change)
+        let mut last_err = String::new();
+        let mut success = false;
+        let is_network_category = is_network_related_category(category);
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let backoff = std::time::Duration::from_millis(2000 * (attempt as u64 + 1));
+                log::info!(
+                    "Retry {}/3 for '{}' after {}ms",
+                    attempt + 1,
+                    category,
+                    backoff.as_millis()
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            match save_batch_changes(host.clone(), single.clone(), password.clone()).await {
+                Ok(_) => {
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    // Network-related categories cause the device to reconfigure its
+                    // network stack, which drops the TCP connection. The settings are
+                    // applied before the connection resets, so treat this as success.
+                    if is_network_category && is_connection_reset_error(&e) {
+                        log::info!(
+                            "Connection reset after '{}' - expected for network settings, treating as success",
+                            category
+                        );
+                        success = true;
+                        break;
+                    }
+                    log::warn!(
+                        "Attempt {} failed for '{}': {}",
+                        attempt + 1,
+                        category,
+                        e
+                    );
+                    last_err = e;
+                }
+            }
+        }
+        if !success {
+            return Err(format!(
+                "Failed to restore '{}' after 3 attempts: {}",
+                category, last_err
+            ));
+        }
+
+        // Extra delay after network categories to let the device finish reconfiguring
+        let delay = if is_network_category { 3000 } else { 1500 };
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    }
+
+    log::info!(
+        "Full config restore complete: {} settings across {} categories",
+        total_items,
+        total_categories
+    );
+    Ok(format!(
+        "Restored {} settings across {} categories",
+        total_items, total_categories
+    ))
+}
+
+/// Check if a category name relates to network/ethernet/wifi settings.
+/// The device may reset its network connection when these are changed.
+fn is_network_related_category(category: &str) -> bool {
+    let lower = category.to_lowercase();
+    lower.contains("ethernet")
+        || lower.contains("wifi")
+        || lower.contains("network")
+}
+
+/// Check if an error message indicates a connection reset (OS error 54 on macOS, 104 on Linux)
+fn is_connection_reset_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("connection reset")
+        || lower.contains("os error 54")
+        || lower.contains("os error 104")
+        || lower.contains("broken pipe")
 }
