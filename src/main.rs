@@ -2142,7 +2142,7 @@ impl Ultimate64Browser {
             row![text("Ultimate64 IP Address:").size(14), discovery_button,]
                 .spacing(10)
                 .align_y(iced::Alignment::Center),
-            text_input("192.168.1.64", &self.host_input)
+            text_input("eg. 192.168.1.64", &self.host_input)
                 .on_input(Message::HostInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
