@@ -469,10 +469,14 @@ impl ConfigEditor {
 
                 Task::perform(
                     async move {
-                        rfd::AsyncFileDialog::new()
+                        let mut dialog = rfd::AsyncFileDialog::new()
                             .set_title("Save Configuration Preset")
                             .set_file_name(&default_name)
-                            .add_filter("JSON files", &["json"])
+                            .add_filter("JSON files", &["json"]);
+                        if let Some(dir) = config_presets::presets_dir() {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog
                             .save_file()
                             .await
                             .map(|handle| handle.path().to_path_buf())
@@ -522,9 +526,13 @@ impl ConfigEditor {
 
             ConfigEditorMessage::LoadPreset => Task::perform(
                 async {
-                    rfd::AsyncFileDialog::new()
+                    let mut dialog = rfd::AsyncFileDialog::new()
                         .set_title("Load Configuration Preset")
-                        .add_filter("JSON files", &["json"])
+                        .add_filter("JSON files", &["json"]);
+                    if let Some(dir) = config_presets::presets_dir() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog
                         .pick_file()
                         .await
                         .map(|handle| handle.path().to_path_buf())
@@ -607,10 +615,14 @@ impl ConfigEditor {
                         self.pending_all_config = Some(preset);
                         Task::perform(
                             async {
-                                rfd::AsyncFileDialog::new()
+                                let mut dialog = rfd::AsyncFileDialog::new()
                                     .set_title("Save Full Configuration Backup")
                                     .set_file_name("ultimate64_full_config.json")
-                                    .add_filter("JSON files", &["json"])
+                                    .add_filter("JSON files", &["json"]);
+                                if let Some(dir) = config_presets::presets_dir() {
+                                    dialog = dialog.set_directory(dir);
+                                }
+                                dialog
                                     .save_file()
                                     .await
                                     .map(|handle| handle.path().to_path_buf())
@@ -654,9 +666,13 @@ impl ConfigEditor {
 
             ConfigEditorMessage::LoadAllConfig => Task::perform(
                 async {
-                    rfd::AsyncFileDialog::new()
+                    let mut dialog = rfd::AsyncFileDialog::new()
                         .set_title("Load Full Configuration Backup")
-                        .add_filter("JSON files", &["json"])
+                        .add_filter("JSON files", &["json"]);
+                    if let Some(dir) = config_presets::presets_dir() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog
                         .pick_file()
                         .await
                         .map(|handle| handle.path().to_path_buf())

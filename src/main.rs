@@ -428,7 +428,7 @@ impl Ultimate64Browser {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
- Message::SaveProfile => {
+            Message::SaveProfile => {
                 // Sync current input fields to the active profile before saving
                 let conn_settings = ConnectionSettings {
                     host: self.host_input.clone(),
