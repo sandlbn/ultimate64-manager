@@ -675,35 +675,31 @@ impl ConfigEditor {
                 Task::none()
             }
 
-            ConfigEditorMessage::LoadAllConfigLoaded(result) => {
-                match result {
-                    Ok(preset) => {
-                        if let Some(host) = host_url {
-                            let total_items: usize =
-                                preset.settings.values().map(|v| v.len()).sum();
-                            let total_categories = preset.settings.len();
-                            self.is_loading = true;
-                            self.status_message = Some(format!(
-                                "Restoring {} settings across {} categories...",
-                                total_items, total_categories
-                            ));
-                            self.error_message = None;
-                            Task::perform(
-                                apply_all_config(host, preset.settings, password),
-                                ConfigEditorMessage::ApplyAllConfigComplete,
-                            )
-                        } else {
-                            self.error_message =
-                                Some("Not connected to Ultimate64".to_string());
-                            Task::none()
-                        }
-                    }
-                    Err(e) => {
-                        self.error_message = Some(format!("Load failed: {}", e));
+            ConfigEditorMessage::LoadAllConfigLoaded(result) => match result {
+                Ok(preset) => {
+                    if let Some(host) = host_url {
+                        let total_items: usize = preset.settings.values().map(|v| v.len()).sum();
+                        let total_categories = preset.settings.len();
+                        self.is_loading = true;
+                        self.status_message = Some(format!(
+                            "Restoring {} settings across {} categories...",
+                            total_items, total_categories
+                        ));
+                        self.error_message = None;
+                        Task::perform(
+                            apply_all_config(host, preset.settings, password),
+                            ConfigEditorMessage::ApplyAllConfigComplete,
+                        )
+                    } else {
+                        self.error_message = Some("Not connected to Ultimate64".to_string());
                         Task::none()
                     }
                 }
-            }
+                Err(e) => {
+                    self.error_message = Some(format!("Load failed: {}", e));
+                    Task::none()
+                }
+            },
 
             ConfigEditorMessage::ApplyAllConfigComplete(result) => {
                 self.is_loading = false;
@@ -1809,12 +1805,7 @@ async fn apply_all_config(
                         success = true;
                         break;
                     }
-                    log::warn!(
-                        "Attempt {} failed for '{}': {}",
-                        attempt + 1,
-                        category,
-                        e
-                    );
+                    log::warn!("Attempt {} failed for '{}': {}", attempt + 1, category, e);
                     last_err = e;
                 }
             }
@@ -1846,9 +1837,7 @@ async fn apply_all_config(
 /// The device may reset its network connection when these are changed.
 fn is_network_related_category(category: &str) -> bool {
     let lower = category.to_lowercase();
-    lower.contains("ethernet")
-        || lower.contains("wifi")
-        || lower.contains("network")
+    lower.contains("ethernet") || lower.contains("wifi") || lower.contains("network")
 }
 
 /// Check if an error message indicates a connection reset (OS error 54 on macOS, 104 on Linux)
