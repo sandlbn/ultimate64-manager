@@ -469,10 +469,14 @@ impl ConfigEditor {
 
                 Task::perform(
                     async move {
-                        rfd::AsyncFileDialog::new()
+                        let mut dialog = rfd::AsyncFileDialog::new()
                             .set_title("Save Configuration Preset")
                             .set_file_name(&default_name)
-                            .add_filter("JSON files", &["json"])
+                            .add_filter("JSON files", &["json"]);
+                        if let Some(dir) = config_presets::presets_dir() {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog
                             .save_file()
                             .await
                             .map(|handle| handle.path().to_path_buf())
@@ -522,9 +526,13 @@ impl ConfigEditor {
 
             ConfigEditorMessage::LoadPreset => Task::perform(
                 async {
-                    rfd::AsyncFileDialog::new()
+                    let mut dialog = rfd::AsyncFileDialog::new()
                         .set_title("Load Configuration Preset")
-                        .add_filter("JSON files", &["json"])
+                        .add_filter("JSON files", &["json"]);
+                    if let Some(dir) = config_presets::presets_dir() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog
                         .pick_file()
                         .await
                         .map(|handle| handle.path().to_path_buf())
@@ -607,10 +615,14 @@ impl ConfigEditor {
                         self.pending_all_config = Some(preset);
                         Task::perform(
                             async {
-                                rfd::AsyncFileDialog::new()
+                                let mut dialog = rfd::AsyncFileDialog::new()
                                     .set_title("Save Full Configuration Backup")
                                     .set_file_name("ultimate64_full_config.json")
-                                    .add_filter("JSON files", &["json"])
+                                    .add_filter("JSON files", &["json"]);
+                                if let Some(dir) = config_presets::presets_dir() {
+                                    dialog = dialog.set_directory(dir);
+                                }
+                                dialog
                                     .save_file()
                                     .await
                                     .map(|handle| handle.path().to_path_buf())
@@ -654,9 +666,13 @@ impl ConfigEditor {
 
             ConfigEditorMessage::LoadAllConfig => Task::perform(
                 async {
-                    rfd::AsyncFileDialog::new()
+                    let mut dialog = rfd::AsyncFileDialog::new()
                         .set_title("Load Full Configuration Backup")
-                        .add_filter("JSON files", &["json"])
+                        .add_filter("JSON files", &["json"]);
+                    if let Some(dir) = config_presets::presets_dir() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    dialog
                         .pick_file()
                         .await
                         .map(|handle| handle.path().to_path_buf())
@@ -675,35 +691,31 @@ impl ConfigEditor {
                 Task::none()
             }
 
-            ConfigEditorMessage::LoadAllConfigLoaded(result) => {
-                match result {
-                    Ok(preset) => {
-                        if let Some(host) = host_url {
-                            let total_items: usize =
-                                preset.settings.values().map(|v| v.len()).sum();
-                            let total_categories = preset.settings.len();
-                            self.is_loading = true;
-                            self.status_message = Some(format!(
-                                "Restoring {} settings across {} categories...",
-                                total_items, total_categories
-                            ));
-                            self.error_message = None;
-                            Task::perform(
-                                apply_all_config(host, preset.settings, password),
-                                ConfigEditorMessage::ApplyAllConfigComplete,
-                            )
-                        } else {
-                            self.error_message =
-                                Some("Not connected to Ultimate64".to_string());
-                            Task::none()
-                        }
-                    }
-                    Err(e) => {
-                        self.error_message = Some(format!("Load failed: {}", e));
+            ConfigEditorMessage::LoadAllConfigLoaded(result) => match result {
+                Ok(preset) => {
+                    if let Some(host) = host_url {
+                        let total_items: usize = preset.settings.values().map(|v| v.len()).sum();
+                        let total_categories = preset.settings.len();
+                        self.is_loading = true;
+                        self.status_message = Some(format!(
+                            "Restoring {} settings across {} categories...",
+                            total_items, total_categories
+                        ));
+                        self.error_message = None;
+                        Task::perform(
+                            apply_all_config(host, preset.settings, password),
+                            ConfigEditorMessage::ApplyAllConfigComplete,
+                        )
+                    } else {
+                        self.error_message = Some("Not connected to Ultimate64".to_string());
                         Task::none()
                     }
                 }
-            }
+                Err(e) => {
+                    self.error_message = Some(format!("Load failed: {}", e));
+                    Task::none()
+                }
+            },
 
             ConfigEditorMessage::ApplyAllConfigComplete(result) => {
                 self.is_loading = false;
@@ -1809,12 +1821,7 @@ async fn apply_all_config(
                         success = true;
                         break;
                     }
-                    log::warn!(
-                        "Attempt {} failed for '{}': {}",
-                        attempt + 1,
-                        category,
-                        e
-                    );
+                    log::warn!("Attempt {} failed for '{}': {}", attempt + 1, category, e);
                     last_err = e;
                 }
             }
@@ -1846,9 +1853,7 @@ async fn apply_all_config(
 /// The device may reset its network connection when these are changed.
 fn is_network_related_category(category: &str) -> bool {
     let lower = category.to_lowercase();
-    lower.contains("ethernet")
-        || lower.contains("wifi")
-        || lower.contains("network")
+    lower.contains("ethernet") || lower.contains("wifi") || lower.contains("network")
 }
 
 /// Check if an error message indicates a connection reset (OS error 54 on macOS, 104 on Linux)

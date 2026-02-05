@@ -138,13 +138,18 @@ impl ProfileManager {
     }
 
     pub fn delete_profile(&mut self, name: &str) -> bool {
-        if self.profiles.len() <= 1 || name == self.active_profile {
+        if self.profiles.len() <= 1 {
             return false;
+        }
+        // If deleting the active profile, switch to another one first
+        if name == self.active_profile {
+            if let Some(other) = self.profiles.iter().find(|p| p.name != name) {
+                self.active_profile = other.name.clone();
+            }
         }
         self.profiles.retain(|p| p.name != name);
         true
     }
-
     pub fn rename_profile(&mut self, old_name: &str, new_name: String) -> bool {
         if self.profiles.iter().any(|p| p.name == new_name) {
             return false;

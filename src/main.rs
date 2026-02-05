@@ -207,6 +207,7 @@ pub enum Message {
     DeleteProfile,
     RenameProfile,
     RenameProfileNameChanged(String),
+    SaveProfile,
     // Discovery
     StartDiscovery,
     DiscoveryComplete(Vec<discovery::DiscoveredDevice>),
@@ -316,16 +317,7 @@ impl Ultimate64Browser {
 
         // Create file browser with configured starting directory
         let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
-        let settings = match AppSettings::load() {
-            Ok(s) => {
-                log::info!("Loaded settings from config file");
-                s
-            }
-            Err(e) => {
-                log::warn!("Could not load settings: {}. Using defaults.", e);
-                AppSettings::default()
-            }
-        };
+
         // Load window icon
         let icon = load_window_icon();
 
@@ -436,6 +428,42 @@ impl Ultimate64Browser {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::SaveProfile => {
+                // Sync current input fields to the active profile before saving
+                let conn_settings = ConnectionSettings {
+                    host: self.host_input.clone(),
+                    password: if self.password_input.is_empty() {
+                        None
+                    } else {
+                        Some(self.password_input.clone())
+                    },
+                    stream_control_method: self.settings.connection.stream_control_method,
+                };
+                self.profile_manager.active_settings_mut().connection = conn_settings;
+
+                if let Ok(size) = self.font_size_input.parse::<u32>() {
+                    if size >= 8 && size <= 24 {
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .font_size = size;
+                    }
+                }
+
+                self.settings = self.profile_manager.active_settings().clone();
+
+                match self.profile_manager.save() {
+                    Ok(()) => {
+                        self.user_message =
+                            Some(UserMessage::Info("Profile saved successfully".to_string()));
+                    }
+                    Err(e) => {
+                        self.user_message =
+                            Some(UserMessage::Error(format!("Failed to save profile: {}", e)));
+                    }
+                }
+                Task::none()
+            }
             Message::StartDiscovery => {
                 if self.is_discovering {
                     return Task::none();
@@ -971,9 +999,7 @@ impl Ultimate64Browser {
                 };
                 self.profile_manager.active_settings_mut().connection = conn_settings;
                 self.settings = self.profile_manager.active_settings().clone();
-                if let Err(e) = self.profile_manager.save() {
-                    log::warn!("Could not save profiles: {}", e);
-                }
+
                 self.establish_connection();
                 // Trigger status refresh and remote browser refresh after a short delay
                 Task::perform(
@@ -1043,9 +1069,7 @@ impl Ultimate64Browser {
                     self.font_size_input = self.settings.preferences.font_size.to_string();
                     self.video_streaming
                         .set_stream_control_method(self.settings.connection.stream_control_method);
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message =
                         Some(UserMessage::Info(format!("Switched to profile: {}", name)));
                     // Disconnect when switching profiles
@@ -1067,9 +1091,7 @@ impl Ultimate64Browser {
                     ));
                 } else if self.profile_manager.add_profile(name.clone()) {
                     self.new_profile_name.clear();
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message =
                         Some(UserMessage::Info(format!("Created profile: {}", name)));
                 } else {
@@ -1086,9 +1108,6 @@ impl Ultimate64Browser {
                     &self.profile_manager.active_profile.clone(),
                     new_name.clone(),
                 ) {
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
                     self.user_message =
                         Some(UserMessage::Info(format!("Duplicated to: {}", new_name)));
                 }
@@ -1099,9 +1118,7 @@ impl Ultimate64Browser {
                 let name = self.profile_manager.active_profile.clone();
                 if self.profile_manager.delete_profile(&name) {
                     self.settings = self.profile_manager.active_settings().clone();
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message =
                         Some(UserMessage::Info(format!("Deleted profile: {}", name)));
                 } else {
@@ -1129,9 +1146,7 @@ impl Ultimate64Browser {
                     .rename_profile(&old_name, new_name.clone())
                 {
                     self.rename_profile_name.clear();
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message =
                         Some(UserMessage::Info(format!("Renamed to: {}", new_name)));
                 } else {
@@ -1403,17 +1418,28 @@ impl Ultimate64Browser {
                     self.streaming_window_id = None;
                     Task::none()
                 } else if self.main_window_id == Some(id) {
-                    // Main window was closed - exit the application
+                    // Main window was closed - clean up immediately and exit
                     log::info!("Main window closed: {:?}", id);
+
                     // Stop streaming if active
                     if self.video_streaming.is_streaming {
                         self.video_streaming
                             .stop_signal
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+
+                    // Disconnect immediately to prevent further status checks
+                    self.connection = None;
+                    self.host_url = None;
+                    self.status.connected = false;
+
+                    // Mark main window as gone so subscriptions stop
+                    self.main_window_id = None;
+
                     // Close any remaining windows and exit
                     if let Some(streaming_id) = self.streaming_window_id {
-                        return iced::window::close(streaming_id);
+                        self.streaming_window_id = None;
+                        return Task::batch(vec![iced::window::close(streaming_id), iced::exit()]);
                     }
                     iced::exit()
                 } else {
@@ -1618,9 +1644,7 @@ impl Ultimate64Browser {
                         .default_paths
                         .file_browser_start_dir = Some(p);
                     self.settings = self.profile_manager.active_settings().clone();
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message = Some(UserMessage::Info(
                         "File Browser start directory set (restart app to apply)".to_string(),
                     ));
@@ -1660,9 +1684,7 @@ impl Ultimate64Browser {
                         .default_paths
                         .music_player_start_dir = Some(p);
                     self.settings = self.profile_manager.active_settings().clone();
-                    if let Err(e) = self.profile_manager.save() {
-                        log::error!("Failed to save profiles: {}", e);
-                    }
+
                     self.user_message = Some(UserMessage::Info(
                         "Music Player start directory set (restart app to apply)".to_string(),
                     ));
@@ -1786,11 +1808,15 @@ impl Ultimate64Browser {
             .height(Length::Fill)
             .into()
     }
-
     fn subscription(&self) -> Subscription<Message> {
         use iced::event::{self, Event};
         use iced::keyboard::{self, Key};
         use std::time::Duration;
+
+        // If main window is closed, stop all subscriptions to allow clean exit
+        if self.main_window_id.is_none() {
+            return Subscription::none();
+        }
 
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
         let keyboard_sub = event::listen_with(|event, _status, _id| {
@@ -2024,6 +2050,15 @@ impl Ultimate64Browser {
                 )
                 .width(Length::Fixed(200.0)),
                 tooltip(
+                    button(text("Save").size(11))
+                        .on_press(Message::SaveProfile)
+                        .padding([4, 10])
+                        .style(button::primary),
+                    "Save all profile settings to disk",
+                    tooltip::Position::Bottom,
+                )
+                .style(container::bordered_box),
+                tooltip(
                     button(text("Duplicate").size(11))
                         .on_press(Message::DuplicateProfile)
                         .padding([4, 10]),
@@ -2056,9 +2091,8 @@ impl Ultimate64Browser {
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
-            text("Use profiles to store different configurations for different machines").size(11),
+            text("Use profiles to store different configurations for different machines. Press Save to persist changes.").size(11),
         ];
-        // Discovery button
         // Discovery button
         let discovery_button: Element<'_, Message> = if self.is_discovering {
             button(text("Scanning...").size(11)).padding([4, 10]).into()
