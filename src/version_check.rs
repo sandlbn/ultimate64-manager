@@ -1,17 +1,27 @@
 use iced::Task;
 use serde::Deserialize;
 
+/// GitHub release asset info
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubAsset {
+    pub name: String,
+    pub browser_download_url: String,
+}
+
 /// GitHub release info
 #[derive(Debug, Clone, Deserialize)]
 pub struct GitHubRelease {
     pub tag_name: String,
     pub html_url: String,
+    #[serde(default)]
+    pub assets: Vec<GitHubAsset>,
 }
 
 /// Version check result
 #[derive(Debug, Clone)]
 pub struct NewVersionInfo {
     pub version: String,
+    /// Direct download URL for the platform-specific binary, falls back to release page
     pub download_url: String,
 }
 
@@ -28,6 +38,24 @@ pub fn check_for_updates(current_version: &str) -> Task<VersionCheckMessage> {
         async move { check_github_release(&current).await },
         VersionCheckMessage::CheckComplete,
     )
+}
+
+/// Find the download URL for the current platform from release assets
+fn find_platform_asset(assets: &[GitHubAsset]) -> Option<&str> {
+    let target = if cfg!(target_os = "windows") {
+        "Win.exe"
+    } else if cfg!(target_os = "macos") {
+        "MacOS.zip"
+    } else if cfg!(target_os = "linux") {
+        "Linux.AppImage"
+    } else {
+        return None;
+    };
+
+    assets
+        .iter()
+        .find(|a| a.name.ends_with(target))
+        .map(|a| a.browser_download_url.as_str())
 }
 
 async fn check_github_release(current_version: &str) -> Result<Option<NewVersionInfo>, String> {
@@ -57,9 +85,14 @@ async fn check_github_release(current_version: &str) -> Result<Option<NewVersion
     let current = current_version.trim_start_matches('v');
 
     if is_newer_version(latest, current) {
+        // Use platform-specific asset URL if available, otherwise fall back to release page
+        let download_url = find_platform_asset(&release.assets)
+            .map(|s| s.to_string())
+            .unwrap_or(release.html_url);
+
         Ok(Some(NewVersionInfo {
             version: release.tag_name,
-            download_url: release.html_url,
+            download_url,
         }))
     } else {
         Ok(None)
@@ -97,5 +130,33 @@ mod tests {
         assert!(is_newer_version("1.0.0", "0.9.9"));
         assert!(!is_newer_version("0.3.3", "0.3.3"));
         assert!(!is_newer_version("0.3.2", "0.3.3"));
+    }
+
+    #[test]
+    fn test_find_platform_asset() {
+        let assets = vec![
+            GitHubAsset {
+                name: "Ultimate64Manager-Linux.AppImage".to_string(),
+                browser_download_url: "https://github.com/sandlbn/ultimate64-manager/releases/download/v0.3.12/Ultimate64Manager-Linux.AppImage".to_string(),
+            },
+            GitHubAsset {
+                name: "Ultimate64Manager-MacOS.zip".to_string(),
+                browser_download_url: "https://github.com/sandlbn/ultimate64-manager/releases/download/v0.3.12/Ultimate64Manager-MacOS.zip".to_string(),
+            },
+            GitHubAsset {
+                name: "Ultimate64Manager-Win.exe".to_string(),
+                browser_download_url: "https://github.com/sandlbn/ultimate64-manager/releases/download/v0.3.12/Ultimate64Manager-Win.exe".to_string(),
+            },
+        ];
+
+        let result = find_platform_asset(&assets);
+        assert!(result.is_some());
+        // The exact URL depends on the platform running the test
+    }
+
+    #[test]
+    fn test_find_platform_asset_empty() {
+        let assets: Vec<GitHubAsset> = vec![];
+        assert!(find_platform_asset(&assets).is_none());
     }
 }
