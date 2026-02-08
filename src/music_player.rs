@@ -128,6 +128,7 @@ pub enum BrowserEntryType {
 pub enum MusicFileType {
     Sid,
     Mod,
+    Prg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -945,7 +946,7 @@ impl MusicPlayer {
                 let was_mod = self
                     .current_playing
                     .and_then(|idx| self.playlist.get(idx))
-                    .map(|entry| entry.file_type == MusicFileType::Mod)
+                    .map(|entry| matches!(entry.file_type, MusicFileType::Mod | MusicFileType::Prg))
                     .unwrap_or(false);
 
                 // Move to next track
@@ -1079,6 +1080,7 @@ impl MusicPlayer {
                 let icon = match entry.file_type {
                     MusicFileType::Sid => "[SID]",
                     MusicFileType::Mod => "[MOD]",
+                    MusicFileType::Prg => "[PRG]",
                 };
                 let name = if entry.name.is_empty() {
                     entry
@@ -1358,6 +1360,7 @@ impl MusicPlayer {
                             let icon = match ft {
                                 MusicFileType::Sid => "[SID]",
                                 MusicFileType::Mod => "[MOD]",
+                                MusicFileType::Prg => "[PRG]",
                             };
 
                             // Show subsong count for multi-subsong files
@@ -1510,6 +1513,7 @@ impl MusicPlayer {
                     let icon = match entry.file_type {
                         MusicFileType::Sid => "S",
                         MusicFileType::Mod => "M",
+                        MusicFileType::Prg => "P",
                     };
 
                     // Show subsong count for multi-subsong files
@@ -1768,6 +1772,9 @@ impl MusicPlayer {
                     entry.duration = Some(info.duration_seconds);
                 }
             }
+        } else if entry.file_type == MusicFileType::Prg {
+            entry.name = browser_entry.name.clone();
+            entry.duration = Some(self.default_song_duration);
         } else {
             entry.name = browser_entry.name.clone();
         }
@@ -1809,6 +1816,7 @@ impl MusicPlayer {
                         let file_type = match ext_lower.as_str() {
                             "sid" => Some(MusicFileType::Sid),
                             "mod" => Some(MusicFileType::Mod),
+                            "prg" => Some(MusicFileType::Prg),
                             _ => None,
                         };
 
@@ -2038,6 +2046,7 @@ async fn play_music_file(
             match file_type {
                 MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
                 MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),
+                MusicFileType::Prg => conn.run_prg(&data).map_err(|e| e.to_string()),
             }
         }),
     )
