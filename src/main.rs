@@ -503,6 +503,13 @@ impl Ultimate64Browser {
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
+                // Auto-load latest releases when CSDb tab is first opened
+                if tab == Tab::CsdbBrowser && !self.csdb_browser.has_content() {
+                    return self
+                        .csdb_browser
+                        .update(CsdbBrowserMessage::RefreshLatest, self.connection.clone())
+                        .map(Message::CsdbBrowser);
+                }
                 Task::none()
             }
             Message::CloseStreamingWindow => {

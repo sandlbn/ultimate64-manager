@@ -230,9 +230,10 @@ pub struct CsdbBrowser {
 
 impl CsdbBrowser {
     pub fn new() -> Self {
-        let download_dir = dirs::download_dir()
-            .or_else(|| dirs::home_dir().map(|h| h.join("Downloads")))
-            .unwrap_or_else(|| PathBuf::from("."));
+        let download_dir = dirs::config_dir()
+            .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")))
+            .join("ultimate64-manager")
+            .join("CSDB");
 
         Self {
             view_state: ViewState::LatestReleases,
@@ -252,6 +253,13 @@ impl CsdbBrowser {
             is_loading: false,
             download_dir,
         }
+    }
+
+    /// Returns true if any content has been loaded (latest, search, or top list)
+    pub fn has_content(&self) -> bool {
+        !self.latest_releases.is_empty()
+            || !self.search_results.is_empty()
+            || !self.top_list_entries.is_empty()
     }
 
     pub fn update(
@@ -471,7 +479,12 @@ impl CsdbBrowser {
                         self.status_message = Some(format!("Downloading {}...", file.filename));
 
                         let file = file.clone();
-                        let out_dir = self.download_dir.clone();
+                        let release_type_dir = release
+                            .release_type
+                            .as_deref()
+                            .map(|t| sanitize_dirname(t))
+                            .unwrap_or_else(|| "Other".to_string());
+                        let out_dir = self.download_dir.join(&release_type_dir);
 
                         return Task::perform(
                             async move {
@@ -1898,6 +1911,26 @@ impl ReleaseItem for SearchResult {
 
     fn release_type(&self) -> Option<&str> {
         self.release_type.as_deref()
+    }
+}
+
+/// Sanitize a string for use as a directory name
+fn sanitize_dirname(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim().to_string();
+    if trimmed.is_empty() {
+        "Other".to_string()
+    } else {
+        trimmed
     }
 }
 
