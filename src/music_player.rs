@@ -1,4 +1,5 @@
 use crate::mod_info;
+use crate::sid_info;
 use iced::{
     Element, Length, Subscription, Task,
     widget::{
@@ -22,16 +23,30 @@ const DEFAULT_SONG_DURATION: u32 = 180; // 3 minutes default
 /// Timeout for REST API operations to prevent hangs when device goes offline
 const REST_TIMEOUT_SECS: u64 = 5;
 
-/// SID file header information
-#[derive(Debug, Clone, Default)]
-pub struct SidInfo {
+/// SID metadata extracted from header, stored with playlist entries for display.
+/// Provides rich info like PAL/NTSC, multi-SID chip addresses, and release year.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SidMetadata {
     pub title: String,
     pub author: String,
-    #[allow(dead_code)]
     pub released: String,
-    pub songs: u8,
-    #[allow(dead_code)]
-    pub start_song: u8,
+    pub video_std: String, // "PAL" or "NTSC"
+    pub num_sids: usize,   // 1, 2, or 3
+    pub sid_info: String,  // e.g. "1xSID" or "2xSID @ $D420"
+}
+
+impl SidMetadata {
+    /// Build SidMetadata from a parsed SID file header.
+    fn from_header(header: &sid_info::SidHeader) -> Self {
+        Self {
+            title: header.name.clone(),
+            author: header.author.clone(),
+            released: header.released.clone(),
+            video_std: header.video_standard().to_string(),
+            num_sids: header.num_sids(),
+            sid_info: header.sid_model_info(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +123,9 @@ pub struct PlaylistEntry {
     pub max_subsongs: u8, // Total subsongs in this file
     #[serde(skip)]
     pub md5_hash: Option<[u8; MD5_HASH_SIZE]>,
+    /// Rich SID metadata for display (None for MOD/PRG)
+    #[serde(default)]
+    pub sid_metadata: Option<SidMetadata>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +134,8 @@ pub struct BrowserEntry {
     pub name: String,
     pub entry_type: BrowserEntryType,
     pub subsongs: u8, // Number of subsongs (1 for non-SID or single-song SID)
+    /// Tooltip text with SID header info (None for directories/non-SID)
+    pub sid_tooltip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,10 +259,10 @@ impl MusicPlayer {
                             if md5_str.len() != 32 {
                                 continue;
                             }
-                            if let Some(hash) = hex_to_md5(md5_str) {
+                            if let Some(hash) = sid_info::hex_to_md5(md5_str) {
                                 let mut lengths = Vec::new();
                                 for token in lengths_str.split_whitespace() {
-                                    if let Some(duration) = parse_time_string(token) {
+                                    if let Some(duration) = sid_info::parse_time_string(token) {
                                         lengths.push(duration + 1);
                                     }
                                 }
@@ -737,7 +757,15 @@ impl MusicPlayer {
                         for entry in &mut self.playlist {
                             if entry.file_type == MusicFileType::Sid {
                                 if let Ok(data) = fs::read(&entry.path) {
-                                    let hash = compute_md5(&data);
+                                    // Re-parse header for metadata (may not be in saved JSON)
+                                    if entry.sid_metadata.is_none() {
+                                        if let Ok(header) = sid_info::parse_header(&data) {
+                                            entry.sid_metadata =
+                                                Some(SidMetadata::from_header(&header));
+                                        }
+                                    }
+
+                                    let hash = sid_info::compute_md5(&data);
                                     entry.md5_hash = Some(hash);
 
                                     // Song length database is authoritative
@@ -1075,7 +1103,7 @@ impl MusicPlayer {
         let header = font_size + 4;
 
         // === TOP: Now playing info ===
-        let now_playing_text = if let Some(idx) = self.current_playing {
+        let (now_playing_text, now_playing_meta) = if let Some(idx) = self.current_playing {
             if let Some(entry) = self.playlist.get(idx) {
                 let icon = match entry.file_type {
                     MusicFileType::Sid => "[SID]",
@@ -1091,12 +1119,29 @@ impl MusicPlayer {
                 } else {
                     entry.name.clone()
                 };
-                format!("{} {}", icon, name)
+
+                // Build metadata line for SID files: "PAL | 2xSID @ $D420 | 11 tunes | © 1988"
+                let meta = if let Some(ref m) = entry.sid_metadata {
+                    let mut parts = Vec::new();
+                    parts.push(m.video_std.clone());
+                    parts.push(m.sid_info.clone());
+                    if entry.max_subsongs > 1 {
+                        parts.push(format!("{} tunes", entry.max_subsongs));
+                    }
+                    if !m.released.is_empty() {
+                        parts.push(format!("© {}", m.released));
+                    }
+                    parts.join(" | ")
+                } else {
+                    String::new()
+                };
+
+                (format!("{} {}", icon, name), meta)
             } else {
-                "No track selected".to_string()
+                ("No track selected".to_string(), String::new())
             }
         } else {
-            "No track selected".to_string()
+            ("No track selected".to_string(), String::new())
         };
 
         let now_playing = text(now_playing_text.clone()).size(large);
@@ -1240,21 +1285,41 @@ impl MusicPlayer {
         ]
         .spacing(5);
 
-        let top_bar = column![
+        // Build the top bar with now-playing info and optional metadata line
+        let mut top_bar_items: Vec<Element<'_, MusicPlayerMessage>> = vec![
             row![now_playing, Space::new().width(Length::Fill), time_display]
-                .align_y(iced::Alignment::Center),
-            row![transport, Space::new().width(20), modes].align_y(iced::Alignment::Center),
-            // Progress bar - dimensions on the widget itself
-            // Progress bar
+                .align_y(iced::Alignment::Center)
+                .into(),
+        ];
+
+        // Show SID metadata line if available (PAL | 2xSID @ $D420 | © 1988)
+        if !now_playing_meta.is_empty() {
+            top_bar_items.push(
+                text(now_playing_meta)
+                    .size(small)
+                    .color(iced::Color::from_rgb(0.6, 0.7, 0.8))
+                    .into(),
+            );
+        }
+
+        top_bar_items.push(
+            row![transport, Space::new().width(20), modes]
+                .align_y(iced::Alignment::Center)
+                .into(),
+        );
+
+        // Progress bar
+        top_bar_items.push(
             container(progress_bar(
                 0.0..=self.current_song_duration as f32,
                 self.elapsed_seconds as f32,
             ))
             .width(Length::Fill)
-            .height(Length::Fixed(8.0)),
-        ]
-        .spacing(8)
-        .padding(10);
+            .height(Length::Fixed(8.0))
+            .into(),
+        );
+
+        let top_bar = Column::with_children(top_bar_items).spacing(8).padding(10);
 
         // === LEFT PANE: File Browser ===
         let dir_display = truncate_path(&self.browser_directory, 40);
@@ -1386,17 +1451,34 @@ impl MusicPlayer {
                                 button::text
                             });
 
-                            let file_element: Element<'_, MusicPlayerMessage> = if is_truncated {
-                                tooltip(
-                                    file_button,
-                                    text(&entry.name).size(normal),
-                                    tooltip::Position::Top,
-                                )
-                                .style(container::bordered_box)
-                                .into()
-                            } else {
-                                file_button.into()
-                            };
+                            // Tooltip: SID info takes priority, include full name if truncated
+                            let file_element: Element<'_, MusicPlayerMessage> =
+                                if let Some(ref tip) = entry.sid_tooltip {
+                                    // SID tooltip: show header metadata (author, title, PAL/NTSC, etc.)
+                                    let tip_text = if is_truncated {
+                                        format!("{}\n\n{}", entry.name, tip)
+                                    } else {
+                                        tip.clone()
+                                    };
+                                    tooltip(
+                                        file_button,
+                                        text(tip_text).size(small),
+                                        tooltip::Position::Top,
+                                    )
+                                    .style(container::bordered_box)
+                                    .into()
+                                } else if is_truncated {
+                                    // Just show full filename for truncated names
+                                    tooltip(
+                                        file_button,
+                                        text(&entry.name).size(normal),
+                                        tooltip::Position::Top,
+                                    )
+                                    .style(container::bordered_box)
+                                    .into()
+                                } else {
+                                    file_button.into()
+                                };
 
                             row![
                                 file_element,
@@ -1510,17 +1592,27 @@ impl MusicPlayer {
                         " "
                     };
 
-                    let icon = match entry.file_type {
-                        MusicFileType::Sid => "S",
-                        MusicFileType::Mod => "M",
-                        MusicFileType::Prg => "P",
-                    };
-
-                    // Show subsong count for multi-subsong files
-                    let subsong_info = if entry.max_subsongs > 1 {
-                        format!("x{}", entry.max_subsongs)
-                    } else {
-                        String::new()
+                    // Build compact badge: [S NTSC 2SID x3] or [M] or [P]
+                    // PAL is omitted (default), NTSC shown explicitly
+                    let badge = match entry.file_type {
+                        MusicFileType::Sid => {
+                            let mut parts = vec!["S".to_string()];
+                            if let Some(ref m) = entry.sid_metadata {
+                                // Only show NTSC (PAL is default/assumed)
+                                if m.video_std == "NTSC" {
+                                    parts.push("NTSC".to_string());
+                                }
+                                if m.num_sids > 1 {
+                                    parts.push(format!("{}SID", m.num_sids));
+                                }
+                            }
+                            if entry.max_subsongs > 1 {
+                                parts.push(format!("x{}", entry.max_subsongs));
+                            }
+                            parts.join(" ")
+                        }
+                        MusicFileType::Mod => "M".to_string(),
+                        MusicFileType::Prg => "P".to_string(),
                     };
 
                     let duration_str = if let Some(dur) = entry.duration {
@@ -1547,8 +1639,8 @@ impl MusicPlayer {
 
                     let playlist_button = button(
                         text(format!(
-                            "{} [{}{}] {} ({})",
-                            prefix, icon, subsong_info, name, duration_str
+                            "{} [{}] {} ({})",
+                            prefix, badge, name, duration_str
                         ))
                         .size(small),
                     )
@@ -1561,16 +1653,36 @@ impl MusicPlayer {
                         button::text
                     });
 
-                    let playlist_element: Element<'_, MusicPlayerMessage> = if is_truncated {
-                        tooltip(
-                            playlist_button,
-                            text(display_name.clone()).size(small),
-                            tooltip::Position::Top,
-                        )
-                        .style(container::bordered_box)
-                        .into()
-                    } else {
-                        playlist_button.into()
+                    // Tooltip: show full name + SID metadata details
+                    let playlist_element: Element<'_, MusicPlayerMessage> = {
+                        let has_meta = entry.sid_metadata.is_some();
+                        if is_truncated || has_meta {
+                            let mut tip_parts = Vec::new();
+                            if is_truncated {
+                                tip_parts.push(display_name.clone());
+                            }
+                            if let Some(ref m) = entry.sid_metadata {
+                                if is_truncated {
+                                    tip_parts.push(String::new()); // blank line separator
+                                }
+                                tip_parts.push(format!(
+                                    "{} | {} | {} tunes",
+                                    m.video_std, m.sid_info, entry.max_subsongs
+                                ));
+                                if !m.released.is_empty() {
+                                    tip_parts.push(format!("© {}", m.released));
+                                }
+                            }
+                            tooltip(
+                                playlist_button,
+                                text(tip_parts.join("\n")).size(small),
+                                tooltip::Position::Top,
+                            )
+                            .style(container::bordered_box)
+                            .into()
+                        } else {
+                            playlist_button.into()
+                        }
                     };
 
                     row![
@@ -1720,28 +1832,29 @@ impl MusicPlayer {
             subsong: 1,
             max_subsongs: browser_entry.subsongs, // Start with SID header count
             md5_hash: None,
+            sid_metadata: None,
         };
 
         // Parse SID header only when adding to playlist (lazy loading)
         if entry.file_type == MusicFileType::Sid {
             if let Ok(data) = fs::read(&entry.path) {
                 // Parse SID header for display name
-                if let Some(info) = parse_sid_header(&data) {
-                    entry.name = if info.title.is_empty() {
+                if let Ok(header) = sid_info::parse_header(&data) {
+                    let display = header.display_name();
+                    entry.name = if display.is_empty() {
                         browser_entry.name.clone()
-                    } else if info.author.is_empty() {
-                        info.title
                     } else {
-                        format!("{} - {}", info.author, info.title)
+                        display
                     };
-                    // Use SID header subsong count as baseline
-                    entry.max_subsongs = info.songs;
+                    entry.max_subsongs = header.songs as u8;
+                    // Store rich metadata for display in playlist and now-playing bar
+                    entry.sid_metadata = Some(SidMetadata::from_header(&header));
                 } else {
                     entry.name = browser_entry.name.clone();
                 }
 
                 // Calculate MD5 and look up in song length database
-                let hash = compute_md5(&data);
+                let hash = sid_info::compute_md5(&data);
                 entry.md5_hash = Some(hash);
 
                 // Song length database is authoritative for subsong count and durations
@@ -1809,6 +1922,7 @@ impl MusicPlayer {
                         name,
                         entry_type: BrowserEntryType::Directory,
                         subsongs: 1,
+                        sid_tooltip: None,
                     });
                 } else if let Some(extension) = path.extension() {
                     if let Some(ext_str) = extension.to_str() {
@@ -1821,11 +1935,42 @@ impl MusicPlayer {
                         };
 
                         if let Some(ft) = file_type {
-                            // Parse SID file to get subsong count
-                            let subsongs = if ft == MusicFileType::Sid {
-                                parse_sid_subsong_count(&path)
+                            // For SID files, parse header for subsong count and tooltip metadata
+                            let (subsongs, sid_tooltip) = if ft == MusicFileType::Sid {
+                                match fs::read(&path)
+                                    .ok()
+                                    .and_then(|data| sid_info::parse_header(&data).ok())
+                                {
+                                    Some(header) => {
+                                        let songs = if header.songs > 0 && header.songs <= 256 {
+                                            header.songs as u8
+                                        } else {
+                                            1
+                                        };
+                                        // Build tooltip: Title, Author, © Released, PAL | 1xSID | N tunes
+                                        let mut tip = Vec::new();
+                                        if !header.name.is_empty() {
+                                            tip.push(header.name.clone());
+                                        }
+                                        if !header.author.is_empty() {
+                                            tip.push(header.author.clone());
+                                        }
+                                        if !header.released.is_empty() {
+                                            tip.push(format!("© {}", header.released));
+                                        }
+                                        tip.push(format!(
+                                            "{} | {} | {} tunes",
+                                            header.video_standard(),
+                                            header.sid_model_info(),
+                                            songs
+                                        ));
+                                        (songs, Some(tip.join("\n")))
+                                    }
+                                    // Fallback: just get subsong count quickly
+                                    None => (sid_info::quick_subsong_count(&path), None),
+                                }
                             } else {
-                                1
+                                (1, None)
                             };
 
                             files.push(BrowserEntry {
@@ -1833,6 +1978,7 @@ impl MusicPlayer {
                                 name,
                                 entry_type: BrowserEntryType::MusicFile(ft),
                                 subsongs,
+                                sid_tooltip,
                             });
                         }
                     }
@@ -1962,68 +2108,6 @@ impl MusicPlayer {
     }
 }
 
-// === SID Header Parsing ===
-
-/// Quick parse to get just subsong count (for browser display)
-fn parse_sid_subsong_count(path: &Path) -> u8 {
-    // Only read first 16 bytes needed for subsong count
-    if let Ok(file) = fs::File::open(path) {
-        use std::io::Read;
-        let mut buffer = [0u8; 16];
-        let mut reader = std::io::BufReader::new(file);
-        if reader.read_exact(&mut buffer).is_ok() {
-            // Check PSID or RSID magic
-            if &buffer[0..4] == b"PSID" || &buffer[0..4] == b"RSID" {
-                // Subsong count at offset 0x0E (big-endian)
-                let songs = ((buffer[14] as u16) << 8) | (buffer[15] as u16);
-                return if songs > 0 { songs as u8 } else { 1 };
-            }
-        }
-    }
-    1 // Default to 1 subsong
-}
-
-fn parse_sid_header(data: &[u8]) -> Option<SidInfo> {
-    if data.len() < 0x76 {
-        return None;
-    }
-
-    let magic = &data[0..4];
-    if magic != b"PSID" && magic != b"RSID" {
-        return None;
-    }
-
-    let songs = u16::from_be_bytes([data[0x0E], data[0x0F]]) as u8;
-    let start_song = u16::from_be_bytes([data[0x10], data[0x11]]) as u8;
-    let title = read_sid_string(&data[0x16..0x36]);
-    let author = read_sid_string(&data[0x36..0x56]);
-    let released = read_sid_string(&data[0x56..0x76]);
-
-    Some(SidInfo {
-        title,
-        author,
-        released,
-        songs: songs.max(1),
-        start_song: start_song.max(1),
-    })
-}
-
-fn read_sid_string(data: &[u8]) -> String {
-    let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-    data[..end]
-        .iter()
-        .filter_map(|&b| {
-            if b >= 32 && b < 127 {
-                Some(b as char)
-            } else {
-                None
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
-}
-
 // === Async Functions ===
 
 async fn play_music_file(
@@ -2144,11 +2228,11 @@ async fn parse_song_lengths_async(
                 continue;
             }
 
-            if let Some(hash) = hex_to_md5(md5_str) {
+            if let Some(hash) = sid_info::hex_to_md5(md5_str) {
                 let mut lengths = Vec::new();
 
                 for token in lengths_str.split_whitespace() {
-                    if let Some(duration) = parse_time_string(token) {
+                    if let Some(duration) = sid_info::parse_time_string(token) {
                         lengths.push(duration + 1);
                     }
                 }
@@ -2210,50 +2294,6 @@ async fn load_playlist_async() -> Result<Vec<PlaylistEntry>, String> {
 }
 
 // === Helper Functions ===
-
-fn compute_md5(data: &[u8]) -> [u8; MD5_HASH_SIZE] {
-    let digest = md5::compute(data);
-    digest.0
-}
-
-fn hex_to_md5(hex_str: &str) -> Option<[u8; MD5_HASH_SIZE]> {
-    if hex_str.len() != 32 {
-        return None;
-    }
-
-    let mut result = [0u8; MD5_HASH_SIZE];
-
-    for (i, byte) in result.iter_mut().enumerate() {
-        let hex_byte = &hex_str[i * 2..i * 2 + 2];
-        *byte = u8::from_str_radix(hex_byte, 16).ok()?;
-    }
-
-    Some(result)
-}
-
-fn parse_time_string(s: &str) -> Option<u32> {
-    // Handle formats: "M:SS", "M:SS.mmm", "H:MM:SS", "H:MM:SS.mmm", or just seconds
-    // Strip any milliseconds (after the decimal point)
-    let s = s.split('.').next().unwrap_or(s);
-
-    let parts: Vec<&str> = s.split(':').collect();
-
-    match parts.len() {
-        1 => parts[0].parse().ok(),
-        2 => {
-            let minutes: u32 = parts[0].parse().ok()?;
-            let seconds: u32 = parts[1].parse().ok()?;
-            Some(minutes * 60 + seconds)
-        }
-        3 => {
-            let hours: u32 = parts[0].parse().ok()?;
-            let minutes: u32 = parts[1].parse().ok()?;
-            let seconds: u32 = parts[2].parse().ok()?;
-            Some(hours * 3600 + minutes * 60 + seconds)
-        }
-        _ => None,
-    }
-}
 
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.chars().count() <= max_len {

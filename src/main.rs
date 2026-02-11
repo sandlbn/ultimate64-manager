@@ -34,6 +34,7 @@ mod petscii;
 mod profiles;
 mod remote_browser;
 mod settings;
+mod sid_info;
 mod stream_control;
 mod streaming;
 mod templates;
