@@ -574,6 +574,27 @@ impl Ultimate64Browser {
                 ) && self.music_player.playback_state
                     == PlaybackState::Playing;
 
+                // Intercept DownloadBatchComplete to show result and refresh local browser
+                if let RemoteBrowserMessage::DownloadBatchComplete(ref result) = msg {
+                    match result {
+                        Ok(m) => {
+                            self.user_message = Some(UserMessage::Info(m.clone()));
+                        }
+                        Err(e) => {
+                            self.user_message = Some(UserMessage::Error(e.clone()));
+                        }
+                    }
+                    let cmd = self
+                        .remote_browser
+                        .update(msg, self.connection.clone())
+                        .map(Message::RemoteBrowser);
+                    let refresh = self
+                        .left_browser
+                        .update(FileBrowserMessage::RefreshFiles, self.connection.clone())
+                        .map(Message::LeftBrowser);
+                    return Task::batch(vec![cmd, refresh]);
+                }
+
                 // Intercept UploadDirectoryComplete to show result in main status bar
                 if let RemoteBrowserMessage::UploadDirectoryComplete(ref result) = msg {
                     match result {
@@ -770,8 +791,23 @@ impl Ultimate64Browser {
                 return Task::batch(commands);
             }
             Message::CopyRemoteToLocal => {
-                // Copy selected remote file to local directory
-                if let Some(remote_path) = self.remote_browser.get_selected_file() {
+                let checked = self.remote_browser.get_checked_files();
+                if !checked.is_empty() {
+                    // Batch download checked files/directories
+                    let local_dest = self.left_browser.get_current_directory().clone();
+                    self.user_message = Some(UserMessage::Info(format!(
+                        "Downloading {} item(s) via FTP...",
+                        checked.len()
+                    )));
+                    return self
+                        .remote_browser
+                        .update(
+                            RemoteBrowserMessage::DownloadCheckedToLocal(local_dest),
+                            self.connection.clone(),
+                        )
+                        .map(Message::RemoteBrowser);
+                } else if let Some(remote_path) = self.remote_browser.get_selected_file() {
+                    // Fall back to single selected file
                     if let Some(host) = &self.host_url {
                         let host = host
                             .trim_start_matches("http://")
@@ -799,7 +835,6 @@ impl Ultimate64Browser {
                                         .set_read_timeout(Some(Duration::from_secs(60)))
                                         .ok();
 
-                                    // Login with configured password or anonymous
                                     if let Some(ref pwd) = password {
                                         if !pwd.is_empty() {
                                             ftp.login("admin", pwd)
@@ -850,7 +885,7 @@ impl Ultimate64Browser {
                     }
                 } else {
                     self.user_message = Some(UserMessage::Error(
-                        "No file selected in remote pane".to_string(),
+                        "No files selected. Use checkboxes to select files.".to_string(),
                     ));
                 }
                 Task::none()

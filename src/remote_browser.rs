@@ -1,10 +1,12 @@
 use iced::{
     Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, row, rule, scrollable, text, text_input, tooltip,
+        Column, Space, button, checkbox, column, container, row, rule, scrollable, text,
+        text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -45,6 +47,13 @@ pub enum RemoteBrowserMessage {
     MountDisk(String, String, String), // path, drive (a/b), mode (readwrite/readonly/unlinked)
     MountComplete(Result<String, String>),
     RunDisk(String, String), // path, drive - mount and reset
+    // Selection (checkboxes)
+    ToggleFileCheck(String, bool),
+    SelectAll,
+    SelectNone,
+    // Batch download
+    DownloadCheckedToLocal(PathBuf), // local destination directory
+    DownloadBatchComplete(Result<String, String>),
     // Filter
     FilterChanged(String),
     // Disk info popup
@@ -76,6 +85,8 @@ pub struct RemoteBrowser {
     pub host_address: Option<String>,
     pub password: Option<String>,
     pub filter: String,
+    // Checked files for batch operations
+    pub checked_files: HashSet<String>,
     // Disk info popup state
     disk_info_popup: Option<DiskInfo>,
     disk_info_path: Option<String>,
@@ -98,6 +109,7 @@ impl Default for RemoteBrowser {
             host_address: None,
             password: None,
             filter: String::new(),
+            checked_files: HashSet::new(),
             disk_info_popup: None,
             disk_info_path: None,
             disk_info_loading: false,
@@ -173,6 +185,7 @@ impl RemoteBrowser {
                     if entry.is_dir {
                         self.current_path = path;
                         self.selected_file = None;
+                        self.checked_files.clear();
                         return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
                     } else {
                         self.selected_file = Some(path);
@@ -183,6 +196,7 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::NavigateUp => {
                 if self.current_path != "/" {
+                    self.checked_files.clear();
                     if let Some(parent) = PathBuf::from(&self.current_path).parent() {
                         self.current_path = parent.to_string_lossy().to_string();
                         if self.current_path.is_empty() {
@@ -196,6 +210,7 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::NavigateToPath(path) => {
                 self.current_path = path;
+                self.checked_files.clear();
                 self.update(RemoteBrowserMessage::RefreshFiles, _connection)
             }
 
@@ -399,6 +414,73 @@ impl RemoteBrowser {
                 }
             }
 
+            RemoteBrowserMessage::ToggleFileCheck(path, checked) => {
+                if checked {
+                    self.checked_files.insert(path);
+                } else {
+                    self.checked_files.remove(&path);
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::SelectAll => {
+                for file in &self.files {
+                    self.checked_files.insert(file.path.clone());
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::SelectNone => {
+                self.checked_files.clear();
+                Task::none()
+            }
+
+            RemoteBrowserMessage::DownloadCheckedToLocal(local_dest) => {
+                if self.checked_files.is_empty() {
+                    self.status_message = Some("No files selected".to_string());
+                    return Task::none();
+                }
+                if let Some(host) = &self.host_address {
+                    let checked: Vec<String> = self.checked_files.iter().cloned().collect();
+                    // Separate files and directories
+                    let mut file_paths = Vec::new();
+                    let mut dir_paths = Vec::new();
+                    for path in &checked {
+                        if let Some(entry) = self.files.iter().find(|f| &f.path == path) {
+                            if entry.is_dir {
+                                dir_paths.push(path.clone());
+                            } else {
+                                file_paths.push(path.clone());
+                            }
+                        }
+                    }
+                    let total = file_paths.len() + dir_paths.len();
+                    self.status_message = Some(format!("Downloading {} item(s)...", total));
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    Task::perform(
+                        download_batch_ftp(host, file_paths, dir_paths, local_dest, password),
+                        RemoteBrowserMessage::DownloadBatchComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Task::none()
+                }
+            }
+
+            RemoteBrowserMessage::DownloadBatchComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        self.checked_files.clear();
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Download failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
             RemoteBrowserMessage::FilterChanged(value) => {
                 self.filter = value;
                 Task::none()
@@ -496,6 +578,7 @@ impl RemoteBrowser {
         };
 
         // Navigation buttons with filter
+        let checked_count = self.checked_files.len();
         let nav_buttons = row![
             tooltip(
                 button(text("⬆ Up").size(normal))
@@ -505,6 +588,27 @@ impl RemoteBrowser {
                 tooltip::Position::Bottom,
             )
             .style(container::bordered_box),
+            tooltip(
+                button(text("✔ All").size(tiny))
+                    .on_press(RemoteBrowserMessage::SelectAll)
+                    .padding([2, 6]),
+                "Select all files",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            tooltip(
+                button(text("✖ None").size(tiny))
+                    .on_press(RemoteBrowserMessage::SelectNone)
+                    .padding([2, 6]),
+                "Deselect all files",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            if checked_count > 0 {
+                text(format!("{} selected", checked_count)).size(small)
+            } else {
+                text("").size(small)
+            },
             Space::new().width(Length::Fill),
             text("Filter:").size(small),
             text_input("filter...", &self.filter)
@@ -855,7 +959,18 @@ impl RemoteBrowser {
                     filename_button.into()
                 };
 
+                let is_checked = self.checked_files.contains(&entry.path);
+                let path_for_check = entry.path.clone();
+                let checkbox_element: Element<'_, RemoteBrowserMessage> = checkbox(is_checked)
+                    .on_toggle(move |checked| {
+                        RemoteBrowserMessage::ToggleFileCheck(path_for_check.clone(), checked)
+                    })
+                    .size(14)
+                    .into();
+
                 let file_row = row![
+                    // Checkbox for selection
+                    checkbox_element,
                     // Clickable filename (with tooltip if truncated)
                     filename_element,
                     // Type label
@@ -1124,6 +1239,14 @@ impl RemoteBrowser {
 
     pub fn get_current_path(&self) -> &str {
         &self.current_path
+    }
+
+    pub fn get_checked_files(&self) -> Vec<String> {
+        self.checked_files.iter().cloned().collect()
+    }
+    #[allow(dead_code)]
+    pub fn clear_checked(&mut self) {
+        self.checked_files.clear();
     }
 }
 
@@ -1763,6 +1886,202 @@ async fn upload_directory_ftp(
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("FTP directory upload timed out - device may be offline".to_string()),
     }
+}
+
+/// Download multiple files and directories via FTP to a local directory
+async fn download_batch_ftp(
+    host: String,
+    file_paths: Vec<String>,
+    dir_paths: Vec<String>,
+    local_dest: PathBuf,
+    password: Option<String>,
+) -> Result<String, String> {
+    log::info!(
+        "FTP: Batch downloading {} files and {} directories to {}",
+        file_paths.len(),
+        dir_paths.len(),
+        local_dest.display()
+    );
+
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_UPLOAD_DIR_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .ok();
+
+            // Login with password or anonymous
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+
+            let mut files_downloaded = 0;
+            let mut dirs_downloaded = 0;
+            let mut errors: Vec<String> = Vec::new();
+
+            // Download individual files
+            for remote_path in &file_paths {
+                let filename = remote_path.rsplit('/').next().unwrap_or("file");
+                let local_path = local_dest.join(filename);
+
+                log::debug!(
+                    "FTP: Downloading file {} to {}",
+                    remote_path,
+                    local_path.display()
+                );
+
+                match ftp.retr_as_stream(remote_path) {
+                    Ok(mut reader) => {
+                        let mut data = Vec::new();
+                        if let Err(e) = reader.read_to_end(&mut data) {
+                            errors.push(format!("Read {}: {}", filename, e));
+                            continue;
+                        }
+                        if let Err(e) = ftp.finalize_retr_stream(reader) {
+                            errors.push(format!("Finalize {}: {}", filename, e));
+                            continue;
+                        }
+                        if let Err(e) = std::fs::write(&local_path, &data) {
+                            errors.push(format!("Write {}: {}", filename, e));
+                            continue;
+                        }
+                        files_downloaded += 1;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Download {}: {}", filename, e));
+                    }
+                }
+            }
+
+            // Download directories recursively
+            for remote_dir in &dir_paths {
+                let dir_name = remote_dir.rsplit('/').next().unwrap_or("dir");
+                let local_dir = local_dest.join(dir_name);
+
+                log::debug!(
+                    "FTP: Downloading directory {} to {}",
+                    remote_dir,
+                    local_dir.display()
+                );
+
+                match download_directory_recursive(&mut ftp, remote_dir, &local_dir) {
+                    Ok((files, dirs)) => {
+                        files_downloaded += files;
+                        dirs_downloaded += dirs;
+                    }
+                    Err(e) => {
+                        errors.push(format!("Dir {}: {}", dir_name, e));
+                    }
+                }
+            }
+
+            let _ = ftp.quit();
+
+            let mut msg = format!(
+                "Downloaded: {} files, {} directories",
+                files_downloaded, dirs_downloaded
+            );
+            if !errors.is_empty() {
+                msg.push_str(&format!(" ({} errors)", errors.len()));
+                for err in errors.iter().take(3) {
+                    log::warn!("Download error: {}", err);
+                }
+            }
+            Ok(msg)
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP batch download timed out - device may be offline".to_string()),
+    }
+}
+
+/// Recursively download a remote directory via FTP
+fn download_directory_recursive(
+    ftp: &mut suppaftp::FtpStream,
+    remote_path: &str,
+    local_path: &std::path::Path,
+) -> Result<(usize, usize), String> {
+    use std::io::Read;
+
+    std::fs::create_dir_all(local_path)
+        .map_err(|e| format!("Create dir {}: {}", local_path.display(), e))?;
+
+    let mut files_count = 0;
+    let mut dirs_count = 1; // Count this directory
+
+    // List remote directory contents
+    let entries = ftp
+        .list(Some(remote_path))
+        .map_err(|e| format!("List {}: {}", remote_path, e))?;
+
+    for entry_line in &entries {
+        // Parse FTP LIST output (Unix-style: "drwxr-xr-x ... name")
+        let parts: Vec<&str> = entry_line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let name = parts[8..].join(" ");
+        if name == "." || name == ".." {
+            continue;
+        }
+
+        let is_dir = entry_line.starts_with('d');
+        let child_remote = format!("{}/{}", remote_path.trim_end_matches('/'), name);
+        let child_local = local_path.join(&name);
+
+        if is_dir {
+            match download_directory_recursive(ftp, &child_remote, &child_local) {
+                Ok((f, d)) => {
+                    files_count += f;
+                    dirs_count += d;
+                }
+                Err(e) => {
+                    log::warn!("Skip dir {}: {}", child_remote, e);
+                }
+            }
+        } else {
+            match ftp.retr_as_stream(&child_remote) {
+                Ok(mut reader) => {
+                    let mut data = Vec::new();
+                    if reader.read_to_end(&mut data).is_ok() {
+                        let _ = ftp.finalize_retr_stream(reader);
+                        if std::fs::write(&child_local, &data).is_ok() {
+                            files_count += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Skip file {}: {}", child_remote, e);
+                }
+            }
+        }
+    }
+
+    Ok((files_count, dirs_count))
 }
 
 /// Download a remote disk image via FTP and parse its contents
