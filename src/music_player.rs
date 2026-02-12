@@ -70,6 +70,9 @@ pub enum MusicPlayerMessage {
     RefreshBrowser,
     BrowserItemClicked(usize), // Click on browser item (double-click plays)
     BrowserFilterChanged(String), // Filter browser entries
+    BrowserSearch,             // Recursive search in current dir and subdirs
+    BrowserSearchComplete(Vec<BrowserEntry>), // Search results arrived
+    BrowserClearSearch,        // Return to normal directory browsing
 
     // Playlist management
     AddToPlaylist(usize),      // Add from browser by index
@@ -163,6 +166,7 @@ pub struct MusicPlayer {
     browser_entries: Vec<BrowserEntry>,
     browser_selected: Option<usize>, // For double-click detection
     browser_filter: String,
+    browser_search_active: bool, // True when showing recursive search results
 
     // Playlist (right pane)
     playlist: Vec<PlaylistEntry>,
@@ -206,6 +210,7 @@ impl MusicPlayer {
             browser_entries: Vec::new(),
             browser_selected: None,
             browser_filter: String::new(),
+            browser_search_active: false,
 
             playlist: Vec::new(),
             playlist_selected: None,
@@ -517,6 +522,7 @@ impl MusicPlayer {
             MusicPlayerMessage::DirectorySelected(path) => {
                 self.browser_directory = path.clone();
                 self.browser_selected = None;
+                self.browser_search_active = false;
                 self.load_browser_entries(&path);
                 Task::none()
             }
@@ -524,6 +530,7 @@ impl MusicPlayer {
             MusicPlayerMessage::NavigateToDirectory(path) => {
                 self.browser_directory = path.clone();
                 self.browser_selected = None;
+                self.browser_search_active = false;
                 self.load_browser_entries(&path);
                 Task::none()
             }
@@ -533,6 +540,7 @@ impl MusicPlayer {
                     let parent = parent.to_path_buf();
                     self.browser_directory = parent.clone();
                     self.browser_selected = None;
+                    self.browser_search_active = false;
                     self.load_browser_entries(&parent);
                 }
                 Task::none()
@@ -540,12 +548,51 @@ impl MusicPlayer {
 
             MusicPlayerMessage::RefreshBrowser => {
                 self.browser_selected = None;
+                self.browser_search_active = false;
                 self.load_browser_entries(&self.browser_directory.clone());
                 Task::none()
             }
 
             MusicPlayerMessage::BrowserFilterChanged(value) => {
                 self.browser_filter = value;
+                Task::none()
+            }
+
+            MusicPlayerMessage::BrowserSearch => {
+                let query = self.browser_filter.trim().to_lowercase();
+                if query.is_empty() {
+                    self.status_message = "Enter a search term first".to_string();
+                    return Task::none();
+                }
+                self.status_message = format!("Searching for \"{}\"...", self.browser_filter);
+                let root = self.browser_directory.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || search_files_recursive(&root, &query))
+                            .await
+                            .unwrap_or_default()
+                    },
+                    MusicPlayerMessage::BrowserSearchComplete,
+                )
+            }
+
+            MusicPlayerMessage::BrowserSearchComplete(results) => {
+                let count = results
+                    .iter()
+                    .filter(|e| matches!(e.entry_type, BrowserEntryType::MusicFile(_)))
+                    .count();
+                self.browser_entries = results;
+                self.browser_selected = None;
+                self.browser_search_active = true;
+                self.status_message = format!("Found {} music files", count);
+                Task::none()
+            }
+
+            MusicPlayerMessage::BrowserClearSearch => {
+                self.browser_search_active = false;
+                self.browser_selected = None;
+                self.load_browser_entries(&self.browser_directory.clone());
+                self.status_message = "Ready".to_string();
                 Task::none()
             }
 
@@ -1333,7 +1380,12 @@ impl MusicPlayer {
 
         let browser_header = container(
             column![
-                text("LOCAL FILES").size(normal),
+                text(if self.browser_search_active {
+                    "SEARCH RESULTS"
+                } else {
+                    "LOCAL FILES"
+                })
+                .size(normal),
                 row![
                     tooltip(
                         button(text("Browse").size(small))
@@ -1363,39 +1415,87 @@ impl MusicPlayer {
                         button(text("Add All").size(small))
                             .on_press(MusicPlayerMessage::AddAllToPlaylist)
                             .padding([3, 8]),
-                        "Add all music files from current directory to playlist",
+                        if self.browser_search_active {
+                            "Add all found files to playlist"
+                        } else {
+                            "Add all music files from current directory to playlist"
+                        },
                         tooltip::Position::Bottom,
                     )
                     .style(container::bordered_box),
-                    Space::new().width(Length::Fill),
-                    text("Filter:").size(small),
-                    text_input("filter...", &self.browser_filter)
+                ]
+                .spacing(5)
+                .align_y(iced::Alignment::Center),
+                row![
+                    text("Search:").size(small),
+                    text_input("filename or directory...", &self.browser_filter)
                         .on_input(MusicPlayerMessage::BrowserFilterChanged)
+                        .on_submit(MusicPlayerMessage::BrowserSearch)
                         .size(small)
                         .padding(4)
-                        .width(Length::Fixed(100.0)),
+                        .width(Length::Fill),
+                    tooltip(
+                        button(text("Find").size(small))
+                            .on_press(MusicPlayerMessage::BrowserSearch)
+                            .padding([3, 8])
+                            .style(button::primary),
+                        "Search recursively in all subdirectories (Enter)",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(container::bordered_box),
+                    if self.browser_search_active {
+                        tooltip(
+                            button(text("Clear").size(small))
+                                .on_press(MusicPlayerMessage::BrowserClearSearch)
+                                .padding([3, 8]),
+                            "Return to directory browsing",
+                            tooltip::Position::Bottom,
+                        )
+                        .style(container::bordered_box)
+                    } else {
+                        // Invisible placeholder to keep layout stable
+                        tooltip(
+                            button(text("Clear").size(small)).padding([3, 8]),
+                            "",
+                            tooltip::Position::Bottom,
+                        )
+                        .style(container::bordered_box)
+                    },
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center),
                 text(dir_display.clone()).size(small),
-                text(format!("{} music files", music_file_count)).size(small),
+                text(if self.browser_search_active {
+                    format!("{} music files found", music_file_count)
+                } else {
+                    format!("{} music files", music_file_count)
+                })
+                .size(small),
             ]
             .spacing(5),
         )
         .padding(10);
 
         let browser_list: Element<'_, MusicPlayerMessage> = if self.browser_entries.is_empty() {
-            container(text("Empty directory").size(normal))
-                .padding(10)
-                .into()
+            container(
+                text(if self.browser_search_active {
+                    "No matching files found"
+                } else {
+                    "Empty directory"
+                })
+                .size(normal),
+            )
+            .padding(10)
+            .into()
         } else {
-            // Filter entries based on filter text
+            // Filter entries based on filter text (skip when showing search results)
             let filtered_entries: Vec<(usize, &BrowserEntry)> = self
                 .browser_entries
                 .iter()
                 .enumerate()
                 .filter(|(_, entry)| {
-                    self.browser_filter.is_empty()
+                    self.browser_search_active
+                        || self.browser_filter.is_empty()
                         || entry
                             .name
                             .to_lowercase()
@@ -2291,6 +2391,133 @@ async fn load_playlist_async() -> Result<Vec<PlaylistEntry>, String> {
         serde_json::from_str(&content).map_err(|e| format!("Parse error: {}", e))?;
 
     Ok(playlist.entries)
+}
+
+// === Recursive File Search ===
+
+/// Search for music files (SID, MOD, PRG) recursively under `root`, matching
+/// filenames or directory names against `query` (case-insensitive).
+/// Returns BrowserEntry items with names showing relative paths from root.
+fn search_files_recursive(root: &Path, query: &str) -> Vec<BrowserEntry> {
+    let mut results: Vec<BrowserEntry> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            // Skip hidden files/directories
+            if name.starts_with('.') {
+                continue;
+            }
+
+            if path.is_dir() {
+                // Always recurse into subdirectories
+                stack.push(path.clone());
+
+                // If the directory name matches, show it as navigable in results
+                if name.to_lowercase().contains(query) {
+                    let rel = path.strip_prefix(root).unwrap_or(&path);
+                    let display_name = format!("[DIR] {}", rel.display());
+                    results.push(BrowserEntry {
+                        path,
+                        name: display_name,
+                        entry_type: BrowserEntryType::Directory,
+                        subsongs: 1,
+                        sid_tooltip: None,
+                    });
+                }
+            } else if let Some(extension) = path.extension() {
+                if let Some(ext_str) = extension.to_str() {
+                    let ext_lower = ext_str.to_lowercase();
+                    let file_type = match ext_lower.as_str() {
+                        "sid" => Some(MusicFileType::Sid),
+                        "mod" => Some(MusicFileType::Mod),
+                        "prg" => Some(MusicFileType::Prg),
+                        _ => None,
+                    };
+
+                    if let Some(ft) = file_type {
+                        // Match against filename or any parent directory name
+                        let rel = path.strip_prefix(root).unwrap_or(&path);
+                        let rel_str = rel.to_string_lossy().to_lowercase();
+
+                        if rel_str.contains(query) {
+                            // For SID files, parse header for subsong count and tooltip
+                            let (subsongs, sid_tooltip) = if ft == MusicFileType::Sid {
+                                match fs::read(&path)
+                                    .ok()
+                                    .and_then(|data| sid_info::parse_header(&data).ok())
+                                {
+                                    Some(header) => {
+                                        let songs = if header.songs > 0 && header.songs <= 256 {
+                                            header.songs as u8
+                                        } else {
+                                            1
+                                        };
+                                        let mut tip = Vec::new();
+                                        if !header.name.is_empty() {
+                                            tip.push(header.name.clone());
+                                        }
+                                        if !header.author.is_empty() {
+                                            tip.push(header.author.clone());
+                                        }
+                                        if !header.released.is_empty() {
+                                            tip.push(format!("© {}", header.released));
+                                        }
+                                        tip.push(format!(
+                                            "{} | {} | {} tunes",
+                                            header.video_standard(),
+                                            header.sid_model_info(),
+                                            songs
+                                        ));
+                                        (songs, Some(tip.join("\n")))
+                                    }
+                                    None => (sid_info::quick_subsong_count(&path), None),
+                                }
+                            } else {
+                                (1, None)
+                            };
+
+                            // Show relative path so user knows where the file is
+                            let display_name = rel.display().to_string();
+
+                            results.push(BrowserEntry {
+                                path,
+                                name: display_name,
+                                entry_type: BrowserEntryType::MusicFile(ft),
+                                subsongs,
+                                sid_tooltip,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort: directories first, then files, both alphabetical
+    results.sort_by(|a, b| {
+        let a_is_dir = matches!(a.entry_type, BrowserEntryType::Directory);
+        let b_is_dir = matches!(b.entry_type, BrowserEntryType::Directory);
+        match (a_is_dir, b_is_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        }
+    });
+
+    results
 }
 
 // === Helper Functions ===
