@@ -1,14 +1,15 @@
 use iced::{
-    Element, Length, Task,
+    Element, Length, Subscription, Task,
     widget::{
-        Column, Space, button, checkbox, column, container, row, rule, scrollable, text,
-        text_input, tooltip,
+        Column, Space, button, checkbox, column, container, progress_bar, row, rule, scrollable,
+        text, text_input, tooltip,
     },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use ultimate64::Rest;
 use walkdir::WalkDir;
@@ -23,6 +24,17 @@ const FTP_TIMEOUT_SECS: u64 = 15;
 const FTP_UPLOAD_DIR_TIMEOUT_SECS: u64 = 120;
 /// Longer timeout for content preview downloads (PDFs can be large)
 const FTP_PREVIEW_TIMEOUT_SECS: u64 = 60;
+
+/// Shared progress state between async FTP tasks and the UI.
+/// Updated by blocking tasks, polled by iced subscription every 250ms.
+#[derive(Debug, Clone)]
+pub struct TransferProgress {
+    pub current: usize,
+    pub total: usize,
+    pub current_file: String,
+    pub operation: String, // "Downloading", "Uploading", etc.
+    pub done: bool,
+}
 
 #[derive(Debug, Clone)]
 pub enum RemoteBrowserMessage {
@@ -64,6 +76,8 @@ pub enum RemoteBrowserMessage {
     ShowContentPreview(String),
     ContentPreviewLoaded(Result<ContentPreview, String>),
     CloseContentPreview,
+    // Transfer progress (polled by subscription)
+    ProgressTick,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +109,8 @@ pub struct RemoteBrowser {
     content_preview: Option<ContentPreview>,
     content_preview_path: Option<String>,
     content_preview_loading: bool,
+    // Transfer progress (shared with async FTP tasks)
+    transfer_progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 }
 
 impl Default for RemoteBrowser {
@@ -116,6 +132,7 @@ impl Default for RemoteBrowser {
             content_preview: None,
             content_preview_path: None,
             content_preview_loading: false,
+            transfer_progress: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -216,11 +233,23 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::DownloadFile(remote_path) => {
                 if let Some(host) = &self.host_address {
-                    self.status_message = Some("Downloading...".to_string());
+                    let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
+                    self.status_message = Some(format!("Downloading {}...", filename));
+                    // Set initial progress for single file
+                    if let Ok(mut g) = self.transfer_progress.lock() {
+                        *g = Some(TransferProgress {
+                            current: 0,
+                            total: 1,
+                            current_file: filename,
+                            operation: "Downloading".to_string(),
+                            done: false,
+                        });
+                    }
                     let host = host.clone();
                     let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
                     Task::perform(
-                        download_file_ftp(host, remote_path, password),
+                        download_file_ftp_with_progress(host, remote_path, password, progress),
                         RemoteBrowserMessage::DownloadComplete,
                     )
                 } else {
@@ -230,6 +259,10 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::DownloadComplete(result) => {
+                // Clear transfer progress
+                if let Ok(mut g) = self.transfer_progress.lock() {
+                    *g = None;
+                }
                 match result {
                     Ok((name, _data)) => {
                         self.status_message = Some(format!("Downloaded: {}", name));
@@ -243,11 +276,27 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::UploadFile(local_path, remote_dest) => {
                 if let Some(host) = &self.host_address {
-                    self.status_message = Some("Uploading...".to_string());
+                    let filename = local_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    self.status_message = Some(format!("Uploading {}...", filename));
+                    // Set initial progress for single file upload
+                    if let Ok(mut g) = self.transfer_progress.lock() {
+                        *g = Some(TransferProgress {
+                            current: 0,
+                            total: 1,
+                            current_file: filename,
+                            operation: "Uploading".to_string(),
+                            done: false,
+                        });
+                    }
                     let host = host.clone();
                     let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
                     Task::perform(
-                        upload_file_ftp(host, local_path, remote_dest, password),
+                        upload_file_ftp(host, local_path, remote_dest, password, progress),
                         RemoteBrowserMessage::UploadComplete,
                     )
                 } else {
@@ -257,6 +306,10 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::UploadComplete(result) => {
+                // Clear transfer progress
+                if let Ok(mut g) = self.transfer_progress.lock() {
+                    *g = None;
+                }
                 match result {
                     Ok(name) => {
                         self.status_message = Some(format!("Uploaded: {}", name));
@@ -274,8 +327,9 @@ impl RemoteBrowser {
                     self.status_message = Some("Uploading directory...".to_string());
                     let host = host.clone();
                     let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
                     Task::perform(
-                        upload_directory_ftp(host, local_path, remote_dest, password),
+                        upload_directory_ftp(host, local_path, remote_dest, password, progress),
                         RemoteBrowserMessage::UploadDirectoryComplete,
                     )
                 } else {
@@ -285,6 +339,10 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::UploadDirectoryComplete(result) => {
+                // Clear transfer progress
+                if let Ok(mut g) = self.transfer_progress.lock() {
+                    *g = None;
+                }
                 match result {
                     Ok(msg) => {
                         self.status_message = Some(msg);
@@ -458,8 +516,11 @@ impl RemoteBrowser {
                     self.status_message = Some(format!("Downloading {} item(s)...", total));
                     let host = host.clone();
                     let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
                     Task::perform(
-                        download_batch_ftp(host, file_paths, dir_paths, local_dest, password),
+                        download_batch_ftp(
+                            host, file_paths, dir_paths, local_dest, password, progress,
+                        ),
                         RemoteBrowserMessage::DownloadBatchComplete,
                     )
                 } else {
@@ -469,6 +530,10 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::DownloadBatchComplete(result) => {
+                // Clear transfer progress
+                if let Ok(mut g) = self.transfer_progress.lock() {
+                    *g = None;
+                }
                 match result {
                     Ok(msg) => {
                         self.status_message = Some(msg);
@@ -560,6 +625,30 @@ impl RemoteBrowser {
             RemoteBrowserMessage::CloseContentPreview => {
                 self.content_preview = None;
                 self.content_preview_path = None;
+                Task::none()
+            }
+
+            RemoteBrowserMessage::ProgressTick => {
+                // Read shared progress state and update status message
+                if let Ok(guard) = self.transfer_progress.lock() {
+                    if let Some(ref progress) = *guard {
+                        if progress.done {
+                            // Transfer complete — clear progress
+                            drop(guard);
+                            if let Ok(mut g) = self.transfer_progress.lock() {
+                                *g = None;
+                            }
+                        } else {
+                            self.status_message = Some(format!(
+                                "{} ({}/{}) {}",
+                                progress.operation,
+                                progress.current,
+                                progress.total,
+                                progress.current_file
+                            ));
+                        }
+                    }
+                }
                 Task::none()
             }
         }
@@ -659,23 +748,24 @@ impl RemoteBrowser {
 
         // Path and status
         let path_display = text(display_path).size(normal);
-        let status = if self.disk_info_loading || self.content_preview_loading {
-            text("Loading...").size(small)
-        } else {
-            text(self.status_message.as_deref().unwrap_or("")).size(small)
-        };
 
         // If disk info popup is open, show it instead of the file list
         if let Some(disk_info) = &self.disk_info_popup {
             let popup = self.view_disk_info_popup(disk_info, font_size);
 
-            return column![nav_buttons, quick_nav, path_display, status, popup,]
-                .spacing(5)
-                .padding(5)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .into();
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                popup,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .into();
         }
         // Show loading panel while downloading content for preview
         if self.content_preview_loading {
@@ -693,25 +783,37 @@ impl RemoteBrowser {
             .center_y(Length::Fill)
             .style(container::bordered_box);
 
-            return column![nav_buttons, quick_nav, path_display, status, loading_panel,]
-                .spacing(5)
-                .padding(5)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .into();
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                loading_panel,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .into();
         }
         // If content preview popup is open, show it instead of the file list
         if let Some(content_preview) = &self.content_preview {
             let popup = self.view_content_preview_popup(content_preview, font_size);
 
-            return column![nav_buttons, quick_nav, path_display, status, popup,]
-                .spacing(5)
-                .padding(5)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(iced::Alignment::Center)
-                .into();
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                popup,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center)
+            .into();
         }
 
         // File list
@@ -994,13 +1096,72 @@ impl RemoteBrowser {
             .into()
         };
 
-        column![nav_buttons, quick_nav, path_display, status, file_list,]
-            .spacing(5)
-            .padding(5)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(iced::Alignment::Center)
-            .into()
+        column![
+            nav_buttons,
+            quick_nav,
+            path_display,
+            self.view_status_bar(small),
+            file_list,
+        ]
+        .spacing(5)
+        .padding(5)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::Center)
+        .into()
+    }
+
+    /// Build the status bar element — shows progress bar during transfers,
+    /// "Loading..." during popup loads, or the regular status message.
+    fn view_status_bar(&self, small: u32) -> Element<'_, RemoteBrowserMessage> {
+        if let Some(prog) = self.get_progress() {
+            // Truncate current filename for display
+            let file_display = if prog.current_file.len() > 30 {
+                format!("...{}", &prog.current_file[prog.current_file.len() - 27..])
+            } else {
+                prog.current_file.clone()
+            };
+
+            if prog.total > 0 {
+                // Determinate progress: known total (e.g. batch of individual files)
+                let pct = prog.current as f32 / prog.total as f32;
+                column![
+                    row![
+                        text(format!(
+                            "{} ({}/{})",
+                            prog.operation, prog.current, prog.total
+                        ))
+                        .size(small),
+                        Space::new().width(Length::Fill),
+                        text(file_display).size(small),
+                    ]
+                    .spacing(5),
+                    container(progress_bar(0.0..=1.0, pct)).height(Length::Fixed(6.0)),
+                ]
+                .spacing(2)
+                .into()
+            } else {
+                // Indeterminate progress: unknown total (e.g. recursive directory download)
+                // Show file count and current filename, bar pulses at 100% to indicate activity
+                column![
+                    row![
+                        text(format!("{} ({} files)", prog.operation, prog.current)).size(small),
+                        Space::new().width(Length::Fill),
+                        text(file_display).size(small),
+                    ]
+                    .spacing(5),
+                    container(progress_bar(0.0..=1.0, 1.0)).height(Length::Fixed(6.0)),
+                ]
+                .spacing(2)
+                .into()
+            }
+        } else if self.disk_info_loading || self.content_preview_loading {
+            text("Loading...").size(small).into()
+        } else {
+            text(self.status_message.as_deref().unwrap_or(""))
+                .size(small)
+                .into()
+        }
     }
 
     fn view_disk_info_popup(
@@ -1244,9 +1405,40 @@ impl RemoteBrowser {
     pub fn get_checked_files(&self) -> Vec<String> {
         self.checked_files.iter().cloned().collect()
     }
+
     #[allow(dead_code)]
     pub fn clear_checked(&mut self) {
         self.checked_files.clear();
+    }
+
+    /// Subscription that ticks every 250ms while a transfer is in progress.
+    /// Wire this into your main app's subscription alongside other subscriptions.
+    pub fn subscription(&self) -> Subscription<RemoteBrowserMessage> {
+        let has_progress = self
+            .transfer_progress
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+
+        if has_progress {
+            iced::time::every(Duration::from_millis(250))
+                .map(|_| RemoteBrowserMessage::ProgressTick)
+        } else {
+            Subscription::none()
+        }
+    }
+
+    /// Returns true if a file transfer is currently in progress
+    pub fn is_transferring(&self) -> bool {
+        self.transfer_progress
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Returns current transfer progress if a transfer is in progress
+    fn get_progress(&self) -> Option<TransferProgress> {
+        self.transfer_progress.lock().ok().and_then(|g| g.clone())
     }
 }
 
@@ -1566,6 +1758,25 @@ async fn download_file_ftp_preview(
 }
 
 // Download file via FTP
+/// Single file download with progress reporting
+async fn download_file_ftp_with_progress(
+    host: String,
+    remote_path: String,
+    password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
+) -> Result<(String, Vec<u8>), String> {
+    let result = download_file_ftp(host, remote_path, password).await;
+    // Mark progress as done
+    if let Ok(mut g) = progress.lock() {
+        if let Some(ref mut p) = *g {
+            p.current = 1;
+            p.done = true;
+        }
+    }
+    result
+}
+
+// Download file via FTP
 async fn download_file_ftp(
     host: String,
     remote_path: String,
@@ -1644,6 +1855,7 @@ async fn upload_file_ftp(
     local_path: PathBuf,
     remote_dest: String,
     password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
     log::info!("FTP: Uploading {} to {}", local_path.display(), remote_dest);
 
@@ -1708,6 +1920,14 @@ async fn upload_file_ftp(
 
             let _ = ftp.quit();
 
+            // Mark progress as done
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.current = 1;
+                    p.done = true;
+                }
+            }
+
             Ok(filename)
         }),
     )
@@ -1726,6 +1946,7 @@ async fn upload_directory_ftp(
     local_path: PathBuf,
     remote_dest: String,
     password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
     log::info!(
         "FTP: Uploading directory {} to {}",
@@ -1740,6 +1961,25 @@ async fn upload_directory_ftp(
             use std::io::Cursor;
             use std::time::Duration;
             use suppaftp::FtpStream;
+
+            // Count total files for progress (quick pre-scan)
+            let total_files = WalkDir::new(&local_path)
+                .min_depth(1)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .count();
+
+            // Initialize progress
+            if let Ok(mut g) = progress.lock() {
+                *g = Some(TransferProgress {
+                    current: 0,
+                    total: total_files,
+                    current_file: String::new(),
+                    operation: "Uploading".to_string(),
+                    done: false,
+                });
+            }
 
             let addr = format!("{}:21", host);
             let mut ftp =
@@ -1823,6 +2063,19 @@ async fn upload_directory_ftp(
                         }
                     }
                 } else if entry.file_type().is_file() {
+                    // Update progress with current filename
+                    let filename_display = entry
+                        .path()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    if let Ok(mut g) = progress.lock() {
+                        if let Some(ref mut p) = *g {
+                            p.current_file = filename_display;
+                        }
+                    }
+
                     // Upload file
                     log::debug!("FTP: Uploading file to {}", remote_path);
 
@@ -1859,10 +2112,24 @@ async fn upload_directory_ftp(
                             errors.push(format!("Upload {}: {}", filename, e));
                         }
                     }
+
+                    // Update progress count
+                    if let Ok(mut g) = progress.lock() {
+                        if let Some(ref mut p) = *g {
+                            p.current = files_uploaded;
+                        }
+                    }
                 }
             }
 
             let _ = ftp.quit();
+
+            // Mark progress as done
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.done = true;
+                }
+            }
 
             // Build result message
             let mut msg = format!(
@@ -1895,6 +2162,7 @@ async fn download_batch_ftp(
     dir_paths: Vec<String>,
     local_dest: PathBuf,
     password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
     log::info!(
         "FTP: Batch downloading {} files and {} directories to {}",
@@ -1902,6 +2170,18 @@ async fn download_batch_ftp(
         dir_paths.len(),
         local_dest.display()
     );
+
+    // Initialize progress (files + directories as total items)
+    let total = file_paths.len() + dir_paths.len();
+    if let Ok(mut g) = progress.lock() {
+        *g = Some(TransferProgress {
+            current: 0,
+            total,
+            current_file: String::new(),
+            operation: "Downloading".to_string(),
+            done: false,
+        });
+    }
 
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_UPLOAD_DIR_TIMEOUT_SECS),
@@ -1937,12 +2217,20 @@ async fn download_batch_ftp(
 
             let mut files_downloaded = 0;
             let mut dirs_downloaded = 0;
+            let mut items_completed = 0;
             let mut errors: Vec<String> = Vec::new();
 
             // Download individual files
             for remote_path in &file_paths {
                 let filename = remote_path.rsplit('/').next().unwrap_or("file");
                 let local_path = local_dest.join(filename);
+
+                // Update progress with current filename
+                if let Ok(mut g) = progress.lock() {
+                    if let Some(ref mut p) = *g {
+                        p.current_file = filename.to_string();
+                    }
+                }
 
                 log::debug!(
                     "FTP: Downloading file {} to {}",
@@ -1971,6 +2259,14 @@ async fn download_batch_ftp(
                         errors.push(format!("Download {}: {}", filename, e));
                     }
                 }
+
+                // Update progress count
+                items_completed += 1;
+                if let Ok(mut g) = progress.lock() {
+                    if let Some(ref mut p) = *g {
+                        p.current = items_completed;
+                    }
+                }
             }
 
             // Download directories recursively
@@ -1978,13 +2274,24 @@ async fn download_batch_ftp(
                 let dir_name = remote_dir.rsplit('/').next().unwrap_or("dir");
                 let local_dir = local_dest.join(dir_name);
 
+                // Switch progress to per-file mode for this directory
+                // total=0 signals indeterminate (we don't know how many files are inside)
+                if let Ok(mut g) = progress.lock() {
+                    if let Some(ref mut p) = *g {
+                        p.current = 0;
+                        p.total = 0;
+                        p.current_file = format!("{}/", dir_name);
+                        p.operation = "Downloading".to_string();
+                    }
+                }
+
                 log::debug!(
                     "FTP: Downloading directory {} to {}",
                     remote_dir,
                     local_dir.display()
                 );
 
-                match download_directory_recursive(&mut ftp, remote_dir, &local_dir) {
+                match download_directory_recursive(&mut ftp, remote_dir, &local_dir, &progress) {
                     Ok((files, dirs)) => {
                         files_downloaded += files;
                         dirs_downloaded += dirs;
@@ -1996,6 +2303,13 @@ async fn download_batch_ftp(
             }
 
             let _ = ftp.quit();
+
+            // Mark progress as done
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.done = true;
+                }
+            }
 
             let mut msg = format!(
                 "Downloaded: {} files, {} directories",
@@ -2024,6 +2338,7 @@ fn download_directory_recursive(
     ftp: &mut suppaftp::FtpStream,
     remote_path: &str,
     local_path: &std::path::Path,
+    progress: &Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<(usize, usize), String> {
     use std::io::Read;
 
@@ -2054,7 +2369,7 @@ fn download_directory_recursive(
         let child_local = local_path.join(&name);
 
         if is_dir {
-            match download_directory_recursive(ftp, &child_remote, &child_local) {
+            match download_directory_recursive(ftp, &child_remote, &child_local, progress) {
                 Ok((f, d)) => {
                     files_count += f;
                     dirs_count += d;
@@ -2064,6 +2379,13 @@ fn download_directory_recursive(
                 }
             }
         } else {
+            // Update progress with current filename
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.current_file = name.clone();
+                }
+            }
+
             match ftp.retr_as_stream(&child_remote) {
                 Ok(mut reader) => {
                     let mut data = Vec::new();
@@ -2071,6 +2393,13 @@ fn download_directory_recursive(
                         let _ = ftp.finalize_retr_stream(reader);
                         if std::fs::write(&child_local, &data).is_ok() {
                             files_count += 1;
+
+                            // Update progress count (increment current for each file)
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.current += 1;
+                                }
+                            }
                         }
                     }
                 }

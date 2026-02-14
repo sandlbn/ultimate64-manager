@@ -1243,6 +1243,11 @@ impl Ultimate64Browser {
                     }
                     Err(e) => {
                         log::error!("Status update failed: {}", e);
+                        if self.remote_browser.is_transferring() {
+                            log::debug!("Ignoring status failure during active transfer");
+                            return Task::none();
+                        }
+
                         // Only show error if we were previously connected (lost connection)
                         if self.status.connected {
                             self.user_message =
@@ -1885,8 +1890,8 @@ impl Ultimate64Browser {
             }
         });
 
-        // Periodic connection check every 60 seconds (only when connected)
-        let status_check = if self.status.connected {
+        // Periodic connection check every 60 seconds (only when connected and not transferring)
+        let status_check = if self.status.connected && !self.remote_browser.is_transferring() {
             iced::time::every(Duration::from_secs(60)).map(|_| Message::RefreshStatus)
         } else {
             Subscription::none()
@@ -1895,6 +1900,9 @@ impl Ultimate64Browser {
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
+            self.remote_browser
+                .subscription()
+                .map(Message::RemoteBrowser),
             keyboard_sub,
             window_events,
             status_check,
