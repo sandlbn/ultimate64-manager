@@ -1037,6 +1037,7 @@ impl FileBrowser {
 
     fn load_directory(&mut self, path: &Path) {
         self.files.clear();
+        self.filter.clear();
 
         if let Ok(entries) = std::fs::read_dir(path) {
             let mut files: Vec<FileEntry> = entries
