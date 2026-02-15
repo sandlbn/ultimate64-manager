@@ -39,6 +39,7 @@ pub enum FileBrowserMessage {
     DriveSelected(DriveOption),
     NavigateToPath(PathBuf),
     FilterChanged(String),
+    NavigateToCsdbDir,
     // Disk info popup
     ShowDiskInfo(PathBuf),
     DiskInfoLoaded(Result<DiskInfo, String>),
@@ -301,6 +302,22 @@ impl FileBrowser {
                 self.filter = value;
                 Task::none()
             }
+            FileBrowserMessage::NavigateToCsdbDir => {
+                if let Some(config_dir) = dirs::config_dir() {
+                    let csdb_dir = config_dir.join("ultimate64-manager").join("CSDB");
+                    if csdb_dir.exists() {
+                        self.load_directory(&csdb_dir);
+                        self.current_directory = csdb_dir;
+                        self.checked_files.clear();
+                    } else {
+                        self.status_message =
+                            Some(format!("CSDb folder not found: {}", csdb_dir.display()));
+                    }
+                } else {
+                    self.status_message = Some("Could not determine config directory".to_string());
+                }
+                Task::none()
+            }
             // Disk info popup messages
             FileBrowserMessage::ShowDiskInfo(path) => {
                 self.disk_info_loading = true;
@@ -402,6 +419,14 @@ impl FileBrowser {
                     .on_press(FileBrowserMessage::SelectDirectory)
                     .padding([4, 8]),
                 "Choose a different folder",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            tooltip(
+                button(text("CSDb").size(small))
+                    .on_press(FileBrowserMessage::NavigateToCsdbDir)
+                    .padding([4, 8]),
+                "Go to CSDb downloads folder",
                 tooltip::Position::Bottom,
             )
             .style(container::bordered_box),
