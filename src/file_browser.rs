@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::{Rest, drives::MountMode};
 
+use crate::csdb::{MAX_ZIP_EXTRACT_BYTES, extract_zip_to_dir};
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
 use crate::pdf_preview;
@@ -40,6 +41,9 @@ pub enum FileBrowserMessage {
     NavigateToPath(PathBuf),
     FilterChanged(String),
     NavigateToCsdbDir,
+    // ZIP extraction: extract archive to a sibling subfolder then navigate there
+    ExtractZip(PathBuf),
+    ZipExtracted(Result<PathBuf, String>),
     // Disk info popup
     ShowDiskInfo(PathBuf),
     DiskInfoLoaded(Result<DiskInfo, String>),
@@ -96,6 +100,8 @@ pub struct FileBrowser {
     selected_drive: DriveOption,
     status_message: Option<String>,
     filter: String,
+    // True while an async operation (e.g. ZIP extraction) is in progress
+    is_loading: bool,
     // Disk info popup state
     disk_info_popup: Option<DiskInfo>,
     disk_info_path: Option<PathBuf>,
@@ -123,6 +129,7 @@ impl FileBrowser {
             selected_drive: DriveOption::A,
             status_message: None,
             filter: String::new(),
+            is_loading: false,
             disk_info_popup: None,
             disk_info_path: None,
             disk_info_loading: false,
@@ -318,6 +325,71 @@ impl FileBrowser {
                 }
                 Task::none()
             }
+            // Extract a ZIP archive into a sibling subfolder (named after the ZIP stem),
+            // then navigate into that folder so the contents are immediately visible.
+            FileBrowserMessage::ExtractZip(zip_path) => {
+                // Reject files above the size limit to avoid accidentally unpacking
+                // massive TOSEC collections or similar large ZIPs
+                match std::fs::metadata(&zip_path) {
+                    Ok(meta) if meta.len() > MAX_ZIP_EXTRACT_BYTES => {
+                        self.status_message = Some(format!(
+                            "ZIP too large ({:.1} MB). Maximum allowed is {} MB.",
+                            meta.len() as f64 / (1024.0 * 1024.0),
+                            MAX_ZIP_EXTRACT_BYTES / (1024 * 1024)
+                        ));
+                        return Task::none();
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Cannot read ZIP metadata: {}", e));
+                        return Task::none();
+                    }
+                    _ => {}
+                }
+
+                // Target dir = same parent as the ZIP, subfolder named after the ZIP stem
+                let zip_stem = zip_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("extracted")
+                    .to_string();
+                let target_dir = match zip_path.parent() {
+                    Some(parent) => parent.join(&zip_stem),
+                    None => {
+                        self.status_message = Some("Cannot determine parent directory".to_string());
+                        return Task::none();
+                    }
+                };
+
+                let zip_name = zip_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("archive.zip")
+                    .to_string();
+
+                self.is_loading = true;
+                self.status_message = Some(format!("Extracting {}...", zip_name));
+
+                Task::perform(
+                    extract_zip_file_async(zip_path, target_dir),
+                    FileBrowserMessage::ZipExtracted,
+                )
+            }
+            FileBrowserMessage::ZipExtracted(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(dir) => {
+                        self.status_message = Some(format!("Extracted to: {}", dir.display()));
+                        // Navigate into the freshly extracted folder
+                        self.load_directory(&dir);
+                        self.current_directory = dir;
+                        self.checked_files.clear();
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Extraction failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
             // Disk info popup messages
             FileBrowserMessage::ShowDiskInfo(path) => {
                 self.disk_info_loading = true;
@@ -492,7 +564,7 @@ impl FileBrowser {
         };
 
         // Status message
-        let status = if self.disk_info_loading || self.content_preview_loading {
+        let status = if self.disk_info_loading || self.content_preview_loading || self.is_loading {
             text("Loading...").size(small)
         } else if let Some(msg) = &self.status_message {
             text(msg).size(small)
@@ -827,6 +899,7 @@ impl FileBrowser {
                 Some("txt") | Some("atxt") | Some("nfo") | Some("diz") => "TXT",
                 Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") => "IMG",
                 Some("pdf") => "PDF",
+                Some("zip") => "ZIP",
                 _ => "",
             }
         };
@@ -945,6 +1018,23 @@ impl FileBrowser {
                 )
                 .style(container::bordered_box)
                 .into(),
+                Some("zip") => {
+                    // Extract the ZIP into a sibling subdirectory, then navigate there.
+                    // Very large ZIPs (TOSEC etc.) are rejected with a clear error message.
+                    tooltip(
+                        button(text("Extract").size(small))
+                            .on_press(FileBrowserMessage::ExtractZip(entry.path.clone()))
+                            .padding([2, 8]),
+                        text(format!(
+                            "Extract ZIP to subfolder (max {} MB)",
+                            MAX_ZIP_EXTRACT_BYTES / (1024 * 1024)
+                        ))
+                        .size(normal),
+                        tooltip::Position::Top,
+                    )
+                    .style(container::bordered_box)
+                    .into()
+                }
                 _ => {
                     // Check for text, image, or PDF preview
                     if is_text_file {
@@ -1079,6 +1169,8 @@ impl FileBrowser {
                                     | Some("mod")
                                     | Some("tap")
                                     | Some("t64")
+                                    // ZIP archives (extract-to-subdir action)
+                                    | Some("zip")
                                     // Text files for readme preview
                                     | Some("txt")
                                     | Some("atxt")
@@ -1127,6 +1219,32 @@ async fn load_disk_info_async(path: PathBuf) -> Result<DiskInfo, String> {
     tokio::task::spawn_blocking(move || disk_image::read_disk_info(&path))
         .await
         .map_err(|e| format!("Task error: {}", e))?
+}
+
+/// Read a ZIP from disk, extract it to `target_dir`, and return the target dir
+/// path on success.  The actual extraction runs on a blocking thread so the
+/// async runtime is not stalled.
+async fn extract_zip_file_async(zip_path: PathBuf, target_dir: PathBuf) -> Result<PathBuf, String> {
+    // Read the ZIP bytes from disk
+    let data = tokio::fs::read(&zip_path)
+        .await
+        .map_err(|e| format!("Failed to read ZIP file: {}", e))?;
+
+    let filename = zip_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("archive.zip")
+        .to_string();
+
+    let target_dir_clone = target_dir.clone();
+    // Run the CPU-bound extraction off the async thread pool
+    tokio::task::spawn_blocking(move || {
+        extract_zip_to_dir(&data, &filename, &target_dir_clone)
+            .map(|_| target_dir_clone)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))?
 }
 
 async fn load_content_preview_async(path: PathBuf) -> Result<ContentPreview, String> {
