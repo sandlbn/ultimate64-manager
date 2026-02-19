@@ -21,7 +21,7 @@ use ultimate64::Rest;
 
 use crate::csdb::{
     CsdbClient, ExtractedZip, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory,
-    SearchResult, TopListCategory, TopListEntry, extract_zip, get_runnable_extracted_files,
+    SearchResult, TopListCategory, TopListEntry, extract_zip_to_dir, get_runnable_extracted_files,
     get_runnable_files, is_zip_file,
 };
 
@@ -350,8 +350,10 @@ impl CsdbBrowser {
             CsdbBrowserMessage::LatestLoaded(result) => {
                 self.is_loading = false;
                 match result {
-                    Ok(releases) => {
+                    Ok(mut releases) => {
                         let count = releases.len();
+                        // Reverse so newest releases appear at the top of the list
+                        releases.reverse();
                         self.latest_releases = releases;
                         self.view_state = ViewState::LatestReleases;
                         self.status_message = Some(format!("Loaded {} release(s)", count));
@@ -754,6 +756,22 @@ impl CsdbBrowser {
 
                         let file = file.clone();
 
+                        // Build target directory: CSDB/<release_type>/<zip_stem>/
+                        // This keeps extracted files organised in the CSDB downloads folder
+                        // alongside any separately downloaded ZIPs.
+                        let release_type_dir = release
+                            .release_type
+                            .as_deref()
+                            .map(|t| sanitize_dirname(t))
+                            .unwrap_or_else(|| "Other".to_string());
+                        let zip_stem = std::path::Path::new(&file.filename)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .map(|s| sanitize_dirname(s))
+                            .unwrap_or_else(|| "extracted".to_string());
+                        let extract_target =
+                            self.download_dir.join(&release_type_dir).join(&zip_stem);
+
                         return Task::perform(
                             async move {
                                 // Download the ZIP file
@@ -767,9 +785,10 @@ impl CsdbBrowser {
                                 .map_err(|_| "Download timed out".to_string())?
                                 .map_err(|e| e.to_string())?;
 
-                                // Extract the ZIP (blocking operation)
+                                // Extract the ZIP to the CSDB folder (blocking operation)
                                 tokio::task::spawn_blocking(move || {
-                                    extract_zip(&data, &filename).map_err(|e| e.to_string())
+                                    extract_zip_to_dir(&data, &filename, &extract_target)
+                                        .map_err(|e| e.to_string())
                                 })
                                 .await
                                 .map_err(|e| format!("Task error: {}", e))?

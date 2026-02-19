@@ -26,6 +26,9 @@ use zip::ZipArchive;
 /// Default delay between requests in milliseconds (1.5 seconds)
 const REQUEST_DELAY_MS: u64 = 1500;
 
+/// Maximum ZIP file size for extraction (100 MB).
+pub const MAX_ZIP_EXTRACT_BYTES: u64 = 100 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchCategory {
     #[default]
@@ -901,21 +904,22 @@ impl Default for CsdbClient {
 // ZIP extraction functions
 // -----------------------------------------------------------------------------
 
-/// Extract a ZIP file from bytes to a temporary directory
-pub fn extract_zip(zip_data: &[u8], source_filename: &str) -> Result<ExtractedZip> {
+/// Extract a ZIP file from bytes to a **specific** target directory.
+///
+/// This is the preferred function when you want the files to land in a known
+/// location (e.g., the CSDB downloads folder).  The directory is created if it
+/// does not exist.  Hidden files and macOS `__MACOSX` metadata entries are
+/// always skipped.  Path components inside the archive are stripped so every
+/// file ends up directly inside `target_dir`.
+pub fn extract_zip_to_dir(
+    zip_data: &[u8],
+    source_filename: &str,
+    target_dir: &std::path::Path,
+) -> Result<ExtractedZip> {
     let reader = Cursor::new(zip_data);
     let mut archive = ZipArchive::new(reader).context("Failed to open ZIP archive")?;
 
-    // Create temp directory for extraction with unique name
-    let temp_dir = std::env::temp_dir().join(format!(
-        "csdb_extract_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    ));
-
-    std::fs::create_dir_all(&temp_dir).context("Failed to create temp directory")?;
+    std::fs::create_dir_all(target_dir).context("Failed to create target directory")?;
 
     let mut files = Vec::new();
 
@@ -937,13 +941,13 @@ pub fn extract_zip(zip_data: &[u8], source_filename: &str) -> Result<ExtractedZi
             continue;
         }
 
-        // Extract just the filename (strip path)
+        // Extract just the filename (strip path components)
         let clean_filename = filename.rsplit('/').next().unwrap_or(&filename).to_string();
         if clean_filename.is_empty() || clean_filename.starts_with('.') {
             continue;
         }
 
-        let out_path = temp_dir.join(&clean_filename);
+        let out_path = target_dir.join(&clean_filename);
 
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
@@ -972,7 +976,7 @@ pub fn extract_zip(zip_data: &[u8], source_filename: &str) -> Result<ExtractedZi
 
     Ok(ExtractedZip {
         source_filename: source_filename.to_string(),
-        extract_dir: temp_dir,
+        extract_dir: target_dir.to_path_buf(),
         files,
     })
 }
