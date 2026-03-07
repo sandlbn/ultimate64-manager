@@ -325,28 +325,48 @@ impl VideoStreaming {
                 Task::none()
             }
             StreamingMessage::TakeScreenshot => {
-                // Take screenshot from the existing scaled frame buffer
-                if !self.is_streaming {
-                    return Task::none();
-                }
+                if self.is_streaming {
+                    // Fast path: grab the current frame directly from the stream buffer.
+                    let frame_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
+                        fb_guard.clone()
+                    } else {
+                        None
+                    };
 
-                // Get current scaled frame from buffer (includes dimensions)
-                let frame_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
-                    fb_guard.clone()
+                    if let Some(frame) = frame_data {
+                        Task::perform(
+                            save_screenshot_to_pictures(frame.data, frame.width, frame.height),
+                            StreamingMessage::ScreenshotComplete,
+                        )
+                    } else {
+                        Task::perform(
+                            async { Err("No frame available".to_string()) },
+                            StreamingMessage::ScreenshotComplete,
+                        )
+                    }
                 } else {
-                    None
-                };
-
-                if let Some(frame) = frame_data {
-                    Task::perform(
-                        save_screenshot_to_pictures(frame.data, frame.width, frame.height),
-                        StreamingMessage::ScreenshotComplete,
-                    )
-                } else {
-                    Task::perform(
-                        async { Err("No frame available".to_string()) },
-                        StreamingMessage::ScreenshotComplete,
-                    )
+                    // Slow path: capture via REST API without starting streaming.
+                    // Requires a connected host.
+                    if let Some(host) = self.ultimate_host.clone() {
+                        let password = self.api_password.clone();
+                        Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::screenshot_api::capture_screenshot_via_api(
+                                        &host, password,
+                                    )
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(e.to_string()))
+                            },
+                            StreamingMessage::ScreenshotComplete,
+                        )
+                    } else {
+                        Task::perform(
+                            async { Err("Not connected to Ultimate64".to_string()) },
+                            StreamingMessage::ScreenshotComplete,
+                        )
+                    }
                 }
             }
             StreamingMessage::ScreenshotComplete(_result) => {
@@ -1039,12 +1059,16 @@ impl VideoStreaming {
             .spacing(3),
         ]
         .spacing(5); // Stream controls with keyboard toggle
-        let screenshot_button = if self.is_streaming {
-            button(text("📸").size(11))
-                .on_press(StreamingMessage::TakeScreenshot)
-                .padding([6, 10])
-        } else {
-            button(text("📸").size(11)).padding([6, 10])
+        // Screenshot works when streaming (instant frame grab) OR when connected
+        // without streaming (REST API capture via screenshot_api module).
+        let screenshot_button = {
+            let can_screenshot = self.is_streaming || self.ultimate_host.is_some();
+            let btn = button(text("📸").size(11)).padding([6, 10]);
+            if can_screenshot {
+                btn.on_press(StreamingMessage::TakeScreenshot)
+            } else {
+                btn
+            }
         };
 
         // Keyboard toggle button
@@ -1115,7 +1139,7 @@ impl VideoStreaming {
                     if self.is_streaming {
                         "Capture frame to Pictures folder"
                     } else {
-                        "Start streaming first"
+                        "Capture frame to Pictures folder"
                     },
                     tooltip::Position::Bottom,
                 )

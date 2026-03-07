@@ -33,6 +33,7 @@ mod pdf_preview;
 mod petscii;
 mod profiles;
 mod remote_browser;
+mod screenshot_api;
 mod settings;
 mod sid_info;
 mod stream_control;
