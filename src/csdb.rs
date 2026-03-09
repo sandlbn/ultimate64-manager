@@ -893,8 +893,10 @@ impl CsdbClient {
     fn extract_screenshot_url_from_html(&self, html: &str) -> Option<String> {
         // CSDb release pages embed the screenshot as:
         //   <img src="/gfx/releases/259000/259056.png" ... alt="ReleaseName" ...>
-        // The image always lives under /gfx/releases/ and has a numeric filename.
-        let re = Regex::new(r#"<img\s[^>]*src="(/gfx/releases/[^"]+\.png)"[^>]*>"#).ok()?;
+        // Older releases may use .gif or .jpg instead of .png.
+        let re =
+            Regex::new(r#"<img\s[^>]*src="(/gfx/releases/[^"]+\.(?:png|gif|jpg|jpeg))"[^>]*>"#)
+                .ok()?;
         re.captures(html)
             .map(|c| format!("https://csdb.dk{}", &c[1]))
     }
