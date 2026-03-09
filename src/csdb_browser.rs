@@ -14,6 +14,7 @@ use iced::{
         text_input, tooltip,
     },
 };
+use reqwest;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -77,6 +78,11 @@ pub enum CsdbBrowserMessage {
 
     // Navigation
     BackToList,
+
+    // Release screenshot
+    LoadScreenshot(String),                    // URL to fetch
+    ScreenshotLoaded(Result<Vec<u8>, String>), // raw PNG bytes
+    ClearScreenshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +232,10 @@ pub struct CsdbBrowser {
 
     // Download directory
     download_dir: PathBuf,
+
+    // Release screenshot
+    screenshot_handle: Option<iced::widget::image::Handle>,
+    screenshot_loading: bool,
 }
 
 impl CsdbBrowser {
@@ -252,6 +262,8 @@ impl CsdbBrowser {
             status_message: None,
             is_loading: false,
             download_dir,
+            screenshot_handle: None,
+            screenshot_loading: false,
         }
     }
 
@@ -440,6 +452,15 @@ impl CsdbBrowser {
                     Ok(details) => {
                         let file_count = details.files.len();
                         let runnable_count = get_runnable_files(&details.files).len();
+                        let screenshot_task = if let Some(url) = details.screenshot_url.clone() {
+                            self.screenshot_loading = true;
+                            self.screenshot_handle = None;
+                            Task::done(CsdbBrowserMessage::LoadScreenshot(url))
+                        } else {
+                            self.screenshot_loading = false;
+                            self.screenshot_handle = None;
+                            Task::none()
+                        };
                         self.current_release = Some(details);
                         self.view_state = ViewState::ReleaseDetails;
                         self.selected_file_index = None;
@@ -447,6 +468,7 @@ impl CsdbBrowser {
                             "{} file(s), {} runnable",
                             file_count, runnable_count
                         ));
+                        return screenshot_task;
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Failed to load release: {}", e));
@@ -455,6 +477,40 @@ impl CsdbBrowser {
                 Task::none()
             }
 
+            CsdbBrowserMessage::ClearScreenshot => {
+                self.screenshot_handle = None;
+                self.screenshot_loading = false;
+                Task::none()
+            }
+            CsdbBrowserMessage::LoadScreenshot(url) => {
+                self.screenshot_loading = true;
+                self.screenshot_handle = None;
+                Task::perform(
+                    async move {
+                        reqwest::get(&url)
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .bytes()
+                            .await
+                            .map(|b| b.to_vec())
+                            .map_err(|e| e.to_string())
+                    },
+                    CsdbBrowserMessage::ScreenshotLoaded,
+                )
+            }
+            CsdbBrowserMessage::ScreenshotLoaded(result) => {
+                self.screenshot_loading = false;
+                match result {
+                    Ok(bytes) => {
+                        self.screenshot_handle =
+                            Some(iced::widget::image::Handle::from_bytes(bytes));
+                    }
+                    Err(_) => {
+                        self.screenshot_handle = None;
+                    }
+                }
+                Task::none()
+            }
             CsdbBrowserMessage::CloseReleaseDetails => {
                 self.current_release = None;
                 self.selected_file_index = None;
@@ -1019,6 +1075,8 @@ impl CsdbBrowser {
             }
 
             CsdbBrowserMessage::BackToList => {
+                self.screenshot_handle = None;
+                self.screenshot_loading = false;
                 self.current_release = None;
                 self.selected_file_index = None;
                 self.extracted_zip = None;
@@ -1661,16 +1719,70 @@ impl CsdbBrowser {
         )
         .height(Length::Fill);
 
+        // Screenshot panel — shown to the right of the file list when available
+        let content_area: Element<'_, CsdbBrowserMessage> =
+            if let Some(handle) = &self.screenshot_handle {
+                // Screenshot loaded — show image alongside file list
+                let screenshot = container(
+                    iced::widget::image(handle.clone())
+                        .width(Length::Fixed(384.0))
+                        .height(Length::Fixed(272.0))
+                        .content_fit(iced::ContentFit::Contain),
+                )
+                .width(Length::Fixed(390.0))
+                .padding(3)
+                .style(container::bordered_box);
+
+                row![
+                    column![filter_row, rule::horizontal(1), file_list,]
+                        .spacing(5)
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                    Space::new().width(5),
+                    screenshot,
+                ]
+                .height(Length::Fill)
+                .into()
+            } else if self.screenshot_loading {
+                // Spinner placeholder while image loads
+                let placeholder = container(
+                    column![text("🖼").size(32), text("Loading preview…").size(small),]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center),
+                )
+                .width(Length::Fixed(390.0))
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(container::bordered_box);
+
+                row![
+                    column![filter_row, rule::horizontal(1), file_list,]
+                        .spacing(5)
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                    Space::new().width(5),
+                    placeholder,
+                ]
+                .height(Length::Fill)
+                .into()
+            } else {
+                // No screenshot — just file list with filter row
+                column![filter_row, rule::horizontal(1), file_list,]
+                    .spacing(5)
+                    .height(Length::Fill)
+                    .into()
+            };
+
         column![
             header,
             rule::horizontal(1),
             info_row,
             rule::horizontal(1),
-            filter_row,
-            rule::horizontal(1),
-            file_list,
+            content_area,
         ]
         .spacing(5)
+        .height(Length::Fill)
         .into()
     }
 

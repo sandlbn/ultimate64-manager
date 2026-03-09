@@ -267,6 +267,8 @@ pub struct ReleaseDetails {
     pub release_date: Option<String>,
     pub platform: Option<String>,
     pub files: Vec<ReleaseFile>,
+    /// URL of the release screenshot/preview image on csdb.dk (e.g. /gfx/releases/…/12345.png)
+    pub screenshot_url: Option<String>,
 }
 
 // -----------------------------------------------------------------------------
@@ -496,6 +498,9 @@ impl CsdbClient {
         // Get downloadable files
         let files = self.build_file_list(&html, release_url).await?;
 
+        // Extract screenshot URL — CSDb images live at /gfx/releases/<bucket>/<id>.png
+        let screenshot_url = self.extract_screenshot_url_from_html(&html);
+
         Ok(ReleaseDetails {
             release_id,
             title,
@@ -504,6 +509,7 @@ impl CsdbClient {
             release_date,
             platform,
             files,
+            screenshot_url,
         })
     }
 
@@ -882,6 +888,15 @@ impl CsdbClient {
             return Some(strip_tags(&cap[1]));
         }
         None
+    }
+
+    fn extract_screenshot_url_from_html(&self, html: &str) -> Option<String> {
+        // CSDb release pages embed the screenshot as:
+        //   <img src="/gfx/releases/259000/259056.png" ... alt="ReleaseName" ...>
+        // The image always lives under /gfx/releases/ and has a numeric filename.
+        let re = Regex::new(r#"<img\s[^>]*src="(/gfx/releases/[^"]+\.png)"[^>]*>"#).ok()?;
+        re.captures(html)
+            .map(|c| format!("https://csdb.dk{}", &c[1]))
     }
 
     fn extract_platform_from_html(&self, html: &str) -> Option<String> {
