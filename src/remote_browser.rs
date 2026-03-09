@@ -18,6 +18,24 @@ use crate::api;
 use crate::dir_preview::ContentPreview;
 use crate::disk_image::{self, DiskInfo, FileType};
 
+/// Disk format chosen in the create-disk dialog
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiskCreateType {
+    D64,
+    D71,
+    D81,
+}
+
+impl std::fmt::Display for DiskCreateType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiskCreateType::D64 => write!(f, "D64  (1541 · 174 KB)"),
+            DiskCreateType::D71 => write!(f, "D71  (1571 · 349 KB)"),
+            DiskCreateType::D81 => write!(f, "D81  (1581 · 800 KB)"),
+        }
+    }
+}
+
 /// Timeout for FTP operations to prevent hangs when device goes offline
 const FTP_TIMEOUT_SECS: u64 = 15;
 /// Longer timeout for directory uploads which may take time
@@ -71,6 +89,15 @@ pub enum RemoteBrowserMessage {
     // Disk info popup
     ShowDiskInfo(String),
     DiskInfoLoaded(Result<DiskInfo, String>),
+
+    // Disk image creator
+    ShowCreateDisk,
+    CloseCreateDisk,
+    CreateDiskNameChanged(String),
+    CreateDiskIdChanged(String),
+    CreateDiskTypeChanged(DiskCreateType),
+    CreateDiskConfirm,
+    CreateDiskComplete(Result<String, String>),
     CloseDiskInfo,
     // Content preview popup (text/image files)
     ShowContentPreview(String),
@@ -105,6 +132,13 @@ pub struct RemoteBrowser {
     disk_info_popup: Option<DiskInfo>,
     disk_info_path: Option<String>,
     disk_info_loading: bool,
+    // Disk image creator dialog state
+    show_create_disk: bool,
+    create_disk_name: String,
+    create_disk_id: String,
+    create_disk_type: DiskCreateType,
+    create_disk_busy: bool,
+
     // Content preview popup state (text/image files)
     content_preview: Option<ContentPreview>,
     content_preview_path: Option<String>,
@@ -128,6 +162,11 @@ impl Default for RemoteBrowser {
             checked_files: HashSet::new(),
             disk_info_popup: None,
             disk_info_path: None,
+            show_create_disk: false,
+            create_disk_name: "NEWDISK".to_string(),
+            create_disk_id: "01 2A".to_string(),
+            create_disk_type: DiskCreateType::D64,
+            create_disk_busy: false,
             disk_info_loading: false,
             content_preview: None,
             content_preview_path: None,
@@ -582,6 +621,75 @@ impl RemoteBrowser {
                 Task::none()
             }
 
+            // ── Disk creator ──────────────────────────────────────────────
+            RemoteBrowserMessage::ShowCreateDisk => {
+                self.show_create_disk = true;
+                Task::none()
+            }
+            RemoteBrowserMessage::CloseCreateDisk => {
+                self.show_create_disk = false;
+                self.create_disk_busy = false;
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDiskNameChanged(s) => {
+                // PETSCII disk names are max 16 chars, uppercase only
+                self.create_disk_name = s.to_uppercase().chars().take(16).collect();
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDiskIdChanged(s) => {
+                self.create_disk_id = s.to_uppercase().chars().take(5).collect();
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDiskTypeChanged(t) => {
+                self.create_disk_type = t;
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDiskConfirm => {
+                if let Some(host) = self.host_address.clone() {
+                    self.create_disk_busy = true;
+                    let name = self.create_disk_name.clone();
+                    let id = self.create_disk_id.clone();
+                    let disk_type = self.create_disk_type;
+                    let dest = self.current_path.clone();
+                    let password = self.password.clone();
+                    Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                create_and_upload_disk(host, name, id, disk_type, dest, password)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        RemoteBrowserMessage::CreateDiskComplete,
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            RemoteBrowserMessage::CreateDiskComplete(result) => {
+                self.create_disk_busy = false;
+                self.show_create_disk = false;
+                match result {
+                    Ok(name) => {
+                        self.status_message = Some(format!("Created: {}", name));
+                        // Refresh the file list
+                        if let Some(host) = self.host_address.clone() {
+                            let path = self.current_path.clone();
+                            let password = self.password.clone();
+                            self.is_loading = true;
+                            return Task::perform(
+                                fetch_files_ftp(host, path, password),
+                                RemoteBrowserMessage::FilesLoaded,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Create failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
             RemoteBrowserMessage::CloseDiskInfo => {
                 self.disk_info_popup = None;
                 self.disk_info_path = None;
@@ -743,11 +851,42 @@ impl RemoteBrowser {
                 tooltip::Position::Bottom,
             )
             .style(container::bordered_box),
+            Space::new().width(Length::Fill),
+            tooltip(
+                {
+                    let btn = button(text("💾 New Disk").size(small)).padding([2, 8]);
+                    if self.is_connected {
+                        btn.on_press(RemoteBrowserMessage::ShowCreateDisk)
+                    } else {
+                        btn
+                    }
+                },
+                "Create a new blank D64/D71/D81 disk image and upload it",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
         ]
         .spacing(3);
 
         // Path and status
         let path_display = text(display_path).size(normal);
+
+        // ── Create-disk dialog ────────────────────────────────────────────────
+        if self.show_create_disk {
+            let dialog = self.view_create_disk_dialog(font_size);
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                dialog,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
 
         // If disk info popup is open, show it instead of the file list
         if let Some(disk_info) = &self.disk_info_popup {
@@ -1162,6 +1301,163 @@ impl RemoteBrowser {
                 .size(small)
                 .into()
         }
+    }
+
+    fn view_create_disk_dialog(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
+
+        let header = row![
+            text("💾 Create New Disk Image").size(normal),
+            Space::new().width(Length::Fill),
+            button(text("✖ Cancel").size(small))
+                .on_press(RemoteBrowserMessage::CloseCreateDisk)
+                .padding([4, 10]),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(5);
+
+        // Disk type radio buttons
+        let type_row = row![
+            text("Format:").size(small).width(Length::Fixed(70.0)),
+            button(
+                text(if self.create_disk_type == DiskCreateType::D64 {
+                    "● D64"
+                } else {
+                    "○ D64"
+                })
+                .size(small)
+            )
+            .on_press(RemoteBrowserMessage::CreateDiskTypeChanged(
+                DiskCreateType::D64
+            ))
+            .padding([4, 10]),
+            button(
+                text(if self.create_disk_type == DiskCreateType::D71 {
+                    "● D71"
+                } else {
+                    "○ D71"
+                })
+                .size(small)
+            )
+            .on_press(RemoteBrowserMessage::CreateDiskTypeChanged(
+                DiskCreateType::D71
+            ))
+            .padding([4, 10]),
+            button(
+                text(if self.create_disk_type == DiskCreateType::D81 {
+                    "● D81"
+                } else {
+                    "○ D81"
+                })
+                .size(small)
+            )
+            .on_press(RemoteBrowserMessage::CreateDiskTypeChanged(
+                DiskCreateType::D81
+            ))
+            .padding([4, 10]),
+            Space::new().width(10),
+            text(format!("({})", self.create_disk_type)).size(tiny),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        // Disk name input
+        let name_row = row![
+            text("Name:").size(small).width(Length::Fixed(70.0)),
+            text_input("DISK NAME (max 16 chars)", &self.create_disk_name)
+                .on_input(RemoteBrowserMessage::CreateDiskNameChanged)
+                .size(normal)
+                .padding(4)
+                .width(Length::Fixed(200.0)),
+            Space::new().width(10),
+            text(format!("{}/16 chars", self.create_disk_name.len())).size(tiny),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        // Disk ID input
+        let id_row = row![
+            text("ID:").size(small).width(Length::Fixed(70.0)),
+            text_input("XX XX", &self.create_disk_id)
+                .on_input(RemoteBrowserMessage::CreateDiskIdChanged)
+                .size(normal)
+                .padding(4)
+                .width(Length::Fixed(80.0)),
+            Space::new().width(10),
+            text("2-char ID + DOS type (e.g. 01 2A)").size(tiny),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        // Destination info
+        let dest_row = row![
+            text("Dest:").size(small).width(Length::Fixed(70.0)),
+            text(format!("{}/", self.current_path)).size(small),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        // Filename preview
+        let safe_name = self.create_disk_name.replace(' ', "_");
+        let ext = match self.create_disk_type {
+            DiskCreateType::D64 => "d64",
+            DiskCreateType::D71 => "d71",
+            DiskCreateType::D81 => "d81",
+        };
+        let filename_preview = format!("{}.{}", safe_name, ext);
+
+        let preview_row = row![
+            text("File:").size(small).width(Length::Fixed(70.0)),
+            text(filename_preview).size(small),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        // Confirm button
+        let can_create =
+            !self.create_disk_busy && !self.create_disk_name.is_empty() && self.is_connected;
+
+        let confirm_btn = if can_create {
+            button(
+                text(if self.create_disk_busy {
+                    "Creating…"
+                } else {
+                    "✔ Create & Upload"
+                })
+                .size(normal),
+            )
+            .on_press(RemoteBrowserMessage::CreateDiskConfirm)
+            .padding([8, 20])
+        } else {
+            button(
+                text(if self.create_disk_busy {
+                    "Creating…"
+                } else {
+                    "✔ Create & Upload"
+                })
+                .size(normal),
+            )
+            .padding([8, 20])
+        };
+
+        container(
+            column![
+                header,
+                rule::horizontal(1),
+                column![type_row, name_row, id_row, dest_row, preview_row]
+                    .spacing(10)
+                    .padding(10),
+                rule::horizontal(1),
+                row![Space::new().width(Length::Fill), confirm_btn].padding([5, 0]),
+            ]
+            .spacing(8)
+            .padding(10),
+        )
+        .width(Length::Fill)
+        .style(container::bordered_box)
+        .into()
     }
 
     fn view_disk_info_popup(
@@ -2504,4 +2800,69 @@ async fn load_remote_content_preview(
     } else {
         Err("Unsupported file type for preview".to_string())
     }
+}
+
+// ─── Disk image creation ──────────────────────────────────────────────────────
+
+/// Create a blank disk image and upload it to the device via FTP.
+fn create_and_upload_disk(
+    host: String,
+    name: String,
+    disk_id: String,
+    disk_type: DiskCreateType,
+    remote_dest: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    use std::io::Cursor;
+    use std::time::Duration;
+    use suppaftp::FtpStream;
+
+    let safe_name = name.replace(' ', "_");
+    let (ext, data) = match disk_type {
+        DiskCreateType::D64 => ("d64", disk_image::build_blank_d64(&name, &disk_id)),
+        DiskCreateType::D71 => ("d71", disk_image::build_blank_d71(&name, &disk_id)),
+        DiskCreateType::D81 => ("d81", disk_image::build_blank_d81(&name, &disk_id)),
+    };
+    let filename = format!("{}.{}", safe_name, ext);
+    let remote_path = format!("{}/{}", remote_dest.trim_end_matches('/'), filename);
+
+    log::info!(
+        "Creating {} ({} bytes) → {}",
+        filename,
+        data.len(),
+        remote_path
+    );
+
+    let addr = format!("{}:21", host);
+    let mut ftp = FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+    ftp.get_ref()
+        .set_write_timeout(Some(Duration::from_secs(60)))
+        .ok();
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            ftp.login("admin", pwd)
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        } else {
+            ftp.login("anonymous", "anonymous")
+                .map_err(|e| format!("FTP login failed: {}", e))?;
+        }
+    } else {
+        ftp.login("anonymous", "anonymous")
+            .map_err(|e| format!("FTP login failed: {}", e))?;
+    }
+
+    ftp.transfer_type(suppaftp::types::FileType::Binary)
+        .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+
+    let dest_dir = remote_dest.trim_end_matches('/');
+    ftp.cwd(dest_dir)
+        .map_err(|e| format!("Cannot cd to {}: {}", dest_dir, e))?;
+
+    let mut cursor = Cursor::new(data);
+    ftp.put_file(&filename, &mut cursor)
+        .map_err(|e| format!("FTP upload failed: {}", e))?;
+
+    ftp.quit().ok();
+    Ok(remote_path)
 }
