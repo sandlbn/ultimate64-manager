@@ -844,6 +844,14 @@ impl RemoteBrowser {
             )
             .style(container::bordered_box),
             tooltip(
+                button(text("Usb2").size(small))
+                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb2".to_string()))
+                    .padding([2, 6]),
+                "USB Drive 2",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            tooltip(
                 button(text("SD").size(small))
                     .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
                     .padding([2, 6]),
