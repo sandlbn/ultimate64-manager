@@ -31,11 +31,13 @@ mod mod_info;
 mod music_player;
 mod pdf_preview;
 mod petscii;
+mod port64;
 mod profiles;
 mod remote_browser;
 mod screenshot_api;
 mod settings;
 mod sid_info;
+mod sid_monitor;
 mod stream_control;
 mod streaming;
 mod templates;
@@ -51,6 +53,7 @@ use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use profiles::ProfileManager;
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings, StreamControlMethod};
+use sid_monitor::{SidMonitor, SidMonitorMessage};
 use streaming::{StreamingMessage, VideoStreaming};
 use templates::{DiskTemplate, TemplateManager};
 
@@ -172,6 +175,8 @@ pub enum Message {
 
     // Memory Editor
     MemoryEditor(MemoryEditorMessage),
+    // Hardware monitor (SID / VIC-II / CIA)
+    Monitor(SidMonitorMessage),
     // Machine control
     ResetMachine,
     RebootMachine,
@@ -222,6 +227,7 @@ pub enum Tab {
     MusicPlayer,
     VideoViewer,
     MemoryEditor,
+    Monitor,
     Configuration,
     CsdbBrowser,
     Settings,
@@ -234,6 +240,7 @@ impl std::fmt::Display for Tab {
             Tab::MusicPlayer => write!(f, "Music Player"),
             Tab::VideoViewer => write!(f, "Video Viewer"),
             Tab::MemoryEditor => write!(f, "Memory Editor"),
+            Tab::Monitor => write!(f, "HW Monitor"),
             Tab::Configuration => write!(f, "Configuration"),
             Tab::CsdbBrowser => write!(f, "CSDb"),
             Tab::Settings => write!(f, "Settings"),
@@ -270,6 +277,7 @@ pub struct Ultimate64Browser {
 
     music_player: MusicPlayer,
     memory_editor: MemoryEditor,
+    sid_monitor: SidMonitor,
     config_editor: ConfigEditor,
     settings: AppSettings,
     template_manager: TemplateManager,
@@ -338,6 +346,7 @@ impl Ultimate64Browser {
             active_pane: Pane::Left,
             music_player,
             memory_editor: MemoryEditor::new(),
+            sid_monitor: SidMonitor::new(),
             config_editor: ConfigEditor::new(),
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
@@ -523,8 +532,17 @@ impl Ultimate64Browser {
             }
             Message::MemoryEditor(msg) => self
                 .memory_editor
-                .update(msg, self.connection.clone())
+                .update(
+                    msg,
+                    self.connection.clone(),
+                    Some(self.settings.connection.host.clone()),
+                    self.settings.connection.password.clone(),
+                )
                 .map(Message::MemoryEditor),
+            Message::Monitor(msg) => self
+                .sid_monitor
+                .update(msg, self.connection.clone())
+                .map(Message::Monitor),
             Message::LeftBrowser(msg) => {
                 // Check if this is a "run" operation that should stop music
                 let should_stop_music = matches!(
@@ -1782,6 +1800,7 @@ impl Ultimate64Browser {
                 self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
                 self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
                 self.tab_button("MEMORY", Tab::MemoryEditor),
+                self.tab_button("MONITOR", Tab::Monitor),
                 self.tab_button("CONFIG", Tab::Configuration),
                 self.tab_button("CSDB", Tab::CsdbBrowser),
                 self.tab_button("SETTINGS", Tab::Settings),
@@ -1824,6 +1843,10 @@ impl Ultimate64Browser {
                 .memory_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::MemoryEditor),
+            Tab::Monitor => self
+                .sid_monitor
+                .view(self.status.connected, self.settings.preferences.font_size)
+                .map(Message::Monitor),
             Tab::Configuration => self
                 .config_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
@@ -1875,6 +1898,21 @@ impl Ultimate64Browser {
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.alt() => Some(
                         Message::Streaming(streaming::StreamingMessage::ToggleFullscreen),
                     ),
+                    // Cmd/Ctrl+Z = Undo, Cmd/Ctrl+Shift+Z = Redo in Memory Editor
+                    Key::Character(ref c)
+                        if c.as_str() == "z" && modifiers.command() && !modifiers.shift() =>
+                    {
+                        Some(Message::MemoryEditor(
+                            memory_editor::MemoryEditorMessage::Undo,
+                        ))
+                    }
+                    Key::Character(ref c)
+                        if c.as_str() == "z" && modifiers.command() && modifiers.shift() =>
+                    {
+                        Some(Message::MemoryEditor(
+                            memory_editor::MemoryEditorMessage::Redo,
+                        ))
+                    }
                     _ => None,
                 }
             } else {
@@ -1904,6 +1942,8 @@ impl Ultimate64Browser {
             self.remote_browser
                 .subscription()
                 .map(Message::RemoteBrowser),
+            self.memory_editor.subscription().map(Message::MemoryEditor),
+            self.sid_monitor.subscription().map(Message::Monitor),
             keyboard_sub,
             window_events,
             status_check,
