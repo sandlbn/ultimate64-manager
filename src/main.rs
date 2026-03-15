@@ -183,6 +183,7 @@ pub enum Message {
     PauseMachine,
     ResumeMachine,
     PoweroffMachine,
+    MenuButton,
     MachineCommandCompleted(Result<String, String>),
 
     // Settings
@@ -1649,6 +1650,36 @@ impl Ultimate64Browser {
                 }
             }
 
+            Message::MenuButton => {
+                if let Some(conn) = &self.connection {
+                    let conn = conn.clone();
+                    Task::perform(
+                        async move {
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let conn = conn.blocking_lock();
+                                    conn.menu()
+                                        .map(|_| "Menu button pressed".to_string())
+                                        .map_err(|e| format!("Menu failed: {}", e))
+                                }),
+                            )
+                            .await;
+
+                            match result {
+                                Ok(Ok(r)) => r,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => Err("Menu timed out - device may be offline".to_string()),
+                            }
+                        },
+                        Message::MachineCommandCompleted,
+                    )
+                } else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    Task::none()
+                }
+            }
+
             Message::MachineCommandCompleted(result) => {
                 match result {
                     Ok(msg) => {
@@ -2526,13 +2557,24 @@ impl Ultimate64Browser {
             text(video_status).size(12).into()
         };
 
+        let connected = self.status.connected;
+
         container(
             row![
                 status_text,
                 Space::new().width(Length::Fill),
                 tooltip(
+                    button(text("MENU").size(11))
+                        .on_press_maybe(connected.then_some(Message::MenuButton))
+                        .padding([4, 8]),
+                    "Press Ultimate64 menu button",
+                    tooltip::Position::Top,
+                )
+                .style(container::bordered_box),
+                text("|").size(12),
+                tooltip(
                     button(text("PAUSE").size(11))
-                        .on_press(Message::PauseMachine)
+                        .on_press_maybe(connected.then_some(Message::PauseMachine))
                         .padding([4, 8]),
                     "Pause the C64 CPU",
                     tooltip::Position::Top,
@@ -2540,7 +2582,7 @@ impl Ultimate64Browser {
                 .style(container::bordered_box),
                 tooltip(
                     button(text("RESUME").size(11))
-                        .on_press(Message::ResumeMachine)
+                        .on_press_maybe(connected.then_some(Message::ResumeMachine))
                         .padding([4, 8]),
                     "Resume the C64 CPU",
                     tooltip::Position::Top,
@@ -2549,7 +2591,7 @@ impl Ultimate64Browser {
                 text("|").size(12),
                 tooltip(
                     button(text("RESET").size(11))
-                        .on_press(Message::ResetMachine)
+                        .on_press_maybe(connected.then_some(Message::ResetMachine))
                         .padding([4, 8]),
                     "Reset the C64 (soft reset)",
                     tooltip::Position::Top,
@@ -2557,7 +2599,7 @@ impl Ultimate64Browser {
                 .style(container::bordered_box),
                 tooltip(
                     button(text("REBOOT").size(11))
-                        .on_press(Message::RebootMachine)
+                        .on_press_maybe(connected.then_some(Message::RebootMachine))
                         .padding([4, 8]),
                     "Reboot the Ultimate64 device",
                     tooltip::Position::Top,
@@ -2565,7 +2607,7 @@ impl Ultimate64Browser {
                 .style(container::bordered_box),
                 tooltip(
                     button(text("POWER OFF").size(11))
-                        .on_press(Message::PoweroffMachine)
+                        .on_press_maybe(connected.then_some(Message::PoweroffMachine))
                         .padding([4, 8]),
                     "Power off the Ultimate64",
                     tooltip::Position::Top,

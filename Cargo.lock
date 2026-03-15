@@ -5500,7 +5500,7 @@ dependencies = [
 
 [[package]]
 name = "ultimate64-manager"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "anyhow",
  "cpal",
