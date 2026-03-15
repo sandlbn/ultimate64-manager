@@ -1,3 +1,6 @@
+use iced::widget::Id as WidgetId;
+use iced::widget::operation::scroll_to;
+use iced::widget::scrollable::{AbsoluteOffset, Viewport};
 use iced::{
     Element, Length, Task,
     widget::{
@@ -5,11 +8,15 @@ use iced::{
         text_input, tooltip,
     },
 };
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use ultimate64::{Rest, drives::MountMode};
+
+/// Stable ID for the main file-list scrollable widget
+const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
 
 use crate::csdb::{MAX_ZIP_EXTRACT_BYTES, extract_zip_to_dir};
 use crate::dir_preview::{self, ContentPreview};
@@ -39,6 +46,10 @@ pub enum FileBrowserMessage {
     NavigateUp,
     DriveSelected(DriveOption),
     NavigateToPath(PathBuf),
+    /// Internal: sent by the framework after a directory change to restore scroll position
+    RestoreScrollOffset(f32),
+    /// Internal: tracks current scroll offset so NavigateUp can restore it
+    Scrolled(Viewport),
     FilterChanged(String),
     NavigateToCsdbDir,
     // ZIP extraction: extract archive to a sibling subfolder then navigate there
@@ -110,6 +121,10 @@ pub struct FileBrowser {
     content_preview: Option<ContentPreview>,
     content_preview_path: Option<PathBuf>,
     content_preview_loading: bool,
+    // Scroll position memory: directory → (y_offset, last selected child path)
+    scroll_memory: HashMap<PathBuf, (f32, Option<PathBuf>)>,
+    // The child directory we most recently entered (used to highlight it on NavigateUp)
+    last_entered_child: Option<PathBuf>,
 }
 
 impl FileBrowser {
@@ -136,6 +151,8 @@ impl FileBrowser {
             content_preview: None,
             content_preview_path: None,
             content_preview_loading: false,
+            scroll_memory: HashMap::new(),
+            last_entered_child: None,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -167,10 +184,20 @@ impl FileBrowser {
                 self.current_directory = path;
                 self.checked_files.clear();
                 self.status_message = None;
+                self.last_entered_child = None;
                 Task::none()
             }
             FileBrowserMessage::FileSelected(path) => {
                 if path.is_dir() {
+                    // Remember which child we're entering, so NavigateUp can highlight it
+                    self.last_entered_child = Some(path.clone());
+                    // Save current scroll position under the current directory
+                    // (actual y-offset is stored when RestoreScrollOffset arrives;
+                    //  here we just make sure an entry exists so NavigateUp can read it)
+                    self.scroll_memory
+                        .entry(self.current_directory.clone())
+                        .or_insert((0.0, None))
+                        .1 = Some(path.clone());
                     self.load_directory(&path);
                     self.current_directory = path;
                     self.checked_files.clear();
@@ -181,6 +208,11 @@ impl FileBrowser {
             }
             FileBrowserMessage::NavigateToPath(path) => {
                 if path.is_dir() {
+                    self.last_entered_child = Some(path.clone());
+                    self.scroll_memory
+                        .entry(self.current_directory.clone())
+                        .or_insert((0.0, None))
+                        .1 = Some(path.clone());
                     self.load_directory(&path);
                     self.current_directory = path;
                     self.checked_files.clear();
@@ -273,14 +305,52 @@ impl FileBrowser {
             FileBrowserMessage::RefreshFiles => {
                 self.load_directory(&self.current_directory.clone());
                 self.status_message = None;
-                Task::none()
+                // Restore scroll to where user was before refresh
+                let saved_y = self
+                    .scroll_memory
+                    .get(&self.current_directory)
+                    .map(|(y, _)| *y)
+                    .unwrap_or(0.0);
+                if saved_y > 0.0 {
+                    Task::done(FileBrowserMessage::RestoreScrollOffset(saved_y))
+                } else {
+                    Task::none()
+                }
             }
             FileBrowserMessage::NavigateUp => {
                 if let Some(parent) = self.current_directory.parent() {
                     let parent_path = parent.to_path_buf();
+                    // Remember which child we're coming back from so it can be highlighted
+                    self.last_entered_child = Some(self.current_directory.clone());
                     self.load_directory(&parent_path);
-                    self.current_directory = parent_path;
+                    self.current_directory = parent_path.clone();
+                    // Also restore selected_file to the child we came from so the
+                    // highlight logic in view_file_entry picks it up
+                    self.selected_file = self.last_entered_child.clone();
+
+                    // Restore saved scroll offset if we have one
+                    let saved_y = self
+                        .scroll_memory
+                        .get(&parent_path)
+                        .map(|(y, _)| *y)
+                        .unwrap_or(0.0);
+
+                    if saved_y > 0.0 {
+                        return Task::done(FileBrowserMessage::RestoreScrollOffset(saved_y));
+                    }
                 }
+                Task::none()
+            }
+            FileBrowserMessage::RestoreScrollOffset(y) => scroll_to(
+                WidgetId::new(FILE_LIST_SCROLLABLE_ID),
+                AbsoluteOffset { x: 0.0, y },
+            ),
+            FileBrowserMessage::Scrolled(viewport) => {
+                let y = viewport.absolute_offset().y;
+                self.scroll_memory
+                    .entry(self.current_directory.clone())
+                    .or_insert((0.0, None))
+                    .0 = y;
                 Task::none()
             }
             FileBrowserMessage::DriveSelected(drive) => {
@@ -316,6 +386,7 @@ impl FileBrowser {
                         self.load_directory(&csdb_dir);
                         self.current_directory = csdb_dir;
                         self.checked_files.clear();
+                        self.last_entered_child = None;
                     } else {
                         self.status_message =
                             Some(format!("CSDb folder not found: {}", csdb_dir.display()));
@@ -383,6 +454,7 @@ impl FileBrowser {
                         self.load_directory(&dir);
                         self.current_directory = dir;
                         self.checked_files.clear();
+                        self.last_entered_child = None;
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Extraction failed: {}", e));
@@ -628,6 +700,8 @@ impl FileBrowser {
                     .spacing(0)
                     .padding(iced::Padding::ZERO.right(12)), // Right padding for scrollbar clearance
             )
+            .id(WidgetId::new(FILE_LIST_SCROLLABLE_ID))
+            .on_scroll(FileBrowserMessage::Scrolled)
             .height(Length::Fill);
 
             column![
@@ -884,6 +958,17 @@ impl FileBrowser {
         let tiny = (font_size.saturating_sub(3)).max(7);
 
         let is_checked = self.checked_files.contains(&entry.path);
+        // Highlight the row that was last entered (coming back via NavigateUp) or currently selected
+        let is_last_visited = self
+            .last_entered_child
+            .as_ref()
+            .map(|p| *p == entry.path)
+            .unwrap_or(false);
+        let is_selected = self
+            .selected_file
+            .as_ref()
+            .map(|p| *p == entry.path)
+            .unwrap_or(false);
 
         // File type label
         let type_label = if entry.is_dir {
@@ -1122,7 +1207,26 @@ impl FileBrowser {
         .align_y(iced::Alignment::Center)
         .padding([2, 4]);
 
-        file_row.into()
+        // Highlight the previously-visited child directory or currently selected file
+        // using a subtle coloured background (reverse video feel)
+        if is_last_visited || is_selected {
+            container(file_row)
+                .width(Length::Fill)
+                .style(|_theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        0.45, 0.52, 0.85, 0.25,
+                    ))),
+                    border: iced::Border {
+                        color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.6),
+                        width: 1.0,
+                        radius: 3.0.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            file_row.into()
+        }
     }
 
     fn load_directory(&mut self, path: &Path) {
