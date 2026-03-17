@@ -8,6 +8,7 @@
 //! - Extract ZIP archives
 
 use anyhow::{Context, Result};
+use chrono::Datelike;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -425,19 +426,21 @@ impl CsdbClient {
         Ok(results)
     }
 
-    /// Get latest releases from CSDb homepage
-    pub async fn get_latest_releases(&self, limit: usize) -> Result<Vec<LatestRelease>> {
+    /// Get latest releases from CSDb dedicated endpoint, using today's date.
+    pub async fn get_latest_releases(&self, count: usize) -> Result<Vec<LatestRelease>> {
         self.rate_limit().await;
 
-        let url = "https://csdb.dk/";
-        let html = self.http_get(url).await?;
+        let now = chrono::Local::now();
+        let url = format!(
+            "https://csdb.dk/latestreleases.php?count={}&day={}&month={}&year={}",
+            count,
+            now.day(),
+            now.month(),
+            now.year()
+        );
 
-        let mut releases = self.parse_latest_releases(&html);
-
-        if limit > 0 && releases.len() > limit {
-            releases.truncate(limit);
-        }
-
+        let html = self.http_get(&url).await?;
+        let releases = self.parse_latest_releases(&html);
         Ok(releases)
     }
 
@@ -696,34 +699,76 @@ impl CsdbClient {
         results
     }
 
+    /// Parse the latestreleases.php table.
+    ///
+    /// Each data row has five `<td>` cells:
+    ///   0 – download icon link  (we extract the download id from href)
+    ///   1 – release name link   (release/?id=NNN)
+    ///   2 – type link           (browse.php?…)
+    ///   3 – group / scener link (may be empty)
+    ///   4 – release date        (<font color="#bebebe">YYYY-MM-DD</font>)
     fn parse_latest_releases(&self, html: &str) -> Vec<LatestRelease> {
         let mut releases = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // CSDb homepage has latest releases in various sections
-        // Look for release links: <a href="/release/?id=12345">Title</a>
-        let release_re = Regex::new(r#"href="(/release/\?id=(\d+))"[^>]*>([^<]+)</a>"#).unwrap();
+        // Match a full <tr>…</tr> block (non-greedy, dot-matches-all via (?s))
+        let row_re = Regex::new(r"(?s)<tr>(.*?)</tr>").unwrap();
 
-        for cap in release_re.captures_iter(html) {
-            let rel_path = &cap[1];
-            let rid = cap[2].to_string();
-            let title = strip_tags(&cap[3]);
+        // Cell 1: release link — href="release/?id=NNN" (relative, no leading slash)
+        let release_re = Regex::new(r#"href="release/\?id=(\d+)"[^>]*>([^<]+)</a>"#).unwrap();
 
-            // Skip if we've seen this release or if title looks like navigation
-            if seen.contains(&rid) || title.len() < 2 || title.contains("...") {
+        // Cell 2: release type text inside the browse.php link
+        let type_re = Regex::new(r#"href="browse\.php[^"]*">([^<]+)</a>"#).unwrap();
+
+        // Cell 3: group or scener name (href may be /group/ or /scener/)
+        // There may be multiple groups separated by ", " — collect them all.
+        let group_re = Regex::new(r#"href="/(?:group|scener)/\?id=\d+"[^>]*>([^<]+)</a>"#).unwrap();
+
+        // Cell 4: date inside the bebebe-coloured font tag
+        let date_re = Regex::new(r##"color="#bebebe"[^>]*>(\d{4}-\d{2}-\d{2})</font>"##).unwrap();
+
+        for row_cap in row_re.captures_iter(html) {
+            let row = &row_cap[1];
+
+            // Must have a release link to be a data row
+            let rel_cap = match release_re.captures(row) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            let rid = rel_cap[1].to_string();
+            if seen.contains(&rid) {
                 continue;
             }
             seen.insert(rid.clone());
 
-            let release_url = format!("https://csdb.dk{}", rel_path);
+            let title = strip_tags(&rel_cap[2]);
+            let release_url = format!("https://csdb.dk/release/?id={}", rid);
+
+            // Release type
+            let release_type = type_re.captures(row).map(|c| strip_tags(&c[1]));
+
+            // Group(s) — join multiple with " / "
+            let groups: Vec<String> = group_re
+                .captures_iter(row)
+                .map(|c| strip_tags(&c[1]))
+                .collect();
+            let group = if groups.is_empty() {
+                None
+            } else {
+                Some(groups.join(" / "))
+            };
+
+            // Date
+            let date = date_re.captures(row).map(|c| c[1].to_string());
 
             releases.push(LatestRelease {
                 release_id: rid,
                 title,
                 release_url,
-                group: None,
-                release_type: None,
-                date: None,
+                group,
+                release_type,
+                date,
             });
         }
 
