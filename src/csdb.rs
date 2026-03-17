@@ -632,10 +632,16 @@ impl CsdbClient {
     }
 
     fn parse_search_results(&self, html: &str) -> Vec<SearchResult> {
+        // ── 1. Isolate the main content area to avoid sidebar contamination ────
+        let content = Self::extract_main_content(html);
+        let html = content.as_deref().unwrap_or(html);
+
+        // ── 2. Further restrict to just the <ol> release list ─────────────────
+        let ol_html = Self::extract_ol_block(html).unwrap_or_else(|| html.to_string());
+
         let mut results = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // First pass: find all release links - be flexible with attributes
         let release_re =
             Regex::new(r#"<a\s[^>]*href="/release/\?id=(\d+)"[^>]*>([^<]+)</a>"#).unwrap();
 
@@ -653,7 +659,10 @@ impl CsdbClient {
         let group_alt_re =
             Regex::new(r#"href="/(?:group|scener)/\?id=\d+"[^>]*>([^<]+)</a>"#).unwrap();
 
-        let matches: Vec<_> = release_re.captures_iter(html).collect();
+        // Date: CSDb uses <font color="#32E814">(28/10-1989)</font> for dates in lists
+        let date_re = Regex::new(r##"<font color="#32E814">\(([^)]+)\)</font>"##).unwrap();
+
+        let matches: Vec<_> = release_re.captures_iter(&ol_html).collect();
 
         for (i, cap) in matches.iter().enumerate() {
             let rid = cap[1].to_string();
@@ -670,9 +679,9 @@ impl CsdbClient {
             let next_match_start = matches
                 .get(i + 1)
                 .map(|m| m.get(0).unwrap().start())
-                .unwrap_or(html.len());
+                .unwrap_or(ol_html.len());
             let context_end = match_end + (500.min(next_match_start.saturating_sub(match_end)));
-            let context = &html[match_end..context_end.min(html.len())];
+            let context = &ol_html[match_end..context_end.min(ol_html.len())];
 
             // Extract type from context
             let release_type = type_re.captures(context).map(|c| strip_tags(&c[1]));
@@ -683,6 +692,9 @@ impl CsdbClient {
                 .map(|c| strip_tags(&c[1]))
                 .or_else(|| group_alt_re.captures(context).map(|c| strip_tags(&c[1])));
 
+            // Extract date from context — green font "(28/10-1989)" pattern
+            let year = date_re.captures(context).map(|c| c[1].to_string());
+
             let release_url = format!("https://csdb.dk/release/?id={}", rid);
 
             results.push(SearchResult {
@@ -691,7 +703,7 @@ impl CsdbClient {
                 release_url,
                 group,
                 release_type,
-                year: None,
+                year,
                 exact_match: false,
             });
         }
@@ -699,59 +711,112 @@ impl CsdbClient {
         results
     }
 
+    /// Extract only the main content region between the HTML comment markers
+    /// that CSDb consistently emits on every page.
+    fn extract_main_content(html: &str) -> Option<String> {
+        let start_marker = "<!-- ----- START MAIN CONTENT ----- -->";
+        let end_marker = "<!-- ----- END MAIN CONTENT ----- -->";
+
+        let start = html.find(start_marker)? + start_marker.len();
+        let end = html.find(end_marker)?;
+
+        if start < end {
+            Some(html[start..end].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Extract the first <ol>…</ol> block from an HTML fragment.
+    /// This is where CSDb puts the numbered release results list.
+    fn extract_ol_block(html: &str) -> Option<String> {
+        let start = html.find("<ol>")?;
+        // Find the matching </ol> — there's only one result list so first is fine
+        let end = html[start..].find("</ol>")? + start + "</ol>".len();
+        Some(html[start..end].to_string())
+    }
+
     /// Parse the latestreleases.php table.
     ///
-    /// Each data row has five `<td>` cells:
-    ///   0 – download icon link  (we extract the download id from href)
-    ///   1 – release name link   (release/?id=NNN)
-    ///   2 – type link           (browse.php?…)
-    ///   3 – group / scener link (may be empty)
-    ///   4 – release date        (<font color="#bebebe">YYYY-MM-DD</font>)
+    /// Rather than splitting by `<tr>` (which is fragile across line-ending
+    /// and whitespace variations), we scan the full HTML for release links
+    /// and date values independently, then pair them up by document order.
+    /// The live page uses unquoted HTML attributes (e.g. color=#bebebe) so
+    /// all regexes must handle both quoted and unquoted attribute values.
     fn parse_latest_releases(&self, html: &str) -> Vec<LatestRelease> {
         let mut releases = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // Match a full <tr>…</tr> block (non-greedy, dot-matches-all via (?s))
-        let row_re = Regex::new(r"(?s)<tr>(.*?)</tr>").unwrap();
-
-        // Cell 1: release link — href="release/?id=NNN" (relative, no leading slash)
+        // ── Collect all release link positions ────────────────────────────────
+        // href="release/?id=NNN" (relative path, no leading slash)
         let release_re = Regex::new(r#"href="release/\?id=(\d+)"[^>]*>([^<]+)</a>"#).unwrap();
 
-        // Cell 2: release type text inside the browse.php link
+        // ── Collect all date positions ─────────────────────────────────────────
+        let date_re = Regex::new(r##"color="?#bebebe"?>(\d{4}-\d{2}-\d{2})</font>"##).unwrap();
+
+        // ── Collect all release-type positions ────────────────────────────────
         let type_re = Regex::new(r#"href="browse\.php[^"]*">([^<]+)</a>"#).unwrap();
 
-        // Cell 3: group or scener name (href may be /group/ or /scener/)
-        // There may be multiple groups separated by ", " — collect them all.
+        // ── Collect all group positions ───────────────────────────────────────
         let group_re = Regex::new(r#"href="/(?:group|scener)/\?id=\d+"[^>]*>([^<]+)</a>"#).unwrap();
 
-        // Cell 4: date inside the bebebe-coloured font tag
-        let date_re = Regex::new(r##"color="#bebebe"[^>]*>(\d{4}-\d{2}-\d{2})</font>"##).unwrap();
+        // Build an ordered list of (byte_offset, release_id, title)
+        let rel_matches: Vec<(usize, String, String)> = release_re
+            .captures_iter(html)
+            .map(|c| {
+                let pos = c.get(0).unwrap().start();
+                (pos, c[1].to_string(), strip_tags(&c[2]))
+            })
+            .collect();
 
-        for row_cap in row_re.captures_iter(html) {
-            let row = &row_cap[1];
+        // Build ordered list of (byte_offset, date_string)
+        let date_matches: Vec<(usize, String)> = date_re
+            .captures_iter(html)
+            .map(|c| (c.get(0).unwrap().start(), c[1].trim().to_string()))
+            .collect();
 
-            // Must have a release link to be a data row
-            let rel_cap = match release_re.captures(row) {
-                Some(c) => c,
-                None => continue,
-            };
+        // Build ordered list of (byte_offset, type_string)
+        let type_matches: Vec<(usize, String)> = type_re
+            .captures_iter(html)
+            .map(|c| (c.get(0).unwrap().start(), strip_tags(&c[1])))
+            .collect();
 
-            let rid = rel_cap[1].to_string();
-            if seen.contains(&rid) {
+        // Build ordered list of (byte_offset, group_string) — grouped by proximity
+        let group_all: Vec<(usize, String)> = group_re
+            .captures_iter(html)
+            .map(|c| (c.get(0).unwrap().start(), strip_tags(&c[1])))
+            .collect();
+
+        // For each release link, find the nearest date, type, and groups that
+        // appear AFTER it in the document but BEFORE the next release link.
+        for (i, (rel_pos, rid, title)) in rel_matches.iter().enumerate() {
+            if seen.contains(rid) {
                 continue;
             }
             seen.insert(rid.clone());
 
-            let title = strip_tags(&rel_cap[2]);
-            let release_url = format!("https://csdb.dk/release/?id={}", rid);
+            let next_rel_pos = rel_matches
+                .get(i + 1)
+                .map(|(p, _, _)| *p)
+                .unwrap_or(html.len());
 
-            // Release type
-            let release_type = type_re.captures(row).map(|c| strip_tags(&c[1]));
+            // Date: first date match between this release and the next
+            let date = date_matches
+                .iter()
+                .find(|(p, _)| *p > *rel_pos && *p < next_rel_pos)
+                .map(|(_, d)| d.clone());
 
-            // Group(s) — join multiple with " / "
-            let groups: Vec<String> = group_re
-                .captures_iter(row)
-                .map(|c| strip_tags(&c[1]))
+            // Type: first browse.php match in the same window
+            let release_type = type_matches
+                .iter()
+                .find(|(p, _)| *p > *rel_pos && *p < next_rel_pos)
+                .map(|(_, t)| t.clone());
+
+            // Groups: all group/scener matches in the same window, joined
+            let groups: Vec<&str> = group_all
+                .iter()
+                .filter(|(p, _)| *p > *rel_pos && *p < next_rel_pos)
+                .map(|(_, g)| g.as_str())
                 .collect();
             let group = if groups.is_empty() {
                 None
@@ -759,12 +824,11 @@ impl CsdbClient {
                 Some(groups.join(" / "))
             };
 
-            // Date
-            let date = date_re.captures(row).map(|c| c[1].to_string());
+            let release_url = format!("https://csdb.dk/release/?id={}", rid);
 
             releases.push(LatestRelease {
-                release_id: rid,
-                title,
+                release_id: rid.clone(),
+                title: title.clone(),
                 release_url,
                 group,
                 release_type,

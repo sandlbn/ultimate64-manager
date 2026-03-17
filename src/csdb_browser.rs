@@ -1194,11 +1194,11 @@ impl CsdbBrowser {
                 .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
             text("Released by")
                 .size(tiny)
-                .width(Length::Fill)
+                .width(Length::Fixed(160.0))
                 .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
             text("Date")
                 .size(tiny)
-                .width(Length::Fixed(80.0))
+                .width(Length::Fill)
                 .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
             // placeholder for the View button column
             Space::new().width(Length::Fixed(50.0)),
@@ -1261,7 +1261,6 @@ impl CsdbBrowser {
             .release_type
             .as_deref()
             .map(|t| {
-                // Strip leading "C64 " to save space; keep the rest
                 if t.len() > 18 {
                     format!("{}…", &t[..15])
                 } else {
@@ -1310,12 +1309,12 @@ impl CsdbBrowser {
             // Group / Released by
             text(group_display)
                 .size(tiny)
-                .width(Length::Fill)
+                .width(Length::Fixed(160.0))
                 .color(iced::Color::from_rgb(0.5, 0.7, 0.9)),
             // Date
             text(date_display)
                 .size(tiny)
-                .width(Length::Fixed(80.0))
+                .width(Length::Fill)
                 .color(iced::Color::from_rgb(0.7, 0.7, 0.5)),
             // View button
             tooltip(
@@ -1340,6 +1339,7 @@ impl CsdbBrowser {
     fn view_search_results(&self, font_size: u32) -> Element<'_, CsdbBrowserMessage> {
         let small = (font_size.saturating_sub(2)).max(8);
         let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
 
         if self.search_results.is_empty() {
             return container(
@@ -1357,6 +1357,34 @@ impl CsdbBrowser {
             .padding(20)
             .into();
         }
+
+        // Column header row — matches the columns in view_release_item
+        let col_header = row![
+            text("ID")
+                .size(tiny)
+                .width(Length::Fixed(70.0))
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
+            text("Name")
+                .size(tiny)
+                .width(Length::Fixed(250.0))
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
+            text("Type")
+                .size(tiny)
+                .width(Length::Fixed(130.0))
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
+            text("Group")
+                .size(tiny)
+                .width(Length::Fixed(150.0))
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
+            text("Date")
+                .size(tiny)
+                .width(Length::Fill)
+                .color(iced::Color::from_rgb(0.5, 0.5, 0.6)),
+            // placeholder for the View button column
+            Space::new().width(Length::Fixed(50.0)),
+        ]
+        .spacing(5)
+        .padding([2, 0]);
 
         let header = row![
             text(format!("Search Results: '{}'", self.search_input)).size(normal + 2),
@@ -1378,9 +1406,15 @@ impl CsdbBrowser {
         )
         .height(Length::Fill);
 
-        column![header, rule::horizontal(1), list,]
-            .spacing(5)
-            .into()
+        column![
+            header,
+            rule::horizontal(1),
+            col_header,
+            rule::horizontal(1),
+            list,
+        ]
+        .spacing(5)
+        .into()
     }
 
     // -------------------------------------------------------------------------
@@ -1536,6 +1570,12 @@ impl CsdbBrowser {
             })
             .unwrap_or_default();
 
+        // Date: shown in muted yellow to match the latest releases date column
+        let year_display: String = release
+            .year()
+            .map(|y| format!("({})", y))
+            .unwrap_or_default();
+
         row![
             text(format!("[{}]", id))
                 .size(tiny)
@@ -1557,8 +1597,12 @@ impl CsdbBrowser {
                 .color(iced::Color::from_rgb(0.6, 0.8, 0.6)),
             text(group_display)
                 .size(tiny)
-                .width(Length::Fill)
+                .width(Length::Fixed(150.0))
                 .color(iced::Color::from_rgb(0.5, 0.7, 0.9)),
+            text(year_display)
+                .size(tiny)
+                .width(Length::Fill)
+                .color(iced::Color::from_rgb(0.7, 0.7, 0.5)),
             tooltip(
                 button(text("View").size(small))
                     .on_press(CsdbBrowserMessage::SelectRelease(url.to_string()))
@@ -2085,6 +2129,7 @@ trait ReleaseItem {
     fn id(&self) -> Option<&str>;
     fn group(&self) -> Option<&str>;
     fn release_type(&self) -> Option<&str>;
+    fn year(&self) -> Option<&str>;
 }
 
 impl ReleaseItem for LatestRelease {
@@ -2103,6 +2148,9 @@ impl ReleaseItem for LatestRelease {
     fn release_type(&self) -> Option<&str> {
         self.release_type.as_deref()
     }
+    fn year(&self) -> Option<&str> {
+        self.date.as_deref()
+    }
 }
 
 impl ReleaseItem for SearchResult {
@@ -2120,6 +2168,9 @@ impl ReleaseItem for SearchResult {
     }
     fn release_type(&self) -> Option<&str> {
         self.release_type.as_deref()
+    }
+    fn year(&self) -> Option<&str> {
+        self.year.as_deref()
     }
 }
 
