@@ -614,33 +614,28 @@ impl MemoryEditor {
             }
 
             // ── Read ─────────────────────────────────────────────
-            MemoryEditorMessage::ReadMemory => {
-                match self.address_space {
-                    AddressSpace::C64Ram => {
-                        if let Some(conn) = connection {
-                            self.is_loading = true;
-                            self.status_message = Some("Reading memory…".to_string());
-                            let address = self.current_address as u16;
-                            let length = self.display_length;
-                            Task::perform(
-                                async move { read_memory_async(conn, address, length).await },
-                                MemoryEditorMessage::ReadMemoryComplete,
-                            )
-                        } else {
-                            self.status_message = Some("Not connected to Ultimate64".to_string());
-                            Task::none()
-                        }
-                    }
-                    AddressSpace::Reu => {
-                        // REU has no REST read endpoint; show a placeholder
-                        self.status_message = Some(
-                            "REU read not available via REST — write-only via raw socket"
-                                .to_string(),
-                        );
+            MemoryEditorMessage::ReadMemory => match self.address_space {
+                AddressSpace::C64Ram => {
+                    if let Some(conn) = connection {
+                        self.is_loading = true;
+                        self.status_message = Some("Reading memory…".to_string());
+                        let address = self.current_address as u16;
+                        let length = self.display_length;
+                        Task::perform(
+                            async move { read_memory_async(conn, address, length).await },
+                            MemoryEditorMessage::ReadMemoryComplete,
+                        )
+                    } else {
+                        self.status_message = Some("Not connected to Ultimate64".to_string());
                         Task::none()
                     }
                 }
-            }
+                AddressSpace::Reu => {
+                    self.status_message =
+                        Some("REU read not supported — write only via raw socket".to_string());
+                    Task::none()
+                }
+            },
 
             MemoryEditorMessage::ReadMemoryComplete(result) => {
                 self.is_loading = false;
@@ -1448,7 +1443,7 @@ impl MemoryEditor {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        let read_btn = button(text("Read").size(sf))
+        let read_btn_inner = button(text("Read").size(sf))
             .on_press_maybe(
                 if self.is_loading || self.address_space == AddressSpace::Reu {
                     None
@@ -1457,6 +1452,20 @@ impl MemoryEditor {
                 },
             )
             .padding([5, 15]);
+
+        let read_btn: Element<'_, MemoryEditorMessage> = if self.address_space == AddressSpace::Reu
+        {
+            tooltip(
+                read_btn_inner,
+                container(text("REU read not supported by firmware").size(sf))
+                    .padding(6)
+                    .style(tooltip_style),
+                tooltip::Position::Bottom,
+            )
+            .into()
+        } else {
+            read_btn_inner.into()
+        };
 
         let location_picker = pick_list(
             MEMORY_LOCATIONS.to_vec(),
