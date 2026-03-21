@@ -63,6 +63,20 @@ pub enum FileBrowserMessage {
     ShowContentPreview(PathBuf),
     ContentPreviewLoaded(Result<ContentPreview, String>),
     CloseContentPreview,
+    // Drive enable dialog
+    /// Check if target drive is enabled before mounting/running; carries the pending action
+    CheckDriveBeforeAction(PendingDriveAction),
+    DriveCheckComplete(Result<bool, String>, PendingDriveAction),
+    ConfirmEnableDrive,
+    CancelEnableDrive,
+    EnableDriveComplete(Result<(), String>),
+}
+
+/// The action to execute once we know the drive is enabled
+#[derive(Debug, Clone)]
+pub enum PendingDriveAction {
+    Mount(PathBuf, String, MountMode),
+    Run(PathBuf, String),
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +139,8 @@ pub struct FileBrowser {
     scroll_memory: HashMap<PathBuf, (f32, Option<PathBuf>)>,
     // The child directory we most recently entered (used to highlight it on NavigateUp)
     last_entered_child: Option<PathBuf>,
+    // Drive enable dialog: Some(...) when we're asking the user to enable a disabled drive
+    drive_enable_dialog: Option<(DriveOption, PendingDriveAction)>,
 }
 
 impl FileBrowser {
@@ -153,6 +169,7 @@ impl FileBrowser {
             content_preview_loading: false,
             scroll_memory: HashMap::new(),
             last_entered_child: None,
+            drive_enable_dialog: None,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -162,6 +179,8 @@ impl FileBrowser {
         &mut self,
         message: FileBrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
+        host: Option<String>,
+        password: Option<String>,
     ) -> Task<FileBrowserMessage> {
         match message {
             FileBrowserMessage::SelectDirectory => Task::perform(
@@ -220,15 +239,9 @@ impl FileBrowser {
                 Task::none()
             }
             FileBrowserMessage::MountDisk(path, drive, mode) => {
-                if let Some(conn) = connection {
-                    self.status_message = Some(format!(
-                        "Mounting {}...",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    Task::perform(
-                        mount_disk_async(conn, path, drive, mode),
-                        FileBrowserMessage::MountCompleted,
-                    )
+                if connection.is_some() {
+                    let action = PendingDriveAction::Mount(path, drive, mode);
+                    return Task::done(FileBrowserMessage::CheckDriveBeforeAction(action));
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     Task::none()
@@ -248,15 +261,9 @@ impl FileBrowser {
                 Task::none()
             }
             FileBrowserMessage::RunDisk(path, drive) => {
-                if let Some(conn) = connection {
-                    self.status_message = Some(format!(
-                        "Running {}...",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    Task::perform(
-                        run_disk_async(conn, path, drive),
-                        FileBrowserMessage::RunDiskCompleted,
-                    )
+                if connection.is_some() {
+                    let action = PendingDriveAction::Run(path, drive);
+                    return Task::done(FileBrowserMessage::CheckDriveBeforeAction(action));
                 } else {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     Task::none()
@@ -516,6 +523,109 @@ impl FileBrowser {
                 self.content_preview_path = None;
                 Task::none()
             }
+
+            // ── Drive enable dialog ──────────────────────────────
+            FileBrowserMessage::CheckDriveBeforeAction(action) => {
+                // Determine which drive letter is targeted
+                let drive_letter = match &action {
+                    PendingDriveAction::Mount(_, d, _) => d.clone(),
+                    PendingDriveAction::Run(_, d) => d.clone(),
+                };
+
+                if let Some(h) = host {
+                    self.is_loading = true;
+                    self.status_message = Some("Checking drive status…".to_string());
+                    Task::perform(
+                        check_drive_enabled_async(h, drive_letter, password),
+                        move |result| {
+                            FileBrowserMessage::DriveCheckComplete(result, action.clone())
+                        },
+                    )
+                } else {
+                    // No host — just try to proceed directly (will fail gracefully)
+                    self.dispatch_action(action, connection)
+                }
+            }
+
+            FileBrowserMessage::DriveCheckComplete(result, action) => {
+                self.is_loading = false;
+                match result {
+                    Ok(true) => {
+                        // Drive already enabled — proceed immediately
+                        self.status_message = None;
+                        self.dispatch_action(action, connection)
+                    }
+                    Ok(false) => {
+                        // Drive is disabled — show confirmation dialog
+                        let drive_letter = match &action {
+                            PendingDriveAction::Mount(_, d, _) => d.clone(),
+                            PendingDriveAction::Run(_, d) => d.clone(),
+                        };
+                        let drive_opt = if drive_letter == "a" {
+                            DriveOption::A
+                        } else {
+                            DriveOption::B
+                        };
+                        self.drive_enable_dialog = Some((drive_opt, action));
+                        self.status_message = None;
+                        Task::none()
+                    }
+                    Err(e) => {
+                        // Can't check — proceed anyway and let mount fail naturally
+                        log::warn!("Could not check drive status: {}", e);
+                        self.status_message = None;
+                        self.dispatch_action(action, connection)
+                    }
+                }
+            }
+
+            FileBrowserMessage::ConfirmEnableDrive => {
+                if let Some((drive_opt, action)) = self.drive_enable_dialog.take() {
+                    let drive_letter = drive_opt.to_drive_string();
+                    if let Some(h) = host {
+                        self.is_loading = true;
+                        self.status_message = Some(format!(
+                            "Enabling Drive {} temporarily…",
+                            drive_letter.to_uppercase()
+                        ));
+                        // Store the action back so EnableDriveComplete can dispatch it
+                        self.drive_enable_dialog = Some((drive_opt, action));
+                        Task::perform(
+                            enable_drive_async(h, drive_letter, password),
+                            FileBrowserMessage::EnableDriveComplete,
+                        )
+                    } else {
+                        Task::none()
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+
+            FileBrowserMessage::CancelEnableDrive => {
+                self.drive_enable_dialog = None;
+                self.status_message = Some("Cancelled".to_string());
+                Task::none()
+            }
+
+            FileBrowserMessage::EnableDriveComplete(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(()) => {
+                        self.status_message =
+                            Some("Drive enabled temporarily (reboot to restore)".to_string());
+                        // Now dispatch the original action that was waiting
+                        if let Some((_, action)) = self.drive_enable_dialog.take() {
+                            return self.dispatch_action(action, connection);
+                        }
+                    }
+                    Err(e) => {
+                        self.drive_enable_dialog = None;
+                        self.status_message = Some(format!("Enable drive failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
     }
     #[allow(dead_code)]
@@ -643,6 +753,54 @@ impl FileBrowser {
         } else {
             text("").size(small)
         };
+
+        // If disk info popup is open, show it instead of the file list
+        if let Some((drive_opt, _)) = &self.drive_enable_dialog {
+            let drive_num = match drive_opt {
+                DriveOption::A => "8",
+                DriveOption::B => "9",
+            };
+            let drive_letter = match drive_opt {
+                DriveOption::A => "A",
+                DriveOption::B => "B",
+            };
+            let dialog = container(
+                column![
+                    text(format!(
+                        "Drive {} (device {}) is currently disabled.",
+                        drive_letter, drive_num
+                    ))
+                    .size(normal),
+                    text("Enable it temporarily? (reboot restores your original settings)")
+                        .size(small),
+                    row![
+                        button(text(format!("Enable Drive {}", drive_letter)).size(small))
+                            .on_press(FileBrowserMessage::ConfirmEnableDrive)
+                            .padding([5, 15]),
+                        button(text("Cancel").size(small))
+                            .on_press(FileBrowserMessage::CancelEnableDrive)
+                            .padding([5, 15]),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(12)
+                .padding(20),
+            )
+            .style(container::bordered_box)
+            .width(Length::Fill);
+
+            return column![
+                path_display,
+                nav_buttons,
+                controls_row,
+                selection_info,
+                dialog,
+                status,
+            ]
+            .spacing(3)
+            .padding(5)
+            .into();
+        }
 
         // If disk info popup is open, show it instead of the file list
         if let Some(disk_info) = &self.disk_info_popup {
@@ -1229,6 +1387,46 @@ impl FileBrowser {
         }
     }
 
+    /// Execute a pending mount/run action directly (drive already confirmed enabled).
+    fn dispatch_action(
+        &mut self,
+        action: PendingDriveAction,
+        connection: Option<Arc<Mutex<Rest>>>,
+    ) -> Task<FileBrowserMessage> {
+        match action {
+            PendingDriveAction::Mount(path, drive, mode) => {
+                if let Some(conn) = connection {
+                    self.status_message = Some(format!(
+                        "Mounting {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    Task::perform(
+                        mount_disk_async(conn, path, drive, mode),
+                        FileBrowserMessage::MountCompleted,
+                    )
+                } else {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    Task::none()
+                }
+            }
+            PendingDriveAction::Run(path, drive) => {
+                if let Some(conn) = connection {
+                    self.status_message = Some(format!(
+                        "Running {}...",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    Task::perform(
+                        run_disk_async(conn, path, drive),
+                        FileBrowserMessage::RunDiskCompleted,
+                    )
+                } else {
+                    self.status_message = Some("Not connected to Ultimate64".to_string());
+                    Task::none()
+                }
+            }
+        }
+    }
+
     fn load_directory(&mut self, path: &Path) {
         self.files.clear();
         self.filter.clear();
@@ -1500,5 +1698,88 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
         Ok(Ok(inner)) => inner,
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("Load timed out - device may be offline".to_string()),
+    }
+}
+
+/// Check whether the given drive (\"a\" or \"b\") is currently enabled.
+/// Returns Ok(true) if enabled, Ok(false) if disabled, Err if unreachable.
+async fn check_drive_enabled_async(
+    host: String,
+    drive: String,
+    password: Option<String>,
+) -> Result<bool, String> {
+    let category = if drive == "a" {
+        "Drive%20A%20Settings"
+    } else {
+        "Drive%20B%20Settings"
+    };
+
+    let url = format!("http://{}/v1/configs/{}/Drive", host, category);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.get(&url);
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            req = req.header("X-password", pwd.as_str());
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+
+    // Response: {"current":"Disabled","values":["Disabled","Enabled"],...}
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let current = json["current"].as_str().unwrap_or("Enabled");
+    Ok(current == "Enabled")
+}
+
+/// Temporarily enable a drive via the config API without writing to flash.
+/// Uses POST /v1/configs with the drive-specific enable key.
+async fn enable_drive_async(
+    host: String,
+    drive: String, // "a" or "b"
+    password: Option<String>,
+) -> Result<(), String> {
+    let category = if drive == "a" {
+        "Drive A Settings"
+    } else {
+        "Drive B Settings"
+    };
+
+    let url = format!("http://{}/v1/configs", host);
+    let body = serde_json::json!({
+        category: { "Drive": "Enabled" }
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&body);
+
+    if let Some(ref pwd) = password {
+        if !pwd.is_empty() {
+            req = req.header("X-password", pwd.as_str());
+        }
+    }
+
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        log::info!(
+            "Drive {} enabled temporarily via config API",
+            drive.to_uppercase()
+        );
+        Ok(())
+    } else {
+        Err(format!("Config API returned HTTP {}", resp.status()))
     }
 }

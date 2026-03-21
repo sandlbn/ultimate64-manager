@@ -556,7 +556,12 @@ impl Ultimate64Browser {
 
                 let cmd = self
                     .left_browser
-                    .update(msg, self.connection.clone())
+                    .update(
+                        msg,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
                     .map(Message::LeftBrowser);
 
                 let mut commands = vec![cmd];
@@ -611,7 +616,12 @@ impl Ultimate64Browser {
                         .map(Message::RemoteBrowser);
                     let refresh = self
                         .left_browser
-                        .update(FileBrowserMessage::RefreshFiles, self.connection.clone())
+                        .update(
+                            FileBrowserMessage::RefreshFiles,
+                            self.connection.clone(),
+                            Some(self.settings.connection.host.clone()),
+                            self.settings.connection.password.clone(),
+                        )
                         .map(Message::LeftBrowser);
                     return Task::batch(vec![cmd, refresh]);
                 }
@@ -921,7 +931,12 @@ impl Ultimate64Browser {
                         // Refresh both browsers
                         return Task::batch(vec![
                             self.left_browser
-                                .update(FileBrowserMessage::RefreshFiles, self.connection.clone())
+                                .update(
+                                    FileBrowserMessage::RefreshFiles,
+                                    self.connection.clone(),
+                                    Some(self.settings.connection.host.clone()),
+                                    self.settings.connection.password.clone(),
+                                )
                                 .map(Message::LeftBrowser),
                             self.remote_browser
                                 .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
