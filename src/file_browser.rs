@@ -532,7 +532,14 @@ impl FileBrowser {
                     PendingDriveAction::Run(_, d) => d.clone(),
                 };
 
-                if let Some(h) = host {
+                let effective_host = host.filter(|h| !h.is_empty());
+                log::info!(
+                    "CheckDriveBeforeAction: drive={} host={:?}",
+                    drive_letter,
+                    effective_host
+                );
+
+                if let Some(h) = effective_host {
                     self.is_loading = true;
                     self.status_message = Some("Checking drive status…".to_string());
                     Task::perform(
@@ -542,13 +549,14 @@ impl FileBrowser {
                         },
                     )
                 } else {
-                    // No host — just try to proceed directly (will fail gracefully)
+                    log::warn!("CheckDriveBeforeAction: no host, skipping drive check");
                     self.dispatch_action(action, connection)
                 }
             }
 
             FileBrowserMessage::DriveCheckComplete(result, action) => {
                 self.is_loading = false;
+                log::info!("DriveCheckComplete: {:?}", result);
                 match result {
                     Ok(true) => {
                         // Drive already enabled — proceed immediately
@@ -1732,9 +1740,17 @@ async fn check_drive_enabled_async(
         return Err(format!("HTTP {}", resp.status()));
     }
 
-    // Response: {"current":"Disabled","values":["Disabled","Enabled"],...}
+    // Response: {"Drive B Settings":{"Drive":{"current":"Disabled",...}},"errors":[]}
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let current = json["current"].as_str().unwrap_or("Enabled");
+    let category_key = if drive == "a" {
+        "Drive A Settings"
+    } else {
+        "Drive B Settings"
+    };
+    let current = json[category_key]["Drive"]["current"]
+        .as_str()
+        .unwrap_or("Disabled");
+    log::info!("Drive {} config current value: {}", drive, current);
     Ok(current == "Enabled")
 }
 
