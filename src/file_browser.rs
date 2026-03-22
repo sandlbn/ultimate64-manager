@@ -131,6 +131,8 @@ pub struct FileBrowser {
     disk_info_popup: Option<DiskInfo>,
     disk_info_path: Option<PathBuf>,
     disk_info_loading: bool,
+    // Rendered C64-style PETSCII listing image (PNG bytes)
+    disk_listing_image: Option<Vec<u8>>,
     // Content preview popup state (text/image files)
     content_preview: Option<ContentPreview>,
     content_preview_path: Option<PathBuf>,
@@ -164,6 +166,7 @@ impl FileBrowser {
             disk_info_popup: None,
             disk_info_path: None,
             disk_info_loading: false,
+            disk_listing_image: None,
             content_preview: None,
             content_preview_path: None,
             content_preview_loading: false,
@@ -482,6 +485,9 @@ impl FileBrowser {
                 self.disk_info_loading = false;
                 match result {
                     Ok(info) => {
+                        // Render a C64-style PETSCII listing image
+                        self.disk_listing_image =
+                            Some(dir_preview::render_disk_listing_image(&info));
                         self.disk_info_popup = Some(info);
                     }
                     Err(e) => {
@@ -494,6 +500,7 @@ impl FileBrowser {
             FileBrowserMessage::CloseDiskInfo => {
                 self.disk_info_popup = None;
                 self.disk_info_path = None;
+                self.disk_listing_image = None;
                 Task::none()
             }
             // Content preview popup messages (text/image files)
@@ -912,39 +919,62 @@ impl FileBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Directory listing
-        let mut listing_items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
-
-        for entry in &disk_info.entries {
-            let type_color = match entry.file_type {
-                FileType::Prg => iced::Color::from_rgb(0.5, 0.8, 0.5),
-                FileType::Seq => iced::Color::from_rgb(0.5, 0.5, 0.8),
-                FileType::Rel => iced::Color::from_rgb(0.8, 0.8, 0.5),
-                _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
+        // Show rendered C64-style PETSCII image if available,
+        // otherwise fall back to plain text listing
+        let listing: Element<'_, FileBrowserMessage> =
+            if let Some(png_bytes) = &self.disk_listing_image {
+                // Render as a pixel-perfect C64 screen image
+                let handle = iced::widget::image::Handle::from_bytes(png_bytes.clone());
+                scrollable(
+                    container(
+                        iced::widget::image(handle)
+                            .width(Length::Fill)
+                            .height(Length::Shrink),
+                    )
+                    .padding(4),
+                )
+                .height(Length::Fill)
+                .into()
+            } else {
+                // Fallback: plain text listing (used while image is loading)
+                let mut items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+                for entry in &disk_info.entries {
+                    let type_color = match entry.file_type {
+                        FileType::Prg => iced::Color::from_rgb(0.5, 0.8, 0.5),
+                        FileType::Seq => iced::Color::from_rgb(0.5, 0.5, 0.8),
+                        FileType::Rel => iced::Color::from_rgb(0.8, 0.8, 0.5),
+                        _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
+                    };
+                    let lock_indicator = if entry.locked { " <" } else { "" };
+                    let closed_indicator = if !entry.closed { "*" } else { "" };
+                    items.push(
+                        row![
+                            text(format!("{:>4}", entry.size_blocks))
+                                .size(tiny)
+                                .width(Length::Fixed(35.0)),
+                            text(format!("\"{}\"", entry.name))
+                                .size(tiny)
+                                .width(Length::Fill),
+                            text(format!(
+                                "{}{}{}",
+                                closed_indicator, entry.file_type, lock_indicator
+                            ))
+                            .size(tiny)
+                            .color(type_color),
+                        ]
+                        .spacing(5)
+                        .align_y(iced::Alignment::Center)
+                        .into(),
+                    );
+                }
+                scrollable(
+                    Column::with_children(items)
+                        .spacing(2)
+                        .padding(iced::Padding::ZERO.right(12)),
+                )
+                .height(Length::Fill)
+                .into()
             };
-
-            let lock_indicator = if entry.locked { " <" } else { "" };
-            let closed_indicator = if !entry.closed { "*" } else { "" };
-
-            let entry_row = row![
-                text(format!("{:>4}", entry.size_blocks))
-                    .size(tiny)
-                    .width(Length::Fixed(35.0)),
-                text(format!("\"{}\"", entry.name))
-                    .size(tiny)
-                    .width(Length::Fill),
-                text(format!(
-                    "{}{}{}",
-                    closed_indicator, entry.file_type, lock_indicator
-                ))
-                .size(tiny)
-                .color(type_color),
-            ]
-            .spacing(5)
-            .align_y(iced::Alignment::Center);
-
-            listing_items.push(entry_row.into());
-        }
 
         // Footer with blocks free
         let footer = row![
@@ -953,14 +983,6 @@ impl FileBrowser {
             text(format!("{} files", disk_info.entries.len())).size(tiny),
         ]
         .spacing(10);
-
-        // Scrollable listing
-        let listing = scrollable(
-            Column::with_children(listing_items)
-                .spacing(2)
-                .padding(iced::Padding::ZERO.right(12)),
-        )
-        .height(Length::Fill);
 
         // Popup container with border styling
         container(

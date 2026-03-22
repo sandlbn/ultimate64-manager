@@ -70,6 +70,9 @@ impl FileType {
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
+    /// Raw PETSCII bytes of the filename (16 bytes, $A0-padded)
+    /// Used for pixel-accurate rendering of special characters
+    pub raw_name: Vec<u8>,
     pub file_type: FileType,
     pub size_blocks: u16,
     pub locked: bool,
@@ -348,12 +351,14 @@ fn read_directory(data: &[u8], kind: ImageKind) -> Result<Vec<DirEntry>, String>
             // Filename is bytes 5-20 (16 characters)
             let name_bytes = &entry_bytes[5..21];
             let name = petscii::to_string(name_bytes);
+            let raw_name = name_bytes.to_vec();
 
             // File size in blocks (bytes 30-31, little-endian)
             let size_blocks = (entry_bytes[30] as u16) | ((entry_bytes[31] as u16) << 8);
 
             entries.push(DirEntry {
                 name,
+                raw_name,
                 file_type,
                 size_blocks,
                 locked,
