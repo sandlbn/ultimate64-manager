@@ -5502,7 +5502,7 @@ dependencies = [
 
 [[package]]
 name = "ultimate64-manager"
-version = "0.3.19"
+version = "0.3.20"
 dependencies = [
  "anyhow",
  "chrono",
