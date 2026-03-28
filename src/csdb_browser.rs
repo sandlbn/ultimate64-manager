@@ -66,6 +66,19 @@ pub enum CsdbBrowserMessage {
     RunExtractedFileCompleted(Result<String, String>),
     MountExtractedFile(usize, MountMode), // mount disk image from extracted ZIP
     MountExtractedFileCompleted(Result<String, String>),
+
+    // Drive enable dialog — same pattern as file_browser
+    /// Check if target drive is enabled before mount/run; carries the pending action
+    CheckDriveBeforeAction(CsdbPendingAction),
+    DriveCheckComplete(Result<bool, String>, CsdbPendingAction),
+    ConfirmEnableDrive,
+    CancelEnableDrive,
+    EnableDriveComplete(Result<(), String>),
+    /// Internal: execute the action after drive is confirmed enabled
+    DoRunFile(usize),
+    DoMountFile(usize, MountMode),
+    DoRunExtractedFile(usize),
+    DoMountExtractedFile(usize, MountMode),
     CloseZipView,
 
     // Disk mounting
@@ -133,6 +146,15 @@ impl std::fmt::Display for MountMode {
             MountMode::ReadWrite => write!(f, "RW"),
         }
     }
+}
+
+/// Pending mount/run action held while the drive-enable dialog is shown
+#[derive(Debug, Clone)]
+pub enum CsdbPendingAction {
+    RunFile(usize),
+    MountFile(usize, MountMode),
+    RunExtractedFile(usize),
+    MountExtractedFile(usize, MountMode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +244,8 @@ pub struct CsdbBrowser {
 
     // Drive selection for mounting
     selected_drive: DriveOption,
+    // Drive enable dialog — Some when asking user to enable a disabled drive
+    drive_enable_dialog: Option<(DriveOption, CsdbPendingAction)>,
 
     // Filter
     file_filter: FileFilter,
@@ -258,6 +282,7 @@ impl CsdbBrowser {
             extracted_zip: None,
             selected_extracted_file_index: None,
             selected_drive: DriveOption::A,
+            drive_enable_dialog: None,
             file_filter: FileFilter::Runnable,
             status_message: None,
             is_loading: false,
@@ -278,6 +303,8 @@ impl CsdbBrowser {
         &mut self,
         message: CsdbBrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
+        host: Option<String>,
+        password: Option<String>,
     ) -> Task<CsdbBrowserMessage> {
         match message {
             CsdbBrowserMessage::SearchInputChanged(value) => {
@@ -583,7 +610,12 @@ impl CsdbBrowser {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     return Task::none();
                 }
+                Task::done(CsdbBrowserMessage::CheckDriveBeforeAction(
+                    CsdbPendingAction::RunFile(index),
+                ))
+            }
 
+            CsdbBrowserMessage::DoRunFile(index) => {
                 if let Some(release) = &self.current_release {
                     if let Some(file) = release.files.iter().find(|f| f.index == index) {
                         self.is_loading = true;
@@ -598,7 +630,6 @@ impl CsdbBrowser {
                         return Task::perform(
                             async move {
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
-
                                 let (filename, data) = tokio::time::timeout(
                                     tokio::time::Duration::from_secs(60),
                                     client.download_file_bytes(&file),
@@ -614,7 +645,6 @@ impl CsdbBrowser {
                                     tokio::time::Duration::from_secs(run_timeout),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
-
                                         match ext.as_str() {
                                             "prg" => conn
                                                 .run_prg(&data)
@@ -629,12 +659,11 @@ impl CsdbBrowser {
                                                 .map(|_| format!("Playing: {}", filename))
                                                 .map_err(|e| e.to_string()),
                                             "d64" | "d71" | "d81" | "g64" => {
-                                                let temp_dir = std::env::temp_dir();
-                                                let temp_path = temp_dir.join(&filename);
+                                                let temp_path =
+                                                    std::env::temp_dir().join(&filename);
                                                 std::fs::write(&temp_path, &data).map_err(|e| {
                                                     format!("Failed to write temp file: {}", e)
                                                 })?;
-
                                                 conn.mount_disk_image(
                                                     &temp_path,
                                                     drive,
@@ -642,7 +671,6 @@ impl CsdbBrowser {
                                                     false,
                                                 )
                                                 .map_err(|e| format!("Mount failed: {}", e))?;
-
                                                 std::thread::sleep(
                                                     std::time::Duration::from_millis(500),
                                                 );
@@ -661,7 +689,6 @@ impl CsdbBrowser {
                                                 ));
                                                 conn.type_text("run\n")
                                                     .map_err(|e| format!("Type failed: {}", e))?;
-
                                                 Ok(format!("Running disk: {}", filename))
                                             }
                                             _ => Err(format!("Unsupported file type: {}", ext)),
@@ -696,12 +723,112 @@ impl CsdbBrowser {
                 Task::none()
             }
 
+            // ── Drive enable dialog ──────────────────────────────────────
+            CsdbBrowserMessage::CheckDriveBeforeAction(action) => {
+                let drive_letter = self.selected_drive.to_drive_string();
+                let effective_host = host.filter(|h| !h.is_empty());
+                log::info!(
+                    "CSDB CheckDriveBeforeAction: drive={} host={:?}",
+                    drive_letter,
+                    effective_host
+                );
+                if let Some(h) = effective_host {
+                    self.is_loading = true;
+                    self.status_message = Some("Checking drive status…".to_string());
+                    Task::perform(
+                        crate::file_browser::check_drive_enabled_async(h, drive_letter, password),
+                        move |result| {
+                            CsdbBrowserMessage::DriveCheckComplete(result, action.clone())
+                        },
+                    )
+                } else {
+                    log::warn!("CSDB CheckDriveBeforeAction: no host, skipping check");
+                    self.dispatch_action(action, connection)
+                }
+            }
+
+            CsdbBrowserMessage::DriveCheckComplete(result, action) => {
+                self.is_loading = false;
+                log::info!("CSDB DriveCheckComplete: {:?}", result);
+                match result {
+                    Ok(true) => {
+                        // Drive already enabled — proceed immediately
+                        self.status_message = None;
+                        self.dispatch_action(action, connection)
+                    }
+                    Ok(false) => {
+                        // Drive disabled — show confirmation dialog
+                        self.drive_enable_dialog = Some((self.selected_drive.clone(), action));
+                        self.status_message = None;
+                        Task::none()
+                    }
+                    Err(e) => {
+                        // Check failed — proceed anyway and let operation fail naturally
+                        log::warn!("Could not check drive status: {}", e);
+                        self.status_message = None;
+                        self.dispatch_action(action, connection)
+                    }
+                }
+            }
+
+            CsdbBrowserMessage::ConfirmEnableDrive => {
+                if let Some((drive_opt, action)) = self.drive_enable_dialog.take() {
+                    let drive_letter = drive_opt.to_drive_string();
+                    if let Some(h) = host {
+                        self.is_loading = true;
+                        self.status_message = Some(format!(
+                            "Enabling Drive {} temporarily…",
+                            drive_letter.to_uppercase()
+                        ));
+                        // Store back so EnableDriveComplete can dispatch it
+                        self.drive_enable_dialog = Some((drive_opt, action));
+                        Task::perform(
+                            crate::file_browser::enable_drive_async(h, drive_letter, password),
+                            CsdbBrowserMessage::EnableDriveComplete,
+                        )
+                    } else {
+                        Task::none()
+                    }
+                } else {
+                    Task::none()
+                }
+            }
+
+            CsdbBrowserMessage::CancelEnableDrive => {
+                self.drive_enable_dialog = None;
+                self.status_message = Some("Cancelled".to_string());
+                Task::none()
+            }
+
+            CsdbBrowserMessage::EnableDriveComplete(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(()) => {
+                        self.status_message =
+                            Some("Drive enabled temporarily (reboot to restore)".to_string());
+                        if let Some((_, action)) = self.drive_enable_dialog.take() {
+                            return self.dispatch_action(action, connection);
+                        }
+                    }
+                    Err(e) => {
+                        self.drive_enable_dialog = None;
+                        self.status_message = Some(format!("Enable drive failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
             CsdbBrowserMessage::MountFile(index, mount_mode) => {
                 if connection.is_none() {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     return Task::none();
                 }
+                Task::done(CsdbBrowserMessage::CheckDriveBeforeAction(
+                    CsdbPendingAction::MountFile(index, mount_mode),
+                ))
+            }
 
+            CsdbBrowserMessage::DoMountFile(index, mount_mode) => {
                 if let Some(release) = &self.current_release {
                     if let Some(file) = release.files.iter().find(|f| f.index == index) {
                         if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
@@ -729,7 +856,6 @@ impl CsdbBrowser {
                         return Task::perform(
                             async move {
                                 let client = CsdbClient::new().map_err(|e| e.to_string())?;
-
                                 let (filename, data) = tokio::time::timeout(
                                     tokio::time::Duration::from_secs(60),
                                     client.download_file_bytes(&file),
@@ -738,9 +864,7 @@ impl CsdbBrowser {
                                 .map_err(|_| "Download timed out".to_string())?
                                 .map_err(|e| e.to_string())?;
 
-                                let temp_dir = std::env::temp_dir();
-                                let temp_path = temp_dir.join(&filename);
-
+                                let temp_path = std::env::temp_dir().join(&filename);
                                 tokio::fs::write(&temp_path, &data)
                                     .await
                                     .map_err(|e| format!("Failed to write temp file: {}", e))?;
@@ -776,7 +900,6 @@ impl CsdbBrowser {
                 }
                 Task::none()
             }
-
             CsdbBrowserMessage::ExtractZip(index) => {
                 if let Some(release) = &self.current_release {
                     if let Some(file) = release.files.iter().find(|f| f.index == index) {
@@ -861,7 +984,12 @@ impl CsdbBrowser {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     return Task::none();
                 }
+                Task::done(CsdbBrowserMessage::CheckDriveBeforeAction(
+                    CsdbPendingAction::RunExtractedFile(index),
+                ))
+            }
 
+            CsdbBrowserMessage::DoRunExtractedFile(index) => {
                 if let Some(extracted) = &self.extracted_zip {
                     if let Some(file) = extracted.files.iter().find(|f| f.index == index) {
                         self.is_loading = true;
@@ -880,14 +1008,11 @@ impl CsdbBrowser {
                                 let data = tokio::fs::read(&file_path)
                                     .await
                                     .map_err(|e| format!("Failed to read file: {}", e))?;
-
                                 let run_timeout = if is_disk { 30 } else { 15 };
-
                                 tokio::time::timeout(
                                     tokio::time::Duration::from_secs(run_timeout),
                                     tokio::task::spawn_blocking(move || {
                                         let conn = conn.blocking_lock();
-
                                         match ext.as_str() {
                                             "prg" => conn
                                                 .run_prg(&data)
@@ -909,7 +1034,6 @@ impl CsdbBrowser {
                                                     false,
                                                 )
                                                 .map_err(|e| format!("Mount failed: {}", e))?;
-
                                                 std::thread::sleep(
                                                     std::time::Duration::from_millis(500),
                                                 );
@@ -928,7 +1052,6 @@ impl CsdbBrowser {
                                                 ));
                                                 conn.type_text("run\n")
                                                     .map_err(|e| format!("Type failed: {}", e))?;
-
                                                 Ok(format!("Running disk: {}", filename))
                                             }
                                             _ => Err(format!("Unsupported file type: {}", ext)),
@@ -963,7 +1086,12 @@ impl CsdbBrowser {
                     self.status_message = Some("Not connected to Ultimate64".to_string());
                     return Task::none();
                 }
+                Task::done(CsdbBrowserMessage::CheckDriveBeforeAction(
+                    CsdbPendingAction::MountExtractedFile(index, mount_mode),
+                ))
+            }
 
+            CsdbBrowserMessage::DoMountExtractedFile(index, mount_mode) => {
                 if let Some(extracted) = &self.extracted_zip {
                     if let Some(file) = extracted.files.iter().find(|f| f.index == index) {
                         if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
@@ -1054,6 +1182,26 @@ impl CsdbBrowser {
         }
     }
 
+    /// Dispatch a pending action directly (drive confirmed enabled)
+    fn dispatch_action(
+        &mut self,
+        action: CsdbPendingAction,
+        _connection: Option<Arc<Mutex<Rest>>>,
+    ) -> Task<CsdbBrowserMessage> {
+        match action {
+            CsdbPendingAction::RunFile(index) => Task::done(CsdbBrowserMessage::DoRunFile(index)),
+            CsdbPendingAction::MountFile(index, mode) => {
+                Task::done(CsdbBrowserMessage::DoMountFile(index, mode))
+            }
+            CsdbPendingAction::RunExtractedFile(index) => {
+                Task::done(CsdbBrowserMessage::DoRunExtractedFile(index))
+            }
+            CsdbPendingAction::MountExtractedFile(index, mode) => {
+                Task::done(CsdbBrowserMessage::DoMountExtractedFile(index, mode))
+            }
+        }
+    }
+
     pub fn view(&self, font_size: u32, is_connected: bool) -> Element<'_, CsdbBrowserMessage> {
         let small = (font_size.saturating_sub(2)).max(8);
         let normal = font_size;
@@ -1138,6 +1286,51 @@ impl CsdbBrowser {
         let status_bar = row![status, Space::new().width(Length::Fill), connection_status,]
             .spacing(10)
             .align_y(iced::Alignment::Center);
+
+        // Show drive enable dialog if active
+        if let Some((drive_opt, _)) = &self.drive_enable_dialog {
+            let drive_num = if drive_opt.to_drive_string() == "a" {
+                "8"
+            } else {
+                "9"
+            };
+            let drive_letter = drive_opt.to_drive_string().to_uppercase();
+            let dialog = container(
+                column![
+                    text(format!(
+                        "Drive {} (device {}) is currently disabled.",
+                        drive_letter, drive_num
+                    ))
+                    .size(normal),
+                    text("Enable it temporarily? (reboot restores your original settings)")
+                        .size(small),
+                    row![
+                        button(text(format!("Enable Drive {}", drive_letter)).size(small))
+                            .on_press(CsdbBrowserMessage::ConfirmEnableDrive)
+                            .padding([5, 15]),
+                        button(text("Cancel").size(small))
+                            .on_press(CsdbBrowserMessage::CancelEnableDrive)
+                            .padding([5, 15]),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(12)
+                .padding(20),
+            )
+            .style(container::bordered_box)
+            .width(Length::Fill);
+
+            return column![
+                search_bar,
+                rule::horizontal(1),
+                dialog,
+                rule::horizontal(1),
+                status_bar,
+            ]
+            .spacing(5)
+            .padding(5)
+            .into();
+        }
 
         column![
             search_bar,

@@ -519,7 +519,12 @@ impl Ultimate64Browser {
                 if tab == Tab::CsdbBrowser && !self.csdb_browser.has_content() {
                     return self
                         .csdb_browser
-                        .update(CsdbBrowserMessage::RefreshLatest, self.connection.clone())
+                        .update(
+                            CsdbBrowserMessage::RefreshLatest,
+                            self.connection.clone(),
+                            Some(self.settings.connection.host.clone()),
+                            self.settings.connection.password.clone(),
+                        )
                         .map(Message::CsdbBrowser);
                 }
                 Task::none()
@@ -1236,7 +1241,12 @@ impl Ultimate64Browser {
             }
             Message::CsdbBrowser(msg) => self
                 .csdb_browser
-                .update(msg, self.connection.clone())
+                .update(
+                    msg,
+                    self.connection.clone(),
+                    Some(self.settings.connection.host.clone()),
+                    self.settings.connection.password.clone(),
+                )
                 .map(Message::CsdbBrowser),
             Message::RefreshAfterConnect => {
                 // Refresh both status and remote browser after connection

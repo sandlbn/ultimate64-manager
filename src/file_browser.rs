@@ -1733,7 +1733,7 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
 
 /// Check whether the given drive (\"a\" or \"b\") is currently enabled.
 /// Returns Ok(true) if enabled, Ok(false) if disabled, Err if unreachable.
-async fn check_drive_enabled_async(
+pub async fn check_drive_enabled_async(
     host: String,
     drive: String,
     password: Option<String>,
@@ -1778,7 +1778,7 @@ async fn check_drive_enabled_async(
 
 /// Temporarily enable a drive via the config API without writing to flash.
 /// Uses POST /v1/configs with the drive-specific enable key.
-async fn enable_drive_async(
+pub async fn enable_drive_async(
     host: String,
     drive: String, // "a" or "b"
     password: Option<String>,
