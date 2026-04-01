@@ -50,7 +50,7 @@ pub struct TransferProgress {
     pub current: usize,
     pub total: usize,
     pub current_file: String,
-    pub operation: String, // "Downloading", "Uploading", etc.
+    pub operation: String, // "Downloading", "Uploading", "Deleting", etc.
     pub done: bool,
 }
 
@@ -105,6 +105,30 @@ pub enum RemoteBrowserMessage {
     CloseContentPreview,
     // Transfer progress (polled by subscription)
     ProgressTick,
+
+    // ── Delete ────────────────────────────────────────────────────────────────
+    /// Request deletion of a single file/dir (shows confirm dialog)
+    DeleteFile(String),
+    /// Request deletion of all currently checked files/dirs (shows confirm dialog)
+    DeleteChecked,
+    /// User confirmed the pending deletion — execute it
+    DeleteConfirm,
+    /// User cancelled the pending deletion
+    DeleteCancel,
+    /// Async deletion finished
+    DeleteComplete(Result<String, String>),
+
+    // ── Rename ───────────────────────────────────────────────────────────────
+    /// Open the rename dialog for a given remote path
+    RenameFile(String),
+    /// User is typing the new name
+    RenameInputChanged(String),
+    /// User confirmed the rename — execute it
+    RenameConfirm,
+    /// User cancelled the rename
+    RenameCancel,
+    /// Async rename finished
+    RenameComplete(Result<String, String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +137,24 @@ pub struct RemoteFileEntry {
     pub is_dir: bool,
     pub size: u64,
     pub path: String,
+}
+
+/// State for the delete confirmation dialog
+#[derive(Debug, Clone)]
+struct DeletePending {
+    /// All paths that will be deleted (files and/or directories)
+    paths: Vec<String>,
+    /// Human-readable summary shown in the dialog
+    summary: String,
+}
+
+/// State for the rename dialog
+#[derive(Debug, Clone)]
+struct RenamePending {
+    /// Full remote path of the item being renamed
+    original_path: String,
+    /// Current value of the name text input
+    new_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +189,11 @@ pub struct RemoteBrowser {
     content_preview_loading: bool,
     // Transfer progress (shared with async FTP tasks)
     transfer_progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
+
+    // Delete confirm dialog
+    delete_pending: Option<DeletePending>,
+    // Rename dialog
+    rename_pending: Option<RenamePending>,
 }
 
 impl Default for RemoteBrowser {
@@ -175,6 +222,8 @@ impl Default for RemoteBrowser {
             content_preview_path: None,
             content_preview_loading: false,
             transfer_progress: Arc::new(std::sync::Mutex::new(None)),
+            delete_pending: None,
+            rename_pending: None,
         }
     }
 }
@@ -185,7 +234,6 @@ impl RemoteBrowser {
     }
 
     pub fn set_host(&mut self, host: Option<String>, password: Option<String>) {
-        // Strip http:// prefix if present, we just need the IP
         self.host_address = host.map(|h| {
             h.trim_start_matches("http://")
                 .trim_start_matches("https://")
@@ -239,7 +287,6 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::FileSelected(path) => {
-                // Check if it's a directory
                 if let Some(entry) = self.files.iter().find(|f| f.path == path) {
                     if entry.is_dir {
                         self.current_path = path;
@@ -277,7 +324,6 @@ impl RemoteBrowser {
                 if let Some(host) = &self.host_address {
                     let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
                     self.status_message = Some(format!("Downloading {}...", filename));
-                    // Set initial progress for single file
                     if let Ok(mut g) = self.transfer_progress.lock() {
                         *g = Some(TransferProgress {
                             current: 0,
@@ -301,7 +347,6 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::DownloadComplete(result) => {
-                // Clear transfer progress
                 if let Ok(mut g) = self.transfer_progress.lock() {
                     *g = None;
                 }
@@ -324,7 +369,6 @@ impl RemoteBrowser {
                         .unwrap_or("file")
                         .to_string();
                     self.status_message = Some(format!("Uploading {}...", filename));
-                    // Set initial progress for single file upload
                     if let Ok(mut g) = self.transfer_progress.lock() {
                         *g = Some(TransferProgress {
                             current: 0,
@@ -348,7 +392,6 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::UploadComplete(result) => {
-                // Clear transfer progress
                 if let Ok(mut g) = self.transfer_progress.lock() {
                     *g = None;
                 }
@@ -381,7 +424,6 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::UploadDirectoryComplete(result) => {
-                // Clear transfer progress
                 if let Ok(mut g) = self.transfer_progress.lock() {
                     *g = None;
                 }
@@ -459,12 +501,8 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::RunnerComplete(result) => {
                 match result {
-                    Ok(msg) => {
-                        self.status_message = Some(msg);
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("Failed: {}", e));
-                    }
+                    Ok(msg) => self.status_message = Some(msg),
+                    Err(e) => self.status_message = Some(format!("Failed: {}", e)),
                 }
                 Task::none()
             }
@@ -487,12 +525,8 @@ impl RemoteBrowser {
 
             RemoteBrowserMessage::MountComplete(result) => {
                 match result {
-                    Ok(msg) => {
-                        self.status_message = Some(msg);
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("Mount failed: {}", e));
-                    }
+                    Ok(msg) => self.status_message = Some(msg),
+                    Err(e) => self.status_message = Some(format!("Mount failed: {}", e)),
                 }
                 Task::none()
             }
@@ -506,7 +540,7 @@ impl RemoteBrowser {
                     let conn = _connection.clone();
                     Task::perform(
                         async move { api::run_disk(&host, &path, &drive, password, conn).await },
-                        RemoteBrowserMessage::MountComplete, // Reuse MountComplete for result
+                        RemoteBrowserMessage::MountComplete,
                     )
                 } else {
                     self.status_message = Some("Not connected".to_string());
@@ -542,7 +576,6 @@ impl RemoteBrowser {
                 }
                 if let Some(host) = &self.host_address {
                     let checked: Vec<String> = self.checked_files.iter().cloned().collect();
-                    // Separate files and directories
                     let mut file_paths = Vec::new();
                     let mut dir_paths = Vec::new();
                     for path in &checked {
@@ -572,7 +605,6 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::DownloadBatchComplete(result) => {
-                // Clear transfer progress
                 if let Ok(mut g) = self.transfer_progress.lock() {
                     *g = None;
                 }
@@ -593,7 +625,6 @@ impl RemoteBrowser {
                 Task::none()
             }
 
-            // Disk info popup messages
             RemoteBrowserMessage::ShowDiskInfo(path) => {
                 if let Some(host) = &self.host_address {
                     self.disk_info_loading = true;
@@ -614,7 +645,6 @@ impl RemoteBrowser {
                 self.disk_info_loading = false;
                 match result {
                     Ok(info) => {
-                        // Render a C64-style PETSCII listing image
                         self.disk_listing_image =
                             Some(crate::dir_preview::render_disk_listing_image(&info));
                         self.disk_info_popup = Some(info);
@@ -627,7 +657,6 @@ impl RemoteBrowser {
                 Task::none()
             }
 
-            // ── Disk creator ──────────────────────────────────────────────
             RemoteBrowserMessage::ShowCreateDisk => {
                 self.show_create_disk = true;
                 Task::none()
@@ -638,7 +667,6 @@ impl RemoteBrowser {
                 Task::none()
             }
             RemoteBrowserMessage::CreateDiskNameChanged(s) => {
-                // PETSCII disk names are max 16 chars, uppercase only
                 self.create_disk_name = s.to_uppercase().chars().take(16).collect();
                 Task::none()
             }
@@ -678,7 +706,6 @@ impl RemoteBrowser {
                 match result {
                     Ok(name) => {
                         self.status_message = Some(format!("Created: {}", name));
-                        // Refresh the file list
                         if let Some(host) = self.host_address.clone() {
                             let path = self.current_path.clone();
                             let password = self.password.clone();
@@ -703,13 +730,11 @@ impl RemoteBrowser {
                 Task::none()
             }
 
-            // Content preview popup messages (text/image files)
             RemoteBrowserMessage::ShowContentPreview(path) => {
                 if let Some(host) = &self.host_address {
                     self.content_preview_loading = true;
                     let filename = path.rsplit('/').next().unwrap_or("file");
                     self.status_message = Some(format!("Downloading {}...", filename));
-
                     self.content_preview_path = Some(path.clone());
                     let host = host.clone();
                     let password = self.password.clone();
@@ -726,9 +751,7 @@ impl RemoteBrowser {
             RemoteBrowserMessage::ContentPreviewLoaded(result) => {
                 self.content_preview_loading = false;
                 match result {
-                    Ok(preview) => {
-                        self.content_preview = Some(preview);
-                    }
+                    Ok(preview) => self.content_preview = Some(preview),
                     Err(e) => {
                         self.status_message = Some(format!("Failed to load content: {}", e));
                         self.content_preview_path = None;
@@ -744,11 +767,9 @@ impl RemoteBrowser {
             }
 
             RemoteBrowserMessage::ProgressTick => {
-                // Read shared progress state and update status message
                 if let Ok(guard) = self.transfer_progress.lock() {
                     if let Some(ref progress) = *guard {
                         if progress.done {
-                            // Transfer complete — clear progress
                             drop(guard);
                             if let Ok(mut g) = self.transfer_progress.lock() {
                                 *g = None;
@@ -766,6 +787,205 @@ impl RemoteBrowser {
                 }
                 Task::none()
             }
+
+            // ── Delete ────────────────────────────────────────────────────────
+            RemoteBrowserMessage::DeleteFile(path) => {
+                // Single file/dir delete — show confirmation dialog
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                let is_dir = self
+                    .files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .map(|f| f.is_dir)
+                    .unwrap_or(false);
+                let summary = if is_dir {
+                    format!("Delete directory \"{}\" and ALL its contents?", name)
+                } else {
+                    format!("Delete file \"{}\"?", name)
+                };
+                self.delete_pending = Some(DeletePending {
+                    paths: vec![path],
+                    summary,
+                });
+                Task::none()
+            }
+
+            RemoteBrowserMessage::DeleteChecked => {
+                if self.checked_files.is_empty() {
+                    self.status_message = Some("No files selected".to_string());
+                    return Task::none();
+                }
+                let paths: Vec<String> = self.checked_files.iter().cloned().collect();
+                let file_count = paths
+                    .iter()
+                    .filter(|p| {
+                        self.files
+                            .iter()
+                            .find(|f| &f.path == *p)
+                            .map(|f| !f.is_dir)
+                            .unwrap_or(true)
+                    })
+                    .count();
+                let dir_count = paths.len() - file_count;
+
+                let summary = match (file_count, dir_count) {
+                    (f, 0) => format!("Delete {} file(s)?", f),
+                    (0, d) => format!(
+                        "Delete {} director{}? (recursive)",
+                        d,
+                        if d == 1 { "y" } else { "ies" }
+                    ),
+                    (f, d) => format!(
+                        "Delete {} file(s) and {} director{}? (recursive)",
+                        f,
+                        d,
+                        if d == 1 { "y" } else { "ies" }
+                    ),
+                };
+                self.delete_pending = Some(DeletePending { paths, summary });
+                Task::none()
+            }
+
+            RemoteBrowserMessage::DeleteCancel => {
+                self.delete_pending = None;
+                Task::none()
+            }
+
+            RemoteBrowserMessage::DeleteConfirm => {
+                let pending = match self.delete_pending.take() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                if let Some(host) = &self.host_address {
+                    let count = pending.paths.len();
+                    self.status_message = Some(format!("Deleting {} item(s)...", count));
+                    if let Ok(mut g) = self.transfer_progress.lock() {
+                        *g = Some(TransferProgress {
+                            current: 0,
+                            total: count,
+                            current_file: String::new(),
+                            operation: "Deleting".to_string(),
+                            done: false,
+                        });
+                    }
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
+                    // Collect is_dir flags so the async fn knows what each path is
+                    let paths_with_type: Vec<(String, bool)> = pending
+                        .paths
+                        .iter()
+                        .map(|p| {
+                            let is_dir = self
+                                .files
+                                .iter()
+                                .find(|f| &f.path == p)
+                                .map(|f| f.is_dir)
+                                .unwrap_or(false);
+                            (p.clone(), is_dir)
+                        })
+                        .collect();
+                    Task::perform(
+                        delete_ftp(host, paths_with_type, password, progress),
+                        RemoteBrowserMessage::DeleteComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Task::none()
+                }
+            }
+
+            RemoteBrowserMessage::DeleteComplete(result) => {
+                if let Ok(mut g) = self.transfer_progress.lock() {
+                    *g = None;
+                }
+                self.checked_files.clear();
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Delete failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
+            // ── Rename ───────────────────────────────────────────────────────
+            RemoteBrowserMessage::RenameFile(path) => {
+                let current_name = path.rsplit('/').next().unwrap_or("").to_string();
+                self.rename_pending = Some(RenamePending {
+                    original_path: path,
+                    new_name: current_name,
+                });
+                Task::none()
+            }
+
+            RemoteBrowserMessage::RenameInputChanged(value) => {
+                if let Some(ref mut rp) = self.rename_pending {
+                    rp.new_name = value;
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::RenameCancel => {
+                self.rename_pending = None;
+                Task::none()
+            }
+
+            RemoteBrowserMessage::RenameConfirm => {
+                let pending = match self.rename_pending.take() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                if pending.new_name.trim().is_empty() {
+                    self.status_message = Some("Name cannot be empty".to_string());
+                    return Task::none();
+                }
+                // Build new path: same parent dir, new name
+                let parent = pending
+                    .original_path
+                    .rsplit_once('/')
+                    .map(|(p, _)| p)
+                    .unwrap_or("/");
+                let new_path = if parent == "" || parent == "/" {
+                    format!("/{}", pending.new_name.trim())
+                } else {
+                    format!("{}/{}", parent, pending.new_name.trim())
+                };
+                if new_path == pending.original_path {
+                    self.rename_pending = None;
+                    return Task::none();
+                }
+                if let Some(host) = &self.host_address {
+                    self.status_message =
+                        Some(format!("Renaming to {}...", pending.new_name.trim()));
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    let old = pending.original_path.clone();
+                    Task::perform(
+                        rename_ftp(host, old, new_path, password),
+                        RemoteBrowserMessage::RenameComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Task::none()
+                }
+            }
+
+            RemoteBrowserMessage::RenameComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Rename failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -774,14 +994,12 @@ impl RemoteBrowser {
         let normal = font_size;
         let tiny = (font_size.saturating_sub(3)).max(7);
 
-        // Path display
         let display_path = if self.current_path.len() > 35 {
             format!("...{}", &self.current_path[self.current_path.len() - 32..])
         } else {
             self.current_path.clone()
         };
 
-        // Navigation buttons with filter
         let checked_count = self.checked_files.len();
         let nav_buttons = row![
             tooltip(
@@ -813,6 +1031,21 @@ impl RemoteBrowser {
             } else {
                 text("").size(small)
             },
+            // Batch delete button — only shown when files are checked
+            if checked_count > 0 {
+                let del_btn: Element<'_, RemoteBrowserMessage> = tooltip(
+                    button(text(format!("🗑 Delete ({})", checked_count)).size(small))
+                        .on_press(RemoteBrowserMessage::DeleteChecked)
+                        .padding([2, 8]),
+                    "Delete all selected files/directories",
+                    tooltip::Position::Bottom,
+                )
+                .style(container::bordered_box)
+                .into();
+                del_btn
+            } else {
+                Space::new().width(0).into()
+            },
             Space::new().width(Length::Fill),
             text("Filter:").size(small),
             text_input("filter...", &self.filter)
@@ -824,7 +1057,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Quick navigation to common paths
         let quick_nav = row![
             tooltip(
                 button(text("/").size(small))
@@ -883,10 +1115,42 @@ impl RemoteBrowser {
         ]
         .spacing(3);
 
-        // Path and status
         let path_display = text(display_path).size(normal);
 
-        // ── Create-disk dialog ────────────────────────────────────────────────
+        // ── Delete confirm dialog — shown over everything else ─────────────
+        if let Some(ref dp) = self.delete_pending {
+            let dialog = self.view_delete_confirm_dialog(dp, font_size);
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                dialog,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
+
+        // ── Rename dialog ─────────────────────────────────────────────────
+        if let Some(ref rp) = self.rename_pending {
+            let dialog = self.view_rename_dialog(rp, font_size);
+            return column![
+                nav_buttons,
+                quick_nav,
+                path_display,
+                self.view_status_bar(small),
+                dialog,
+            ]
+            .spacing(5)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
+
         if self.show_create_disk {
             let dialog = self.view_create_disk_dialog(font_size);
             return column![
@@ -903,10 +1167,8 @@ impl RemoteBrowser {
             .into();
         }
 
-        // If disk info popup is open, show it instead of the file list
         if let Some(disk_info) = &self.disk_info_popup {
             let popup = self.view_disk_info_popup(disk_info, font_size);
-
             return column![
                 nav_buttons,
                 quick_nav,
@@ -921,7 +1183,7 @@ impl RemoteBrowser {
             .align_x(iced::Alignment::Center)
             .into();
         }
-        // Show loading panel while downloading content for preview
+
         if self.content_preview_loading {
             let loading_panel = container(
                 column![
@@ -936,7 +1198,6 @@ impl RemoteBrowser {
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .style(container::bordered_box);
-
             return column![
                 nav_buttons,
                 quick_nav,
@@ -951,10 +1212,9 @@ impl RemoteBrowser {
             .align_x(iced::Alignment::Center)
             .into();
         }
-        // If content preview popup is open, show it instead of the file list
+
         if let Some(content_preview) = &self.content_preview {
             let popup = self.view_content_preview_popup(content_preview, font_size);
-
             return column![
                 nav_buttons,
                 quick_nav,
@@ -970,7 +1230,7 @@ impl RemoteBrowser {
             .into();
         }
 
-        // File list
+        // ── File list ─────────────────────────────────────────────────────
         let file_list: Element<'_, RemoteBrowserMessage> = if self.files.is_empty() {
             if self.is_loading {
                 text("Loading...").size(normal).into()
@@ -982,7 +1242,6 @@ impl RemoteBrowser {
                 text("Empty directory").size(normal).into()
             }
         } else {
-            // Filter files based on filter text
             let filtered_files: Vec<&RemoteFileEntry> = self
                 .files
                 .iter()
@@ -996,18 +1255,15 @@ impl RemoteBrowser {
 
             for (i, entry) in filtered_files.iter().enumerate() {
                 if i > 0 {
-                    // Add divider between rows
                     items.push(rule::horizontal(1).into());
                 }
 
-                // File type label
                 let type_label = if entry.is_dir {
                     ""
                 } else {
                     get_file_icon(&entry.name)
                 };
 
-                // Truncate long filenames
                 let max_name_len = 45;
                 let display_name = if entry.name.len() > max_name_len {
                     format!("{}...", &entry.name[..max_name_len - 3])
@@ -1015,18 +1271,14 @@ impl RemoteBrowser {
                     entry.name.clone()
                 };
 
-                // Check if this is a disk image that can show info (D64/D71 only)
                 let is_disk_image = {
                     let lower = entry.name.to_lowercase();
                     lower.ends_with(".d64") || lower.ends_with(".d71")
                 };
-
-                // Check if this is a previewable text or image file
                 let is_text_file = is_remote_text_file(&entry.name);
                 let is_image_file = is_remote_image_file(&entry.name);
                 let is_pdf_file = is_remote_pdf_file(&entry.name);
 
-                // Action button based on file type
                 let ext = entry.name.to_lowercase();
                 let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     tooltip(
@@ -1084,10 +1336,7 @@ impl RemoteBrowser {
                     || ext.ends_with(".g71")
                     || ext.ends_with(".d81")
                 {
-                    // Disk image - show run and mount buttons
                     let mut buttons = row![].spacing(2);
-
-                    // Info button for D64/D71 only
                     if is_disk_image {
                         buttons = buttons.push(
                             tooltip(
@@ -1102,7 +1351,6 @@ impl RemoteBrowser {
                             .style(container::bordered_box),
                         );
                     }
-
                     buttons = buttons
                         .push(
                             tooltip(
@@ -1159,34 +1407,19 @@ impl RemoteBrowser {
                             )
                             .style(container::bordered_box),
                         );
-
                     buttons.into()
-                } else if is_text_file {
+                } else if is_text_file || is_image_file || is_pdf_file {
                     tooltip(
                         button(text("View").size(small))
                             .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
                             .padding([2, 8]),
-                        "View text content",
-                        tooltip::Position::Top,
-                    )
-                    .style(container::bordered_box)
-                    .into()
-                } else if is_image_file {
-                    tooltip(
-                        button(text("View").size(small))
-                            .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
-                            .padding([2, 8]),
-                        "View image",
-                        tooltip::Position::Top,
-                    )
-                    .style(container::bordered_box)
-                    .into()
-                } else if is_pdf_file {
-                    tooltip(
-                        button(text("View").size(small))
-                            .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
-                            .padding([2, 8]),
-                        "View PDF",
+                        if is_text_file {
+                            "View text content"
+                        } else if is_image_file {
+                            "View image"
+                        } else {
+                            "View PDF"
+                        },
                         tooltip::Position::Top,
                     )
                     .style(container::bordered_box)
@@ -1195,7 +1428,6 @@ impl RemoteBrowser {
                     iced::widget::Space::new().width(0).into()
                 };
 
-                // Wrap filename in tooltip if truncated to show full name
                 let is_truncated = entry.name.len() > max_name_len;
                 let filename_button = button(text(display_name.clone()).size(normal))
                     .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
@@ -1224,15 +1456,40 @@ impl RemoteBrowser {
                     .size(14)
                     .into();
 
+                // ── Per-row rename and delete buttons ──────────────────────
+                let path_for_rename = entry.path.clone();
+                let path_for_delete = entry.path.clone();
+
+                let rename_btn = tooltip(
+                    button(text("✎").size(tiny))
+                        .on_press(RemoteBrowserMessage::RenameFile(path_for_rename))
+                        .padding([2, 5]),
+                    "Rename",
+                    tooltip::Position::Top,
+                )
+                .style(container::bordered_box);
+
+                let delete_btn = tooltip(
+                    button(text("🗑").size(tiny))
+                        .on_press(RemoteBrowserMessage::DeleteFile(path_for_delete))
+                        .padding([2, 5]),
+                    if entry.is_dir {
+                        "Delete directory (recursive)"
+                    } else {
+                        "Delete file"
+                    },
+                    tooltip::Position::Top,
+                )
+                .style(container::bordered_box);
+
                 let file_row = row![
-                    // Checkbox for selection
                     checkbox_element,
-                    // Clickable filename (with tooltip if truncated)
                     filename_element,
-                    // Type label
                     text(type_label).size(tiny).width(Length::Fixed(28.0)),
-                    // Action button
                     action_button,
+                    Space::new().width(4),
+                    rename_btn,
+                    delete_btn,
                 ]
                 .spacing(4)
                 .align_y(iced::Alignment::Center)
@@ -1244,7 +1501,7 @@ impl RemoteBrowser {
             scrollable(
                 Column::with_children(items)
                     .spacing(0)
-                    .padding(iced::Padding::ZERO.right(12)), // Right padding for scrollbar clearance
+                    .padding(iced::Padding::ZERO.right(12)),
             )
             .height(Length::Fill)
             .into()
@@ -1265,11 +1522,161 @@ impl RemoteBrowser {
         .into()
     }
 
+    // ── Delete confirm dialog ─────────────────────────────────────────────────
+
+    fn view_delete_confirm_dialog<'a>(
+        &self,
+        dp: &'a DeletePending,
+        font_size: u32,
+    ) -> Element<'a, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+
+        let header = row![
+            text("⚠ Confirm Delete").size(normal),
+            Space::new().width(Length::Fill),
+        ]
+        .align_y(iced::Alignment::Center);
+
+        // List up to 8 paths, then summarise the rest
+        let mut path_items: Vec<Element<'_, RemoteBrowserMessage>> = dp
+            .paths
+            .iter()
+            .take(8)
+            .map(|p| {
+                text(p.rsplit('/').next().unwrap_or(p))
+                    .size(small)
+                    .color(iced::Color::from_rgb(0.8, 0.8, 0.8))
+                    .into()
+            })
+            .collect();
+        if dp.paths.len() > 8 {
+            path_items.push(
+                text(format!("… and {} more", dp.paths.len() - 8))
+                    .size(small)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6))
+                    .into(),
+            );
+        }
+
+        let buttons = row![
+            button(text("Cancel").size(normal))
+                .on_press(RemoteBrowserMessage::DeleteCancel)
+                .padding([6, 16]),
+            Space::new().width(10),
+            button(text("🗑 Delete").size(normal))
+                .on_press(RemoteBrowserMessage::DeleteConfirm)
+                .padding([6, 16]),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center);
+
+        container(
+            column![
+                header,
+                rule::horizontal(1),
+                text(&dp.summary)
+                    .size(normal)
+                    .color(iced::Color::from_rgb(1.0, 0.6, 0.3)),
+                Column::with_children(path_items).spacing(2).padding([4, 8]),
+                text("This cannot be undone.")
+                    .size(small)
+                    .color(iced::Color::from_rgb(0.7, 0.3, 0.3)),
+                rule::horizontal(1),
+                row![Space::new().width(Length::Fill), buttons].padding([4, 0]),
+            ]
+            .spacing(8)
+            .padding(12),
+        )
+        .width(Length::Fill)
+        .style(container::bordered_box)
+        .into()
+    }
+
+    // ── Rename dialog ─────────────────────────────────────────────────────────
+
+    fn view_rename_dialog<'a>(
+        &self,
+        rp: &'a RenamePending,
+        font_size: u32,
+    ) -> Element<'a, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+        let tiny = (font_size.saturating_sub(3)).max(7);
+
+        let original_name = rp
+            .original_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&rp.original_path);
+
+        let header = row![
+            text("✎ Rename").size(normal),
+            Space::new().width(Length::Fill),
+            button(text("✖ Cancel").size(small))
+                .on_press(RemoteBrowserMessage::RenameCancel)
+                .padding([4, 10]),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(5);
+
+        let from_row = row![
+            text("From:").size(small).width(Length::Fixed(55.0)),
+            text(original_name)
+                .size(normal)
+                .color(iced::Color::from_rgb(0.7, 0.7, 0.7)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let to_row = row![
+            text("To:").size(small).width(Length::Fixed(55.0)),
+            text_input("new name...", &rp.new_name)
+                .on_input(RemoteBrowserMessage::RenameInputChanged)
+                .on_submit(RemoteBrowserMessage::RenameConfirm)
+                .size(normal)
+                .padding(6)
+                .width(Length::Fill),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let can_rename = !rp.new_name.trim().is_empty() && rp.new_name.trim() != original_name;
+
+        let confirm_btn = if can_rename {
+            button(text("✔ Rename").size(normal))
+                .on_press(RemoteBrowserMessage::RenameConfirm)
+                .padding([6, 16])
+        } else {
+            button(text("✔ Rename").size(normal)).padding([6, 16])
+        };
+
+        let hint = text("Press Enter or click Rename to confirm.")
+            .size(tiny)
+            .color(iced::Color::from_rgb(0.5, 0.5, 0.5));
+
+        container(
+            column![
+                header,
+                rule::horizontal(1),
+                from_row,
+                to_row,
+                hint,
+                rule::horizontal(1),
+                row![Space::new().width(Length::Fill), confirm_btn].padding([4, 0]),
+            ]
+            .spacing(8)
+            .padding(12),
+        )
+        .width(Length::Fill)
+        .style(container::bordered_box)
+        .into()
+    }
+
     /// Build the status bar element — shows progress bar during transfers,
     /// "Loading..." during popup loads, or the regular status message.
     fn view_status_bar(&self, small: u32) -> Element<'_, RemoteBrowserMessage> {
         if let Some(prog) = self.get_progress() {
-            // Truncate current filename for display
             let file_display = if prog.current_file.len() > 30 {
                 format!("...{}", &prog.current_file[prog.current_file.len() - 27..])
             } else {
@@ -1277,7 +1684,6 @@ impl RemoteBrowser {
             };
 
             if prog.total > 0 {
-                // Determinate progress: known total (e.g. batch of individual files)
                 let pct = prog.current as f32 / prog.total as f32;
                 column![
                     row![
@@ -1295,8 +1701,6 @@ impl RemoteBrowser {
                 .spacing(2)
                 .into()
             } else {
-                // Indeterminate progress: unknown total (e.g. recursive directory download)
-                // Show file count and current filename, bar pulses at 100% to indicate activity
                 column![
                     row![
                         text(format!("{} ({} files)", prog.operation, prog.current)).size(small),
@@ -1333,7 +1737,6 @@ impl RemoteBrowser {
         .align_y(iced::Alignment::Center)
         .spacing(5);
 
-        // Disk type radio buttons
         let type_row = row![
             text("Format:").size(small).width(Length::Fixed(70.0)),
             button(
@@ -1378,7 +1781,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Disk name input
         let name_row = row![
             text("Name:").size(small).width(Length::Fixed(70.0)),
             text_input("DISK NAME (max 16 chars)", &self.create_disk_name)
@@ -1392,7 +1794,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Disk ID input
         let id_row = row![
             text("ID:").size(small).width(Length::Fixed(70.0)),
             text_input("XX XX", &self.create_disk_id)
@@ -1406,7 +1807,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Destination info
         let dest_row = row![
             text("Dest:").size(small).width(Length::Fixed(70.0)),
             text(format!("{}/", self.current_path)).size(small),
@@ -1414,7 +1814,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Filename preview
         let safe_name = self.create_disk_name.replace(' ', "_");
         let ext = match self.create_disk_type {
             DiskCreateType::D64 => "d64",
@@ -1430,7 +1829,6 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Confirm button
         let can_create =
             !self.create_disk_busy && !self.create_disk_name.is_empty() && self.is_connected;
 
@@ -1484,7 +1882,6 @@ impl RemoteBrowser {
         let normal = font_size;
         let tiny = (font_size.saturating_sub(3)).max(7);
 
-        // Header with disk name and close button
         let header = row![
             text(format!("{} - ", disk_info.kind)).size(small),
             text(format!("\"{}\"", disk_info.name)).size(normal),
@@ -1503,11 +1900,8 @@ impl RemoteBrowser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        // Show rendered C64-style PETSCII image if available,
-        // otherwise fall back to plain text listing
         let listing: Element<'_, RemoteBrowserMessage> =
             if let Some(png_bytes) = &self.disk_listing_image {
-                // Render as a pixel-perfect C64 screen image
                 let handle = iced::widget::image::Handle::from_bytes(png_bytes.clone());
                 scrollable(
                     container(
@@ -1520,7 +1914,6 @@ impl RemoteBrowser {
                 .height(Length::Fill)
                 .into()
             } else {
-                // Fallback: plain text listing (used while image is loading)
                 let mut items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
                 for entry in &disk_info.entries {
                     let type_color = match entry.file_type {
@@ -1560,7 +1953,6 @@ impl RemoteBrowser {
                 .into()
             };
 
-        // Footer with blocks free
         let footer = row![
             text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(small),
             Space::new().width(Length::Fill),
@@ -1568,14 +1960,13 @@ impl RemoteBrowser {
         ]
         .spacing(10);
 
-        // Popup container with border styling
         container(
             column![
                 header,
                 rule::horizontal(1),
                 listing,
                 rule::horizontal(1),
-                footer,
+                footer
             ]
             .spacing(5)
             .padding(10),
@@ -1601,17 +1992,15 @@ impl RemoteBrowser {
                 content,
                 line_count,
             } => {
-                // Truncate long filenames
                 let display_name = if filename.len() > 40 {
                     format!("{}...", &filename[..37])
                 } else {
                     filename.clone()
                 };
 
-                // Header with filename and close button
                 let header = row![
                     text("TEXT - ").size(small),
-                    text(display_name.clone()).size(normal),
+                    text(display_name).size(normal),
                     Space::new().width(Length::Fill),
                     text(format!("{} lines", line_count)).size(small),
                     Space::new().width(10),
@@ -1627,7 +2016,6 @@ impl RemoteBrowser {
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
 
-                // Text content with line numbers
                 let mut text_lines: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
                 for (i, line) in content.lines().enumerate() {
                     let line_row = row![
@@ -1641,7 +2029,6 @@ impl RemoteBrowser {
                     text_lines.push(line_row.into());
                 }
 
-                // Scrollable text content
                 let text_content = scrollable(
                     Column::with_children(text_lines)
                         .spacing(2)
@@ -1649,9 +2036,8 @@ impl RemoteBrowser {
                 )
                 .height(Length::Fill);
 
-                // Popup container
                 container(
-                    column![header, rule::horizontal(1), text_content,]
+                    column![header, rule::horizontal(1), text_content]
                         .spacing(5)
                         .padding(10),
                 )
@@ -1666,17 +2052,15 @@ impl RemoteBrowser {
                 width,
                 height,
             } => {
-                // Truncate long filenames
                 let display_name = if filename.len() > 40 {
                     format!("{}...", &filename[..37])
                 } else {
                     filename.clone()
                 };
 
-                // Header with filename and close button
                 let header = row![
                     text("IMAGE - ").size(small),
-                    text(display_name.clone()).size(normal),
+                    text(display_name).size(normal),
                     Space::new().width(Length::Fill),
                     text(format!("{}x{}", width, height)).size(small),
                     Space::new().width(10),
@@ -1692,13 +2076,11 @@ impl RemoteBrowser {
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
 
-                // Image display using iced's image widget
                 let image_handle = iced::widget::image::Handle::from_bytes(data.clone());
                 let image_widget = iced::widget::image(image_handle)
                     .width(Length::Fill)
                     .height(Length::Fill);
 
-                // Popup container
                 container(
                     column![
                         header,
@@ -1737,8 +2119,6 @@ impl RemoteBrowser {
         self.checked_files.clear();
     }
 
-    /// Subscription that ticks every 250ms while a transfer is in progress.
-    /// Wire this into your main app's subscription alongside other subscriptions.
     pub fn subscription(&self) -> Subscription<RemoteBrowserMessage> {
         let has_progress = self
             .transfer_progress
@@ -1754,7 +2134,6 @@ impl RemoteBrowser {
         }
     }
 
-    /// Returns true if a file transfer is currently in progress
     pub fn is_transferring(&self) -> bool {
         self.transfer_progress
             .lock()
@@ -1762,13 +2141,222 @@ impl RemoteBrowser {
             .unwrap_or(false)
     }
 
-    /// Returns current transfer progress if a transfer is in progress
     fn get_progress(&self) -> Option<TransferProgress> {
         self.transfer_progress.lock().ok().and_then(|g| g.clone())
     }
 }
 
-// Get icon for file type
+// ─── Delete via FTP ───────────────────────────────────────────────────────────
+
+/// Delete a list of remote paths. Directories are deleted recursively.
+/// `paths_with_type` is `(remote_path, is_dir)`.
+async fn delete_ftp(
+    host: String,
+    paths_with_type: Vec<(String, bool)>,
+    password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
+) -> Result<String, String> {
+    let total = paths_with_type.len();
+    log::info!("FTP: Deleting {} item(s)", total);
+
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_UPLOAD_DIR_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .ok();
+            ftp.get_ref()
+                .set_write_timeout(Some(Duration::from_secs(30)))
+                .ok();
+
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            let mut deleted = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+
+            for (i, (path, is_dir)) in paths_with_type.iter().enumerate() {
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+
+                // Update progress
+                if let Ok(mut g) = progress.lock() {
+                    if let Some(ref mut p) = *g {
+                        p.current = i;
+                        p.current_file = name.clone();
+                    }
+                }
+
+                if *is_dir {
+                    match delete_dir_recursive_ftp(&mut ftp, path) {
+                        Ok(count) => deleted += count,
+                        Err(e) => errors.push(format!("{}: {}", name, e)),
+                    }
+                } else {
+                    match ftp.rm(path) {
+                        Ok(_) => {
+                            deleted += 1;
+                            log::debug!("FTP: Deleted file {}", path);
+                        }
+                        Err(e) => errors.push(format!("{}: {}", name, e)),
+                    }
+                }
+            }
+
+            // Mark progress done
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.current = total;
+                    p.done = true;
+                }
+            }
+
+            let _ = ftp.quit();
+
+            let mut msg = format!("Deleted {} item(s)", deleted);
+            if !errors.is_empty() {
+                msg.push_str(&format!(" ({} errors)", errors.len()));
+                for e in errors.iter().take(3) {
+                    log::warn!("Delete error: {}", e);
+                }
+            }
+            Ok(msg)
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Delete timed out".to_string()),
+    }
+}
+
+/// Recursively delete a remote directory and all its contents via FTP.
+/// Returns the number of items deleted.
+fn delete_dir_recursive_ftp(
+    ftp: &mut suppaftp::FtpStream,
+    remote_path: &str,
+) -> Result<usize, String> {
+    let mut deleted = 0usize;
+
+    // List contents
+    let entries = ftp
+        .list(Some(remote_path))
+        .map_err(|e| format!("List {}: {}", remote_path, e))?;
+
+    for line in &entries {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let name = parts[8..].join(" ");
+        if name == "." || name == ".." {
+            continue;
+        }
+        let is_dir = line.starts_with('d');
+        let child = format!("{}/{}", remote_path.trim_end_matches('/'), name);
+
+        if is_dir {
+            deleted += delete_dir_recursive_ftp(ftp, &child)?;
+        } else {
+            match ftp.rm(&child) {
+                Ok(_) => {
+                    deleted += 1;
+                    log::debug!("FTP: Deleted {}", child);
+                }
+                Err(e) => log::warn!("FTP: Failed to delete {}: {}", child, e),
+            }
+        }
+    }
+
+    // Now remove the (now-empty) directory itself
+    match ftp.rmdir(remote_path) {
+        Ok(_) => {
+            deleted += 1;
+            log::debug!("FTP: Removed directory {}", remote_path);
+        }
+        Err(e) => log::warn!("FTP: Failed to rmdir {}: {}", remote_path, e),
+    }
+
+    Ok(deleted)
+}
+
+// ─── Rename via FTP ───────────────────────────────────────────────────────────
+
+/// Rename/move a remote file or directory using FTP RNFR/RNTO.
+async fn rename_ftp(
+    host: String,
+    old_path: String,
+    new_path: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    log::info!("FTP: Renaming {} → {}", old_path, new_path);
+
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .ok();
+
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            let new_name = new_path.rsplit('/').next().unwrap_or(&new_path).to_string();
+
+            ftp.rename(&old_path, &new_path)
+                .map_err(|e| format!("Rename failed: {}", e))?;
+
+            let _ = ftp.quit();
+
+            Ok(format!("Renamed to {}", new_name))
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Rename timed out".to_string()),
+    }
+}
+
+// ─── Existing helpers (unchanged) ────────────────────────────────────────────
+
 fn get_file_icon(name: &str) -> &'static str {
     let lower = name.to_lowercase();
     if lower.ends_with(".prg") {
@@ -1810,7 +2398,6 @@ fn get_file_icon(name: &str) -> &'static str {
     }
 }
 
-/// Check if a remote file is a previewable text file (by name)
 fn is_remote_text_file(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".txt")
@@ -1821,7 +2408,6 @@ fn is_remote_text_file(name: &str) -> bool {
         || lower == "file_id.diz"
 }
 
-/// Check if a remote file is a previewable image file (by name)
 fn is_remote_image_file(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".png")
@@ -1831,7 +2417,10 @@ fn is_remote_image_file(name: &str) -> bool {
         || lower.ends_with(".bmp")
 }
 
-// Fetch files via FTP
+fn is_remote_pdf_file(name: &str) -> bool {
+    name.to_lowercase().ends_with(".pdf")
+}
+
 async fn fetch_files_ftp(
     host: String,
     path: String,
@@ -1839,19 +2428,16 @@ async fn fetch_files_ftp(
 ) -> Result<Vec<RemoteFileEntry>, String> {
     log::info!("FTP: Listing {} on {}", path, host);
 
-    // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
             use std::time::Duration;
             use suppaftp::FtpStream;
 
-            // Connect to FTP server (port 21)
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
 
-            // Set timeout
             ftp.get_ref()
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .ok();
@@ -1859,7 +2445,6 @@ async fn fetch_files_ftp(
                 .set_write_timeout(Some(Duration::from_secs(10)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -1873,7 +2458,6 @@ async fn fetch_files_ftp(
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
 
-            // Change to directory
             let ftp_path = if path.is_empty() || path == "/" {
                 "/"
             } else {
@@ -1882,13 +2466,11 @@ async fn fetch_files_ftp(
             ftp.cwd(ftp_path)
                 .map_err(|e| format!("Cannot access {}: {}", ftp_path, e))?;
 
-            // List directory
             let list = ftp
                 .list(None)
                 .map_err(|e| format!("FTP list failed: {}", e))?;
 
             let mut entries = Vec::new();
-
             for line in list {
                 if let Some(entry) = parse_ftp_line(&line, &path) {
                     if entry.name != "." && entry.name != ".." {
@@ -1897,16 +2479,13 @@ async fn fetch_files_ftp(
                 }
             }
 
-            // Sort: directories first, then by name
             entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
             });
 
-            // Logout
             let _ = ftp.quit();
-
             Ok(entries)
         }),
     )
@@ -1919,35 +2498,27 @@ async fn fetch_files_ftp(
     }
 }
 
-// Parse FTP LIST line (Unix or DOS format)
 fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
     let line = line.trim();
     if line.is_empty() {
         return None;
     }
 
-    // Try Unix format: drwxr-xr-x 2 owner group 4096 Jan 1 12:00 filename
-    // Or: -rw-r--r-- 1 owner group 12345 Jan 1 12:00 filename
     if line.len() > 10 && (line.starts_with('d') || line.starts_with('-') || line.starts_with('l'))
     {
         let is_dir = line.starts_with('d');
-
-        // Split by whitespace, filename is everything after the 8th field
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 9 {
             let size: u64 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
             let name = parts[8..].join(" ");
-
             if name.is_empty() || name == "." || name == ".." {
                 return None;
             }
-
             let entry_path = if parent_path == "/" {
                 format!("/{}", name)
             } else {
                 format!("{}/{}", parent_path.trim_end_matches('/'), name)
             };
-
             return Some(RemoteFileEntry {
                 name,
                 is_dir,
@@ -1957,8 +2528,6 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
         }
     }
 
-    // Try DOS/Windows format: 01-01-24 12:00PM <DIR> dirname
-    // Or: 01-01-24 12:00PM 12345 filename
     if line.contains("<DIR>") {
         let parts: Vec<&str> = line.split("<DIR>").collect();
         if parts.len() == 2 {
@@ -1980,25 +2549,20 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
         }
     }
 
-    // Simple format: just filename or "filename size"
     let parts: Vec<&str> = line.split_whitespace().collect();
     if !parts.is_empty() {
         let name = parts[0].to_string();
         let is_dir = name.ends_with('/');
         let name = name.trim_end_matches('/').to_string();
-
         if name.is_empty() || name == "." || name == ".." {
             return None;
         }
-
         let size: u64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-
         let entry_path = if parent_path == "/" {
             format!("/{}", name)
         } else {
             format!("{}/{}", parent_path.trim_end_matches('/'), name)
         };
-
         return Some(RemoteFileEntry {
             name,
             is_dir,
@@ -2010,15 +2574,11 @@ fn parse_ftp_line(line: &str, parent_path: &str) -> Option<RemoteFileEntry> {
     None
 }
 
-// Download file via FTP with longer timeout for previews
 async fn download_file_ftp_preview(
     host: String,
     remote_path: String,
     password: Option<String>,
 ) -> Result<(String, Vec<u8>), String> {
-    log::info!("FTP: Downloading preview {}", remote_path);
-
-    // Use longer timeout for preview downloads
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_PREVIEW_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -2029,12 +2589,10 @@ async fn download_file_ftp_preview(
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
-
             ftp.get_ref()
                 .set_read_timeout(Some(Duration::from_secs(120)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -2048,29 +2606,20 @@ async fn download_file_ftp_preview(
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
 
-            // Set binary transfer mode
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-            // Get filename from path
             let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
-
-            // Retrieve file
             let mut reader = ftp
                 .retr_as_stream(&remote_path)
                 .map_err(|e| format!("FTP download failed: {}", e))?;
-
             let mut data = Vec::new();
             reader
                 .read_to_end(&mut data)
                 .map_err(|e| format!("Read error: {}", e))?;
-
-            // Finalize transfer
             ftp.finalize_retr_stream(reader)
                 .map_err(|e| format!("Transfer finalize error: {}", e))?;
-
             let _ = ftp.quit();
-
             Ok((filename, data))
         }),
     )
@@ -2083,8 +2632,6 @@ async fn download_file_ftp_preview(
     }
 }
 
-// Download file via FTP
-/// Single file download with progress reporting
 async fn download_file_ftp_with_progress(
     host: String,
     remote_path: String,
@@ -2092,7 +2639,6 @@ async fn download_file_ftp_with_progress(
     progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<(String, Vec<u8>), String> {
     let result = download_file_ftp(host, remote_path, password).await;
-    // Mark progress as done
     if let Ok(mut g) = progress.lock() {
         if let Some(ref mut p) = *g {
             p.current = 1;
@@ -2102,7 +2648,6 @@ async fn download_file_ftp_with_progress(
     result
 }
 
-// Download file via FTP
 async fn download_file_ftp(
     host: String,
     remote_path: String,
@@ -2110,7 +2655,6 @@ async fn download_file_ftp(
 ) -> Result<(String, Vec<u8>), String> {
     log::info!("FTP: Downloading {}", remote_path);
 
-    // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -2121,12 +2665,10 @@ async fn download_file_ftp(
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
-
             ftp.get_ref()
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -2140,29 +2682,20 @@ async fn download_file_ftp(
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
 
-            // Set binary transfer mode
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-            // Get filename from path
             let filename = remote_path.rsplit('/').next().unwrap_or("file").to_string();
-
-            // Retrieve file
             let mut reader = ftp
                 .retr_as_stream(&remote_path)
                 .map_err(|e| format!("FTP download failed: {}", e))?;
-
             let mut data = Vec::new();
             reader
                 .read_to_end(&mut data)
                 .map_err(|e| format!("Read error: {}", e))?;
-
-            // Finalize transfer
             ftp.finalize_retr_stream(reader)
                 .map_err(|e| format!("Transfer finalize error: {}", e))?;
-
             let _ = ftp.quit();
-
             Ok((filename, data))
         }),
     )
@@ -2175,7 +2708,6 @@ async fn download_file_ftp(
     }
 }
 
-// Upload file via FTP
 async fn upload_file_ftp(
     host: String,
     local_path: PathBuf,
@@ -2183,9 +2715,6 @@ async fn upload_file_ftp(
     password: Option<String>,
     progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
-    log::info!("FTP: Uploading {} to {}", local_path.display(), remote_dest);
-
-    // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -2193,10 +2722,8 @@ async fn upload_file_ftp(
             use std::time::Duration;
             use suppaftp::FtpStream;
 
-            // Read local file
             let data =
                 std::fs::read(&local_path).map_err(|e| format!("Cannot read file: {}", e))?;
-
             let filename = local_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2206,12 +2733,10 @@ async fn upload_file_ftp(
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
-
             ftp.get_ref()
                 .set_write_timeout(Some(Duration::from_secs(120)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -2225,35 +2750,28 @@ async fn upload_file_ftp(
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
 
-            // Set binary transfer mode
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-            // Change to destination directory
             let dest_dir = if remote_dest.ends_with('/') {
                 remote_dest.as_str()
             } else {
                 remote_dest.rsplit_once('/').map(|(d, _)| d).unwrap_or("/")
             };
-
             ftp.cwd(dest_dir)
                 .map_err(|e| format!("Cannot access {}: {}", dest_dir, e))?;
 
-            // Upload file
             let mut cursor = Cursor::new(data);
             ftp.put_file(&filename, &mut cursor)
                 .map_err(|e| format!("FTP upload failed: {}", e))?;
-
             let _ = ftp.quit();
 
-            // Mark progress as done
             if let Ok(mut g) = progress.lock() {
                 if let Some(ref mut p) = *g {
                     p.current = 1;
                     p.done = true;
                 }
             }
-
             Ok(filename)
         }),
     )
@@ -2266,7 +2784,6 @@ async fn upload_file_ftp(
     }
 }
 
-// Upload directory recursively via FTP
 async fn upload_directory_ftp(
     host: String,
     local_path: PathBuf,
@@ -2274,13 +2791,6 @@ async fn upload_directory_ftp(
     password: Option<String>,
     progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
-    log::info!(
-        "FTP: Uploading directory {} to {}",
-        local_path.display(),
-        remote_dest
-    );
-
-    // Use longer timeout for directory uploads which may take time
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(FTP_UPLOAD_DIR_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
@@ -2288,7 +2798,6 @@ async fn upload_directory_ftp(
             use std::time::Duration;
             use suppaftp::FtpStream;
 
-            // Count total files for progress (quick pre-scan)
             let total_files = WalkDir::new(&local_path)
                 .min_depth(1)
                 .into_iter()
@@ -2296,7 +2805,6 @@ async fn upload_directory_ftp(
                 .filter(|e| e.file_type().is_file())
                 .count();
 
-            // Initialize progress
             if let Ok(mut g) = progress.lock() {
                 *g = Some(TransferProgress {
                     current: 0,
@@ -2310,12 +2818,10 @@ async fn upload_directory_ftp(
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
-
             ftp.get_ref()
                 .set_write_timeout(Some(Duration::from_secs(120)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -2329,17 +2835,14 @@ async fn upload_directory_ftp(
                     .map_err(|e| format!("FTP login failed: {}", e))?;
             }
 
-            // Set binary transfer mode
             ftp.transfer_type(suppaftp::types::FileType::Binary)
                 .map_err(|e| format!("Failed to set binary mode: {}", e))?;
 
-            // Get the directory name to create on remote
             let dir_name = local_path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .ok_or_else(|| "Invalid directory name".to_string())?;
 
-            // Build base remote path
             let base_remote = if remote_dest.ends_with('/') {
                 format!("{}{}", remote_dest, dir_name)
             } else {
@@ -2350,7 +2853,6 @@ async fn upload_directory_ftp(
             let mut files_uploaded = 0;
             let mut errors: Vec<String> = Vec::new();
 
-            // Walk the directory tree
             for entry in WalkDir::new(&local_path).min_depth(0) {
                 let entry = match entry {
                     Ok(e) => e,
@@ -2360,36 +2862,28 @@ async fn upload_directory_ftp(
                     }
                 };
 
-                // Get relative path from the source directory
                 let relative = match entry.path().strip_prefix(&local_path) {
                     Ok(r) => r,
                     Err(_) => continue,
                 };
 
-                // Build remote path
                 let remote_path = if relative.as_os_str().is_empty() {
                     base_remote.clone()
                 } else {
-                    // Convert path separators to forward slashes for FTP
                     let relative_str = relative.to_string_lossy().replace('\\', "/");
                     format!("{}/{}", base_remote, relative_str)
                 };
 
                 if entry.file_type().is_dir() {
-                    // Create directory on remote (ignore errors if it exists)
-                    log::debug!("FTP: Creating directory {}", remote_path);
                     match ftp.mkdir(&remote_path) {
                         Ok(_) => {
                             dirs_created += 1;
-                            log::debug!("FTP: Created directory {}", remote_path);
                         }
                         Err(e) => {
-                            // Directory might already exist, log but continue
                             log::debug!("FTP: mkdir {} (may exist): {}", remote_path, e);
                         }
                     }
                 } else if entry.file_type().is_file() {
-                    // Update progress with current filename
                     let filename_display = entry
                         .path()
                         .file_name()
@@ -2402,10 +2896,6 @@ async fn upload_directory_ftp(
                         }
                     }
 
-                    // Upload file
-                    log::debug!("FTP: Uploading file to {}", remote_path);
-
-                    // Read file data
                     let data = match std::fs::read(entry.path()) {
                         Ok(d) => d,
                         Err(e) => {
@@ -2414,35 +2904,29 @@ async fn upload_directory_ftp(
                         }
                     };
 
-                    // Get parent directory and filename
                     let (parent_dir, filename) = if let Some(pos) = remote_path.rfind('/') {
                         (&remote_path[..pos], &remote_path[pos + 1..])
                     } else {
                         ("/", remote_path.as_str())
                     };
 
-                    // Change to parent directory
                     if let Err(e) = ftp.cwd(parent_dir) {
                         errors.push(format!("CWD {}: {}", parent_dir, e));
                         continue;
                     }
 
-                    // Upload the file
                     let mut cursor = Cursor::new(data);
                     match ftp.put_file(filename, &mut cursor) {
                         Ok(_) => {
                             files_uploaded += 1;
-                            log::debug!("FTP: Uploaded {}", remote_path);
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.current = files_uploaded;
+                                }
+                            }
                         }
                         Err(e) => {
                             errors.push(format!("Upload {}: {}", filename, e));
-                        }
-                    }
-
-                    // Update progress count
-                    if let Ok(mut g) = progress.lock() {
-                        if let Some(ref mut p) = *g {
-                            p.current = files_uploaded;
                         }
                     }
                 }
@@ -2450,25 +2934,19 @@ async fn upload_directory_ftp(
 
             let _ = ftp.quit();
 
-            // Mark progress as done
             if let Ok(mut g) = progress.lock() {
                 if let Some(ref mut p) = *g {
                     p.done = true;
                 }
             }
 
-            // Build result message
             let mut msg = format!(
                 "Uploaded: {} files, {} directories",
                 files_uploaded, dirs_created
             );
             if !errors.is_empty() {
                 msg.push_str(&format!(" ({} errors)", errors.len()));
-                for err in errors.iter().take(3) {
-                    log::warn!("Upload error: {}", err);
-                }
             }
-
             Ok(msg)
         }),
     )
@@ -2481,7 +2959,6 @@ async fn upload_directory_ftp(
     }
 }
 
-/// Download multiple files and directories via FTP to a local directory
 async fn download_batch_ftp(
     host: String,
     file_paths: Vec<String>,
@@ -2490,14 +2967,6 @@ async fn download_batch_ftp(
     password: Option<String>,
     progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
 ) -> Result<String, String> {
-    log::info!(
-        "FTP: Batch downloading {} files and {} directories to {}",
-        file_paths.len(),
-        dir_paths.len(),
-        local_dest.display()
-    );
-
-    // Initialize progress (files + directories as total items)
     let total = file_paths.len() + dir_paths.len();
     if let Ok(mut g) = progress.lock() {
         *g = Some(TransferProgress {
@@ -2519,12 +2988,10 @@ async fn download_batch_ftp(
             let addr = format!("{}:21", host);
             let mut ftp =
                 FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
-
             ftp.get_ref()
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .ok();
 
-            // Login with password or anonymous
             if let Some(ref pwd) = password {
                 if !pwd.is_empty() {
                     ftp.login("admin", pwd)
@@ -2546,23 +3013,15 @@ async fn download_batch_ftp(
             let mut items_completed = 0;
             let mut errors: Vec<String> = Vec::new();
 
-            // Download individual files
             for remote_path in &file_paths {
                 let filename = remote_path.rsplit('/').next().unwrap_or("file");
                 let local_path = local_dest.join(filename);
 
-                // Update progress with current filename
                 if let Ok(mut g) = progress.lock() {
                     if let Some(ref mut p) = *g {
                         p.current_file = filename.to_string();
                     }
                 }
-
-                log::debug!(
-                    "FTP: Downloading file {} to {}",
-                    remote_path,
-                    local_path.display()
-                );
 
                 match ftp.retr_as_stream(remote_path) {
                     Ok(mut reader) => {
@@ -2586,7 +3045,6 @@ async fn download_batch_ftp(
                     }
                 }
 
-                // Update progress count
                 items_completed += 1;
                 if let Ok(mut g) = progress.lock() {
                     if let Some(ref mut p) = *g {
@@ -2595,13 +3053,10 @@ async fn download_batch_ftp(
                 }
             }
 
-            // Download directories recursively
             for remote_dir in &dir_paths {
                 let dir_name = remote_dir.rsplit('/').next().unwrap_or("dir");
                 let local_dir = local_dest.join(dir_name);
 
-                // Switch progress to per-file mode for this directory
-                // total=0 signals indeterminate (we don't know how many files are inside)
                 if let Ok(mut g) = progress.lock() {
                     if let Some(ref mut p) = *g {
                         p.current = 0;
@@ -2610,12 +3065,6 @@ async fn download_batch_ftp(
                         p.operation = "Downloading".to_string();
                     }
                 }
-
-                log::debug!(
-                    "FTP: Downloading directory {} to {}",
-                    remote_dir,
-                    local_dir.display()
-                );
 
                 match download_directory_recursive(&mut ftp, remote_dir, &local_dir, &progress) {
                     Ok((files, dirs)) => {
@@ -2630,7 +3079,6 @@ async fn download_batch_ftp(
 
             let _ = ftp.quit();
 
-            // Mark progress as done
             if let Ok(mut g) = progress.lock() {
                 if let Some(ref mut p) = *g {
                     p.done = true;
@@ -2643,9 +3091,6 @@ async fn download_batch_ftp(
             );
             if !errors.is_empty() {
                 msg.push_str(&format!(" ({} errors)", errors.len()));
-                for err in errors.iter().take(3) {
-                    log::warn!("Download error: {}", err);
-                }
             }
             Ok(msg)
         }),
@@ -2659,7 +3104,6 @@ async fn download_batch_ftp(
     }
 }
 
-/// Recursively download a remote directory via FTP
 fn download_directory_recursive(
     ftp: &mut suppaftp::FtpStream,
     remote_path: &str,
@@ -2672,15 +3116,13 @@ fn download_directory_recursive(
         .map_err(|e| format!("Create dir {}: {}", local_path.display(), e))?;
 
     let mut files_count = 0;
-    let mut dirs_count = 1; // Count this directory
+    let mut dirs_count = 1;
 
-    // List remote directory contents
     let entries = ftp
         .list(Some(remote_path))
         .map_err(|e| format!("List {}: {}", remote_path, e))?;
 
     for entry_line in &entries {
-        // Parse FTP LIST output (Unix-style: "drwxr-xr-x ... name")
         let parts: Vec<&str> = entry_line.split_whitespace().collect();
         if parts.len() < 9 {
             continue;
@@ -2705,13 +3147,11 @@ fn download_directory_recursive(
                 }
             }
         } else {
-            // Update progress with current filename
             if let Ok(mut g) = progress.lock() {
                 if let Some(ref mut p) = *g {
                     p.current_file = name.clone();
                 }
             }
-
             match ftp.retr_as_stream(&child_remote) {
                 Ok(mut reader) => {
                     let mut data = Vec::new();
@@ -2719,8 +3159,6 @@ fn download_directory_recursive(
                         let _ = ftp.finalize_retr_stream(reader);
                         if std::fs::write(&child_local, &data).is_ok() {
                             files_count += 1;
-
-                            // Update progress count (increment current for each file)
                             if let Ok(mut g) = progress.lock() {
                                 if let Some(ref mut p) = *g {
                                     p.current += 1;
@@ -2739,64 +3177,41 @@ fn download_directory_recursive(
     Ok((files_count, dirs_count))
 }
 
-/// Download a remote disk image via FTP and parse its contents
 async fn load_remote_disk_info(
     host: String,
     remote_path: String,
     password: Option<String>,
 ) -> Result<DiskInfo, String> {
-    log::info!("FTP: Loading disk info for {}", remote_path);
-
-    // Download the file first
     let (_, data) = download_file_ftp(host, remote_path, password).await?;
-
-    // Parse the disk image from bytes
     tokio::task::spawn_blocking(move || disk_image::read_disk_info_from_bytes(&data))
         .await
         .map_err(|e| format!("Task error: {}", e))?
 }
 
-fn is_remote_pdf_file(name: &str) -> bool {
-    name.to_lowercase().ends_with(".pdf")
-}
-
-/// Download a remote file via FTP and create a content preview
 async fn load_remote_content_preview(
     host: String,
     remote_path: String,
     password: Option<String>,
 ) -> Result<ContentPreview, String> {
-    log::info!("FTP: Loading content preview for {}", remote_path);
-
-    // Get filename from path
     let filename = remote_path
         .rsplit('/')
         .next()
         .unwrap_or("unknown")
         .to_string();
-
-    // Download the file first
     let (_, data) = download_file_ftp_preview(host, remote_path.clone(), password).await?;
 
-    // Determine if text, image, or PDF based on filename
     if is_remote_text_file(&filename) {
-        // Parse as text
         tokio::task::spawn_blocking(move || {
             let lower = filename.to_lowercase();
-
-            // For PETSCII text files (.atxt), convert from PETSCII
             let content = if lower.ends_with(".atxt") {
                 crate::petscii::convert_text_file(&data)
             } else {
-                // Regular text file - try UTF-8, fall back to lossy conversion
                 match String::from_utf8(data.clone()) {
                     Ok(s) => s,
                     Err(_) => String::from_utf8_lossy(&data).to_string(),
                 }
             };
-
             let line_count = content.lines().count();
-
             Ok(ContentPreview::Text {
                 filename,
                 content,
@@ -2806,15 +3221,11 @@ async fn load_remote_content_preview(
         .await
         .map_err(|e| format!("Task error: {}", e))?
     } else if is_remote_image_file(&filename) {
-        // Parse as image
         tokio::task::spawn_blocking(move || {
-            // Decode image to get dimensions
             let img = image::load_from_memory(&data)
                 .map_err(|e| format!("Failed to decode image: {}", e))?;
-
             let width = img.width();
             let height = img.height();
-
             Ok(ContentPreview::Image {
                 filename,
                 data,
@@ -2825,16 +3236,12 @@ async fn load_remote_content_preview(
         .await
         .map_err(|e| format!("Task error: {}", e))?
     } else if is_remote_pdf_file(&filename) {
-        // Parse as PDF
         crate::pdf_preview::load_pdf_preview_from_bytes_async(data, filename).await
     } else {
         Err("Unsupported file type for preview".to_string())
     }
 }
 
-// ─── Disk image creation ──────────────────────────────────────────────────────
-
-/// Create a blank disk image and upload it to the device via FTP.
 fn create_and_upload_disk(
     host: String,
     name: String,
@@ -2855,13 +3262,6 @@ fn create_and_upload_disk(
     };
     let filename = format!("{}.{}", safe_name, ext);
     let remote_path = format!("{}/{}", remote_dest.trim_end_matches('/'), filename);
-
-    log::info!(
-        "Creating {} ({} bytes) → {}",
-        filename,
-        data.len(),
-        remote_path
-    );
 
     let addr = format!("{}:21", host);
     let mut ftp = FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
