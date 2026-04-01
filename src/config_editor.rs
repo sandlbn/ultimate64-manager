@@ -1117,7 +1117,7 @@ impl ConfigEditor {
             if let Some(default) = &details.default {
                 text(format!("Default: {}", format_value(default)))
                     .size(small)
-                    .color(iced::Color::from_rgb(0.1, 0.1, 0.1))
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.55))
             } else {
                 text("").size(small)
             }
