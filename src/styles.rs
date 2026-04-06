@@ -43,6 +43,32 @@ pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+/// Active pane style — gray border to indicate which pane is active
+pub fn active_pane_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: None,
+        border: iced::Border {
+            color: iced::Color::from_rgb(0.55, 0.55, 0.58),
+            width: 2.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Inactive pane style — subtle border
+pub fn inactive_pane_style(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: None,
+        border: iced::Border {
+            color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..Default::default()
+    }
+}
+
 /// Section style (subtle bordered container) for grouping related UI elements
 pub fn section_style(_theme: &iced::Theme) -> container::Style {
     container::Style {

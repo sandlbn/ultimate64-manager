@@ -1,7 +1,7 @@
 use iced::{
     widget::{
-        button, checkbox, column, container, progress_bar, row, rule, scrollable, text, text_input,
-        tooltip, Column, Space,
+        button, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, text,
+        text_input, tooltip, Column, Space,
     },
     Element, Length, Subscription, Task,
 };
@@ -15,6 +15,7 @@ use ultimate64::Rest;
 use crate::api;
 use crate::dir_preview::ContentPreview;
 use crate::disk_image::{DiskInfo, FileType};
+use crate::file_browser::DriveOption;
 use crate::ftp_ops::*;
 
 #[derive(Debug, Clone)]
@@ -92,6 +93,25 @@ pub enum RemoteBrowserMessage {
     RenameCancel,
     /// Async rename finished
     RenameComplete(Result<String, String>),
+
+    // ── Create Directory ──────────────────────────────────────────────────
+    /// Show the create directory dialog
+    ShowCreateDir,
+    /// User is typing the directory name
+    CreateDirNameChanged(String),
+    /// User confirmed — create the directory
+    CreateDirConfirm,
+    /// User cancelled
+    CreateDirCancel,
+    /// Async mkdir finished
+    CreateDirComplete(Result<String, String>),
+
+    // ── Sort ─────────────────────────────────────────────────────────────
+    /// Change sort column (or toggle order if same column)
+    SortBy(crate::file_types::SortColumn),
+
+    /// Drive picker changed
+    DriveSelected(DriveOption),
 }
 
 /// State for the delete confirmation dialog
@@ -149,6 +169,16 @@ pub struct RemoteBrowser {
     delete_pending: Option<DeletePending>,
     // Rename dialog
     rename_pending: Option<RenamePending>,
+    // Create directory dialog
+    show_create_dir: bool,
+    create_dir_name: String,
+    // Sort state
+    sort_column: crate::file_types::SortColumn,
+    sort_order: crate::file_types::SortOrder,
+    // Drive selector
+    pub selected_drive: DriveOption,
+    // Cached root directory names for quick nav
+    root_dirs: Vec<String>,
 }
 
 impl Default for RemoteBrowser {
@@ -179,6 +209,12 @@ impl Default for RemoteBrowser {
             transfer_progress: Arc::new(std::sync::Mutex::new(None)),
             delete_pending: None,
             rename_pending: None,
+            show_create_dir: false,
+            create_dir_name: String::new(),
+            sort_column: crate::file_types::SortColumn::Name,
+            sort_order: crate::file_types::SortOrder::Ascending,
+            selected_drive: DriveOption::A,
+            root_dirs: Vec::new(),
         }
     }
 }
@@ -230,7 +266,16 @@ impl RemoteBrowser {
                 self.is_loading = false;
                 match result {
                     Ok(files) => {
+                        // Cache root directories for the quick nav bar
+                        if self.current_path == "/" {
+                            self.root_dirs = files
+                                .iter()
+                                .filter(|f| f.is_dir)
+                                .map(|f| f.name.clone())
+                                .collect();
+                        }
                         self.files = files;
+                        self.sort_files();
                         self.is_connected = true;
                         self.status_message = Some(format!("{} items", self.files.len()));
                     }
@@ -941,7 +986,269 @@ impl RemoteBrowser {
                 }
                 Task::none()
             }
+
+            RemoteBrowserMessage::SortBy(col) => {
+                if self.sort_column == col {
+                    self.sort_order = self.sort_order.toggle();
+                } else {
+                    self.sort_column = col;
+                    self.sort_order = crate::file_types::SortOrder::Ascending;
+                }
+                self.sort_files();
+                Task::none()
+            }
+
+            RemoteBrowserMessage::DriveSelected(drive) => {
+                self.selected_drive = drive;
+                Task::none()
+            }
+
+            // ── Create Directory ─────────────────────────────────────────────
+            RemoteBrowserMessage::ShowCreateDir => {
+                self.show_create_dir = true;
+                self.create_dir_name = String::new();
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDirNameChanged(name) => {
+                self.create_dir_name = name;
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDirCancel => {
+                self.show_create_dir = false;
+                Task::none()
+            }
+            RemoteBrowserMessage::CreateDirConfirm => {
+                if self.create_dir_name.trim().is_empty() {
+                    return Task::none();
+                }
+                let dir_name = self.create_dir_name.trim().to_string();
+                let remote_path =
+                    format!("{}/{}", self.current_path.trim_end_matches('/'), dir_name);
+                let host = self.host_address.clone().unwrap_or_default();
+                let password = self.password.clone();
+                self.show_create_dir = false;
+
+                Task::perform(
+                    crate::ftp_ops::mkdir_ftp(host, remote_path, password),
+                    RemoteBrowserMessage::CreateDirComplete,
+                )
+            }
+            RemoteBrowserMessage::CreateDirComplete(result) => {
+                match result {
+                    Ok(msg) => {
+                        self.status_message = Some(msg);
+                        // Refresh files to show new directory
+                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Error: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
+    }
+
+    fn sort_files(&mut self) {
+        use crate::file_types::{SortColumn, SortOrder};
+        let col = self.sort_column;
+        let ord = self.sort_order;
+        self.files.sort_by(|a, b| {
+            // Directories always come first
+            match (a.is_dir, b.is_dir) {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
+            let cmp = match col {
+                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortColumn::Size => a.size.cmp(&b.size),
+                SortColumn::Type => {
+                    let ext_a = a.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                    let ext_b = b.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                    ext_a.cmp(&ext_b)
+                }
+            };
+            if ord == SortOrder::Descending {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        });
+    }
+
+    // ── Builder helper methods for Total Commander-style layout ──────────
+
+    fn build_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let display_path = if self.current_path.len() > 35 {
+            format!("...{}", &self.current_path[self.current_path.len() - 32..])
+        } else {
+            self.current_path.clone()
+        };
+        row![
+            tooltip(
+                button(text("⬆").size(font_size))
+                    .on_press(RemoteBrowserMessage::NavigateUp)
+                    .padding([4, 8]),
+                "Go to parent folder",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            text(display_path).size(small).width(Length::Fill),
+            tooltip(
+                button(text("⟳").size(small))
+                    .on_press(RemoteBrowserMessage::RefreshFiles)
+                    .padding([2, 6]),
+                "Refresh file listing",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let mut nav = row![tooltip(
+            button(text("/").size(small))
+                .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
+                .padding([2, 6]),
+            "Root directory",
+            tooltip::Position::Bottom,
+        )
+        .style(container::bordered_box),]
+        .spacing(3)
+        .align_y(iced::Alignment::Center);
+
+        if self.root_dirs.is_empty() {
+            // Fallback: show default drives before first root listing
+            for name in &["Usb0", "SD"] {
+                let path = format!("/{}", name);
+                nav = nav.push(
+                    tooltip(
+                        button(text(*name).size(small))
+                            .on_press(RemoteBrowserMessage::NavigateToPath(path))
+                            .padding([2, 6]),
+                        *name,
+                        tooltip::Position::Bottom,
+                    )
+                    .style(container::bordered_box),
+                );
+            }
+        } else {
+            // Show actual root directories from the device
+            for dir_name in &self.root_dirs {
+                let path = format!("/{}", dir_name);
+                nav = nav.push(
+                    tooltip(
+                        button(text(dir_name.as_str()).size(small))
+                            .on_press(RemoteBrowserMessage::NavigateToPath(path))
+                            .padding([2, 6]),
+                        text(format!("Navigate to /{}", dir_name)).size(small),
+                        tooltip::Position::Bottom,
+                    )
+                    .style(container::bordered_box),
+                );
+            }
+        }
+
+        nav.into()
+    }
+
+    fn build_status_bar(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let tiny = (font_size.saturating_sub(3)).max(7);
+        let small = (font_size.saturating_sub(2)).max(8);
+        let file_count = self.files.len();
+        let checked_count = self.checked_files.len();
+
+        // Show progress bar during transfers (delegate to existing view_status_bar)
+        if self.get_progress().is_some() {
+            return self.view_status_bar(small);
+        }
+
+        if self.disk_info_loading || self.content_preview_loading {
+            return self.view_status_bar(small);
+        }
+
+        let mut items = row![].spacing(8).align_y(iced::Alignment::Center);
+
+        items = items.push(text(format!("{} files", file_count)).size(tiny));
+
+        if checked_count > 0 {
+            items = items.push(text("|").size(tiny));
+            items = items.push(text(format!("{} sel", checked_count)).size(tiny));
+        }
+
+        items = items.push(
+            pick_list(
+                DriveOption::get_all(),
+                Some(self.selected_drive.clone()),
+                RemoteBrowserMessage::DriveSelected,
+            )
+            .placeholder("Drive")
+            .text_size(tiny)
+            .width(Length::Fixed(95.0)),
+        );
+
+        items = items.push(Space::new().width(Length::Fill));
+
+        if self.is_connected {
+            items = items.push(text("Connected").size(tiny));
+        }
+
+        items.into()
+    }
+
+    fn build_column_headers(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+
+        let name_indicator = if self.sort_column == crate::file_types::SortColumn::Name {
+            self.sort_order.indicator()
+        } else {
+            ""
+        };
+        let size_indicator = if self.sort_column == crate::file_types::SortColumn::Size {
+            self.sort_order.indicator()
+        } else {
+            ""
+        };
+        let type_indicator = if self.sort_column == crate::file_types::SortColumn::Type {
+            self.sort_order.indicator()
+        } else {
+            ""
+        };
+
+        row![
+            Space::new().width(24), // checkbox space
+            button(text(format!("Name{}", name_indicator)).size(small))
+                .on_press(RemoteBrowserMessage::SortBy(
+                    crate::file_types::SortColumn::Name
+                ))
+                .padding([2, 4])
+                .style(button::text),
+            Space::new().width(Length::Fill),
+            button(text(format!("Size{}", size_indicator)).size(small))
+                .on_press(RemoteBrowserMessage::SortBy(
+                    crate::file_types::SortColumn::Size
+                ))
+                .padding([2, 4])
+                .width(Length::Fixed(65.0))
+                .style(button::text),
+            button(text(format!("Type{}", type_indicator)).size(small))
+                .on_press(RemoteBrowserMessage::SortBy(
+                    crate::file_types::SortColumn::Type
+                ))
+                .padding([2, 4])
+                .width(Length::Fixed(35.0))
+                .style(button::text),
+            Space::new().width(Length::Shrink), // action buttons space
+        ]
+        .spacing(4)
+        .align_y(iced::Alignment::Center)
+        .into()
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
@@ -949,140 +1256,16 @@ impl RemoteBrowser {
         let normal = font_size;
         let tiny = (font_size.saturating_sub(3)).max(7);
 
-        let display_path = if self.current_path.len() > 35 {
-            format!("...{}", &self.current_path[self.current_path.len() - 32..])
-        } else {
-            self.current_path.clone()
-        };
-
-        let checked_count = self.checked_files.len();
-        let nav_buttons = row![
-            tooltip(
-                button(text("⬆ Up").size(normal))
-                    .on_press(RemoteBrowserMessage::NavigateUp)
-                    .padding([4, 8]),
-                "Go to parent folder",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("✔ All").size(tiny))
-                    .on_press(RemoteBrowserMessage::SelectAll)
-                    .padding([2, 6]),
-                "Select all files",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("✖ None").size(tiny))
-                    .on_press(RemoteBrowserMessage::SelectNone)
-                    .padding([2, 6]),
-                "Deselect all files",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            if checked_count > 0 {
-                text(format!("{} selected", checked_count)).size(small)
-            } else {
-                text("").size(small)
-            },
-            // Batch delete button — only shown when files are checked
-            if checked_count > 0 {
-                let del_btn: Element<'_, RemoteBrowserMessage> = tooltip(
-                    button(text(format!("🗑 Delete ({})", checked_count)).size(small))
-                        .on_press(RemoteBrowserMessage::DeleteChecked)
-                        .padding([2, 8]),
-                    "Delete all selected files/directories",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box)
-                .into();
-                del_btn
-            } else {
-                Space::new().width(0).into()
-            },
-            Space::new().width(Length::Fill),
-            text("Filter:").size(small),
-            text_input("filter...", &self.filter)
-                .on_input(RemoteBrowserMessage::FilterChanged)
-                .size(normal)
-                .padding(4)
-                .width(Length::Fixed(100.0)),
-        ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center);
-
-        let quick_nav = row![
-            tooltip(
-                button(text("/").size(small))
-                    .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
-                    .padding([2, 6]),
-                "Root directory",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("Usb0").size(small))
-                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb0".to_string()))
-                    .padding([2, 6]),
-                "USB Drive 0",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("Usb1").size(small))
-                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb1".to_string()))
-                    .padding([2, 6]),
-                "USB Drive 1",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("Usb2").size(small))
-                    .on_press(RemoteBrowserMessage::NavigateToPath("/Usb2".to_string()))
-                    .padding([2, 6]),
-                "USB Drive 2",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("SD").size(small))
-                    .on_press(RemoteBrowserMessage::NavigateToPath("/SD".to_string()))
-                    .padding([2, 6]),
-                "SD Card",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            Space::new().width(Length::Fill),
-            tooltip(
-                {
-                    let btn = button(text("💾 New Disk").size(small)).padding([2, 8]);
-                    if self.is_connected {
-                        btn.on_press(RemoteBrowserMessage::ShowCreateDisk)
-                    } else {
-                        btn
-                    }
-                },
-                "Create a new blank D64/D71/D81 disk image and upload it",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-        ]
-        .spacing(3);
-
-        let path_display = text(display_path).size(normal);
-
         // ── Delete confirm dialog — shown over everything else ─────────────
         if let Some(ref dp) = self.delete_pending {
             let dialog = self.view_delete_confirm_dialog(dp, font_size);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 dialog,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1093,13 +1276,12 @@ impl RemoteBrowser {
         if let Some(ref rp) = self.rename_pending {
             let dialog = self.view_rename_dialog(rp, font_size);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 dialog,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1109,13 +1291,58 @@ impl RemoteBrowser {
         if self.show_create_disk {
             let dialog = self.view_create_disk_dialog(font_size);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 dialog,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
+            .padding(5)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        }
+
+        // ── Create directory dialog ────────────────────────────────────────
+        if self.show_create_dir {
+            let small = (font_size.saturating_sub(2)).max(8);
+            let dialog = container(
+                column![
+                    text("Create Directory").size(font_size),
+                    row![
+                        text("Name:").size(small),
+                        text_input("directory name...", &self.create_dir_name)
+                            .on_input(RemoteBrowserMessage::CreateDirNameChanged)
+                            .on_submit(RemoteBrowserMessage::CreateDirConfirm)
+                            .size(small as f32)
+                            .padding(4)
+                            .width(Length::Fixed(200.0)),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        button(text("Create").size(small))
+                            .on_press(RemoteBrowserMessage::CreateDirConfirm)
+                            .padding([5, 15]),
+                        button(text("Cancel").size(small))
+                            .on_press(RemoteBrowserMessage::CreateDirCancel)
+                            .padding([5, 15]),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(10)
+                .padding(15),
+            )
+            .style(container::bordered_box)
+            .width(Length::Fill);
+
+            return column![
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                dialog,
+                self.build_status_bar(font_size),
+            ]
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1125,13 +1352,12 @@ impl RemoteBrowser {
         if let Some(disk_info) = &self.disk_info_popup {
             let popup = self.view_disk_info_popup(disk_info, font_size);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 popup,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1154,13 +1380,12 @@ impl RemoteBrowser {
             .center_y(Length::Fill)
             .style(container::bordered_box);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 loading_panel,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1171,13 +1396,12 @@ impl RemoteBrowser {
         if let Some(content_preview) = &self.content_preview {
             let popup = self.view_content_preview_popup(content_preview, font_size);
             return column![
-                nav_buttons,
-                quick_nav,
-                path_display,
-                self.view_status_bar(small),
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 popup,
+                self.build_status_bar(font_size),
             ]
-            .spacing(5)
+            .spacing(2)
             .padding(5)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1226,25 +1450,19 @@ impl RemoteBrowser {
                     entry.name.clone()
                 };
 
-                let is_disk_image = {
+                let can_show_disk_info = {
                     let lower = entry.name.to_lowercase();
                     lower.ends_with(".d64") || lower.ends_with(".d71")
                 };
+                let ext_for_disk = entry.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                let _is_disk_image = crate::file_types::is_disk_image(&ext_for_disk);
                 let is_text_file = is_remote_text_file(&entry.name);
                 let is_image_file = is_remote_image_file(&entry.name);
                 let is_pdf_file = is_remote_pdf_file(&entry.name);
 
                 let ext = entry.name.to_lowercase();
                 let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
-                    tooltip(
-                        button(text("Open").size(small))
-                            .on_press(RemoteBrowserMessage::FileSelected(entry.path.clone()))
-                            .padding([2, 8]),
-                        "Open folder",
-                        tooltip::Position::Top,
-                    )
-                    .style(container::bordered_box)
-                    .into()
+                    Space::new().width(0).into()
                 } else if ext.ends_with(".prg") {
                     tooltip(
                         button(text("Run").size(small))
@@ -1292,7 +1510,8 @@ impl RemoteBrowser {
                     || ext.ends_with(".d81")
                 {
                     let mut buttons = row![].spacing(2);
-                    if is_disk_image {
+                    // Show disk info button for D64/D71 only (formats we can parse)
+                    if can_show_disk_info {
                         buttons = buttons.push(
                             tooltip(
                                 button(text("?").size(small))
@@ -1306,58 +1525,49 @@ impl RemoteBrowser {
                             .style(container::bordered_box),
                         );
                     }
+                    let drive_str = self.selected_drive.to_drive_string();
+                    let drive_label = match self.selected_drive {
+                        DriveOption::A => "A",
+                        DriveOption::B => "B",
+                    };
                     buttons = buttons
                         .push(
                             tooltip(
                                 button(text("Run").size(tiny))
                                     .on_press(RemoteBrowserMessage::RunDisk(
                                         entry.path.clone(),
-                                        "a".to_string(),
+                                        drive_str.clone(),
                                     ))
                                     .padding([2, 6]),
-                                "Mount, reset & LOAD\"*\",8,1",
+                                text(format!("Mount to Drive {} & run", drive_label)),
                                 tooltip::Position::Top,
                             )
                             .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
-                                button(text("A:RW").size(tiny))
+                                button(text(format!("{}:RW", drive_label)).size(tiny))
                                     .on_press(RemoteBrowserMessage::MountDisk(
                                         entry.path.clone(),
-                                        "a".to_string(),
+                                        drive_str.clone(),
                                         "readwrite".to_string(),
                                     ))
                                     .padding([2, 4]),
-                                "Mount to Drive A (Read/Write)",
+                                text(format!("Mount to Drive {} (Read/Write)", drive_label)),
                                 tooltip::Position::Top,
                             )
                             .style(container::bordered_box),
                         )
                         .push(
                             tooltip(
-                                button(text("A:RO").size(tiny))
+                                button(text(format!("{}:RO", drive_label)).size(tiny))
                                     .on_press(RemoteBrowserMessage::MountDisk(
                                         entry.path.clone(),
-                                        "a".to_string(),
+                                        drive_str,
                                         "readonly".to_string(),
                                     ))
                                     .padding([2, 4]),
-                                "Mount to Drive A (Read Only)",
-                                tooltip::Position::Top,
-                            )
-                            .style(container::bordered_box),
-                        )
-                        .push(
-                            tooltip(
-                                button(text("B:RW").size(tiny))
-                                    .on_press(RemoteBrowserMessage::MountDisk(
-                                        entry.path.clone(),
-                                        "b".to_string(),
-                                        "readwrite".to_string(),
-                                    ))
-                                    .padding([2, 4]),
-                                "Mount to Drive B (Read/Write)",
+                                text(format!("Mount to Drive {} (Read Only)", drive_label)),
                                 tooltip::Position::Top,
                             )
                             .style(container::bordered_box),
@@ -1416,7 +1626,7 @@ impl RemoteBrowser {
                 let path_for_delete = entry.path.clone();
 
                 let rename_btn = tooltip(
-                    button(text("✎").size(tiny))
+                    button(text("Ren").size(tiny))
                         .on_press(RemoteBrowserMessage::RenameFile(path_for_rename))
                         .padding([2, 5]),
                     "Rename",
@@ -1425,7 +1635,7 @@ impl RemoteBrowser {
                 .style(container::bordered_box);
 
                 let delete_btn = tooltip(
-                    button(text("🗑").size(tiny))
+                    button(text("Del").size(tiny))
                         .on_press(RemoteBrowserMessage::DeleteFile(path_for_delete))
                         .padding([2, 5]),
                     if entry.is_dir {
@@ -1437,10 +1647,20 @@ impl RemoteBrowser {
                 )
                 .style(container::bordered_box);
 
+                let size_text: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
+                    text("<DIR>").size(tiny).width(Length::Fixed(65.0)).into()
+                } else {
+                    text(crate::file_types::format_file_size(entry.size))
+                        .size(tiny)
+                        .width(Length::Fixed(65.0))
+                        .into()
+                };
+
                 let file_row = row![
                     checkbox_element,
                     filename_element,
-                    text(type_label).size(tiny).width(Length::Fixed(28.0)),
+                    size_text,
+                    text(type_label).size(tiny).width(Length::Fixed(35.0)),
                     action_button,
                     Space::new().width(4),
                     rename_btn,
@@ -1463,17 +1683,18 @@ impl RemoteBrowser {
         };
 
         column![
-            nav_buttons,
-            quick_nav,
-            path_display,
-            self.view_status_bar(small),
+            self.build_nav_row(font_size),
+            self.build_quick_nav_row(font_size),
+            self.build_column_headers(font_size),
+            rule::horizontal(1),
             file_list,
+            rule::horizontal(1),
+            self.build_status_bar(font_size),
         ]
-        .spacing(5)
+        .spacing(2)
         .padding(5)
         .width(Length::Fill)
         .height(Length::Fill)
-        .align_x(iced::Alignment::Center)
         .into()
     }
 
@@ -2055,6 +2276,10 @@ impl RemoteBrowser {
                 .into()
             }
         }
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
     }
 
     pub fn get_selected_file(&self) -> Option<&str> {

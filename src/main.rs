@@ -171,6 +171,16 @@ pub enum Message {
     TemplateSelected(DiskTemplate),
     ExecuteTemplate,
 
+    // Function bar actions
+    FnView,
+    FnCopy,
+    FnMkDir,
+    FnDelete,
+    ToggleActivePane,
+    NavigateUpActivePane,
+    SelectAllActivePane,
+    FilterChanged(String),
+
     // Errors
     ShowError(String),
     ShowInfo(String),
@@ -557,6 +567,24 @@ impl Ultimate64Browser {
                 .update(msg, self.connection.clone())
                 .map(Message::Monitor),
             Message::LeftBrowser(msg) => {
+                // User interaction with left pane makes it active
+                // (exclude async completion callbacks which aren't user-initiated)
+                if !matches!(
+                    &msg,
+                    FileBrowserMessage::MountCompleted(_)
+                        | FileBrowserMessage::RunDiskCompleted(_)
+                        | FileBrowserMessage::LoadCompleted(_)
+                        | FileBrowserMessage::ZipExtracted(_)
+                        | FileBrowserMessage::DiskInfoLoaded(_)
+                        | FileBrowserMessage::ContentPreviewLoaded(_)
+                        | FileBrowserMessage::DriveCheckComplete(_, _)
+                        | FileBrowserMessage::EnableDriveComplete(_)
+                        | FileBrowserMessage::RestoreScrollOffset(_)
+                        | FileBrowserMessage::DeleteComplete(_)
+                ) {
+                    self.active_pane = Pane::Left;
+                }
+
                 // Check if this is a "run" operation that should stop music
                 let should_stop_music = matches!(
                     &msg,
@@ -601,6 +629,28 @@ impl Ultimate64Browser {
             }
 
             Message::RemoteBrowser(msg) => {
+                // User interaction with right pane makes it active
+                // (exclude async completion callbacks which aren't user-initiated)
+                if !matches!(
+                    &msg,
+                    RemoteBrowserMessage::FilesLoaded(_)
+                        | RemoteBrowserMessage::DownloadComplete(_)
+                        | RemoteBrowserMessage::UploadComplete(_)
+                        | RemoteBrowserMessage::UploadDirectoryComplete(_)
+                        | RemoteBrowserMessage::RunnerComplete(_)
+                        | RemoteBrowserMessage::MountComplete(_)
+                        | RemoteBrowserMessage::DownloadBatchComplete(_)
+                        | RemoteBrowserMessage::DiskInfoLoaded(_)
+                        | RemoteBrowserMessage::ContentPreviewLoaded(_)
+                        | RemoteBrowserMessage::CreateDiskComplete(_)
+                        | RemoteBrowserMessage::CreateDirComplete(_)
+                        | RemoteBrowserMessage::DeleteComplete(_)
+                        | RemoteBrowserMessage::RenameComplete(_)
+                        | RemoteBrowserMessage::ProgressTick
+                ) {
+                    self.active_pane = Pane::Right;
+                }
+
                 // Check if this is a "run" operation that should stop music
                 let should_stop_music = matches!(
                     &msg,
@@ -671,6 +721,157 @@ impl Ultimate64Browser {
                 self.active_pane = pane;
                 Task::none()
             }
+
+            Message::FnView => {
+                // Preview selected file in active pane
+                match self.active_pane {
+                    Pane::Left => {
+                        if let Some(path) = self.left_browser.get_selected_file().cloned() {
+                            return self
+                                .left_browser
+                                .update(
+                                    FileBrowserMessage::ShowContentPreview(path),
+                                    self.connection.clone(),
+                                    Some(self.settings.connection.host.clone()),
+                                    self.settings.connection.password.clone(),
+                                )
+                                .map(Message::LeftBrowser);
+                        }
+                        Task::none()
+                    }
+                    Pane::Right => {
+                        if let Some(path) =
+                            self.remote_browser.get_selected_file().map(String::from)
+                        {
+                            return self
+                                .remote_browser
+                                .update(
+                                    RemoteBrowserMessage::ShowContentPreview(path),
+                                    self.connection.clone(),
+                                )
+                                .map(Message::RemoteBrowser);
+                        }
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::FnCopy => {
+                // Copy from active pane to other pane
+                match self.active_pane {
+                    Pane::Left => self.update(Message::CopyLocalToRemote),
+                    Pane::Right => self.update(Message::CopyRemoteToLocal),
+                }
+            }
+
+            Message::FnMkDir => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::ShowCreateDir,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::ShowCreateDir, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
+
+            Message::FnDelete => {
+                // Delete selected files in active pane
+                match self.active_pane {
+                    Pane::Left => {
+                        let checked_count = self.left_browser.get_checked_files().len();
+                        if checked_count > 0 {
+                            return self
+                                .left_browser
+                                .update(
+                                    FileBrowserMessage::DeleteChecked,
+                                    self.connection.clone(),
+                                    Some(self.settings.connection.host.clone()),
+                                    self.settings.connection.password.clone(),
+                                )
+                                .map(Message::LeftBrowser);
+                        }
+                        Task::none()
+                    }
+                    Pane::Right => {
+                        let checked_count = self.remote_browser.checked_files.len();
+                        if checked_count > 0 {
+                            return self
+                                .remote_browser
+                                .update(
+                                    RemoteBrowserMessage::DeleteChecked,
+                                    self.connection.clone(),
+                                )
+                                .map(Message::RemoteBrowser);
+                        }
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::FilterChanged(text) => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::FilterChanged(text),
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(
+                        RemoteBrowserMessage::FilterChanged(text),
+                        self.connection.clone(),
+                    )
+                    .map(Message::RemoteBrowser),
+            },
+
+            Message::ToggleActivePane => {
+                self.active_pane = match self.active_pane {
+                    Pane::Left => Pane::Right,
+                    Pane::Right => Pane::Left,
+                };
+                Task::none()
+            }
+
+            Message::NavigateUpActivePane => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::NavigateUp,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::NavigateUp, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
+
+            Message::SelectAllActivePane => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::SelectAll,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::SelectAll, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
 
             Message::CopyLocalToRemote => {
                 // Copy checked local files and directories to Ultimate64
@@ -1963,6 +2164,20 @@ impl Ultimate64Browser {
                             memory_editor::MemoryEditorMessage::Redo,
                         ))
                     }
+                    // File browser shortcuts (TC-style)
+                    Key::Named(keyboard::key::Named::F3) => Some(Message::FnView),
+                    Key::Named(keyboard::key::Named::F5) => Some(Message::FnCopy),
+                    Key::Named(keyboard::key::Named::F7) => Some(Message::FnMkDir),
+                    Key::Named(keyboard::key::Named::F8) => Some(Message::FnDelete),
+                    Key::Named(keyboard::key::Named::Tab) if !modifiers.shift() => {
+                        Some(Message::ToggleActivePane)
+                    }
+                    Key::Named(keyboard::key::Named::Backspace) => {
+                        Some(Message::NavigateUpActivePane)
+                    }
+                    Key::Character(ref c) if c.as_str() == "a" && modifiers.command() => {
+                        Some(Message::SelectAllActivePane)
+                    }
                     _ => None,
                 }
             } else {
@@ -2057,116 +2272,110 @@ impl Ultimate64Browser {
 
     fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Left pane - Local files
-        let left_header = row![
-            text("LOCAL").size(12).width(Length::Fill),
-            if self.active_pane == Pane::Left {
-                text("[ACTIVE]").size(10)
-            } else {
-                text("").size(10)
-            }
-        ]
-        .padding(5)
-        .align_y(iced::Alignment::Center);
-
-        let left_pane = container(column![
-            left_header,
-            rule::horizontal(1),
+        let left_pane = container(
             self.left_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::LeftBrowser),
-        ])
+        )
         .width(Length::FillPortion(1))
         .height(Length::Fill)
-        .padding(if self.active_pane == Pane::Left { 2 } else { 0 });
-
-        // Copy buttons in center
-        let copy_buttons = container(
-            column![
-                tooltip(
-                    button(text("📄 →").size(14))
-                        .on_press(Message::CopyLocalToRemote)
-                        .padding([8, 12]),
-                    "Upload checked files to Ultimate64",
-                    tooltip::Position::Right,
-                )
-                .style(container::bordered_box),
-                Space::new().height(10),
-                tooltip(
-                    button(text("📄 ←").size(14))
-                        .on_press(Message::CopyRemoteToLocal)
-                        .padding([8, 12]),
-                    "Download selected file from Ultimate64",
-                    tooltip::Position::Left,
-                )
-                .style(container::bordered_box),
-            ]
-            .align_x(iced::Alignment::Center),
-        )
-        .padding([20, 5])
-        .center_y(Length::Shrink);
+        .padding(2)
+        .style(if self.active_pane == Pane::Left {
+            crate::styles::active_pane_style
+        } else {
+            crate::styles::inactive_pane_style
+        });
 
         // Right pane - Ultimate64 files
-        let connection_indicator = if self.status.connected { "*" } else { "" };
-        let right_header = row![
-            text(format!("ULTIMATE64 {}", connection_indicator))
-                .size(12)
-                .width(Length::Fill),
-            tooltip(
-                button(text("⟳ Refresh").size(10))
-                    .on_press(Message::RemoteBrowser(RemoteBrowserMessage::RefreshFiles))
-                    .padding([2, 6]),
-                "Refresh remote file listing",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-        ]
-        .padding(5)
-        .align_y(iced::Alignment::Center);
-
-        let right_pane = container(column![
-            right_header,
-            rule::horizontal(1),
+        let right_pane = container(
             self.remote_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::RemoteBrowser),
-        ])
+        )
         .width(Length::FillPortion(1))
         .height(Length::Fill)
-        .padding(if self.active_pane == Pane::Right {
-            2
+        .padding(2)
+        .style(if self.active_pane == Pane::Right {
+            crate::styles::active_pane_style
         } else {
-            0
+            crate::styles::inactive_pane_style
         });
 
-        // Template section at bottom
-        let template_section = container(
+        // Function bar at bottom
+        let small = (self.settings.preferences.font_size.saturating_sub(2)).max(8) as f32;
+        let tiny = (self.settings.preferences.font_size.saturating_sub(3)).max(7) as f32;
+
+        let active_filter = match self.active_pane {
+            Pane::Left => self.left_browser.filter(),
+            Pane::Right => self.remote_browser.filter(),
+        };
+
+        let function_bar = container(
             row![
-                text("Quick Actions:").size(12),
+                button(text("F3 View").size(small))
+                    .on_press(Message::FnView)
+                    .padding([4, 10])
+                    .style(button::secondary),
+                button(
+                    text(match self.active_pane {
+                        Pane::Left => "F5 Copy \u{2192}",  // →
+                        Pane::Right => "F5 Copy \u{2190}", // ←
+                    })
+                    .size(small),
+                )
+                .on_press(Message::FnCopy)
+                .padding([4, 10])
+                .style(button::secondary),
+                button(
+                    text(match self.active_pane {
+                        Pane::Left => "F7 MkDir (local)",
+                        Pane::Right => "F7 MkDir (remote)",
+                    })
+                    .size(small),
+                )
+                .on_press(Message::FnMkDir)
+                .padding([4, 10])
+                .style(button::secondary),
+                button(
+                    text(match self.active_pane {
+                        Pane::Left => "F8 Delete (local)",
+                        Pane::Right => "F8 Delete (remote)",
+                    })
+                    .size(small),
+                )
+                .on_press(Message::FnDelete)
+                .padding([4, 10])
+                .style(button::secondary),
+                Space::new().width(Length::Fill),
+                text("Filter:").size(tiny),
+                text_input("filter...", active_filter)
+                    .on_input(Message::FilterChanged)
+                    .size(small)
+                    .padding(4)
+                    .width(Length::Fixed(120.0)),
+                Space::new().width(8),
                 pick_list(
                     self.template_manager.get_templates(),
                     self.selected_template.clone(),
                     Message::TemplateSelected,
                 )
-                .placeholder("Select template...")
-                .width(Length::Fixed(200.0)),
-                tooltip(
-                    button(text("Execute").size(12))
-                        .on_press(Message::ExecuteTemplate)
-                        .padding([4, 12]),
-                    "Run the selected template commands",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
+                .placeholder("Template...")
+                .text_size(tiny)
+                .width(Length::Fixed(150.0)),
+                button(text("Exec").size(tiny))
+                    .on_press(Message::ExecuteTemplate)
+                    .padding([4, 8]),
             ]
-            .spacing(10)
+            .spacing(4)
             .align_y(iced::Alignment::Center),
         )
-        .padding(10);
+        .padding([6, 10])
+        .width(Length::Fill);
 
         column![
-            row![left_pane, copy_buttons, right_pane].height(Length::Fill),
+            row![left_pane, rule::vertical(1), right_pane].height(Length::Fill),
             rule::horizontal(1),
-            template_section,
+            function_bar,
         ]
         .into()
     }

@@ -1,5 +1,51 @@
 use std::path::Path;
 
+// ─── Sort types ──────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    Name,
+    Size,
+    Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    pub fn toggle(self) -> Self {
+        match self {
+            SortOrder::Ascending => SortOrder::Descending,
+            SortOrder::Descending => SortOrder::Ascending,
+        }
+    }
+
+    pub fn indicator(self) -> &'static str {
+        match self {
+            SortOrder::Ascending => " \u{25B2}",
+            SortOrder::Descending => " \u{25BC}",
+        }
+    }
+}
+
+// ─── File size formatting ────────────────────────────────────────────────────
+
+/// Format a byte count as a human-readable size string
+pub fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{} KB", bytes / 1024)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+// ─── File type classification ────────────────────────────────────────────────
+
 /// Check if an extension (lowercase, no dot) is a supported disk image format
 pub fn is_disk_image(ext: &str) -> bool {
     matches!(ext, "d64" | "d71" | "d81" | "g64" | "g71")

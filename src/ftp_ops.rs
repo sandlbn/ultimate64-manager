@@ -1134,3 +1134,54 @@ pub fn create_and_upload_disk(
     ftp.quit().ok();
     Ok(remote_path)
 }
+
+/// Create a directory on the remote device via FTP.
+pub async fn mkdir_ftp(
+    host: String,
+    remote_path: String,
+    password: Option<String>,
+) -> Result<String, String> {
+    log::info!("FTP: Creating directory {}", remote_path);
+
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            ftp.get_ref()
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .ok();
+
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            ftp.mkdir(&remote_path)
+                .map_err(|e| format!("MkDir failed: {}", e))?;
+
+            let _ = ftp.quit();
+            let dir_name = remote_path.rsplit('/').next().unwrap_or(&remote_path);
+            Ok(format!("Created directory: {}", dir_name))
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("MkDir timed out".to_string()),
+    }
+}
