@@ -1090,20 +1090,22 @@ impl RemoteBrowser {
             tooltip(
                 button(text("⬆").size(font_size))
                     .on_press(RemoteBrowserMessage::NavigateUp)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             text(display_path).size(small).width(Length::Fill),
             tooltip(
                 button(text("⟳").size(small))
                     .on_press(RemoteBrowserMessage::RefreshFiles)
-                    .padding([2, 6]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Refresh file listing",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center)
@@ -1115,11 +1117,12 @@ impl RemoteBrowser {
         let mut nav = row![tooltip(
             button(text("/").size(small))
                 .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
-                .padding([2, 6]),
+                .padding([2, 6])
+                .style(crate::styles::nav_button),
             "Root directory",
             tooltip::Position::Bottom,
         )
-        .style(container::bordered_box),]
+        .style(crate::styles::subtle_tooltip),]
         .spacing(3)
         .align_y(iced::Alignment::Center);
 
@@ -1131,11 +1134,12 @@ impl RemoteBrowser {
                     tooltip(
                         button(text(*name).size(small))
                             .on_press(RemoteBrowserMessage::NavigateToPath(path))
-                            .padding([2, 6]),
+                            .padding([2, 6])
+                            .style(crate::styles::nav_button),
                         *name,
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 );
             }
         } else {
@@ -1146,11 +1150,12 @@ impl RemoteBrowser {
                     tooltip(
                         button(text(dir_name.as_str()).size(small))
                             .on_press(RemoteBrowserMessage::NavigateToPath(path))
-                            .padding([2, 6]),
+                            .padding([2, 6])
+                            .style(crate::styles::nav_button),
                         text(format!("Navigate to /{}", dir_name)).size(small),
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 );
             }
         }
@@ -1323,17 +1328,19 @@ impl RemoteBrowser {
                     row![
                         button(text("Create").size(small))
                             .on_press(RemoteBrowserMessage::CreateDirConfirm)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                         button(text("Cancel").size(small))
                             .on_press(RemoteBrowserMessage::CreateDirCancel)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                     ]
                     .spacing(10),
                 ]
                 .spacing(10)
                 .padding(15),
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .width(Length::Fill);
 
             return column![
@@ -1378,7 +1385,7 @@ impl RemoteBrowser {
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .style(container::bordered_box);
+            .style(crate::styles::subtle_tooltip);
             return column![
                 self.build_nav_row(font_size),
                 self.build_quick_nav_row(font_size),
@@ -1467,41 +1474,45 @@ impl RemoteBrowser {
                     tooltip(
                         button(text("Run").size(small))
                             .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         "Load and run PRG file",
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else if ext.ends_with(".crt") {
                     tooltip(
                         button(text("Run").size(small))
                             .on_press(RemoteBrowserMessage::RunCrt(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         "Load cartridge image",
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else if ext.ends_with(".sid") {
                     tooltip(
                         button(text("Play").size(small))
                             .on_press(RemoteBrowserMessage::PlaySid(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         "Play SID music",
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else if ext.ends_with(".mod") || ext.ends_with(".xm") || ext.ends_with(".s3m") {
                     tooltip(
                         button(text("Play").size(small))
                             .on_press(RemoteBrowserMessage::PlayMod(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         "Play MOD/tracker music",
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else if ext.ends_with(".d64")
                     || ext.ends_with(".g64")
@@ -1518,11 +1529,12 @@ impl RemoteBrowser {
                                     .on_press(RemoteBrowserMessage::ShowDiskInfo(
                                         entry.path.clone(),
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 "Show disk directory listing",
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
                     }
                     let drive_str = self.selected_drive.to_drive_string();
@@ -1538,11 +1550,12 @@ impl RemoteBrowser {
                                         entry.path.clone(),
                                         drive_str.clone(),
                                     ))
-                                    .padding([2, 6]),
+                                    .padding([2, 6])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount to Drive {} & run", drive_label)),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1552,11 +1565,12 @@ impl RemoteBrowser {
                                         drive_str.clone(),
                                         "readwrite".to_string(),
                                     ))
-                                    .padding([2, 4]),
+                                    .padding([2, 4])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount to Drive {} (Read/Write)", drive_label)),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1566,18 +1580,20 @@ impl RemoteBrowser {
                                         drive_str,
                                         "readonly".to_string(),
                                     ))
-                                    .padding([2, 4]),
+                                    .padding([2, 4])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount to Drive {} (Read Only)", drive_label)),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
                     buttons.into()
                 } else if is_text_file || is_image_file || is_pdf_file {
                     tooltip(
                         button(text("View").size(small))
                             .on_press(RemoteBrowserMessage::ShowContentPreview(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         if is_text_file {
                             "View text content"
                         } else if is_image_file {
@@ -1587,7 +1603,7 @@ impl RemoteBrowser {
                         },
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else {
                     iced::widget::Space::new().width(0).into()
@@ -1606,7 +1622,7 @@ impl RemoteBrowser {
                         text(&entry.name).size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 } else {
                     filename_button.into()
@@ -1628,16 +1644,18 @@ impl RemoteBrowser {
                 let rename_btn = tooltip(
                     button(text("Ren").size(tiny))
                         .on_press(RemoteBrowserMessage::RenameFile(path_for_rename))
-                        .padding([2, 5]),
+                        .padding([2, 5])
+                        .style(crate::styles::nav_button),
                     "Rename",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box);
+                .style(crate::styles::subtle_tooltip);
 
                 let delete_btn = tooltip(
                     button(text("Del").size(tiny))
                         .on_press(RemoteBrowserMessage::DeleteFile(path_for_delete))
-                        .padding([2, 5]),
+                        .padding([2, 5])
+                        .style(crate::styles::nav_button),
                     if entry.is_dir {
                         "Delete directory (recursive)"
                     } else {
@@ -1645,7 +1663,7 @@ impl RemoteBrowser {
                     },
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box);
+                .style(crate::styles::subtle_tooltip);
 
                 let size_text: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     text("<DIR>").size(tiny).width(Length::Fixed(65.0)).into()
@@ -1738,11 +1756,13 @@ impl RemoteBrowser {
         let buttons = row![
             button(text("Cancel").size(normal))
                 .on_press(RemoteBrowserMessage::DeleteCancel)
-                .padding([6, 16]),
+                .padding([6, 16])
+                .style(button::secondary),
             Space::new().width(10),
             button(text("🗑 Delete").size(normal))
                 .on_press(RemoteBrowserMessage::DeleteConfirm)
-                .padding([6, 16]),
+                .padding([6, 16])
+                .style(button::secondary),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
@@ -1765,7 +1785,7 @@ impl RemoteBrowser {
             .padding(12),
         )
         .width(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -1845,7 +1865,7 @@ impl RemoteBrowser {
             .padding(12),
         )
         .width(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -2045,7 +2065,7 @@ impl RemoteBrowser {
             .padding(10),
         )
         .width(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -2067,11 +2087,12 @@ impl RemoteBrowser {
             tooltip(
                 button(text("Close").size(small))
                     .on_press(RemoteBrowserMessage::CloseDiskInfo)
-                    .padding([4, 10]),
+                    .padding([4, 10])
+                    .style(button::secondary),
                 "Close directory listing",
                 tooltip::Position::Left,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
@@ -2149,7 +2170,7 @@ impl RemoteBrowser {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -2183,11 +2204,12 @@ impl RemoteBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(RemoteBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close text preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -2219,7 +2241,7 @@ impl RemoteBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
             ContentPreview::Image {
@@ -2243,11 +2265,12 @@ impl RemoteBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(RemoteBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close image preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -2272,7 +2295,7 @@ impl RemoteBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
         }

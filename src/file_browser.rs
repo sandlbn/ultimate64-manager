@@ -866,11 +866,12 @@ impl FileBrowser {
             tooltip(
                 button(text("⬆").size(normal))
                     .on_press(FileBrowserMessage::NavigateUp)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             text(display_path).size(small).width(Length::Fill),
         ]
         .spacing(5)
@@ -886,29 +887,32 @@ impl FileBrowser {
             tooltip(
                 button(text("🔍 Browse").size(small))
                     .on_press(FileBrowserMessage::SelectDirectory)
-                    .padding([2, 6]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Choose a different folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(text("CSDb").size(small))
                     .on_press(FileBrowserMessage::NavigateToCsdbDir)
-                    .padding([2, 6]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Go to CSDb downloads folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(text("🏠 Home").size(small))
                     .on_press(FileBrowserMessage::NavigateToPath(
                         dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
                     ))
-                    .padding([2, 6]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Go to home directory",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(3)
         .align_y(iced::Alignment::Center)
@@ -1037,17 +1041,19 @@ impl FileBrowser {
                     row![
                         button(text(format!("Enable Drive {}", drive_letter)).size(small))
                             .on_press(FileBrowserMessage::ConfirmEnableDrive)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                         button(text("Cancel").size(small))
                             .on_press(FileBrowserMessage::CancelEnableDrive)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                     ]
                     .spacing(10),
                 ]
                 .spacing(12)
                 .padding(20),
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .width(Length::Fill);
 
             return column![
@@ -1111,17 +1117,19 @@ impl FileBrowser {
                     row![
                         button(text("Delete").size(small))
                             .on_press(FileBrowserMessage::DeleteConfirmed)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                         button(text("Cancel").size(small))
                             .on_press(FileBrowserMessage::DeleteCancelled)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                     ]
                     .spacing(10),
                 ]
                 .spacing(10)
                 .padding(15),
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .width(Length::Fill);
 
             column![
@@ -1152,17 +1160,19 @@ impl FileBrowser {
                     row![
                         button(text("Create").size(small))
                             .on_press(FileBrowserMessage::CreateDirConfirm)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                         button(text("Cancel").size(small))
                             .on_press(FileBrowserMessage::CreateDirCancel)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                     ]
                     .spacing(10),
                 ]
                 .spacing(10)
                 .padding(15),
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .width(Length::Fill);
 
             column![
@@ -1238,11 +1248,12 @@ impl FileBrowser {
             tooltip(
                 button(text("Close").size(small))
                     .on_press(FileBrowserMessage::CloseDiskInfo)
-                    .padding([4, 10]),
+                    .padding([4, 10])
+                    .style(button::secondary),
                 "Close directory listing",
                 tooltip::Position::Left,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
@@ -1326,7 +1337,7 @@ impl FileBrowser {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -1362,11 +1373,12 @@ impl FileBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close text preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -1401,7 +1413,7 @@ impl FileBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
             ContentPreview::Image {
@@ -1427,11 +1439,12 @@ impl FileBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close image preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -1458,7 +1471,7 @@ impl FileBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
         }
@@ -1548,11 +1561,12 @@ impl FileBrowser {
                             tooltip(
                                 button(text("?").size(small))
                                     .on_press(FileBrowserMessage::ShowDiskInfo(entry.path.clone()))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 "Show disk directory listing",
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
                     }
 
@@ -1564,12 +1578,13 @@ impl FileBrowser {
                                         entry.path.clone(),
                                         self.selected_drive.to_drive_string(),
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1579,12 +1594,13 @@ impl FileBrowser {
                                         self.selected_drive.to_drive_string(),
                                         MountMode::ReadWrite,
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read/Write)", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1594,12 +1610,13 @@ impl FileBrowser {
                                         self.selected_drive.to_drive_string(),
                                         MountMode::ReadOnly,
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read Only)", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
 
                     buttons.into()
@@ -1607,29 +1624,32 @@ impl FileBrowser {
                 Some("prg") | Some("crt") => tooltip(
                     button(text("Run").size(small))
                         .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone()))
-                        .padding([2, 10]),
+                        .padding([2, 10])
+                        .style(crate::styles::action_button),
                     "Load and run on Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("sid") => tooltip(
                     button(text("Play").size(small))
                         .on_press(FileBrowserMessage::PlaySid(entry.path.clone()))
-                        .padding([2, 8]),
+                        .padding([2, 8])
+                        .style(crate::styles::action_button),
                     "Play SID music on Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("mod") => tooltip(
                     button(text("Play").size(small))
                         .on_press(FileBrowserMessage::PlayMod(entry.path.clone()))
-                        .padding([2, 8]),
+                        .padding([2, 8])
+                        .style(crate::styles::action_button),
                     "Play MOD music on Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("zip") => {
                     // Extract the ZIP into a sibling subdirectory, then navigate there.
@@ -1637,7 +1657,8 @@ impl FileBrowser {
                     tooltip(
                         button(text("Extract").size(small))
                             .on_press(FileBrowserMessage::ExtractZip(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         text(format!(
                             "Extract ZIP to subfolder (max {} MB)",
                             MAX_ZIP_EXTRACT_BYTES / (1024 * 1024)
@@ -1645,7 +1666,7 @@ impl FileBrowser {
                         .size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 }
                 _ => {
@@ -1656,11 +1677,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View text content",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else if is_image_file {
                         tooltip(
@@ -1668,11 +1690,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View image",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else if is_pdf_file {
                         tooltip(
@@ -1680,11 +1703,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View PDF",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else {
                         Space::new().width(0).into()
@@ -1715,7 +1739,7 @@ impl FileBrowser {
                 text(entry.name.clone()).size(normal),
                 tooltip::Position::Top,
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .into()
         } else {
             filename_button.into()

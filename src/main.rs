@@ -2315,7 +2315,7 @@ impl Ultimate64Browser {
                 button(text("F3 View").size(small))
                     .on_press(Message::FnView)
                     .padding([4, 10])
-                    .style(button::secondary),
+                    .style(crate::styles::nav_button),
                 button(
                     text(match self.active_pane {
                         Pane::Left => "F5 Copy \u{2192}",  // →
@@ -2325,7 +2325,7 @@ impl Ultimate64Browser {
                 )
                 .on_press(Message::FnCopy)
                 .padding([4, 10])
-                .style(button::secondary),
+                .style(crate::styles::nav_button),
                 button(
                     text(match self.active_pane {
                         Pane::Left => "F7 MkDir (local)",
@@ -2335,7 +2335,7 @@ impl Ultimate64Browser {
                 )
                 .on_press(Message::FnMkDir)
                 .padding([4, 10])
-                .style(button::secondary),
+                .style(crate::styles::nav_button),
                 button(
                     text(match self.active_pane {
                         Pane::Left => "F8 Delete (local)",
@@ -2345,7 +2345,7 @@ impl Ultimate64Browser {
                 )
                 .on_press(Message::FnDelete)
                 .padding([4, 10])
-                .style(button::secondary),
+                .style(crate::styles::nav_button),
                 Space::new().width(Length::Fill),
                 text("Filter:").size(tiny),
                 text_input("filter...", active_filter)
