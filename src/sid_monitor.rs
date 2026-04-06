@@ -9,8 +9,8 @@
 //!
 
 use iced::{
+    widget::{button, column, container, pick_list, row, rule, scrollable, text, Column, Space},
     Element, Length, Subscription, Task,
-    widget::{Column, Space, button, column, container, pick_list, row, rule, scrollable, text},
 };
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -1111,11 +1111,9 @@ impl SidMonitor {
 
         let sprites_block = container(
             if spr_rows.is_empty() {
-                column![
-                    text("No sprites enabled")
-                        .size(mf)
-                        .color(iced::Color::from_rgb(0.4, 0.4, 0.4))
-                ]
+                column![text("No sprites enabled")
+                    .size(mf)
+                    .color(iced::Color::from_rgb(0.4, 0.4, 0.4))]
             } else {
                 column![
                     text("Active Sprites").size(mf),
@@ -1313,7 +1311,11 @@ fn kv<'a>(key: &str, value: &str, font_size: u32) -> Element<'a, SidMonitorMessa
 }
 
 fn yn(b: bool) -> String {
-    if b { "Yes".into() } else { "No".into() }
+    if b {
+        "Yes".into()
+    } else {
+        "No".into()
+    }
 }
 
 /// Coloured square swatch + colour name
@@ -1378,18 +1380,8 @@ fn voice_header_row<M: 'static>(font_size: u32) -> Element<'static, M> {
     .into()
 }
 
-fn section_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgba(
-            1.0, 1.0, 1.0, 0.04,
-        ))),
-        border: iced::Border {
-            color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.10),
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        ..Default::default()
-    }
+fn section_style(theme: &iced::Theme) -> container::Style {
+    crate::styles::section_style(theme)
 }
 
 // ─────────────────────────────────────────────────────────────────

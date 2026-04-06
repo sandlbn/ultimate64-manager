@@ -1,11 +1,12 @@
 use crate::mod_info;
+use crate::net_utils::REST_TIMEOUT_SECS;
 use crate::sid_info;
 use iced::{
-    Element, Length, Subscription, Task,
     widget::{
-        Column, Space, button, column, container, progress_bar, row, rule, scrollable, text,
-        text_input, tooltip,
+        button, column, container, progress_bar, row, rule, scrollable, text, text_input, tooltip,
+        Column, Space,
     },
+    Element, Length, Subscription, Task,
 };
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -17,11 +18,11 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use ultimate64::Rest;
 
+use crate::music_ops;
+
 // MD5 hash size
 const MD5_HASH_SIZE: usize = 16;
 const DEFAULT_SONG_DURATION: u32 = 180; // 3 minutes default
-/// Timeout for REST API operations to prevent hangs when device goes offline
-const REST_TIMEOUT_SECS: u64 = 5;
 
 /// SID metadata extracted from header, stored with playlist entries for display.
 /// Provides rich info like PAL/NTSC, multi-SID chip addresses, and release year.
@@ -1333,11 +1334,12 @@ impl MusicPlayer {
         .spacing(5);
 
         // Build the top bar with now-playing info and optional metadata line
-        let mut top_bar_items: Vec<Element<'_, MusicPlayerMessage>> = vec![
-            row![now_playing, Space::new().width(Length::Fill), time_display]
-                .align_y(iced::Alignment::Center)
-                .into(),
-        ];
+        let mut top_bar_items: Vec<Element<'_, MusicPlayerMessage>> =
+            vec![
+                row![now_playing, Space::new().width(Length::Fill), time_display]
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+            ];
 
         // Show SID metadata line if available (PAL | 2xSID @ $D420 | © 1988)
         if !now_playing_meta.is_empty() {
@@ -1511,13 +1513,11 @@ impl MusicPlayer {
                     match &entry.entry_type {
                         BrowserEntryType::Directory => {
                             // Directory entry - click to navigate
-                            row![
-                                button(text(format!("[DIR] {}", entry.name)).size(normal))
-                                    .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
-                                    .padding([6, 8])
-                                    .width(Length::Fill)
-                                    .style(button::text),
-                            ]
+                            row![button(text(format!("[DIR] {}", entry.name)).size(normal))
+                                .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
+                                .padding([6, 8])
+                                .width(Length::Fill)
+                                .style(button::text),]
                             .into()
                         }
                         BrowserEntryType::MusicFile(ft) => {
@@ -1829,16 +1829,14 @@ impl MusicPlayer {
 
         // Play selected button
         let playlist_controls = container(if let Some(selected) = self.playlist_selected {
-            row![
-                tooltip(
-                    button(text("Play Selected").size(small))
-                        .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
-                        .padding([4, 10]),
-                    "Start playing the selected track",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-            ]
+            row![tooltip(
+                button(text("Play Selected").size(small))
+                    .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
+                    .padding([4, 10]),
+                "Start playing the selected track",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),]
         } else {
             row![]
         })
@@ -2216,343 +2214,41 @@ async fn play_music_file(
     song_number: Option<u8>,
     file_type: MusicFileType,
 ) -> Result<(), String> {
-    log::info!("Playing: {} (song: {:?})", path.display(), song_number);
-
-    let data = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    // Wrap in timeout to prevent hangs when device is offline
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
-            match file_type {
-                MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
-                MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),
-                MusicFileType::Prg => conn.run_prg(&data).map_err(|e| e.to_string()),
-            }
-        }),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Play timed out - device may be offline".to_string()),
-    }
+    music_ops::play_music_file(connection, path, song_number, file_type).await
 }
 
 async fn download_song_lengths_async() -> Result<String, String> {
-    let urls = [
-        "https://hvsc.perv.dk/HVSC/C64Music/DOCUMENTS/Songlengths.md5",
-        "http://hvsc.brona.dk/HVSC/C64Music/DOCUMENTS/Songlengths.md5",
-    ];
-
-    let config_dir = dirs::config_dir()
-        .ok_or("Cannot determine config directory")?
-        .join("ultimate64-manager");
-
-    tokio::fs::create_dir_all(&config_dir)
-        .await
-        .map_err(|e| format!("Cannot create config dir: {}", e))?;
-
-    let dest_path = config_dir.join("Songlengths.md5");
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("HTTP client error: {}", e))?;
-
-    for url in urls {
-        log::info!("Trying to download from: {}", url);
-
-        match client.get(url).send().await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let bytes = response
-                        .bytes()
-                        .await
-                        .map_err(|e| format!("Download error: {}", e))?;
-
-                    tokio::fs::write(&dest_path, &bytes)
-                        .await
-                        .map_err(|e| format!("Write error: {}", e))?;
-
-                    return Ok(dest_path.to_string_lossy().to_string());
-                }
-            }
-            Err(e) => {
-                log::warn!("Failed to download from {}: {}", url, e);
-                continue;
-            }
-        }
-    }
-
-    Err("All download attempts failed".to_string())
+    music_ops::download_song_lengths_async().await
 }
 
 async fn parse_song_lengths_async(
     path: PathBuf,
 ) -> Result<HashMap<[u8; MD5_HASH_SIZE], Vec<u32>>, String> {
-    // Song length database format:
-    // Each line: MD5HASH=duration1 duration2 duration3 ...
-    // Where each duration corresponds to a subsong (subsong 1 = index 0, etc.)
-    // The number of durations = number of subsongs in the file
-    // This is more authoritative than the SID header subsong count
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("Cannot read file: {}", e))?;
-
-    let mut db: HashMap<[u8; MD5_HASH_SIZE], Vec<u32>> = HashMap::new();
-    let mut count = 0;
-
-    for line in content.lines() {
-        let line = line.trim();
-
-        // Skip empty lines, comments, and section headers like [Database]
-        if line.is_empty()
-            || line.starts_with(';')
-            || line.starts_with('#')
-            || line.starts_with('[')
-        {
-            continue;
-        }
-
-        if let Some(eq_pos) = line.find('=') {
-            let md5_str = &line[..eq_pos];
-            let lengths_str = &line[eq_pos + 1..];
-
-            if md5_str.len() != 32 {
-                continue;
-            }
-
-            if let Some(hash) = sid_info::hex_to_md5(md5_str) {
-                let mut lengths = Vec::new();
-
-                for token in lengths_str.split_whitespace() {
-                    if let Some(duration) = sid_info::parse_time_string(token) {
-                        lengths.push(duration + 1);
-                    }
-                }
-
-                if !lengths.is_empty() {
-                    db.insert(hash, lengths);
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    log::info!(
-        "Parsed {} song length entries from {}",
-        count,
-        path.display()
-    );
-
-    Ok(db)
+    music_ops::parse_song_lengths_async(path).await
 }
 
 async fn save_playlist_async(playlist: SavedPlaylist) -> Result<String, String> {
-    let handle = rfd::AsyncFileDialog::new()
-        .add_filter("Playlist", &["json"])
-        .set_file_name(&format!("{}.json", playlist.name))
-        .save_file()
-        .await
-        .ok_or("Save cancelled")?;
-
-    let path = handle.path().to_path_buf();
-
-    let json = serde_json::to_string_pretty(&playlist)
-        .map_err(|e| format!("Serialization error: {}", e))?;
-
-    tokio::fs::write(&path, json)
-        .await
-        .map_err(|e| format!("Write error: {}", e))?;
-
-    Ok(path.to_string_lossy().to_string())
+    music_ops::save_playlist_async(playlist).await
 }
 
 async fn load_playlist_async() -> Result<Vec<PlaylistEntry>, String> {
-    let handle = rfd::AsyncFileDialog::new()
-        .add_filter("Playlist", &["json"])
-        .pick_file()
-        .await
-        .ok_or("Load cancelled")?;
-
-    let path = handle.path().to_path_buf();
-
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("Read error: {}", e))?;
-
-    let playlist: SavedPlaylist =
-        serde_json::from_str(&content).map_err(|e| format!("Parse error: {}", e))?;
-
-    Ok(playlist.entries)
+    music_ops::load_playlist_async().await
 }
 
-// === Recursive File Search ===
-
-/// Search for music files (SID, MOD, PRG) recursively under `root`, matching
-/// filenames or directory names against `query` (case-insensitive).
-/// Returns BrowserEntry items with names showing relative paths from root.
 fn search_files_recursive(root: &Path, query: &str) -> Vec<BrowserEntry> {
-    let mut results: Vec<BrowserEntry> = Vec::new();
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            // Skip hidden files/directories
-            if name.starts_with('.') {
-                continue;
-            }
-
-            if path.is_dir() {
-                // Always recurse into subdirectories
-                stack.push(path.clone());
-
-                // If the directory name matches, show it as navigable in results
-                if name.to_lowercase().contains(query) {
-                    let rel = path.strip_prefix(root).unwrap_or(&path);
-                    let display_name = format!("[DIR] {}", rel.display());
-                    results.push(BrowserEntry {
-                        path,
-                        name: display_name,
-                        entry_type: BrowserEntryType::Directory,
-                        subsongs: 1,
-                        sid_tooltip: None,
-                    });
-                }
-            } else if let Some(extension) = path.extension() {
-                if let Some(ext_str) = extension.to_str() {
-                    let ext_lower = ext_str.to_lowercase();
-                    let file_type = match ext_lower.as_str() {
-                        "sid" => Some(MusicFileType::Sid),
-                        "mod" => Some(MusicFileType::Mod),
-                        "prg" => Some(MusicFileType::Prg),
-                        _ => None,
-                    };
-
-                    if let Some(ft) = file_type {
-                        // Match against filename or any parent directory name
-                        let rel = path.strip_prefix(root).unwrap_or(&path);
-                        let rel_str = rel.to_string_lossy().to_lowercase();
-
-                        if rel_str.contains(query) {
-                            // For SID files, parse header for subsong count and tooltip
-                            let (subsongs, sid_tooltip) = if ft == MusicFileType::Sid {
-                                match fs::read(&path)
-                                    .ok()
-                                    .and_then(|data| sid_info::parse_header(&data).ok())
-                                {
-                                    Some(header) => {
-                                        let songs = if header.songs > 0 && header.songs <= 256 {
-                                            header.songs as u8
-                                        } else {
-                                            1
-                                        };
-                                        let mut tip = Vec::new();
-                                        if !header.name.is_empty() {
-                                            tip.push(header.name.clone());
-                                        }
-                                        if !header.author.is_empty() {
-                                            tip.push(header.author.clone());
-                                        }
-                                        if !header.released.is_empty() {
-                                            tip.push(format!("© {}", header.released));
-                                        }
-                                        tip.push(format!(
-                                            "{} | {} | {} tunes",
-                                            header.video_standard(),
-                                            header.sid_model_info(),
-                                            songs
-                                        ));
-                                        (songs, Some(tip.join("\n")))
-                                    }
-                                    None => (sid_info::quick_subsong_count(&path), None),
-                                }
-                            } else {
-                                (1, None)
-                            };
-
-                            // Show relative path so user knows where the file is
-                            let display_name = rel.display().to_string();
-
-                            results.push(BrowserEntry {
-                                path,
-                                name: display_name,
-                                entry_type: BrowserEntryType::MusicFile(ft),
-                                subsongs,
-                                sid_tooltip,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Sort: directories first, then files, both alphabetical
-    results.sort_by(|a, b| {
-        let a_is_dir = matches!(a.entry_type, BrowserEntryType::Directory);
-        let b_is_dir = matches!(b.entry_type, BrowserEntryType::Directory);
-        match (a_is_dir, b_is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
-    });
-
-    results
+    music_ops::search_files_recursive(root, query)
 }
 
 // === Helper Functions ===
 
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.chars().count() <= max_len {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{}...", truncated)
-    }
+    crate::string_utils::truncate_string(s, max_len)
 }
 
 fn truncate_path(path: &Path, max_len: usize) -> String {
-    let s = path.to_string_lossy();
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("...{}", &s[s.len().saturating_sub(max_len - 3)..])
-    }
+    crate::string_utils::truncate_path(path, max_len)
 }
 
 fn format_total_duration(entries: &[PlaylistEntry], default_duration: u32) -> String {
-    let total_seconds: u32 = entries
-        .iter()
-        .map(|e| e.duration.unwrap_or(default_duration))
-        .sum();
-
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if hours > 0 {
-        format!("{}h {}m {}s", hours, minutes, seconds)
-    } else {
-        format!("{}m {}s", minutes, seconds)
-    }
+    music_ops::format_total_duration(entries, default_duration)
 }

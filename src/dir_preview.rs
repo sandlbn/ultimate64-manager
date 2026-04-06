@@ -344,33 +344,12 @@ pub async fn render_disk_listing_image_async(disk_info: DiskInfo) -> Vec<u8> {
 /// white text — matching the real C64 directory listing appearance.
 /// Check if a file is a previewable text file
 pub fn is_text_file(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
-
-    matches!(
-        ext.as_deref(),
-        Some("txt") | Some("atxt") | Some("nfo") | Some("diz") | Some("readme")
-    ) || path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase())
-        .map(|s| s.starts_with("readme") || s == "file_id.diz")
-        .unwrap_or(false)
+    crate::file_types::is_text_file_path(path)
 }
 
 /// Check if a file is a previewable image file
 pub fn is_image_file(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_lowercase());
-
-    matches!(
-        ext.as_deref(),
-        Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp")
-    )
+    crate::file_types::is_image_file_path(path)
 }
 
 /// Load text file content

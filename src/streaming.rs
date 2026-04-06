@@ -1,19 +1,20 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use iced::widget::image::FilterMethod;
 use iced::{
-    Element, Length, Subscription, Task,
     event::{self, Event},
     keyboard::{self, Key, Modifiers},
     widget::{
-        Column, Space, button, checkbox, column, container, image as iced_image, mouse_area, row,
-        rule, scrollable, text, text_input, tooltip,
+        button, checkbox, column, container, image as iced_image, mouse_area, row, rule,
+        scrollable, text, text_input, tooltip, Column, Space,
     },
+    Element, Length, Subscription, Task,
 };
 
+use crate::net_utils::get_local_ip;
 use crate::settings::StreamControlMethod;
-use crate::stream_control::{get_local_ip, send_stop_command, send_stream_command};
+use crate::stream_control::{send_stop_command, send_stream_command};
 use crate::video_scaling::{
-    C64_PALETTE, apply_crt_effect, apply_scanlines, integer_scale, scale2x,
+    apply_crt_effect, apply_scanlines, integer_scale, scale2x, C64_PALETTE,
 };
 
 use std::collections::VecDeque;
@@ -23,8 +24,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
-use ultimate64::Rest;
 use ultimate64::petscii::Petscii;
+use ultimate64::Rest;
 
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
@@ -34,7 +35,7 @@ pub const VIC_HEIGHT: u32 = 272;
 // Audio constants
 const AUDIO_PORT_OFFSET: u16 = 1; // Audio port = video port + 1
 const AUDIO_SAMPLE_RATE: u32 = 48000; // Output sample rate (what cpal uses)
-// const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
+                                      // const AUDIO_SAMPLES_PER_PACKET: usize = 192 * 4; // 768 samples (384 stereo pairs)
 const AUDIO_HEADER_SIZE: usize = 2; // Just sequence number
 const AUDIO_BUFFER_SIZE: usize = AUDIO_SAMPLE_RATE as usize; // ~1 second buffer
 
@@ -1059,8 +1060,8 @@ impl VideoStreaming {
             .spacing(3),
         ]
         .spacing(5); // Stream controls with keyboard toggle
-        // Screenshot works when streaming (instant frame grab) OR when connected
-        // without streaming (REST API capture via screenshot_api module).
+                     // Screenshot works when streaming (instant frame grab) OR when connected
+                     // without streaming (REST API capture via screenshot_api module).
         let screenshot_button = {
             let can_screenshot = self.is_streaming || self.ultimate_host.is_some();
             let btn = button(text("📸").size(11)).padding([6, 10]);

@@ -39,12 +39,20 @@ impl SidHeader {
     /// Frame rate in Hz.
     #[allow(dead_code)]
     pub fn frame_rate(&self) -> f64 {
-        if self.is_pal { 50.0 } else { 60.0 }
+        if self.is_pal {
+            50.0
+        } else {
+            60.0
+        }
     }
 
     /// Frame duration in microseconds.
     pub fn frame_us(&self) -> u64 {
-        if self.is_pal { 20_000 } else { 16_667 }
+        if self.is_pal {
+            20_000
+        } else {
+            16_667
+        }
     }
 
     /// Display name: "Author - Title" or just "Title" if no author.
@@ -60,7 +68,11 @@ impl SidHeader {
 
     /// Video standard as string.
     pub fn video_standard(&self) -> &'static str {
-        if self.is_pal { "PAL" } else { "NTSC" }
+        if self.is_pal {
+            "PAL"
+        } else {
+            "NTSC"
+        }
     }
 
     /// SID model info string (e.g., "1xSID" or "2xSID @ $D420").
@@ -101,20 +113,7 @@ fn read_be_u32(d: &[u8], o: usize) -> u32 {
 }
 
 fn read_string(d: &[u8], o: usize, len: usize) -> String {
-    let s = &d[o..o + len];
-    let end = s.iter().position(|&b| b == 0).unwrap_or(len);
-    s[..end]
-        .iter()
-        .filter_map(|&b| {
-            if b >= 32 && b < 127 {
-                Some(b as char)
-            } else {
-                None
-            }
-        })
-        .collect::<String>()
-        .trim()
-        .to_string()
+    crate::string_utils::read_binary_string(d, o, len)
 }
 
 /// Decode a SID address byte (from header offset $7A or $7B).

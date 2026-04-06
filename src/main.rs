@@ -3,13 +3,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
-    Element, Length, Subscription, Task, Theme,
     widget::{
-        Space, button, column, container, pick_list, row, rule, scrollable, text, text_input,
-        tooltip,
+        button, column, container, pick_list, row, rule, scrollable, text, text_input, tooltip,
+        Space,
     },
-    window,
+    window, Element, Length, Subscription, Task, Theme,
 };
+use net_utils::REST_TIMEOUT_SECS;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -18,6 +18,7 @@ use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
+mod config_api;
 mod config_editor;
 mod config_presets;
 mod csdb;
@@ -26,9 +27,13 @@ mod dir_preview;
 mod discovery;
 mod disk_image;
 mod file_browser;
+mod file_types;
+mod ftp_ops;
 mod memory_editor;
 mod mod_info;
+mod music_ops;
 mod music_player;
+mod net_utils;
 mod pdf_preview;
 mod petscii;
 mod port64;
@@ -40,6 +45,8 @@ mod sid_info;
 mod sid_monitor;
 mod stream_control;
 mod streaming;
+mod string_utils;
+mod styles;
 mod templates;
 mod version_check;
 mod video_scaling;
@@ -994,10 +1001,8 @@ impl Ultimate64Browser {
                         let url = format!("{}/v1/machine:pause", host);
                         let pause_cmd = Task::perform(
                             async move {
-                                let client = reqwest::Client::builder()
-                                    .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
-                                    .build()
-                                    .map_err(|e| format!("Client error: {}", e))?;
+                                let client =
+                                    crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
                                 client
                                     .put(&url)
                                     .send()
@@ -1025,10 +1030,8 @@ impl Ultimate64Browser {
                             let url = format!("{}/v1/machine:resume", host);
                             let resume_cmd = Task::perform(
                                 async move {
-                                    let client = reqwest::Client::builder()
-                                        .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
-                                        .build()
-                                        .map_err(|e| format!("Client error: {}", e))?;
+                                    let client =
+                                        crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
                                     client
                                         .put(&url)
                                         .send()
@@ -1576,10 +1579,7 @@ impl Ultimate64Browser {
                     let url = format!("{}/v1/machine:reboot", host);
                     Task::perform(
                         async move {
-                            let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
-                                .build()
-                                .map_err(|e| format!("Client error: {}", e))?;
+                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
                             client
                                 .put(&url)
                                 .send()
@@ -1600,10 +1600,7 @@ impl Ultimate64Browser {
                     let url = format!("{}/v1/machine:pause", host);
                     Task::perform(
                         async move {
-                            let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
-                                .build()
-                                .map_err(|e| format!("Client error: {}", e))?;
+                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
                             client
                                 .put(&url)
                                 .send()
@@ -1624,10 +1621,7 @@ impl Ultimate64Browser {
                     let url = format!("{}/v1/machine:resume", host);
                     Task::perform(
                         async move {
-                            let client = reqwest::Client::builder()
-                                .timeout(std::time::Duration::from_secs(REST_TIMEOUT_SECS))
-                                .build()
-                                .map_err(|e| format!("Client error: {}", e))?;
+                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
                             client
                                 .put(&url)
                                 .send()
@@ -2303,14 +2297,12 @@ impl Ultimate64Browser {
                 .width(Length::Fixed(300.0)),
             Space::new().height(10),
             text("Stream Control Method:").size(14),
-            row![
-                pick_list(
-                    &StreamControlMethod::ALL[..],
-                    Some(self.settings.connection.stream_control_method),
-                    Message::StreamControlMethodChanged,
-                )
-                .width(Length::Fixed(250.0)),
-            ]
+            row![pick_list(
+                &StreamControlMethod::ALL[..],
+                Some(self.settings.connection.stream_control_method),
+                Message::StreamControlMethodChanged,
+            )
+            .width(Length::Fixed(250.0)),]
             .spacing(10),
             text("Controls how video/audio streaming communicates with the Ultimate64").size(11),
             Space::new().height(15),
@@ -2797,9 +2789,6 @@ async fn execute_template_commands(
 
     Ok(())
 }
-
-/// Timeout for REST API operations to prevent hangs when device goes offline
-const REST_TIMEOUT_SECS: u64 = 5;
 
 async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, String> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate

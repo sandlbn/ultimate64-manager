@@ -1,30 +1,28 @@
-use iced::widget::Id as WidgetId;
 use iced::widget::operation::scroll_to;
 use iced::widget::scrollable::{AbsoluteOffset, Viewport};
+use iced::widget::Id as WidgetId;
 use iced::{
-    Element, Length, Task,
     widget::{
-        Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text,
-        text_input, tooltip,
+        button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_input,
+        tooltip, Column, Space,
     },
+    Element, Length, Task,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use ultimate64::{Rest, drives::MountMode};
+use ultimate64::{drives::MountMode, Rest};
 
 /// Stable ID for the main file-list scrollable widget
 const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
 
-use crate::csdb::{MAX_ZIP_EXTRACT_BYTES, extract_zip_to_dir};
+use crate::csdb::{extract_zip_to_dir, MAX_ZIP_EXTRACT_BYTES};
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
+use crate::net_utils::REST_TIMEOUT_SECS;
 use crate::pdf_preview;
-
-/// Timeout for REST API operations to prevent hangs when device goes offline
-const REST_TIMEOUT_SECS: u64 = 5;
 /// Longer timeout for run_disk which includes boot delays
 const RUN_DISK_TIMEOUT_SECS: u64 = 15;
 
@@ -1186,7 +1184,10 @@ impl FileBrowser {
         };
 
         // Check if this is a disk image that can show info
-        let is_disk_image = matches!(entry.extension.as_deref(), Some("d64") | Some("d71"));
+        let is_disk_image = entry
+            .extension
+            .as_deref()
+            .map_or(false, |ext| crate::file_types::is_disk_image(ext));
 
         // Check if this is a previewable text or image file
         let is_text_file = dir_preview::is_text_file(&entry.path);
@@ -1487,36 +1488,15 @@ impl FileBrowser {
 
                         // Filter: show directories and relevant file types
                         // Including text files and images for preview
+                        let ext_str = extension.as_deref().unwrap_or("");
                         if is_dir
-                            || matches!(
-                                extension.as_deref(),
-                                Some("d64")
-                                    | Some("d71")
-                                    | Some("d81")
-                                    | Some("g64")
-                                    | Some("g71")
-                                    | Some("prg")
-                                    | Some("crt")
-                                    | Some("sid")
-                                    | Some("mod")
-                                    | Some("tap")
-                                    | Some("t64")
-                                    // ZIP archives (extract-to-subdir action)
-                                    | Some("zip")
-                                    // Text files for readme preview
-                                    | Some("txt")
-                                    | Some("atxt")
-                                    | Some("nfo")
-                                    | Some("diz")
-                                    // Image files for preview
-                                    | Some("png")
-                                    | Some("jpg")
-                                    | Some("jpeg")
-                                    | Some("gif")
-                                    | Some("bmp")
-                                    | Some("pdf")
-                            )
-                            || dir_preview::is_text_file(&path)
+                            || crate::file_types::is_disk_image(ext_str)
+                            || crate::file_types::is_runnable(ext_str)
+                            || crate::file_types::is_zip_file(ext_str)
+                            || matches!(ext_str, "mod" | "tap" | "t64")
+                            || crate::file_types::is_text_file(&name)
+                            || crate::file_types::is_image_file(&name)
+                            || crate::file_types::is_pdf_file(&name)
                         {
                             Some(FileEntry {
                                 path,
@@ -1745,17 +1725,10 @@ pub async fn check_drive_enabled_async(
     };
 
     let url = format!("http://{}/v1/configs/{}/Drive", host, category);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client =
+        crate::net_utils::build_device_client(REST_TIMEOUT_SECS).map_err(|e| e.to_string())?;
 
-    let mut req = client.get(&url);
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            req = req.header("X-password", pwd.as_str());
-        }
-    }
+    let req = crate::net_utils::with_password(client.get(&url), password.as_deref());
 
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -1794,21 +1767,16 @@ pub async fn enable_drive_async(
         category: { "Drive": "Enabled" }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client =
+        crate::net_utils::build_device_client(REST_TIMEOUT_SECS).map_err(|e| e.to_string())?;
 
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body);
-
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            req = req.header("X-password", pwd.as_str());
-        }
-    }
+    let req = crate::net_utils::with_password(
+        client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body),
+        password.as_deref(),
+    );
 
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if resp.status().is_success() {

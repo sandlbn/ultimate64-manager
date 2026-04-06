@@ -1,21 +1,15 @@
 use iced::{
-    Element, Length, Subscription, Task,
     widget::{
-        Column, Row, Space, button, column, container, pick_list, row, rule, scrollable, text,
-        text_input, tooltip,
+        button, column, container, pick_list, row, rule, scrollable, text, text_input, tooltip,
+        Column, Row, Space,
     },
+    Element, Length, Subscription, Task,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
 
 use crate::port64;
-
-/// Timeout for REST API operations
-const REST_TIMEOUT_SECS: u64 = 5;
-
-/// Maximum bytes per REST write chunk (mirrors the C++ SOCKET_BUFFER_SIZE guard).
-const RAW_CHUNK: usize = 256;
 
 // ─────────────────────────────────────────────────────────────────
 //  Memory locations
@@ -1666,11 +1660,9 @@ impl MemoryEditor {
             .into()
         };
 
-        column![
-            first_row, search_row, fill_row, undo_row, bm_row, status_row
-        ]
-        .spacing(8)
-        .into()
+        column![first_row, search_row, fill_row, undo_row, bm_row, status_row]
+            .spacing(8)
+            .into()
     }
 
     // ── Bookmark bar ─────────────────────────────────────────────
@@ -2075,51 +2067,23 @@ impl MemoryEditor {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Style helpers
+//  Style helpers (delegated to crate::styles)
 // ─────────────────────────────────────────────────────────────────
 
-fn highlight_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(
-            1.0, 1.0, 0.0,
-        ))),
-        border: iced::Border::default(),
-        text_color: Some(iced::Color::BLACK),
-        shadow: iced::Shadow::default(),
-        snap: false,
-    }
+fn highlight_style(theme: &iced::Theme) -> container::Style {
+    crate::styles::highlight_style(theme)
 }
 
-fn editing_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(
-            0.3, 0.8, 0.3,
-        ))),
-        border: iced::Border::default(),
-        text_color: Some(iced::Color::BLACK),
-        shadow: iced::Shadow::default(),
-        snap: false,
-    }
+fn editing_style(theme: &iced::Theme) -> container::Style {
+    crate::styles::editing_style(theme)
 }
 
-fn tooltip_style(_theme: &iced::Theme) -> container::Style {
-    container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb(
-            0.2, 0.2, 0.25,
-        ))),
-        border: iced::Border {
-            color: iced::Color::from_rgb(0.4, 0.4, 0.5),
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        text_color: Some(iced::Color::WHITE),
-        shadow: iced::Shadow::default(),
-        snap: false,
-    }
+fn tooltip_style(theme: &iced::Theme) -> container::Style {
+    crate::styles::tooltip_style(theme)
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  REST async helpers (unchanged from original)
+//  REST async helpers (delegated to crate::api)
 // ─────────────────────────────────────────────────────────────────
 
 async fn read_memory_async(
@@ -2127,20 +2091,7 @@ async fn read_memory_async(
     address: u16,
     length: u16,
 ) -> Result<Vec<u8>, String> {
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
-            conn.read_mem(address, length)
-                .map_err(|e| format!("Read failed: {}", e))
-        }),
-    )
-    .await;
-    match result {
-        Ok(Ok(data)) => data,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Read timed out — device may be offline".to_string()),
-    }
+    crate::api::read_memory_async(connection, address, length).await
 }
 
 async fn write_byte_async(
@@ -2148,20 +2099,7 @@ async fn write_byte_async(
     address: u16,
     value: u8,
 ) -> Result<(), String> {
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
-            conn.write_mem(address, &[value])
-                .map_err(|e| format!("Write failed: {}", e))
-        }),
-    )
-    .await;
-    match result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Write timed out — device may be offline".to_string()),
-    }
+    crate::api::write_byte_async(connection, address, value).await
 }
 
 async fn fill_memory_async(
@@ -2170,29 +2108,7 @@ async fn fill_memory_async(
     length: u16,
     value: u8,
 ) -> Result<(), String> {
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS * 2),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
-            let fill_data: Vec<u8> = vec![value; RAW_CHUNK];
-            let mut offset = 0u16;
-            while offset < length {
-                let remaining = (length - offset) as usize;
-                let write_size = remaining.min(RAW_CHUNK);
-                let current_addr = address.wrapping_add(offset);
-                conn.write_mem(current_addr, &fill_data[..write_size])
-                    .map_err(|e| format!("Fill failed at ${:04X}: {}", current_addr, e))?;
-                offset += write_size as u16;
-            }
-            Ok(())
-        }),
-    )
-    .await;
-    match result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Fill timed out — device may be offline".to_string()),
-    }
+    crate::api::fill_memory_async(connection, address, length, value).await
 }
 
 async fn write_memory_async(
@@ -2200,25 +2116,5 @@ async fn write_memory_async(
     address: u16,
     data: Vec<u8>,
 ) -> Result<(), String> {
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS * 4),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
-            let mut offset = 0usize;
-            while offset < data.len() {
-                let write_size = (data.len() - offset).min(RAW_CHUNK);
-                let current_addr = address.wrapping_add(offset as u16);
-                conn.write_mem(current_addr, &data[offset..offset + write_size])
-                    .map_err(|e| format!("Write failed at ${:04X}: {}", current_addr, e))?;
-                offset += write_size;
-            }
-            Ok(())
-        }),
-    )
-    .await;
-    match result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Write timed out — device may be offline".to_string()),
-    }
+    crate::api::write_memory_async(connection, address, data).await
 }

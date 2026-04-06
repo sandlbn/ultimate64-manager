@@ -1,3 +1,4 @@
+use crate::net_utils::get_local_ip;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -146,18 +147,6 @@ async fn check_ultimate_api(ip: &str, timeout_ms: u64) -> Option<DiscoveredDevic
     }
 
     None
-}
-
-/// Get local IP address
-fn get_local_ip() -> Option<String> {
-    use std::net::UdpSocket;
-
-    // Connect to a public IP (doesn't actually send data)
-    // This trick reveals our local IP
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let addr = socket.local_addr().ok()?;
-    Some(addr.ip().to_string())
 }
 
 #[cfg(test)]

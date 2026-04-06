@@ -306,7 +306,7 @@ pub struct CsdbClient {
 impl CsdbClient {
     pub fn new() -> Result<Self> {
         use reqwest::header::{
-            ACCEPT, ACCEPT_LANGUAGE, CONNECTION, HeaderMap, HeaderValue, REFERER,
+            HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, CONNECTION, REFERER,
         };
 
         let mut headers = HeaderMap::new();
@@ -1122,7 +1122,7 @@ pub fn get_runnable_extracted_files(files: &[ExtractedFile]) -> Vec<&ExtractedFi
 
 /// Check if a file extension indicates a ZIP archive
 pub fn is_zip_file(ext: &str) -> bool {
-    ext == "zip"
+    crate::file_types::is_zip_file(ext)
 }
 
 // -----------------------------------------------------------------------------

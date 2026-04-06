@@ -8,11 +8,11 @@
 //! - Extracting and browsing ZIP archives
 
 use iced::{
-    Element, Length, Task,
     widget::{
-        Column, Space, button, column, container, pick_list, row, rule, scrollable, text,
-        text_input, tooltip,
+        button, column, container, pick_list, row, rule, scrollable, text, text_input, tooltip,
+        Column, Space,
     },
+    Element, Length, Task,
 };
 use reqwest;
 use std::path::PathBuf;
@@ -21,9 +21,9 @@ use tokio::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::csdb::{
-    CsdbClient, ExtractedZip, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory,
-    SearchResult, TopListCategory, TopListEntry, extract_zip_to_dir, get_runnable_extracted_files,
-    get_runnable_files, is_zip_file,
+    extract_zip_to_dir, get_runnable_extracted_files, get_runnable_files, is_zip_file, CsdbClient,
+    ExtractedZip, LatestRelease, ReleaseDetails, ReleaseFile, SearchCategory, SearchResult,
+    TopListCategory, TopListEntry,
 };
 
 /// Timeout for CSDb operations
@@ -196,15 +196,12 @@ impl FileFilter {
         match self {
             FileFilter::All => true,
             FileFilter::Runnable => {
-                matches!(
-                    ext,
-                    "prg" | "d64" | "d71" | "d81" | "g64" | "crt" | "sid" | "zip"
-                )
+                crate::file_types::is_runnable(ext) || crate::file_types::is_zip_file(ext)
             }
-            FileFilter::Disk => matches!(ext, "d64" | "d71" | "d81" | "g64" | "g71"),
+            FileFilter::Disk => crate::file_types::is_disk_image(ext),
             FileFilter::Program => matches!(ext, "prg" | "crt"),
             FileFilter::Music => ext == "sid",
-            FileFilter::Archive => ext == "zip",
+            FileFilter::Archive => crate::file_types::is_zip_file(ext),
         }
     }
 }
@@ -625,7 +622,7 @@ impl CsdbBrowser {
                         let conn = connection.unwrap();
                         let drive = self.selected_drive.to_drive_string();
                         let device_num = self.selected_drive.device_number().to_string();
-                        let is_disk = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+                        let is_disk = crate::file_types::is_disk_image(&file.ext);
 
                         return Task::perform(
                             async move {
@@ -831,7 +828,7 @@ impl CsdbBrowser {
             CsdbBrowserMessage::DoMountFile(index, mount_mode) => {
                 if let Some(release) = &self.current_release {
                     if let Some(file) = release.files.iter().find(|f| f.index == index) {
-                        if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
+                        if !crate::file_types::is_disk_image(&file.ext) {
                             self.status_message =
                                 Some("Only disk images can be mounted".to_string());
                             return Task::none();
@@ -1001,7 +998,7 @@ impl CsdbBrowser {
                         let conn = connection.unwrap();
                         let drive = self.selected_drive.to_drive_string();
                         let device_num = self.selected_drive.device_number().to_string();
-                        let is_disk = matches!(ext.as_str(), "d64" | "d71" | "d81" | "g64");
+                        let is_disk = crate::file_types::is_disk_image(ext.as_str());
 
                         return Task::perform(
                             async move {
@@ -1094,7 +1091,7 @@ impl CsdbBrowser {
             CsdbBrowserMessage::DoMountExtractedFile(index, mount_mode) => {
                 if let Some(extracted) = &self.extracted_zip {
                     if let Some(file) = extracted.files.iter().find(|f| f.index == index) {
-                        if !matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64") {
+                        if !crate::file_types::is_disk_image(&file.ext) {
                             self.status_message =
                                 Some("Only disk images can be mounted".to_string());
                             return Task::none();
@@ -1911,11 +1908,8 @@ impl CsdbBrowser {
         } else {
             for file in filtered_files {
                 let is_selected = self.selected_file_index == Some(file.index);
-                let is_runnable = matches!(
-                    file.ext.as_str(),
-                    "prg" | "crt" | "sid" | "d64" | "d71" | "d81" | "g64"
-                );
-                let is_disk_image = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+                let is_runnable = crate::file_types::is_runnable(&file.ext);
+                let is_disk_image = crate::file_types::is_disk_image(&file.ext);
                 let is_zip = is_zip_file(&file.ext);
 
                 let filename_display = if file.filename.len() > 35 {
@@ -1924,14 +1918,7 @@ impl CsdbBrowser {
                     file.filename.clone()
                 };
 
-                let ext_color = match file.ext.as_str() {
-                    "prg" => iced::Color::from_rgb(0.5, 0.8, 0.5),
-                    "d64" | "d71" | "d81" | "g64" => iced::Color::from_rgb(0.5, 0.7, 0.9),
-                    "crt" => iced::Color::from_rgb(0.9, 0.7, 0.5),
-                    "sid" => iced::Color::from_rgb(0.8, 0.5, 0.8),
-                    "zip" => iced::Color::from_rgb(0.9, 0.9, 0.5),
-                    _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
-                };
+                let ext_color = crate::file_types::ext_color(&file.ext);
 
                 let mut file_row = row![
                     text(format!("{:02}.", file.index))
@@ -2179,11 +2166,8 @@ impl CsdbBrowser {
         } else {
             for file in &extracted.files {
                 let is_selected = self.selected_extracted_file_index == Some(file.index);
-                let is_runnable = matches!(
-                    file.ext.as_str(),
-                    "prg" | "crt" | "sid" | "d64" | "d71" | "d81" | "g64"
-                );
-                let is_disk_image = matches!(file.ext.as_str(), "d64" | "d71" | "d81" | "g64");
+                let is_runnable = crate::file_types::is_runnable(&file.ext);
+                let is_disk_image = crate::file_types::is_disk_image(&file.ext);
 
                 let filename_display = if file.filename.len() > 40 {
                     format!("{}...", &file.filename[..37])
@@ -2191,13 +2175,7 @@ impl CsdbBrowser {
                     file.filename.clone()
                 };
 
-                let ext_color = match file.ext.as_str() {
-                    "prg" => iced::Color::from_rgb(0.5, 0.8, 0.5),
-                    "d64" | "d71" | "d81" | "g64" => iced::Color::from_rgb(0.5, 0.7, 0.9),
-                    "crt" => iced::Color::from_rgb(0.9, 0.7, 0.5),
-                    "sid" => iced::Color::from_rgb(0.8, 0.5, 0.8),
-                    _ => iced::Color::from_rgb(0.6, 0.6, 0.6),
-                };
+                let ext_color = crate::file_types::ext_color(&file.ext);
 
                 let size_str = if file.size >= 1024 * 1024 {
                     format!("{:.1} MB", file.size as f64 / (1024.0 * 1024.0))
