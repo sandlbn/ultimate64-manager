@@ -1,30 +1,28 @@
-use iced::widget::Id as WidgetId;
 use iced::widget::operation::scroll_to;
 use iced::widget::scrollable::{AbsoluteOffset, Viewport};
+use iced::widget::Id as WidgetId;
 use iced::{
-    Element, Length, Task,
     widget::{
-        Column, Space, button, checkbox, column, container, pick_list, row, rule, scrollable, text,
-        text_input, tooltip,
+        button, checkbox, column, container, pick_list, row, rule, scrollable, text, tooltip,
+        Column, Space,
     },
+    Element, Length, Task,
 };
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use ultimate64::{Rest, drives::MountMode};
+use ultimate64::{drives::MountMode, Rest};
 
 /// Stable ID for the main file-list scrollable widget
 const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
 
-use crate::csdb::{MAX_ZIP_EXTRACT_BYTES, extract_zip_to_dir};
+use crate::csdb::{extract_zip_to_dir, MAX_ZIP_EXTRACT_BYTES};
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
+use crate::net_utils::REST_TIMEOUT_SECS;
 use crate::pdf_preview;
-
-/// Timeout for REST API operations to prevent hangs when device goes offline
-const REST_TIMEOUT_SECS: u64 = 5;
 /// Longer timeout for run_disk which includes boot delays
 const RUN_DISK_TIMEOUT_SECS: u64 = 15;
 
@@ -70,6 +68,19 @@ pub enum FileBrowserMessage {
     ConfirmEnableDrive,
     CancelEnableDrive,
     EnableDriveComplete(Result<(), String>),
+    SortBy(crate::file_types::SortColumn),
+    PlaySid(PathBuf),
+    PlayMod(PathBuf),
+    // Local delete
+    DeleteChecked,
+    DeleteConfirmed,
+    DeleteCancelled,
+    DeleteComplete(Result<String, String>),
+    // Local mkdir
+    ShowCreateDir,
+    CreateDirNameChanged(String),
+    CreateDirConfirm,
+    CreateDirCancel,
 }
 
 /// The action to execute once we know the drive is enabled
@@ -85,7 +96,6 @@ pub struct FileEntry {
     pub name: String,
     pub is_dir: bool,
     pub extension: Option<String>,
-    #[allow(dead_code)]
     pub size: Option<u64>,
 }
 
@@ -105,14 +115,14 @@ impl std::fmt::Display for DriveOption {
 }
 
 impl DriveOption {
-    fn to_drive_string(&self) -> String {
+    pub fn to_drive_string(&self) -> String {
         match self {
             DriveOption::A => "a".to_string(),
             DriveOption::B => "b".to_string(),
         }
     }
 
-    fn get_all() -> Vec<DriveOption> {
+    pub fn get_all() -> Vec<DriveOption> {
         vec![DriveOption::A, DriveOption::B]
     }
 }
@@ -143,6 +153,14 @@ pub struct FileBrowser {
     last_entered_child: Option<PathBuf>,
     // Drive enable dialog: Some(...) when we're asking the user to enable a disabled drive
     drive_enable_dialog: Option<(DriveOption, PendingDriveAction)>,
+    // Sort state for column headers
+    sort_column: crate::file_types::SortColumn,
+    sort_order: crate::file_types::SortOrder,
+    // Delete confirmation: paths pending deletion
+    delete_pending: Option<Vec<PathBuf>>,
+    // Create directory dialog
+    show_create_dir: bool,
+    create_dir_name: String,
 }
 
 impl FileBrowser {
@@ -173,6 +191,11 @@ impl FileBrowser {
             scroll_memory: HashMap::new(),
             last_entered_child: None,
             drive_enable_dialog: None,
+            sort_column: crate::file_types::SortColumn::Name,
+            sort_order: crate::file_types::SortOrder::Ascending,
+            delete_pending: None,
+            show_create_dir: false,
+            create_dir_name: String::new(),
         };
         browser.load_directory(&initial_dir);
         browser
@@ -641,11 +664,178 @@ impl FileBrowser {
                 }
                 Task::none()
             }
+
+            FileBrowserMessage::PlaySid(path) => {
+                if let (Some(_host), Some(conn)) = (host.clone(), connection.clone()) {
+                    Task::perform(
+                        async move {
+                            let data = tokio::fs::read(&path)
+                                .await
+                                .map_err(|e| format!("Failed to read file: {}", e))?;
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let c = conn.blocking_lock();
+                                    c.sid_play(&data, None).map_err(|e| e.to_string())
+                                }),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(inner)) => inner,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => Err("Play timed out".to_string()),
+                            }
+                        },
+                        |result| match result {
+                            Ok(_) => FileBrowserMessage::LoadCompleted(Ok(())),
+                            Err(e) => FileBrowserMessage::LoadCompleted(Err(e)),
+                        },
+                    )
+                } else {
+                    self.status_message = Some("Not connected to device".to_string());
+                    Task::none()
+                }
+            }
+            FileBrowserMessage::PlayMod(path) => {
+                if let (Some(_host), Some(conn)) = (host.clone(), connection.clone()) {
+                    Task::perform(
+                        async move {
+                            let data = tokio::fs::read(&path)
+                                .await
+                                .map_err(|e| format!("Failed to read file: {}", e))?;
+                            let result = tokio::time::timeout(
+                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
+                                tokio::task::spawn_blocking(move || {
+                                    let c = conn.blocking_lock();
+                                    c.mod_play(&data).map_err(|e| e.to_string())
+                                }),
+                            )
+                            .await;
+                            match result {
+                                Ok(Ok(inner)) => inner,
+                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                                Err(_) => Err("Play timed out".to_string()),
+                            }
+                        },
+                        |result| match result {
+                            Ok(_) => FileBrowserMessage::LoadCompleted(Ok(())),
+                            Err(e) => FileBrowserMessage::LoadCompleted(Err(e)),
+                        },
+                    )
+                } else {
+                    self.status_message = Some("Not connected to device".to_string());
+                    Task::none()
+                }
+            }
+            FileBrowserMessage::SortBy(col) => {
+                if self.sort_column == col {
+                    self.sort_order = self.sort_order.toggle();
+                } else {
+                    self.sort_column = col;
+                    self.sort_order = crate::file_types::SortOrder::Ascending;
+                }
+                self.sort_files();
+                Task::none()
+            }
+
+            // ── Local delete ─────────────────────────────────────────────────
+            FileBrowserMessage::DeleteChecked => {
+                let checked: Vec<PathBuf> = self.checked_files.iter().cloned().collect();
+                if checked.is_empty() {
+                    self.status_message = Some("No files selected".to_string());
+                    return Task::none();
+                }
+                self.delete_pending = Some(checked);
+                Task::none()
+            }
+            FileBrowserMessage::DeleteConfirmed => {
+                if let Some(paths) = self.delete_pending.take() {
+                    let current_dir = self.current_directory.clone();
+                    return Task::perform(
+                        async move {
+                            let mut deleted = 0;
+                            let mut errors = Vec::new();
+                            for path in &paths {
+                                let result = if path.is_dir() {
+                                    tokio::fs::remove_dir_all(path).await
+                                } else {
+                                    tokio::fs::remove_file(path).await
+                                };
+                                match result {
+                                    Ok(_) => deleted += 1,
+                                    Err(e) => errors.push(format!(
+                                        "{}: {}",
+                                        path.file_name().unwrap_or_default().to_string_lossy(),
+                                        e
+                                    )),
+                                }
+                            }
+                            let mut msg = format!("Deleted {} item(s)", deleted);
+                            if !errors.is_empty() {
+                                msg.push_str(&format!(" ({} errors)", errors.len()));
+                            }
+                            Ok(msg)
+                        },
+                        FileBrowserMessage::DeleteComplete,
+                    );
+                }
+                Task::none()
+            }
+            FileBrowserMessage::DeleteCancelled => {
+                self.delete_pending = None;
+                Task::none()
+            }
+            FileBrowserMessage::DeleteComplete(result) => {
+                match &result {
+                    Ok(msg) => self.status_message = Some(msg.clone()),
+                    Err(e) => self.status_message = Some(format!("Error: {}", e)),
+                }
+                self.checked_files.clear();
+                self.load_directory(&self.current_directory.clone());
+                Task::none()
+            }
+
+            // ── Local mkdir ──────────────────────────────────────────────────
+            FileBrowserMessage::ShowCreateDir => {
+                self.show_create_dir = true;
+                self.create_dir_name = String::new();
+                Task::none()
+            }
+            FileBrowserMessage::CreateDirNameChanged(name) => {
+                self.create_dir_name = name;
+                Task::none()
+            }
+            FileBrowserMessage::CreateDirConfirm => {
+                if self.create_dir_name.trim().is_empty() {
+                    return Task::none();
+                }
+                let dir_path = self.current_directory.join(self.create_dir_name.trim());
+                self.show_create_dir = false;
+                match std::fs::create_dir(&dir_path) {
+                    Ok(_) => {
+                        self.status_message =
+                            Some(format!("Created: {}", self.create_dir_name.trim()));
+                        self.load_directory(&self.current_directory.clone());
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Error: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            FileBrowserMessage::CreateDirCancel => {
+                self.show_create_dir = false;
+                Task::none()
+            }
         }
     }
     #[allow(dead_code)]
     pub fn get_selected_file(&self) -> Option<&PathBuf> {
         self.selected_file.as_ref()
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
     }
 
     pub fn get_checked_files(&self) -> Vec<PathBuf> {
@@ -660,12 +850,11 @@ impl FileBrowser {
         &self.current_directory
     }
 
-    pub fn view(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+    /// Build the compact navigation row: [Up] path/to/current/dir...
+    fn build_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
         let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let small = (font_size.saturating_sub(2)).max(8);
 
-        // Current path display (truncated if too long)
         let path_str = self.current_directory.to_string_lossy();
         let display_path = if path_str.len() > 45 {
             format!("...{}", &path_str[path_str.len() - 43..])
@@ -673,103 +862,164 @@ impl FileBrowser {
             path_str.to_string()
         };
 
-        // Navigation buttons with filter
-        let nav_buttons = row![
+        row![
             tooltip(
-                button(text("⬆ Up").size(normal))
+                button(text("⬆").size(normal))
                     .on_press(FileBrowserMessage::NavigateUp)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
+            text(display_path).size(small).width(Length::Fill),
+        ]
+        .spacing(5)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    /// Build the quick navigation row: [Browse] [CSDb] [Home]
+    fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+
+        row![
             tooltip(
-                button(text("🔍 Browse").size(normal))
+                button(text("🔍 Browse").size(small))
                     .on_press(FileBrowserMessage::SelectDirectory)
-                    .padding([4, 8]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Choose a different folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(text("CSDb").size(small))
                     .on_press(FileBrowserMessage::NavigateToCsdbDir)
-                    .padding([4, 8]),
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
                 "Go to CSDb downloads folder",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
-            Space::new().width(Length::Fill),
-            text("Filter:").size(small),
-            text_input("filter...", &self.filter)
-                .on_input(FileBrowserMessage::FilterChanged)
-                .size(normal as f32)
-                .padding(4)
-                .width(Length::Fixed(100.0)),
+            .style(crate::styles::subtle_tooltip),
+            tooltip(
+                button(text("🏠 Home").size(small))
+                    .on_press(FileBrowserMessage::NavigateToPath(
+                        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+                    ))
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                "Go to home directory",
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip),
         ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center);
+        .spacing(3)
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
 
-        // Path display
-        let path_display = text(display_path).size(normal);
-
-        // Drive selection and selection controls
-        let controls_row = row![
-            text("Mount:").size(small),
-            tooltip(
-                pick_list(
-                    DriveOption::get_all(),
-                    Some(self.selected_drive.clone()),
-                    FileBrowserMessage::DriveSelected,
-                )
-                .placeholder("Drive")
-                .text_size(normal)
-                .width(Length::Fixed(95.0)),
-                "Select target drive for mounting disks",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            Space::new().width(10),
-            tooltip(
-                button(text("✔ All").size(tiny))
-                    .on_press(FileBrowserMessage::SelectAll)
-                    .padding([2, 6]),
-                "Select all files",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            tooltip(
-                button(text("✖ None").size(tiny))
-                    .on_press(FileBrowserMessage::SelectNone)
-                    .padding([2, 6]),
-                "Deselect all files",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box),
-            Space::new().width(Length::Fill),
-            text(format!("{} files", self.files.len())).size(small),
-        ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center);
-
-        // Checked count
+    /// Build the status bar: file count | selection | Drive picker
+    fn build_status_bar(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
+        let tiny = (font_size.saturating_sub(3)).max(7);
         let checked_count = self.checked_files.len();
-        let selection_info = if checked_count > 0 {
-            text(format!("{} selected", checked_count)).size(small)
-        } else {
-            text("").size(small)
-        };
+        let file_count = self.files.len();
 
-        // Status message
-        let status = if self.disk_info_loading || self.content_preview_loading || self.is_loading {
-            text("Loading...").size(small)
+        let mut items = row![].spacing(8).align_y(iced::Alignment::Center);
+
+        // Loading indicator or status message
+        if self.disk_info_loading || self.content_preview_loading || self.is_loading {
+            items = items.push(text("Loading...").size(tiny));
         } else if let Some(msg) = &self.status_message {
-            text(msg).size(small)
-        } else {
-            text("").size(small)
-        };
+            items = items.push(text(msg).size(tiny));
+        }
 
-        // If disk info popup is open, show it instead of the file list
+        items = items.push(text(format!("{} files", file_count)).size(tiny));
+
+        if checked_count > 0 {
+            items = items.push(text("|").size(tiny));
+            items = items.push(text(format!("{} sel", checked_count)).size(tiny));
+        }
+
+        items = items.push(Space::new().width(Length::Fill));
+        items = items.push(text("Drive:").size(tiny));
+        items = items.push(
+            pick_list(
+                DriveOption::get_all(),
+                Some(self.selected_drive.clone()),
+                FileBrowserMessage::DriveSelected,
+            )
+            .placeholder("Drive")
+            .text_size(tiny)
+            .width(Length::Fixed(95.0)),
+        );
+
+        items.into()
+    }
+
+    /// Build column headers for the file list (Name, Size, Type)
+    fn build_column_headers(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
+        use crate::file_types::SortColumn;
+        let small = (font_size.saturating_sub(2)).max(8);
+
+        row![
+            Space::new().width(24), // checkbox space
+            button(
+                text(format!(
+                    "Name{}",
+                    if self.sort_column == SortColumn::Name {
+                        self.sort_order.indicator()
+                    } else {
+                        ""
+                    }
+                ))
+                .size(small),
+            )
+            .on_press(FileBrowserMessage::SortBy(SortColumn::Name))
+            .padding([2, 4])
+            .style(button::text),
+            Space::new().width(Length::Fill),
+            button(
+                text(format!(
+                    "Size{}",
+                    if self.sort_column == SortColumn::Size {
+                        self.sort_order.indicator()
+                    } else {
+                        ""
+                    }
+                ))
+                .size(small),
+            )
+            .on_press(FileBrowserMessage::SortBy(SortColumn::Size))
+            .padding([2, 4])
+            .style(button::text)
+            .width(Length::Fixed(65.0)),
+            button(
+                text(format!(
+                    "Type{}",
+                    if self.sort_column == SortColumn::Type {
+                        self.sort_order.indicator()
+                    } else {
+                        ""
+                    }
+                ))
+                .size(small),
+            )
+            .on_press(FileBrowserMessage::SortBy(SortColumn::Type))
+            .padding([2, 4])
+            .width(Length::Fixed(35.0))
+            .style(button::text),
+            Space::new().width(Length::Shrink), // action buttons space
+        ]
+        .align_y(iced::Alignment::Center)
+        .into()
+    }
+
+    pub fn view(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
+        let small = (font_size.saturating_sub(2)).max(8);
+        let normal = font_size;
+
+        // If drive enable dialog is open, show it instead of the file list
         if let Some((drive_opt, _)) = &self.drive_enable_dialog {
             let drive_num = match drive_opt {
                 DriveOption::A => "8",
@@ -791,28 +1041,28 @@ impl FileBrowser {
                     row![
                         button(text(format!("Enable Drive {}", drive_letter)).size(small))
                             .on_press(FileBrowserMessage::ConfirmEnableDrive)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                         button(text("Cancel").size(small))
                             .on_press(FileBrowserMessage::CancelEnableDrive)
-                            .padding([5, 15]),
+                            .padding([5, 15])
+                            .style(button::secondary),
                     ]
                     .spacing(10),
                 ]
                 .spacing(12)
                 .padding(20),
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .width(Length::Fill);
 
             return column![
-                path_display,
-                nav_buttons,
-                controls_row,
-                selection_info,
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 dialog,
-                status,
+                self.build_status_bar(font_size),
             ]
-            .spacing(3)
+            .spacing(2)
             .padding(5)
             .into();
         }
@@ -822,14 +1072,12 @@ impl FileBrowser {
             let popup = self.view_disk_info_popup(disk_info, font_size);
 
             column![
-                path_display,
-                nav_buttons,
-                controls_row,
-                selection_info,
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 popup,
-                status,
+                self.build_status_bar(font_size),
             ]
-            .spacing(3)
+            .spacing(2)
             .padding(5)
             .into()
         } else if let Some(content_preview) = &self.content_preview {
@@ -837,14 +1085,103 @@ impl FileBrowser {
             let popup = self.view_content_preview_popup(content_preview, font_size);
 
             column![
-                path_display,
-                nav_buttons,
-                controls_row,
-                selection_info,
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
                 popup,
-                status,
+                self.build_status_bar(font_size),
             ]
-            .spacing(3)
+            .spacing(2)
+            .padding(5)
+            .into()
+        } else if let Some(ref paths) = self.delete_pending {
+            // Delete confirmation dialog
+            let summary = paths
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dialog = container(
+                column![
+                    text(format!("Delete {} item(s)?", paths.len())).size(normal),
+                    text(if summary.len() > 80 {
+                        format!("{}...", &summary[..77])
+                    } else {
+                        summary
+                    })
+                    .size(small),
+                    row![
+                        button(text("Delete").size(small))
+                            .on_press(FileBrowserMessage::DeleteConfirmed)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                        button(text("Cancel").size(small))
+                            .on_press(FileBrowserMessage::DeleteCancelled)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(10)
+                .padding(15),
+            )
+            .style(crate::styles::subtle_tooltip)
+            .width(Length::Fill);
+
+            column![
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                dialog,
+                self.build_status_bar(font_size),
+            ]
+            .spacing(2)
+            .padding(5)
+            .into()
+        } else if self.show_create_dir {
+            // Create directory dialog
+            let dialog = container(
+                column![
+                    text("Create Directory").size(normal),
+                    row![
+                        text("Name:").size(small),
+                        iced::widget::text_input("directory name...", &self.create_dir_name)
+                            .on_input(FileBrowserMessage::CreateDirNameChanged)
+                            .on_submit(FileBrowserMessage::CreateDirConfirm)
+                            .size(small as f32)
+                            .padding(4)
+                            .width(Length::Fixed(200.0)),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        button(text("Create").size(small))
+                            .on_press(FileBrowserMessage::CreateDirConfirm)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                        button(text("Cancel").size(small))
+                            .on_press(FileBrowserMessage::CreateDirCancel)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(10)
+                .padding(15),
+            )
+            .style(crate::styles::subtle_tooltip)
+            .width(Length::Fill);
+
+            column![
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                dialog,
+                self.build_status_bar(font_size),
+            ]
+            .spacing(2)
             .padding(5)
             .into()
         } else {
@@ -878,14 +1215,15 @@ impl FileBrowser {
             .height(Length::Fill);
 
             column![
-                path_display,
-                nav_buttons,
-                controls_row,
-                selection_info,
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                self.build_column_headers(font_size),
+                rule::horizontal(1),
                 scrollable_list,
-                status,
+                rule::horizontal(1),
+                self.build_status_bar(font_size),
             ]
-            .spacing(3)
+            .spacing(2)
             .padding(5)
             .into()
         }
@@ -910,11 +1248,12 @@ impl FileBrowser {
             tooltip(
                 button(text("Close").size(small))
                     .on_press(FileBrowserMessage::CloseDiskInfo)
-                    .padding([4, 10]),
+                    .padding([4, 10])
+                    .style(button::secondary),
                 "Close directory listing",
                 tooltip::Position::Left,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
@@ -998,7 +1337,7 @@ impl FileBrowser {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(container::bordered_box)
+        .style(crate::styles::subtle_tooltip)
         .into()
     }
 
@@ -1034,11 +1373,12 @@ impl FileBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close text preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -1073,7 +1413,7 @@ impl FileBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
             ContentPreview::Image {
@@ -1099,11 +1439,12 @@ impl FileBrowser {
                     tooltip(
                         button(text("Close").size(small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
-                            .padding([4, 10]),
+                            .padding([4, 10])
+                            .style(button::secondary),
                         "Close image preview",
                         tooltip::Position::Left,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center);
@@ -1130,7 +1471,7 @@ impl FileBrowser {
                 )
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
                 .into()
             }
         }
@@ -1186,25 +1527,19 @@ impl FileBrowser {
         };
 
         // Check if this is a disk image that can show info
-        let is_disk_image = matches!(entry.extension.as_deref(), Some("d64") | Some("d71"));
+        let is_disk_image = entry
+            .extension
+            .as_deref()
+            .map_or(false, |ext| crate::file_types::is_disk_image(ext));
 
         // Check if this is a previewable text or image file
         let is_text_file = dir_preview::is_text_file(&entry.path);
         let is_image_file = dir_preview::is_image_file(&entry.path);
         let is_pdf_file = entry.extension.as_deref() == Some("pdf");
 
-        // Action button based on file type
+        // Action button based on file type (directories open via filename click)
         let action_button: Element<'_, FileBrowserMessage> = if entry.is_dir {
-            // Directory - click to enter
-            tooltip(
-                button(text("Open").size(small))
-                    .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
-                    .padding([2, 8]),
-                "Open folder",
-                tooltip::Position::Top,
-            )
-            .style(container::bordered_box)
-            .into()
+            Space::new().width(0).into()
         } else {
             match entry.extension.as_deref() {
                 Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => {
@@ -1226,11 +1561,12 @@ impl FileBrowser {
                             tooltip(
                                 button(text("?").size(small))
                                     .on_press(FileBrowserMessage::ShowDiskInfo(entry.path.clone()))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 "Show disk directory listing",
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
                     }
 
@@ -1242,12 +1578,13 @@ impl FileBrowser {
                                         entry.path.clone(),
                                         self.selected_drive.to_drive_string(),
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1257,12 +1594,13 @@ impl FileBrowser {
                                         self.selected_drive.to_drive_string(),
                                         MountMode::ReadWrite,
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read/Write)", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
@@ -1272,12 +1610,13 @@ impl FileBrowser {
                                         self.selected_drive.to_drive_string(),
                                         MountMode::ReadOnly,
                                     ))
-                                    .padding([2, 5]),
+                                    .padding([2, 5])
+                                    .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read Only)", drive_num))
                                     .size(normal),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box),
+                            .style(crate::styles::subtle_tooltip),
                         );
 
                     buttons.into()
@@ -1285,11 +1624,32 @@ impl FileBrowser {
                 Some("prg") | Some("crt") => tooltip(
                     button(text("Run").size(small))
                         .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone()))
-                        .padding([2, 10]),
+                        .padding([2, 10])
+                        .style(crate::styles::action_button),
                     "Load and run on Ultimate64",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box)
+                .style(crate::styles::subtle_tooltip)
+                .into(),
+                Some("sid") => tooltip(
+                    button(text("Play").size(small))
+                        .on_press(FileBrowserMessage::PlaySid(entry.path.clone()))
+                        .padding([2, 8])
+                        .style(crate::styles::action_button),
+                    "Play SID music on Ultimate64",
+                    tooltip::Position::Top,
+                )
+                .style(crate::styles::subtle_tooltip)
+                .into(),
+                Some("mod") => tooltip(
+                    button(text("Play").size(small))
+                        .on_press(FileBrowserMessage::PlayMod(entry.path.clone()))
+                        .padding([2, 8])
+                        .style(crate::styles::action_button),
+                    "Play MOD music on Ultimate64",
+                    tooltip::Position::Top,
+                )
+                .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("zip") => {
                     // Extract the ZIP into a sibling subdirectory, then navigate there.
@@ -1297,7 +1657,8 @@ impl FileBrowser {
                     tooltip(
                         button(text("Extract").size(small))
                             .on_press(FileBrowserMessage::ExtractZip(entry.path.clone()))
-                            .padding([2, 8]),
+                            .padding([2, 8])
+                            .style(crate::styles::action_button),
                         text(format!(
                             "Extract ZIP to subfolder (max {} MB)",
                             MAX_ZIP_EXTRACT_BYTES / (1024 * 1024)
@@ -1305,7 +1666,7 @@ impl FileBrowser {
                         .size(normal),
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box)
+                    .style(crate::styles::subtle_tooltip)
                     .into()
                 }
                 _ => {
@@ -1316,11 +1677,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View text content",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else if is_image_file {
                         tooltip(
@@ -1328,11 +1690,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View image",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else if is_pdf_file {
                         tooltip(
@@ -1340,11 +1703,12 @@ impl FileBrowser {
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
-                                .padding([2, 8]),
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
                             "View PDF",
                             tooltip::Position::Top,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                         .into()
                     } else {
                         Space::new().width(0).into()
@@ -1375,10 +1739,17 @@ impl FileBrowser {
                 text(entry.name.clone()).size(normal),
                 tooltip::Position::Top,
             )
-            .style(container::bordered_box)
+            .style(crate::styles::subtle_tooltip)
             .into()
         } else {
             filename_button.into()
+        };
+
+        // Size column
+        let size_text = if entry.is_dir {
+            "<DIR>".to_string()
+        } else {
+            crate::file_types::format_file_size(entry.size.unwrap_or(0))
         };
 
         let file_row = row![
@@ -1386,8 +1757,13 @@ impl FileBrowser {
             checkbox_element,
             // Clickable filename (truncated, with tooltip if needed)
             filename_element,
+            // Size column
+            text(size_text)
+                .size(tiny)
+                .width(Length::Fixed(65.0))
+                .align_x(iced::alignment::Horizontal::Right),
             // Type label
-            text(type_label).size(tiny).width(Length::Fixed(28.0)),
+            text(type_label).size(tiny).width(Length::Fixed(35.0)),
             // Action button
             action_button,
         ]
@@ -1457,12 +1833,40 @@ impl FileBrowser {
         }
     }
 
+    fn sort_files(&mut self) {
+        use crate::file_types::{SortColumn, SortOrder};
+        let col = self.sort_column;
+        let order = self.sort_order;
+        self.files.sort_by(|a, b| {
+            // Directories always come first
+            match (a.is_dir, b.is_dir) {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
+            let cmp = match col {
+                SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortColumn::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
+                SortColumn::Type => {
+                    let a_ext = a.extension.as_deref().unwrap_or("");
+                    let b_ext = b.extension.as_deref().unwrap_or("");
+                    a_ext.cmp(b_ext)
+                }
+            };
+            if order == SortOrder::Descending {
+                cmp.reverse()
+            } else {
+                cmp
+            }
+        });
+    }
+
     fn load_directory(&mut self, path: &Path) {
         self.files.clear();
         self.filter.clear();
 
         if let Ok(entries) = std::fs::read_dir(path) {
-            let mut files: Vec<FileEntry> = entries
+            let files: Vec<FileEntry> = entries
                 .filter_map(|entry| {
                     entry.ok().and_then(|e| {
                         let path = e.path();
@@ -1487,36 +1891,15 @@ impl FileBrowser {
 
                         // Filter: show directories and relevant file types
                         // Including text files and images for preview
+                        let ext_str = extension.as_deref().unwrap_or("");
                         if is_dir
-                            || matches!(
-                                extension.as_deref(),
-                                Some("d64")
-                                    | Some("d71")
-                                    | Some("d81")
-                                    | Some("g64")
-                                    | Some("g71")
-                                    | Some("prg")
-                                    | Some("crt")
-                                    | Some("sid")
-                                    | Some("mod")
-                                    | Some("tap")
-                                    | Some("t64")
-                                    // ZIP archives (extract-to-subdir action)
-                                    | Some("zip")
-                                    // Text files for readme preview
-                                    | Some("txt")
-                                    | Some("atxt")
-                                    | Some("nfo")
-                                    | Some("diz")
-                                    // Image files for preview
-                                    | Some("png")
-                                    | Some("jpg")
-                                    | Some("jpeg")
-                                    | Some("gif")
-                                    | Some("bmp")
-                                    | Some("pdf")
-                            )
-                            || dir_preview::is_text_file(&path)
+                            || crate::file_types::is_disk_image(ext_str)
+                            || crate::file_types::is_runnable(ext_str)
+                            || crate::file_types::is_zip_file(ext_str)
+                            || matches!(ext_str, "mod" | "tap" | "t64")
+                            || crate::file_types::is_text_file(&name)
+                            || crate::file_types::is_image_file(&name)
+                            || crate::file_types::is_pdf_file(&name)
                         {
                             Some(FileEntry {
                                 path,
@@ -1532,14 +1915,8 @@ impl FileBrowser {
                 })
                 .collect();
 
-            // Sort: directories first, then alphabetically
-            files.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-            });
-
             self.files = files;
+            self.sort_files();
         }
 
         log::debug!("Loaded {} items from {}", self.files.len(), path.display());
@@ -1745,17 +2122,10 @@ pub async fn check_drive_enabled_async(
     };
 
     let url = format!("http://{}/v1/configs/{}/Drive", host, category);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client =
+        crate::net_utils::build_device_client(REST_TIMEOUT_SECS).map_err(|e| e.to_string())?;
 
-    let mut req = client.get(&url);
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            req = req.header("X-password", pwd.as_str());
-        }
-    }
+    let req = crate::net_utils::with_password(client.get(&url), password.as_deref());
 
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -1794,21 +2164,16 @@ pub async fn enable_drive_async(
         category: { "Drive": "Enabled" }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
+    let client =
+        crate::net_utils::build_device_client(REST_TIMEOUT_SECS).map_err(|e| e.to_string())?;
 
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .json(&body);
-
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            req = req.header("X-password", pwd.as_str());
-        }
-    }
+    let req = crate::net_utils::with_password(
+        client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body),
+        password.as_deref(),
+    );
 
     let resp = req.send().await.map_err(|e| e.to_string())?;
     if resp.status().is_success() {

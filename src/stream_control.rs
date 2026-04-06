@@ -1,3 +1,4 @@
+use crate::net_utils::resolve_host;
 use crate::settings::StreamControlMethod;
 
 /// Send binary stream control command to Ultimate64 (port 64)
@@ -394,30 +395,4 @@ fn send_stop_command_binary_only(ultimate_ip: &str, stream_cmd: u8) -> std::io::
 // ============================================================================
 // Utility Functions
 // ============================================================================
-
-/// Detect local IP address that can reach the network
-pub fn get_local_ip() -> Option<String> {
-    // Method: Try to get IP by creating a UDP socket (doesn't actually send anything)
-    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        // Connect to a public IP (doesn't send data, just determines route)
-        if socket.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                return Some(addr.ip().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Resolve hostname to SocketAddr (supports both IP addresses and hostnames)
-pub fn resolve_host(host: &str, port: u16) -> std::io::Result<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-
-    let addr_str = format!("{}:{}", host, port);
-    addr_str.to_socket_addrs()?.next().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Could not resolve hostname: {}", host),
-        )
-    })
-}
+// get_local_ip() and resolve_host() are now in crate::net_utils

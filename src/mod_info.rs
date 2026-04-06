@@ -59,13 +59,7 @@ pub fn parse_mod(data: &[u8]) -> Result<ModInfo, String> {
 
 /// Read null-terminated ASCII string, filtering non-printable chars
 fn read_string(data: &[u8]) -> String {
-    data.iter()
-        .take_while(|&&b| b != 0)
-        .filter(|&&b| b >= 32 && b < 127)
-        .map(|&b| b as char)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    crate::string_utils::read_binary_string(data, 0, data.len())
 }
 
 /// Detect number of channels from format identifier

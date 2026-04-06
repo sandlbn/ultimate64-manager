@@ -377,12 +377,7 @@ fn read_directory(data: &[u8], kind: ImageKind) -> Result<Vec<DirEntry>, String>
 /// Quick check if a file appears to be a supported disk image
 #[allow(dead_code)]
 pub fn is_disk_image(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_lowercase());
-
-    matches!(ext.as_deref(), Some("d64") | Some("d71") | Some("d81"))
+    crate::file_types::is_disk_image_path(path)
 }
 
 /// Get a brief summary of the disk (for tooltips, etc.)
@@ -612,7 +607,7 @@ pub fn build_blank_d81(name: &str, disk_id: &str) -> Vec<u8> {
                 img[entry] = 0;
             } else {
                 img[entry] = 40; // 40 sectors free
-                // All 40 bits set across 5 bytes
+                                 // All 40 bits set across 5 bytes
                 img[entry + 1] = 0xFF;
                 img[entry + 2] = 0xFF;
                 img[entry + 3] = 0xFF;
@@ -684,7 +679,7 @@ mod tests {
         // BAM sector at track 18 sector 0
         let bam = ts_offset(18, 0, ImageKind::D64).unwrap();
         assert_eq!(img[bam + 2], 0x41); // DOS version 'A'
-        // First data track (track 1) should have 21 free sectors
+                                        // First data track (track 1) should have 21 free sectors
         assert_eq!(img[bam + 4], 21);
         // Directory track (18) should have zero free sectors
         assert_eq!(img[bam + 4 + 17 * 4], 0);

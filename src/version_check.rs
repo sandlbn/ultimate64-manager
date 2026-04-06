@@ -59,11 +59,7 @@ fn find_platform_asset(assets: &[GitHubAsset]) -> Option<&str> {
 }
 
 async fn check_github_release(current_version: &str) -> Result<Option<NewVersionInfo>, String> {
-    let client = reqwest::Client::builder()
-        .user_agent("Ultimate64-Manager")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Client error: {}", e))?;
+    let client = crate::net_utils::build_external_client("Ultimate64-Manager", 10)?;
 
     let response = client
         .get("https://api.github.com/repos/sandlbn/ultimate64-manager/releases/latest")
