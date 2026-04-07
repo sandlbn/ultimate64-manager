@@ -1,5 +1,29 @@
 use iced::widget::{button, container};
 
+/// Centralized font size tiers derived from the user's configured base font size.
+#[derive(Clone, Copy)]
+pub struct FontSizes {
+    pub tiny: u32,   // base - 3, min 8 — scale buttons, close "X"
+    pub small: u32,  // base - 1, min 8 — buttons, labels, descriptions
+    pub normal: u32, // base — body text, standard content
+    pub large: u32,  // base + 2 — section labels, nav buttons
+    pub header: u32, // base + 6 — section headers
+    pub icon: u32,   // base * 2 + 6 — emoji icons
+}
+
+impl FontSizes {
+    pub fn from_base(font_size: u32) -> Self {
+        Self {
+            tiny: font_size.saturating_sub(3).max(8),
+            small: font_size.saturating_sub(1).max(8),
+            normal: font_size,
+            large: font_size + 2,
+            header: font_size + 6,
+            icon: font_size * 2 + 6,
+        }
+    }
+}
+
 /// Highlight style (yellow background, black text) for selected hex cells
 pub fn highlight_style(_theme: &iced::Theme) -> container::Style {
     container::Style {

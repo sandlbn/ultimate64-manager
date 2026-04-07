@@ -2032,7 +2032,7 @@ impl Ultimate64Browser {
         if Some(window_id) == self.streaming_window_id {
             return self
                 .video_streaming
-                .view_separate_window()
+                .view_separate_window(self.settings.preferences.font_size)
                 .map(Message::Streaming);
         }
 
@@ -2040,7 +2040,7 @@ impl Ultimate64Browser {
         if self.video_streaming.is_fullscreen {
             return self
                 .video_streaming
-                .view_fullscreen()
+                .view_fullscreen(self.settings.preferences.font_size)
                 .map(Message::Streaming);
         }
 
@@ -2070,11 +2070,12 @@ impl Ultimate64Browser {
             Tab::VideoViewer => {
                 if self.streaming_window_id.is_some() {
                     // Streaming is shown in separate window - show placeholder
+                    let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
                     container(
                         column![
-                            text("Video is displayed in separate window").size(16),
+                            text("Video is displayed in separate window").size(fs.large + 2),
                             Space::new(),
-                            button(text("Close Separate Window").size(12))
+                            button(text("Close Separate Window").size(fs.normal))
                                 .on_press(Message::CloseStreamingWindow)
                                 .padding([8, 16]),
                         ]
@@ -2087,7 +2088,7 @@ impl Ultimate64Browser {
                     .center_y(Length::Fill)
                     .into()
                 } else {
-                    self.video_streaming.view().map(Message::Streaming)
+                    self.video_streaming.view(self.settings.preferences.font_size).map(Message::Streaming)
                 }
             }
             Tab::MemoryEditor => self
@@ -2216,8 +2217,9 @@ impl Ultimate64Browser {
     }
 
     fn tab_button<'a>(&self, label: &'a str, tab: Tab) -> Element<'a, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let is_active = self.active_tab == tab;
-        button(text(label).size(14))
+        button(text(label).size(fs.large))
             .on_press(Message::TabSelected(tab))
             .padding([8, 16])
             .style(if is_active {
@@ -2229,21 +2231,22 @@ impl Ultimate64Browser {
     }
 
     fn view_connection_bar(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let status_indicator = if self.status.connected {
             text("● CONNECTED").color(iced::Color::from_rgb(0.2, 0.8, 0.2))
         } else {
             text("○ DISCONNECTED").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
         };
 
-        let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(12);
+        let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(fs.normal);
 
         // Update notification on the right side
         let update_notification: Element<'_, Message> = if let Some(info) = &self.new_version {
             row![
                 text(format!("🎉 {} available!", info.version))
-                    .size(12)
+                    .size(fs.normal)
                     .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
-                button(text("Download").size(11))
+                button(text("Download").size(fs.small))
                     .on_press(Message::OpenReleasePage)
                     .padding([2, 8])
                     .style(button::primary),
@@ -2258,7 +2261,7 @@ impl Ultimate64Browser {
         container(
             row![
                 status_indicator,
-                text(" | ").size(12),
+                text(" | ").size(fs.normal),
                 device_text,
                 Space::new().width(Length::Fill),
                 update_notification,
@@ -2302,8 +2305,9 @@ impl Ultimate64Browser {
         });
 
         // Function bar at bottom
-        let small = (self.settings.preferences.font_size.saturating_sub(2)).max(8) as f32;
-        let tiny = (self.settings.preferences.font_size.saturating_sub(3)).max(7) as f32;
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let small = fs.small as f32;
+        let tiny = fs.tiny as f32;
 
         let active_filter = match self.active_pane {
             Pane::Left => self.left_browser.filter(),
@@ -2387,13 +2391,14 @@ impl Ultimate64Browser {
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         // Profile management section
         let profile_names = self.profile_manager.profile_names();
         let profile_section = column![
-            text("CONFIGURATION PROFILES").size(18),
+            text("CONFIGURATION PROFILES").size(fs.header),
             Space::new().height(10),
             row![
-                text("Active Profile:").size(14),
+                text("Active Profile:").size(fs.large),
                 pick_list(
                     profile_names,
                     Some(self.profile_manager.active_profile.clone()),
@@ -2401,7 +2406,7 @@ impl Ultimate64Browser {
                 )
                 .width(Length::Fixed(200.0)),
                 tooltip(
-                    button(text("Save").size(11))
+                    button(text("Save").size(fs.small))
                         .on_press(Message::SaveProfile)
                         .padding([4, 10])
                         .style(button::primary),
@@ -2410,7 +2415,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Duplicate").size(11))
+                    button(text("Duplicate").size(fs.small))
                         .on_press(Message::DuplicateProfile)
                         .padding([4, 10]),
                     "Create a copy of current profile",
@@ -2418,7 +2423,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Delete").size(11))
+                    button(text("Delete").size(fs.small))
                         .on_press(Message::DeleteProfile)
                         .padding([4, 10]),
                     "Delete current profile (cannot delete last profile)",
@@ -2430,26 +2435,26 @@ impl Ultimate64Browser {
             .align_y(iced::Alignment::Center),
             Space::new().height(10),
             row![
-                text("New Profile:").size(14),
+                text("New Profile:").size(fs.large),
                 text_input("Profile name...", &self.new_profile_name)
                     .on_input(Message::NewProfileNameChanged)
                     .on_submit(Message::CreateProfile)
                     .padding(8)
                     .width(Length::Fixed(200.0)),
-                button(text("Create").size(11))
+                button(text("Create").size(fs.small))
                     .on_press(Message::CreateProfile)
                     .padding([4, 10]),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
-            text("Use profiles to store different configurations for different machines. Press Save to persist changes.").size(11),
+            text("Use profiles to store different configurations for different machines. Press Save to persist changes.").size(fs.small),
         ];
         // Discovery button
         let discovery_button: Element<'_, Message> = if self.is_discovering {
-            button(text("Scanning...").size(11)).padding([4, 10]).into()
+            button(text("Scanning...").size(fs.small)).padding([4, 10]).into()
         } else {
             tooltip(
-                button(text("🔍 Find Devices").size(11))
+                button(text("🔍 Find Devices").size(fs.small))
                     .on_press(Message::StartDiscovery)
                     .padding([4, 10]),
                 "Scan local network for Ultimate64 devices",
@@ -2463,7 +2468,7 @@ impl Ultimate64Browser {
         // List of discovered devices
         let discovered_list: Element<'_, Message> = if self.discovered_devices.is_empty() {
             if self.is_discovering {
-                text("Scanning network...").size(11).into()
+                text("Scanning network...").size(fs.small).into()
             } else {
                 text("").size(1).into()
             }
@@ -2474,7 +2479,7 @@ impl Ultimate64Browser {
                     .map(|d| {
                         let device = d.clone();
                         let label = format!("{} - {} ({})", d.ip, d.product, d.firmware);
-                        button(text(label).size(11))
+                        button(text(label).size(fs.small))
                             .on_press(Message::SelectDiscoveredDevice(device))
                             .padding([4, 8])
                             .width(Length::Fill)
@@ -2488,9 +2493,9 @@ impl Ultimate64Browser {
             .into()
         };
         let connection_section = column![
-            text("CONNECTION SETTINGS").size(18),
+            text("CONNECTION SETTINGS").size(fs.header),
             Space::new().height(10),
-            row![text("Ultimate64 IP Address:").size(14), discovery_button,]
+            row![text("Ultimate64 IP Address:").size(fs.large), discovery_button,]
                 .spacing(10)
                 .align_y(iced::Alignment::Center),
             text_input("eg. 192.168.1.64", &self.host_input)
@@ -2499,13 +2504,13 @@ impl Ultimate64Browser {
                 .width(Length::Fixed(300.0)),
             discovered_list,
             Space::new().height(10),
-            text("Password (optional):").size(14),
+            text("Password (optional):").size(fs.large),
             text_input("Enter password...", &self.password_input)
                 .on_input(Message::PasswordInputChanged)
                 .padding(10)
                 .width(Length::Fixed(300.0)),
             Space::new().height(10),
-            text("Stream Control Method:").size(14),
+            text("Stream Control Method:").size(fs.large),
             row![pick_list(
                 &StreamControlMethod::ALL[..],
                 Some(self.settings.connection.stream_control_method),
@@ -2513,7 +2518,7 @@ impl Ultimate64Browser {
             )
             .width(Length::Fixed(250.0)),]
             .spacing(10),
-            text("Controls how video/audio streaming communicates with the Ultimate64").size(11),
+            text("Controls how video/audio streaming communicates with the Ultimate64").size(fs.small),
             Space::new().height(15),
             row![
                 tooltip(
@@ -2547,7 +2552,7 @@ impl Ultimate64Browser {
             Space::new().height(20),
             rule::horizontal(1),
             Space::new().height(10),
-            text("CONNECTION STATUS").size(18),
+            text("CONNECTION STATUS").size(fs.header),
             Space::new().height(10),
             if self.status.connected {
                 text(format!("Connected to {}", self.settings.connection.host))
@@ -2556,9 +2561,9 @@ impl Ultimate64Browser {
                 text("Not connected").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
             },
             if let Some(info) = &self.status.device_info {
-                text(format!("Device: {}", info)).size(14)
+                text(format!("Device: {}", info)).size(fs.large)
             } else {
-                text("").size(14)
+                text("").size(fs.large)
             },
         ];
 
@@ -2583,15 +2588,15 @@ impl Ultimate64Browser {
             Space::new().height(20),
             rule::horizontal(1),
             Space::new().height(10),
-            text("STARTING DIRECTORIES").size(18),
+            text("STARTING DIRECTORIES").size(fs.header),
             Space::new().height(10),
-            text("File Browser tab starting directory:").size(14),
+            text("File Browser tab starting directory:").size(fs.large),
             row![
                 text(file_browser_start_dir_display.clone())
-                    .size(12)
+                    .size(fs.normal)
                     .width(Length::Fixed(400.0)),
                 tooltip(
-                    button(text("Browse").size(11))
+                    button(text("Browse").size(fs.small))
                         .on_press(Message::BrowseFileBrowserStartDir)
                         .padding([4, 10]),
                     "Select starting directory for File Browser",
@@ -2599,7 +2604,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Clear").size(11))
+                    button(text("Clear").size(fs.small))
                         .on_press(Message::ClearFileBrowserStartDir)
                         .padding([4, 10]),
                     "Reset to home directory",
@@ -2610,13 +2615,13 @@ impl Ultimate64Browser {
             .spacing(10)
             .align_y(iced::Alignment::Center),
             Space::new().height(10),
-            text("Music Player tab starting directory:").size(14),
+            text("Music Player tab starting directory:").size(fs.large),
             row![
                 text(music_player_start_dir_display.clone())
-                    .size(12)
+                    .size(fs.normal)
                     .width(Length::Fixed(400.0)),
                 tooltip(
-                    button(text("Browse").size(11))
+                    button(text("Browse").size(fs.small))
                         .on_press(Message::BrowseMusicPlayerStartDir)
                         .padding([4, 10]),
                     "Select starting directory for Music Player",
@@ -2624,7 +2629,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Clear").size(11))
+                    button(text("Clear").size(fs.small))
                         .on_press(Message::ClearMusicPlayerStartDir)
                         .padding([4, 10]),
                     "Reset to home directory",
@@ -2634,17 +2639,17 @@ impl Ultimate64Browser {
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
-            text("(Changes take effect on next application restart)").size(11),
+            text("(Changes take effect on next application restart)").size(fs.small),
         ];
 
         let music_section = column![
             Space::new().height(20),
             rule::horizontal(1),
             Space::new().height(10),
-            text("MUSIC PLAYER SETTINGS").size(18),
+            text("MUSIC PLAYER SETTINGS").size(fs.header),
             Space::new().height(10),
             row![
-                text("Default song duration (seconds):").size(14),
+                text("Default song duration (seconds):").size(fs.large),
                 text_input(
                     "180",
                     &self.settings.preferences.default_song_duration.to_string()
@@ -2652,7 +2657,7 @@ impl Ultimate64Browser {
                 .on_input(Message::DefaultSongDurationChanged)
                 .padding(8)
                 .width(Length::Fixed(80.0)),
-                text("(used when song length is unknown)").size(11),
+                text("(used when song length is unknown)").size(fs.small),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -2662,15 +2667,15 @@ impl Ultimate64Browser {
             Space::new().height(20),
             rule::horizontal(1),
             Space::new().height(10),
-            text("UI SETTINGS").size(18),
+            text("UI SETTINGS").size(fs.header),
             Space::new().height(10),
             row![
-                text("Font size:").size(14),
+                text("Font size:").size(fs.large),
                 text_input("12", &self.font_size_input)
                     .on_input(Message::FontSizeChanged)
                     .padding(8)
                     .width(Length::Fixed(60.0)),
-                text("(8-24, applies to File Browser and Music Player)").size(11),
+                text("(8-24, applies to all UI elements)").size(fs.small),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -2680,19 +2685,19 @@ impl Ultimate64Browser {
             Space::new().height(20),
             rule::horizontal(1),
             Space::new().height(10),
-            text("DEBUG INFO").size(18),
-            text(format!("Platform: {}", std::env::consts::OS)).size(12),
-            text(format!("Config dir: {:?}", dirs::config_dir())).size(12),
+            text("DEBUG INFO").size(fs.header),
+            text(format!("Platform: {}", std::env::consts::OS)).size(fs.normal),
+            text(format!("Config dir: {:?}", dirs::config_dir())).size(fs.normal),
             text(format!(
                 "Active profile: {}",
                 self.profile_manager.active_profile
             ))
-            .size(12),
+            .size(fs.normal),
             text(format!(
                 "Total profiles: {}",
                 self.profile_manager.profiles.len()
             ))
-            .size(12),
+            .size(fs.normal),
         ];
 
         scrollable(container(
@@ -2716,6 +2721,7 @@ impl Ultimate64Browser {
     }
 
     fn view_status_bar(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let video_status = if self.video_streaming.is_streaming {
             "STREAMING"
         } else {
@@ -2740,10 +2746,10 @@ impl Ultimate64Browser {
                     .strip_prefix("Screenshot saved: ")
                     .unwrap_or(message);
                 row![
-                    text("Screenshot saved: ").size(12).color(color),
+                    text("Screenshot saved: ").size(fs.normal).color(color),
                     button(
                         text(path)
-                            .size(12)
+                            .size(fs.normal)
                             .color(iced::Color::from_rgb(0.3, 0.6, 1.0))
                     )
                     .style(button::text)
@@ -2752,7 +2758,7 @@ impl Ultimate64Browser {
                     )))
                     .padding(0),
                     tooltip(
-                        button(text("X").size(10))
+                        button(text("X").size(fs.tiny))
                             .on_press(Message::DismissMessage)
                             .padding([2, 6]),
                         "Dismiss message",
@@ -2765,9 +2771,9 @@ impl Ultimate64Browser {
                 .into()
             } else {
                 row![
-                    text(format!("{}{}", prefix, message)).size(12).color(color),
+                    text(format!("{}{}", prefix, message)).size(fs.normal).color(color),
                     tooltip(
-                        button(text("X").size(10))
+                        button(text("X").size(fs.tiny))
                             .on_press(Message::DismissMessage)
                             .padding([2, 6]),
                         "Dismiss message",
@@ -2780,7 +2786,7 @@ impl Ultimate64Browser {
                 .into()
             }
         } else {
-            text(video_status).size(12).into()
+            text(video_status).size(fs.normal).into()
         };
 
         let connected = self.status.connected;
@@ -2790,16 +2796,16 @@ impl Ultimate64Browser {
                 status_text,
                 Space::new().width(Length::Fill),
                 tooltip(
-                    button(text("MENU").size(11))
+                    button(text("MENU").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::MenuButton))
                         .padding([4, 8]),
                     "Press Ultimate64 menu button",
                     tooltip::Position::Top,
                 )
                 .style(container::bordered_box),
-                text("|").size(12),
+                text("|").size(fs.normal),
                 tooltip(
-                    button(text("PAUSE").size(11))
+                    button(text("PAUSE").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::PauseMachine))
                         .padding([4, 8]),
                     "Pause the C64 CPU",
@@ -2807,16 +2813,16 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("RESUME").size(11))
+                    button(text("RESUME").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::ResumeMachine))
                         .padding([4, 8]),
                     "Resume the C64 CPU",
                     tooltip::Position::Top,
                 )
                 .style(container::bordered_box),
-                text("|").size(12),
+                text("|").size(fs.normal),
                 tooltip(
-                    button(text("RESET").size(11))
+                    button(text("RESET").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::ResetMachine))
                         .padding([4, 8]),
                     "Reset the C64 (soft reset)",
@@ -2824,7 +2830,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("REBOOT").size(11))
+                    button(text("REBOOT").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::RebootMachine))
                         .padding([4, 8]),
                     "Reboot the Ultimate64 device",
@@ -2832,7 +2838,7 @@ impl Ultimate64Browser {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("POWER OFF").size(11))
+                    button(text("POWER OFF").size(fs.small))
                         .on_press_maybe(connected.then_some(Message::PoweroffMachine))
                         .padding([4, 8]),
                     "Power off the Ultimate64",

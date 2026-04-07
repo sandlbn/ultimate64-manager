@@ -1080,7 +1080,8 @@ impl RemoteBrowser {
     // ── Builder helper methods for Total Commander-style layout ──────────
 
     fn build_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
         let display_path = if self.current_path.len() > 35 {
             format!("...{}", &self.current_path[self.current_path.len() - 32..])
         } else {
@@ -1113,7 +1114,8 @@ impl RemoteBrowser {
     }
 
     fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
         let mut nav = row![tooltip(
             button(text("/").size(small))
                 .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
@@ -1164,8 +1166,9 @@ impl RemoteBrowser {
     }
 
     fn build_status_bar(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let tiny = (font_size.saturating_sub(3)).max(7);
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let tiny = fs.tiny;
+        let small = fs.small;
         let file_count = self.files.len();
         let checked_count = self.checked_files.len();
 
@@ -1208,7 +1211,8 @@ impl RemoteBrowser {
     }
 
     fn build_column_headers(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
 
         let name_indicator = if self.sort_column == crate::file_types::SortColumn::Name {
             self.sort_order.indicator()
@@ -1257,9 +1261,10 @@ impl RemoteBrowser {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         // ── Delete confirm dialog — shown over everything else ─────────────
         if let Some(ref dp) = self.delete_pending {
@@ -1310,7 +1315,7 @@ impl RemoteBrowser {
 
         // ── Create directory dialog ────────────────────────────────────────
         if self.show_create_dir {
-            let small = (font_size.saturating_sub(2)).max(8);
+            let small = fs.small;
             let dialog = container(
                 column![
                     text("Create Directory").size(font_size),
@@ -1634,7 +1639,7 @@ impl RemoteBrowser {
                     .on_toggle(move |checked| {
                         RemoteBrowserMessage::ToggleFileCheck(path_for_check.clone(), checked)
                     })
-                    .size(14)
+                    .size(fs.large)
                     .into();
 
                 // ── Per-row rename and delete buttons ──────────────────────
@@ -1723,8 +1728,9 @@ impl RemoteBrowser {
         dp: &'a DeletePending,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
 
         let header = row![
             text("⚠ Confirm Delete").size(normal),
@@ -1796,9 +1802,10 @@ impl RemoteBrowser {
         rp: &'a RenamePending,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let original_name = rp
             .original_path
@@ -1919,9 +1926,10 @@ impl RemoteBrowser {
     }
 
     fn view_create_disk_dialog(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let header = row![
             text("💾 Create New Disk Image").size(normal),
@@ -2074,9 +2082,10 @@ impl RemoteBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let header = row![
             text(format!("{} - ", disk_info.kind)).size(small),
@@ -2179,9 +2188,10 @@ impl RemoteBrowser {
         content: &'a ContentPreview,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         match content {
             ContentPreview::Text {

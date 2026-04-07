@@ -852,8 +852,7 @@ impl FileBrowser {
 
     /// Build the compact navigation row: [Up] path/to/current/dir...
     fn build_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let normal = font_size;
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         let path_str = self.current_directory.to_string_lossy();
         let display_path = if path_str.len() > 45 {
@@ -864,7 +863,7 @@ impl FileBrowser {
 
         row![
             tooltip(
-                button(text("⬆").size(normal))
+                button(text("⬆").size(fs.normal))
                     .on_press(FileBrowserMessage::NavigateUp)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
@@ -872,7 +871,7 @@ impl FileBrowser {
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),
-            text(display_path).size(small).width(Length::Fill),
+            text(display_path).size(fs.small).width(Length::Fill),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center)
@@ -881,11 +880,11 @@ impl FileBrowser {
 
     /// Build the quick navigation row: [Browse] [CSDb] [Home]
     fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         row![
             tooltip(
-                button(text("🔍 Browse").size(small))
+                button(text("🔍 Browse").size(fs.small))
                     .on_press(FileBrowserMessage::SelectDirectory)
                     .padding([2, 6])
                     .style(crate::styles::nav_button),
@@ -894,7 +893,7 @@ impl FileBrowser {
             )
             .style(crate::styles::subtle_tooltip),
             tooltip(
-                button(text("CSDb").size(small))
+                button(text("CSDb").size(fs.small))
                     .on_press(FileBrowserMessage::NavigateToCsdbDir)
                     .padding([2, 6])
                     .style(crate::styles::nav_button),
@@ -903,7 +902,7 @@ impl FileBrowser {
             )
             .style(crate::styles::subtle_tooltip),
             tooltip(
-                button(text("🏠 Home").size(small))
+                button(text("🏠 Home").size(fs.small))
                     .on_press(FileBrowserMessage::NavigateToPath(
                         dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
                     ))
@@ -921,7 +920,7 @@ impl FileBrowser {
 
     /// Build the status bar: file count | selection | Drive picker
     fn build_status_bar(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
         let checked_count = self.checked_files.len();
         let file_count = self.files.len();
 
@@ -929,20 +928,20 @@ impl FileBrowser {
 
         // Loading indicator or status message
         if self.disk_info_loading || self.content_preview_loading || self.is_loading {
-            items = items.push(text("Loading...").size(tiny));
+            items = items.push(text("Loading...").size(fs.tiny));
         } else if let Some(msg) = &self.status_message {
-            items = items.push(text(msg).size(tiny));
+            items = items.push(text(msg).size(fs.tiny));
         }
 
-        items = items.push(text(format!("{} files", file_count)).size(tiny));
+        items = items.push(text(format!("{} files", file_count)).size(fs.tiny));
 
         if checked_count > 0 {
-            items = items.push(text("|").size(tiny));
-            items = items.push(text(format!("{} sel", checked_count)).size(tiny));
+            items = items.push(text("|").size(fs.tiny));
+            items = items.push(text(format!("{} sel", checked_count)).size(fs.tiny));
         }
 
         items = items.push(Space::new().width(Length::Fill));
-        items = items.push(text("Drive:").size(tiny));
+        items = items.push(text("Drive:").size(fs.tiny));
         items = items.push(
             pick_list(
                 DriveOption::get_all(),
@@ -950,7 +949,7 @@ impl FileBrowser {
                 FileBrowserMessage::DriveSelected,
             )
             .placeholder("Drive")
-            .text_size(tiny)
+            .text_size(fs.tiny)
             .width(Length::Fixed(95.0)),
         );
 
@@ -960,7 +959,7 @@ impl FileBrowser {
     /// Build column headers for the file list (Name, Size, Type)
     fn build_column_headers(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
         use crate::file_types::SortColumn;
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         row![
             Space::new().width(24), // checkbox space
@@ -973,7 +972,7 @@ impl FileBrowser {
                         ""
                     }
                 ))
-                .size(small),
+                .size(fs.small),
             )
             .on_press(FileBrowserMessage::SortBy(SortColumn::Name))
             .padding([2, 4])
@@ -988,7 +987,7 @@ impl FileBrowser {
                         ""
                     }
                 ))
-                .size(small),
+                .size(fs.small),
             )
             .on_press(FileBrowserMessage::SortBy(SortColumn::Size))
             .padding([2, 4])
@@ -1003,7 +1002,7 @@ impl FileBrowser {
                         ""
                     }
                 ))
-                .size(small),
+                .size(fs.small),
             )
             .on_press(FileBrowserMessage::SortBy(SortColumn::Type))
             .padding([2, 4])
@@ -1016,8 +1015,7 @@ impl FileBrowser {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         // If drive enable dialog is open, show it instead of the file list
         if let Some((drive_opt, _)) = &self.drive_enable_dialog {
@@ -1035,15 +1033,15 @@ impl FileBrowser {
                         "Drive {} (device {}) is currently disabled.",
                         drive_letter, drive_num
                     ))
-                    .size(normal),
+                    .size(fs.normal),
                     text("Enable it temporarily? (reboot restores your original settings)")
-                        .size(small),
+                        .size(fs.small),
                     row![
-                        button(text(format!("Enable Drive {}", drive_letter)).size(small))
+                        button(text(format!("Enable Drive {}", drive_letter)).size(fs.small))
                             .on_press(FileBrowserMessage::ConfirmEnableDrive)
                             .padding([5, 15])
                             .style(button::secondary),
-                        button(text("Cancel").size(small))
+                        button(text("Cancel").size(fs.small))
                             .on_press(FileBrowserMessage::CancelEnableDrive)
                             .padding([5, 15])
                             .style(button::secondary),
@@ -1107,19 +1105,19 @@ impl FileBrowser {
                 .join(", ");
             let dialog = container(
                 column![
-                    text(format!("Delete {} item(s)?", paths.len())).size(normal),
+                    text(format!("Delete {} item(s)?", paths.len())).size(fs.normal),
                     text(if summary.len() > 80 {
                         format!("{}...", &summary[..77])
                     } else {
                         summary
                     })
-                    .size(small),
+                    .size(fs.small),
                     row![
-                        button(text("Delete").size(small))
+                        button(text("Delete").size(fs.small))
                             .on_press(FileBrowserMessage::DeleteConfirmed)
                             .padding([5, 15])
                             .style(button::secondary),
-                        button(text("Cancel").size(small))
+                        button(text("Cancel").size(fs.small))
                             .on_press(FileBrowserMessage::DeleteCancelled)
                             .padding([5, 15])
                             .style(button::secondary),
@@ -1145,24 +1143,24 @@ impl FileBrowser {
             // Create directory dialog
             let dialog = container(
                 column![
-                    text("Create Directory").size(normal),
+                    text("Create Directory").size(fs.normal),
                     row![
-                        text("Name:").size(small),
+                        text("Name:").size(fs.small),
                         iced::widget::text_input("directory name...", &self.create_dir_name)
                             .on_input(FileBrowserMessage::CreateDirNameChanged)
                             .on_submit(FileBrowserMessage::CreateDirConfirm)
-                            .size(small as f32)
+                            .size(fs.small as f32)
                             .padding(4)
                             .width(Length::Fixed(200.0)),
                     ]
                     .spacing(8)
                     .align_y(iced::Alignment::Center),
                     row![
-                        button(text("Create").size(small))
+                        button(text("Create").size(fs.small))
                             .on_press(FileBrowserMessage::CreateDirConfirm)
                             .padding([5, 15])
                             .style(button::secondary),
-                        button(text("Cancel").size(small))
+                        button(text("Cancel").size(fs.small))
                             .on_press(FileBrowserMessage::CreateDirCancel)
                             .padding([5, 15])
                             .style(button::secondary),
@@ -1234,19 +1232,17 @@ impl FileBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         // Header with disk name and close button
         let header = row![
-            text(format!("{} - ", disk_info.kind)).size(small),
-            text(format!("\"{}\"", disk_info.name)).size(normal),
+            text(format!("{} - ", disk_info.kind)).size(fs.small),
+            text(format!("\"{}\"", disk_info.name)).size(fs.normal),
             Space::new().width(Length::Fill),
-            text(format!("{} {}", disk_info.disk_id, disk_info.dos_type)).size(small),
+            text(format!("{} {}", disk_info.disk_id, disk_info.dos_type)).size(fs.small),
             Space::new().width(10),
             tooltip(
-                button(text("Close").size(small))
+                button(text("Close").size(fs.small))
                     .on_press(FileBrowserMessage::CloseDiskInfo)
                     .padding([4, 10])
                     .style(button::secondary),
@@ -1289,16 +1285,16 @@ impl FileBrowser {
                     items.push(
                         row![
                             text(format!("{:>4}", entry.size_blocks))
-                                .size(tiny)
+                                .size(fs.tiny)
                                 .width(Length::Fixed(35.0)),
                             text(format!("\"{}\"", entry.name))
-                                .size(tiny)
+                                .size(fs.tiny)
                                 .width(Length::Fill),
                             text(format!(
                                 "{}{}{}",
                                 closed_indicator, entry.file_type, lock_indicator
                             ))
-                            .size(tiny)
+                            .size(fs.tiny)
                             .color(type_color),
                         ]
                         .spacing(5)
@@ -1317,9 +1313,9 @@ impl FileBrowser {
 
         // Footer with blocks free
         let footer = row![
-            text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(small),
+            text(format!("{} BLOCKS FREE", disk_info.blocks_free)).size(fs.small),
             Space::new().width(Length::Fill),
-            text(format!("{} files", disk_info.entries.len())).size(tiny),
+            text(format!("{} files", disk_info.entries.len())).size(fs.tiny),
         ]
         .spacing(10);
 
@@ -1346,9 +1342,7 @@ impl FileBrowser {
         content: &'a ContentPreview,
         font_size: u32,
     ) -> Element<'a, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         match content {
             ContentPreview::Text {
@@ -1365,13 +1359,13 @@ impl FileBrowser {
 
                 // Header with filename and close button
                 let header = row![
-                    text("TEXT - ").size(small),
-                    text(display_name.clone()).size(normal),
+                    text("TEXT - ").size(fs.small),
+                    text(display_name.clone()).size(fs.normal),
                     Space::new().width(Length::Fill),
-                    text(format!("{} lines", line_count)).size(small),
+                    text(format!("{} lines", line_count)).size(fs.small),
                     Space::new().width(10),
                     tooltip(
-                        button(text("Close").size(small))
+                        button(text("Close").size(fs.small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
                             .padding([4, 10])
                             .style(button::secondary),
@@ -1388,10 +1382,10 @@ impl FileBrowser {
                 for (i, line) in content.lines().enumerate() {
                     let line_row = row![
                         text(format!("{:>4}", i + 1))
-                            .size(tiny)
+                            .size(fs.tiny)
                             .width(Length::Fixed(35.0))
                             .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
-                        text(line).size(tiny),
+                        text(line).size(fs.tiny),
                     ]
                     .spacing(10);
                     text_lines.push(line_row.into());
@@ -1431,13 +1425,13 @@ impl FileBrowser {
 
                 // Header with filename and close button
                 let header = row![
-                    text("IMAGE - ").size(small),
-                    text(display_name.clone()).size(normal),
+                    text("IMAGE - ").size(fs.small),
+                    text(display_name.clone()).size(fs.normal),
                     Space::new().width(Length::Fill),
-                    text(format!("{}x{}", width, height)).size(small),
+                    text(format!("{}x{}", width, height)).size(fs.small),
                     Space::new().width(10),
                     tooltip(
-                        button(text("Close").size(small))
+                        button(text("Close").size(fs.small))
                             .on_press(FileBrowserMessage::CloseContentPreview)
                             .padding([4, 10])
                             .style(button::secondary),
@@ -1482,9 +1476,7 @@ impl FileBrowser {
         entry: &FileEntry,
         font_size: u32,
     ) -> Element<'_, FileBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         let is_checked = self.checked_files.contains(&entry.path);
         // Highlight the row that was last entered (coming back via NavigateUp) or currently selected
@@ -1559,7 +1551,7 @@ impl FileBrowser {
                     if is_disk_image {
                         buttons = buttons.push(
                             tooltip(
-                                button(text("?").size(small))
+                                button(text("?").size(fs.small))
                                     .on_press(FileBrowserMessage::ShowDiskInfo(entry.path.clone()))
                                     .padding([2, 5])
                                     .style(crate::styles::action_button),
@@ -1573,7 +1565,7 @@ impl FileBrowser {
                     buttons = buttons
                         .push(
                             tooltip(
-                                button(text("Run").size(small))
+                                button(text("Run").size(fs.small))
                                     .on_press(FileBrowserMessage::RunDisk(
                                         entry.path.clone(),
                                         self.selected_drive.to_drive_string(),
@@ -1581,14 +1573,14 @@ impl FileBrowser {
                                     .padding([2, 5])
                                     .style(crate::styles::action_button),
                                 text(format!("Mount, reset and LOAD\"*\",{},1 + RUN", drive_num))
-                                    .size(normal),
+                                    .size(fs.normal),
                                 tooltip::Position::Top,
                             )
                             .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
-                                button(text(format!("{}:RW", drive)).size(small))
+                                button(text(format!("{}:RW", drive)).size(fs.small))
                                     .on_press(FileBrowserMessage::MountDisk(
                                         entry.path.clone(),
                                         self.selected_drive.to_drive_string(),
@@ -1597,14 +1589,14 @@ impl FileBrowser {
                                     .padding([2, 5])
                                     .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read/Write)", drive_num))
-                                    .size(normal),
+                                    .size(fs.normal),
                                 tooltip::Position::Top,
                             )
                             .style(crate::styles::subtle_tooltip),
                         )
                         .push(
                             tooltip(
-                                button(text(format!("{}:RO", drive)).size(small))
+                                button(text(format!("{}:RO", drive)).size(fs.small))
                                     .on_press(FileBrowserMessage::MountDisk(
                                         entry.path.clone(),
                                         self.selected_drive.to_drive_string(),
@@ -1613,7 +1605,7 @@ impl FileBrowser {
                                     .padding([2, 5])
                                     .style(crate::styles::action_button),
                                 text(format!("Mount as Drive {} (Read Only)", drive_num))
-                                    .size(normal),
+                                    .size(fs.normal),
                                 tooltip::Position::Top,
                             )
                             .style(crate::styles::subtle_tooltip),
@@ -1622,7 +1614,7 @@ impl FileBrowser {
                     buttons.into()
                 }
                 Some("prg") | Some("crt") => tooltip(
-                    button(text("Run").size(small))
+                    button(text("Run").size(fs.small))
                         .on_press(FileBrowserMessage::LoadAndRun(entry.path.clone()))
                         .padding([2, 10])
                         .style(crate::styles::action_button),
@@ -1632,7 +1624,7 @@ impl FileBrowser {
                 .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("sid") => tooltip(
-                    button(text("Play").size(small))
+                    button(text("Play").size(fs.small))
                         .on_press(FileBrowserMessage::PlaySid(entry.path.clone()))
                         .padding([2, 8])
                         .style(crate::styles::action_button),
@@ -1642,7 +1634,7 @@ impl FileBrowser {
                 .style(crate::styles::subtle_tooltip)
                 .into(),
                 Some("mod") => tooltip(
-                    button(text("Play").size(small))
+                    button(text("Play").size(fs.small))
                         .on_press(FileBrowserMessage::PlayMod(entry.path.clone()))
                         .padding([2, 8])
                         .style(crate::styles::action_button),
@@ -1655,7 +1647,7 @@ impl FileBrowser {
                     // Extract the ZIP into a sibling subdirectory, then navigate there.
                     // Very large ZIPs (TOSEC etc.) are rejected with a clear error message.
                     tooltip(
-                        button(text("Extract").size(small))
+                        button(text("Extract").size(fs.small))
                             .on_press(FileBrowserMessage::ExtractZip(entry.path.clone()))
                             .padding([2, 8])
                             .style(crate::styles::action_button),
@@ -1663,7 +1655,7 @@ impl FileBrowser {
                             "Extract ZIP to subfolder (max {} MB)",
                             MAX_ZIP_EXTRACT_BYTES / (1024 * 1024)
                         ))
-                        .size(normal),
+                        .size(fs.normal),
                         tooltip::Position::Top,
                     )
                     .style(crate::styles::subtle_tooltip)
@@ -1673,7 +1665,7 @@ impl FileBrowser {
                     // Check for text, image, or PDF preview
                     if is_text_file {
                         tooltip(
-                            button(text("View").size(small))
+                            button(text("View").size(fs.small))
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
@@ -1686,7 +1678,7 @@ impl FileBrowser {
                         .into()
                     } else if is_image_file {
                         tooltip(
-                            button(text("View").size(small))
+                            button(text("View").size(fs.small))
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
@@ -1699,7 +1691,7 @@ impl FileBrowser {
                         .into()
                     } else if is_pdf_file {
                         tooltip(
-                            button(text("View").size(small))
+                            button(text("View").size(fs.small))
                                 .on_press(FileBrowserMessage::ShowContentPreview(
                                     entry.path.clone(),
                                 ))
@@ -1723,11 +1715,11 @@ impl FileBrowser {
             .on_toggle(move |checked| {
                 FileBrowserMessage::ToggleFileCheck(path_clone.clone(), checked)
             })
-            .size(16)
+            .size(fs.large)
             .into();
 
         // Wrap filename in tooltip if truncated to show full name
-        let filename_button = button(text(display_name.clone()).size(normal))
+        let filename_button = button(text(display_name.clone()).size(fs.normal))
             .on_press(FileBrowserMessage::FileSelected(entry.path.clone()))
             .padding([4, 6])
             .width(Length::Fill)
@@ -1736,7 +1728,7 @@ impl FileBrowser {
         let filename_element: Element<'_, FileBrowserMessage> = if entry.name.len() > max_name_len {
             tooltip(
                 filename_button,
-                text(entry.name.clone()).size(normal),
+                text(entry.name.clone()).size(fs.normal),
                 tooltip::Position::Top,
             )
             .style(crate::styles::subtle_tooltip)
@@ -1759,11 +1751,11 @@ impl FileBrowser {
             filename_element,
             // Size column
             text(size_text)
-                .size(tiny)
+                .size(fs.tiny)
                 .width(Length::Fixed(65.0))
                 .align_x(iced::alignment::Horizontal::Right),
             // Type label
-            text(type_label).size(tiny).width(Length::Fixed(35.0)),
+            text(type_label).size(fs.tiny).width(Length::Fixed(35.0)),
             // Action button
             action_button,
         ]

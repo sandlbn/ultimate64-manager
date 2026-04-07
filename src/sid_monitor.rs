@@ -658,7 +658,8 @@ impl SidMonitor {
     // ─────────────────────────────────────────────────────────────
 
     pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, SidMonitorMessage> {
-        let sf = font_size.saturating_sub(2);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let sf = fs.small;
 
         if !is_connected {
             return container(

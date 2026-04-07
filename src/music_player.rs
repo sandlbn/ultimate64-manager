@@ -1145,10 +1145,7 @@ impl MusicPlayer {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, MusicPlayerMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let large = font_size + 2;
-        let header = font_size + 4;
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         // === TOP: Now playing info ===
         let (now_playing_text, now_playing_meta) = if let Some(idx) = self.current_playing {
@@ -1192,7 +1189,7 @@ impl MusicPlayer {
             ("No track selected".to_string(), String::new())
         };
 
-        let now_playing = text(now_playing_text.clone()).size(large);
+        let now_playing = text(now_playing_text.clone()).size(fs.large);
 
         // Time display
         let remaining = self
@@ -1207,13 +1204,13 @@ impl MusicPlayer {
             remaining / 60,
             remaining % 60
         ))
-        .size(normal);
+        .size(fs.normal);
 
         // Transport buttons - separate file and subsong navigation
         let transport = row![
             // File navigation
             tooltip(
-                button(text("|<").size(normal))
+                button(text("|<").size(fs.normal))
                     .on_press(MusicPlayerMessage::PreviousFile)
                     .padding([4, 8]),
                 "Previous file in playlist",
@@ -1222,7 +1219,7 @@ impl MusicPlayer {
             .style(container::bordered_box),
             // Subsong navigation
             tooltip(
-                button(text("<<").size(normal))
+                button(text("<<").size(fs.normal))
                     .on_press(MusicPlayerMessage::PreviousSubsong)
                     .padding([4, 6]),
                 "Previous subsong within current file",
@@ -1236,7 +1233,7 @@ impl MusicPlayer {
                     } else {
                         "▶"
                     })
-                    .size(normal)
+                    .size(fs.normal)
                 )
                 .on_press(if self.playback_state == PlaybackState::Playing {
                     MusicPlayerMessage::Pause
@@ -1253,7 +1250,7 @@ impl MusicPlayer {
             )
             .style(container::bordered_box),
             tooltip(
-                button(text("■").size(normal))
+                button(text("■").size(fs.normal))
                     .on_press(MusicPlayerMessage::Stop)
                     .padding([4, 8]),
                 "Stop playback and reset to beginning",
@@ -1262,7 +1259,7 @@ impl MusicPlayer {
             .style(container::bordered_box),
             // Subsong navigation
             tooltip(
-                button(text(">>").size(normal))
+                button(text(">>").size(fs.normal))
                     .on_press(MusicPlayerMessage::NextSubsong)
                     .padding([4, 6]),
                 "Next subsong within current file",
@@ -1271,7 +1268,7 @@ impl MusicPlayer {
             .style(container::bordered_box),
             // File navigation
             tooltip(
-                button(text(">|").size(normal))
+                button(text(">|").size(fs.normal))
                     .on_press(MusicPlayerMessage::NextFile)
                     .padding([4, 8]),
                 "Next file in playlist",
@@ -1283,7 +1280,7 @@ impl MusicPlayer {
                 "Tune {}/{}",
                 self.current_subsong, self.max_subsongs
             ))
-            .size(normal),
+            .size(fs.normal),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
@@ -1297,7 +1294,7 @@ impl MusicPlayer {
                     } else {
                         "↭ Shuffle"
                     })
-                    .size(small)
+                    .size(fs.small)
                 )
                 .on_press(MusicPlayerMessage::ToggleShuffle)
                 .padding([3, 6])
@@ -1317,7 +1314,7 @@ impl MusicPlayer {
                     } else {
                         "⟳ Repeat"
                     })
-                    .size(small)
+                    .size(fs.small)
                 )
                 .on_press(MusicPlayerMessage::ToggleRepeat)
                 .padding([3, 6])
@@ -1345,7 +1342,7 @@ impl MusicPlayer {
         if !now_playing_meta.is_empty() {
             top_bar_items.push(
                 text(now_playing_meta)
-                    .size(small)
+                    .size(fs.small)
                     .color(iced::Color::from_rgb(0.6, 0.7, 0.8))
                     .into(),
             );
@@ -1387,10 +1384,10 @@ impl MusicPlayer {
                 } else {
                     "LOCAL FILES"
                 })
-                .size(normal),
+                .size(fs.normal),
                 row![
                     tooltip(
-                        button(text("Browse").size(small))
+                        button(text("Browse").size(fs.small))
                             .on_press(MusicPlayerMessage::SelectDirectory)
                             .padding([3, 8]),
                         "Select a directory to browse",
@@ -1398,7 +1395,7 @@ impl MusicPlayer {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Up").size(small))
+                        button(text("Up").size(fs.small))
                             .on_press(MusicPlayerMessage::NavigateUp)
                             .padding([3, 8]),
                         "Go to parent directory",
@@ -1406,7 +1403,7 @@ impl MusicPlayer {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Refresh").size(small))
+                        button(text("Refresh").size(fs.small))
                             .on_press(MusicPlayerMessage::RefreshBrowser)
                             .padding([3, 8]),
                         "Refresh current directory listing",
@@ -1414,7 +1411,7 @@ impl MusicPlayer {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Add All").size(small))
+                        button(text("Add All").size(fs.small))
                             .on_press(MusicPlayerMessage::AddAllToPlaylist)
                             .padding([3, 8]),
                         if self.browser_search_active {
@@ -1429,15 +1426,15 @@ impl MusicPlayer {
                 .spacing(5)
                 .align_y(iced::Alignment::Center),
                 row![
-                    text("Search:").size(small),
+                    text("Search:").size(fs.small),
                     text_input("filename or directory...", &self.browser_filter)
                         .on_input(MusicPlayerMessage::BrowserFilterChanged)
                         .on_submit(MusicPlayerMessage::BrowserSearch)
-                        .size(small)
+                        .size(fs.small)
                         .padding(4)
                         .width(Length::Fill),
                     tooltip(
-                        button(text("Find").size(small))
+                        button(text("Find").size(fs.small))
                             .on_press(MusicPlayerMessage::BrowserSearch)
                             .padding([3, 8])
                             .style(button::primary),
@@ -1447,7 +1444,7 @@ impl MusicPlayer {
                     .style(container::bordered_box),
                     if self.browser_search_active {
                         tooltip(
-                            button(text("Clear").size(small))
+                            button(text("Clear").size(fs.small))
                                 .on_press(MusicPlayerMessage::BrowserClearSearch)
                                 .padding([3, 8]),
                             "Return to directory browsing",
@@ -1457,7 +1454,7 @@ impl MusicPlayer {
                     } else {
                         // Invisible placeholder to keep layout stable
                         tooltip(
-                            button(text("Clear").size(small)).padding([3, 8]),
+                            button(text("Clear").size(fs.small)).padding([3, 8]),
                             "",
                             tooltip::Position::Bottom,
                         )
@@ -1466,13 +1463,13 @@ impl MusicPlayer {
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center),
-                text(dir_display.clone()).size(small),
+                text(dir_display.clone()).size(fs.small),
                 text(if self.browser_search_active {
                     format!("{} music files found", music_file_count)
                 } else {
                     format!("{} music files", music_file_count)
                 })
-                .size(small),
+                .size(fs.small),
             ]
             .spacing(5),
         )
@@ -1485,7 +1482,7 @@ impl MusicPlayer {
                 } else {
                     "Empty directory"
                 })
-                .size(normal),
+                .size(fs.normal),
             )
             .padding(10)
             .into()
@@ -1513,7 +1510,7 @@ impl MusicPlayer {
                     match &entry.entry_type {
                         BrowserEntryType::Directory => {
                             // Directory entry - click to navigate
-                            row![button(text(format!("[DIR] {}", entry.name)).size(normal))
+                            row![button(text(format!("[DIR] {}", entry.name)).size(fs.normal))
                                 .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                                 .padding([6, 8])
                                 .width(Length::Fill)
@@ -1540,7 +1537,7 @@ impl MusicPlayer {
                             let is_truncated = entry.name.chars().count() > max_name_len;
 
                             let file_button = button(
-                                text(format!("{}{} {}", icon, subsong_info, display)).size(normal),
+                                text(format!("{}{} {}", icon, subsong_info, display)).size(fs.normal),
                             )
                             .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                             .padding([6, 8])
@@ -1562,7 +1559,7 @@ impl MusicPlayer {
                                     };
                                     tooltip(
                                         file_button,
-                                        text(tip_text).size(small),
+                                        text(tip_text).size(fs.small),
                                         tooltip::Position::Top,
                                     )
                                     .style(container::bordered_box)
@@ -1571,7 +1568,7 @@ impl MusicPlayer {
                                     // Just show full filename for truncated names
                                     tooltip(
                                         file_button,
-                                        text(&entry.name).size(normal),
+                                        text(&entry.name).size(fs.normal),
                                         tooltip::Position::Top,
                                     )
                                     .style(container::bordered_box)
@@ -1583,7 +1580,7 @@ impl MusicPlayer {
                             row![
                                 file_element,
                                 tooltip(
-                                    button(text(">").size(small))
+                                    button(text(">").size(fs.small))
                                         .on_press(MusicPlayerMessage::AddAndPlay(*idx))
                                         .padding([4, 8]),
                                     "Add to playlist and play immediately",
@@ -1591,7 +1588,7 @@ impl MusicPlayer {
                                 )
                                 .style(container::bordered_box),
                                 tooltip(
-                                    button(text("+").size(small))
+                                    button(text("+").size(fs.small))
                                         .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
                                         .padding([4, 8]),
                                     "Add to playlist",
@@ -1626,14 +1623,14 @@ impl MusicPlayer {
         // === RIGHT PANE: Playlist ===
         let playlist_header = container(
             column![
-                text("PLAYLIST").size(normal),
+                text("PLAYLIST").size(fs.normal),
                 row![
                     text_input("Playlist name", &self.playlist_name)
                         .on_input(MusicPlayerMessage::PlaylistNameChanged)
-                        .size(small)
+                        .size(fs.small)
                         .width(Length::Fixed(120.0)),
                     tooltip(
-                        button(text("Save").size(small))
+                        button(text("Save").size(fs.small))
                             .on_press(MusicPlayerMessage::SavePlaylist)
                             .padding([3, 6]),
                         "Save playlist to a JSON file",
@@ -1641,7 +1638,7 @@ impl MusicPlayer {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Load").size(small))
+                        button(text("Load").size(fs.small))
                             .on_press(MusicPlayerMessage::LoadPlaylist)
                             .padding([3, 6]),
                         "Load playlist from a JSON file",
@@ -1649,7 +1646,7 @@ impl MusicPlayer {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Clear").size(small))
+                        button(text("Clear").size(fs.small))
                             .on_press(MusicPlayerMessage::ClearPlaylist)
                             .padding([3, 6]),
                         "Remove all items from playlist",
@@ -1663,14 +1660,14 @@ impl MusicPlayer {
                     self.playlist.len(),
                     format_total_duration(&self.playlist, self.default_song_duration)
                 ))
-                .size(small),
+                .size(fs.small),
             ]
             .spacing(5),
         )
         .padding(10);
 
         let playlist_list: Element<'_, MusicPlayerMessage> = if self.playlist.is_empty() {
-            container(text("Playlist is empty\nDouble-click files to add and play").size(normal))
+            container(text("Playlist is empty\nDouble-click files to add and play").size(fs.normal))
                 .padding(10)
                 .into()
         } else {
@@ -1735,14 +1732,13 @@ impl MusicPlayer {
                     let name = truncate_string(&display_name, max_name_len);
                     let is_truncated = display_name.chars().count() > max_name_len;
 
-                    let tiny = (font_size.saturating_sub(3)).max(7);
 
                     let playlist_button = button(
                         text(format!(
                             "{} [{}] {} ({})",
                             prefix, badge, name, duration_str
                         ))
-                        .size(small),
+                        .size(fs.small),
                     )
                     .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
                     .padding([6, 8])
@@ -1775,7 +1771,7 @@ impl MusicPlayer {
                             }
                             tooltip(
                                 playlist_button,
-                                text(tip_parts.join("\n")).size(small),
+                                text(tip_parts.join("\n")).size(fs.small),
                                 tooltip::Position::Top,
                             )
                             .style(container::bordered_box)
@@ -1788,7 +1784,7 @@ impl MusicPlayer {
                     row![
                         playlist_element,
                         tooltip(
-                            button(text("^").size(tiny))
+                            button(text("^").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
                                 .padding([4, 6]),
                             "Move up in playlist",
@@ -1796,7 +1792,7 @@ impl MusicPlayer {
                         )
                         .style(container::bordered_box),
                         tooltip(
-                            button(text("v").size(tiny))
+                            button(text("v").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
                                 .padding([4, 6]),
                             "Move down in playlist",
@@ -1804,7 +1800,7 @@ impl MusicPlayer {
                         )
                         .style(container::bordered_box),
                         tooltip(
-                            button(text("X").size(tiny))
+                            button(text("X").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
                                 .padding([4, 6]),
                             "Remove from playlist",
@@ -1830,7 +1826,7 @@ impl MusicPlayer {
         // Play selected button
         let playlist_controls = container(if let Some(selected) = self.playlist_selected {
             row![tooltip(
-                button(text("Play Selected").size(small))
+                button(text("Play Selected").size(fs.small))
                     .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
                     .padding([4, 10]),
                 "Start playing the selected track",
@@ -1863,9 +1859,9 @@ impl MusicPlayer {
 
         let db_controls = container(
             row![
-                text("Song Lengths:").size(small),
+                text("Song Lengths:").size(fs.small),
                 tooltip(
-                    button(text("Download HVSC").size(small))
+                    button(text("Download HVSC").size(fs.small))
                         .on_press(MusicPlayerMessage::DownloadSongLengths)
                         .padding([3, 8]),
                     "Download song length database from HVSC\n(High Voltage SID Collection)",
@@ -1873,16 +1869,16 @@ impl MusicPlayer {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Load File").size(small))
+                    button(text("Load File").size(fs.small))
                         .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
                         .padding([3, 8]),
                     "Load song length database from local file",
                     tooltip::Position::Top,
                 )
                 .style(container::bordered_box),
-                text(db_status.clone()).size(small),
+                text(db_status.clone()).size(fs.small),
                 Space::new().width(Length::Fill),
-                text(&self.status_message).size(small),
+                text(&self.status_message).size(fs.small),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -1894,7 +1890,7 @@ impl MusicPlayer {
             row![browser_pane, rule::vertical(1), playlist_pane].height(Length::Fill);
 
         column![
-            text("MUSIC PLAYER").size(header),
+            text("MUSIC PLAYER").size(fs.header),
             rule::horizontal(1),
             top_bar,
             rule::horizontal(1),
