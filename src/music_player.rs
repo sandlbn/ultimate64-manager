@@ -1212,20 +1212,22 @@ impl MusicPlayer {
             tooltip(
                 button(text("|<").size(fs.normal))
                     .on_press(MusicPlayerMessage::PreviousFile)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Previous file in playlist",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             // Subsong navigation
             tooltip(
                 button(text("<<").size(fs.normal))
                     .on_press(MusicPlayerMessage::PreviousSubsong)
-                    .padding([4, 6]),
+                    .padding([4, 6])
+                    .style(crate::styles::nav_button),
                 "Previous subsong within current file",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(
                     text(if self.playback_state == PlaybackState::Playing {
@@ -1240,7 +1242,8 @@ impl MusicPlayer {
                 } else {
                     MusicPlayerMessage::Play
                 })
-                .padding([4, 12]),
+                .padding([4, 12])
+                .style(crate::styles::nav_button),
                 if self.playback_state == PlaybackState::Playing {
                     "Pause playback"
                 } else {
@@ -1248,33 +1251,36 @@ impl MusicPlayer {
                 },
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(text("■").size(fs.normal))
                     .on_press(MusicPlayerMessage::Stop)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Stop playback and reset to beginning",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             // Subsong navigation
             tooltip(
                 button(text(">>").size(fs.normal))
                     .on_press(MusicPlayerMessage::NextSubsong)
-                    .padding([4, 6]),
+                    .padding([4, 6])
+                    .style(crate::styles::nav_button),
                 "Next subsong within current file",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             // File navigation
             tooltip(
                 button(text(">|").size(fs.normal))
                     .on_press(MusicPlayerMessage::NextFile)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 "Next file in playlist",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             // Subsong indicator
             text(format!(
                 "Tune {}/{}",
@@ -1299,14 +1305,14 @@ impl MusicPlayer {
                 .on_press(MusicPlayerMessage::ToggleShuffle)
                 .padding([3, 6])
                 .style(if self.shuffle_enabled {
-                    button::primary
+                    crate::styles::action_button
                 } else {
-                    button::secondary
+                    crate::styles::nav_button
                 }),
                 "Randomize playlist order",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
             tooltip(
                 button(
                     text(if self.repeat_enabled {
@@ -1319,14 +1325,14 @@ impl MusicPlayer {
                 .on_press(MusicPlayerMessage::ToggleRepeat)
                 .padding([3, 6])
                 .style(if self.repeat_enabled {
-                    button::primary
+                    crate::styles::action_button
                 } else {
-                    button::secondary
+                    crate::styles::nav_button
                 }),
                 "Repeat playlist when finished",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(5);
 
@@ -1384,36 +1390,41 @@ impl MusicPlayer {
                 } else {
                     "LOCAL FILES"
                 })
-                .size(fs.normal),
+                .size(fs.normal)
+                .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
                 row![
                     tooltip(
                         button(text("Browse").size(fs.small))
                             .on_press(MusicPlayerMessage::SelectDirectory)
-                            .padding([3, 8]),
+                            .padding([3, 8])
+                            .style(crate::styles::nav_button),
                         "Select a directory to browse",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     tooltip(
                         button(text("Up").size(fs.small))
                             .on_press(MusicPlayerMessage::NavigateUp)
-                            .padding([3, 8]),
+                            .padding([3, 8])
+                            .style(crate::styles::nav_button),
                         "Go to parent directory",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     tooltip(
                         button(text("Refresh").size(fs.small))
                             .on_press(MusicPlayerMessage::RefreshBrowser)
-                            .padding([3, 8]),
+                            .padding([3, 8])
+                            .style(crate::styles::nav_button),
                         "Refresh current directory listing",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     tooltip(
                         button(text("Add All").size(fs.small))
                             .on_press(MusicPlayerMessage::AddAllToPlaylist)
-                            .padding([3, 8]),
+                            .padding([3, 8])
+                            .style(crate::styles::nav_button),
                         if self.browser_search_active {
                             "Add all found files to playlist"
                         } else {
@@ -1421,7 +1432,7 @@ impl MusicPlayer {
                         },
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center),
@@ -1437,39 +1448,45 @@ impl MusicPlayer {
                         button(text("Find").size(fs.small))
                             .on_press(MusicPlayerMessage::BrowserSearch)
                             .padding([3, 8])
-                            .style(button::primary),
+                            .style(crate::styles::nav_button),
                         "Search recursively in all subdirectories (Enter)",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     if self.browser_search_active {
                         tooltip(
                             button(text("Clear").size(fs.small))
                                 .on_press(MusicPlayerMessage::BrowserClearSearch)
-                                .padding([3, 8]),
+                                .padding([3, 8])
+                                .style(crate::styles::nav_button),
                             "Return to directory browsing",
                             tooltip::Position::Bottom,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                     } else {
                         // Invisible placeholder to keep layout stable
                         tooltip(
-                            button(text("Clear").size(fs.small)).padding([3, 8]),
+                            button(text("Clear").size(fs.small))
+                                .padding([3, 8])
+                                .style(crate::styles::nav_button),
                             "",
                             tooltip::Position::Bottom,
                         )
-                        .style(container::bordered_box)
+                        .style(crate::styles::subtle_tooltip)
                     },
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center),
-                text(dir_display.clone()).size(fs.small),
+                text(dir_display.clone())
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
                 text(if self.browser_search_active {
                     format!("{} music files found", music_file_count)
                 } else {
                     format!("{} music files", music_file_count)
                 })
-                .size(fs.small),
+                .size(fs.small)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
             ]
             .spacing(5),
         )
@@ -1565,7 +1582,7 @@ impl MusicPlayer {
                                         text(tip_text).size(fs.small),
                                         tooltip::Position::Top,
                                     )
-                                    .style(container::bordered_box)
+                                    .style(crate::styles::subtle_tooltip)
                                     .into()
                                 } else if is_truncated {
                                     // Just show full filename for truncated names
@@ -1574,7 +1591,7 @@ impl MusicPlayer {
                                         text(&entry.name).size(fs.normal),
                                         tooltip::Position::Top,
                                     )
-                                    .style(container::bordered_box)
+                                    .style(crate::styles::subtle_tooltip)
                                     .into()
                                 } else {
                                     file_button.into()
@@ -1585,19 +1602,21 @@ impl MusicPlayer {
                                 tooltip(
                                     button(text(">").size(fs.small))
                                         .on_press(MusicPlayerMessage::AddAndPlay(*idx))
-                                        .padding([4, 8]),
+                                        .padding([4, 8])
+                                        .style(crate::styles::action_button),
                                     "Add to playlist and play immediately",
                                     tooltip::Position::Bottom,
                                 )
-                                .style(container::bordered_box),
+                                .style(crate::styles::subtle_tooltip),
                                 tooltip(
                                     button(text("+").size(fs.small))
                                         .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
-                                        .padding([4, 8]),
+                                        .padding([4, 8])
+                                        .style(crate::styles::action_button),
                                     "Add to playlist",
                                     tooltip::Position::Bottom,
                                 )
-                                .style(container::bordered_box),
+                                .style(crate::styles::subtle_tooltip),
                             ]
                             .spacing(4)
                             .align_y(iced::Alignment::Center)
@@ -1626,7 +1645,9 @@ impl MusicPlayer {
         // === RIGHT PANE: Playlist ===
         let playlist_header = container(
             column![
-                text("PLAYLIST").size(fs.normal),
+                text("PLAYLIST")
+                    .size(fs.normal)
+                    .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
                 row![
                     text_input("Playlist name", &self.playlist_name)
                         .on_input(MusicPlayerMessage::PlaylistNameChanged)
@@ -1635,27 +1656,30 @@ impl MusicPlayer {
                     tooltip(
                         button(text("Save").size(fs.small))
                             .on_press(MusicPlayerMessage::SavePlaylist)
-                            .padding([3, 6]),
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
                         "Save playlist to a JSON file",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     tooltip(
                         button(text("Load").size(fs.small))
                             .on_press(MusicPlayerMessage::LoadPlaylist)
-                            .padding([3, 6]),
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
                         "Load playlist from a JSON file",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                     tooltip(
                         button(text("Clear").size(fs.small))
                             .on_press(MusicPlayerMessage::ClearPlaylist)
-                            .padding([3, 6]),
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
                         "Remove all items from playlist",
                         tooltip::Position::Bottom,
                     )
-                    .style(container::bordered_box),
+                    .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5),
                 text(format!(
@@ -1663,7 +1687,8 @@ impl MusicPlayer {
                     self.playlist.len(),
                     format_total_duration(&self.playlist, self.default_song_duration)
                 ))
-                .size(fs.small),
+                .size(fs.small)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
             ]
             .spacing(5),
         )
@@ -1776,7 +1801,7 @@ impl MusicPlayer {
                                 text(tip_parts.join("\n")).size(fs.small),
                                 tooltip::Position::Top,
                             )
-                            .style(container::bordered_box)
+                            .style(crate::styles::subtle_tooltip)
                             .into()
                         } else {
                             playlist_button.into()
@@ -1788,27 +1813,30 @@ impl MusicPlayer {
                         tooltip(
                             button(text("^").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
-                                .padding([4, 6]),
+                                .padding([4, 6])
+                                .style(crate::styles::nav_button),
                             "Move up in playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(container::bordered_box),
+                        .style(crate::styles::subtle_tooltip),
                         tooltip(
                             button(text("v").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
-                                .padding([4, 6]),
+                                .padding([4, 6])
+                                .style(crate::styles::nav_button),
                             "Move down in playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(container::bordered_box),
+                        .style(crate::styles::subtle_tooltip),
                         tooltip(
                             button(text("X").size(fs.tiny))
                                 .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
-                                .padding([4, 6]),
+                                .padding([4, 6])
+                                .style(crate::styles::nav_button),
                             "Remove from playlist",
                             tooltip::Position::Bottom,
                         )
-                        .style(container::bordered_box),
+                        .style(crate::styles::subtle_tooltip),
                     ]
                     .spacing(2)
                     .align_y(iced::Alignment::Center)
@@ -1830,11 +1858,12 @@ impl MusicPlayer {
             row![tooltip(
                 button(text("Play Selected").size(fs.small))
                     .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(selected))
-                    .padding([4, 10]),
+                    .padding([4, 10])
+                    .style(crate::styles::action_button),
                 "Start playing the selected track",
                 tooltip::Position::Bottom,
             )
-            .style(container::bordered_box),]
+            .style(crate::styles::subtle_tooltip),]
         } else {
             row![]
         })
@@ -1861,26 +1890,34 @@ impl MusicPlayer {
 
         let db_controls = container(
             row![
-                text("Song Lengths:").size(fs.small),
+                text("Song Lengths:")
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
                 tooltip(
                     button(text("Download HVSC").size(fs.small))
                         .on_press(MusicPlayerMessage::DownloadSongLengths)
-                        .padding([3, 8]),
+                        .padding([3, 8])
+                        .style(crate::styles::nav_button),
                     "Download song length database from HVSC\n(High Voltage SID Collection)",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box),
+                .style(crate::styles::subtle_tooltip),
                 tooltip(
                     button(text("Load File").size(fs.small))
                         .on_press(MusicPlayerMessage::LoadSongLengthsFromFile)
-                        .padding([3, 8]),
+                        .padding([3, 8])
+                        .style(crate::styles::nav_button),
                     "Load song length database from local file",
                     tooltip::Position::Top,
                 )
-                .style(container::bordered_box),
-                text(db_status.clone()).size(fs.small),
+                .style(crate::styles::subtle_tooltip),
+                text(db_status.clone())
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
                 Space::new().width(Length::Fill),
-                text(&self.status_message).size(fs.small),
+                text(&self.status_message)
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
             ]
             .spacing(10)
             .align_y(iced::Alignment::Center),
@@ -1892,8 +1929,6 @@ impl MusicPlayer {
             row![browser_pane, rule::vertical(1), playlist_pane].height(Length::Fill);
 
         column![
-            text("MUSIC PLAYER").size(fs.header),
-            rule::horizontal(1),
             top_bar,
             rule::horizontal(1),
             main_content,
