@@ -81,6 +81,13 @@ pub enum FileBrowserMessage {
     CreateDirNameChanged(String),
     CreateDirConfirm,
     CreateDirCancel,
+    // Local disk image creation
+    ShowCreateDisk,
+    CloseCreateDisk,
+    CreateDiskNameChanged(String),
+    CreateDiskIdChanged(String),
+    CreateDiskTypeChanged(crate::ftp_ops::DiskCreateType),
+    CreateDiskConfirm,
 }
 
 /// The action to execute once we know the drive is enabled
@@ -161,6 +168,11 @@ pub struct FileBrowser {
     // Create directory dialog
     show_create_dir: bool,
     create_dir_name: String,
+    // Create disk image dialog
+    show_create_disk: bool,
+    create_disk_name: String,
+    create_disk_id: String,
+    create_disk_type: crate::ftp_ops::DiskCreateType,
 }
 
 impl FileBrowser {
@@ -196,6 +208,10 @@ impl FileBrowser {
             delete_pending: None,
             show_create_dir: false,
             create_dir_name: String::new(),
+            show_create_disk: false,
+            create_disk_name: "NEWDISK".to_string(),
+            create_disk_id: "01 2A".to_string(),
+            create_disk_type: crate::ftp_ops::DiskCreateType::D64,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -826,6 +842,63 @@ impl FileBrowser {
                 self.show_create_dir = false;
                 Task::none()
             }
+
+            // ── Local create disk image ──────────────────────────────────
+            FileBrowserMessage::ShowCreateDisk => {
+                self.show_create_disk = true;
+                self.create_disk_name = "NEWDISK".to_string();
+                self.create_disk_id = "01 2A".to_string();
+                Task::none()
+            }
+            FileBrowserMessage::CloseCreateDisk => {
+                self.show_create_disk = false;
+                Task::none()
+            }
+            FileBrowserMessage::CreateDiskNameChanged(name) => {
+                self.create_disk_name = name.to_uppercase();
+                Task::none()
+            }
+            FileBrowserMessage::CreateDiskIdChanged(id) => {
+                self.create_disk_id = id;
+                Task::none()
+            }
+            FileBrowserMessage::CreateDiskTypeChanged(dt) => {
+                self.create_disk_type = dt;
+                Task::none()
+            }
+            FileBrowserMessage::CreateDiskConfirm => {
+                use crate::disk_image;
+                let name = self.create_disk_name.trim().to_string();
+                if name.is_empty() {
+                    return Task::none();
+                }
+                let id = self.create_disk_id.trim().to_string();
+                let safe_name = name.replace(' ', "_");
+                let (ext, data) = match self.create_disk_type {
+                    crate::ftp_ops::DiskCreateType::D64 => {
+                        ("d64", disk_image::build_blank_d64(&name, &id))
+                    }
+                    crate::ftp_ops::DiskCreateType::D71 => {
+                        ("d71", disk_image::build_blank_d71(&name, &id))
+                    }
+                    crate::ftp_ops::DiskCreateType::D81 => {
+                        ("d81", disk_image::build_blank_d81(&name, &id))
+                    }
+                };
+                let filename = format!("{}.{}", safe_name, ext);
+                let file_path = self.current_directory.join(&filename);
+                match std::fs::write(&file_path, &data) {
+                    Ok(_) => {
+                        self.status_message = Some(format!("Created: {}", filename));
+                        self.show_create_disk = false;
+                        self.load_directory(&self.current_directory.clone());
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Error: {}", e));
+                    }
+                }
+                Task::none()
+            }
         }
     }
     #[allow(dead_code)]
@@ -1170,6 +1243,165 @@ impl FileBrowser {
                 .padding(15),
             )
             .style(crate::styles::subtle_tooltip)
+            .width(Length::Fill);
+
+            column![
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                dialog,
+                self.build_status_bar(font_size),
+            ]
+            .spacing(2)
+            .padding(5)
+            .into()
+        } else if self.show_create_disk {
+            // Create disk image dialog
+            let dim = iced::Color::from_rgb(0.55, 0.55, 0.6);
+            let safe_name = self.create_disk_name.replace(' ', "_");
+            let ext = match self.create_disk_type {
+                crate::ftp_ops::DiskCreateType::D64 => "d64",
+                crate::ftp_ops::DiskCreateType::D71 => "d71",
+                crate::ftp_ops::DiskCreateType::D81 => "d81",
+            };
+            let preview_filename = format!("{}.{}", safe_name, ext);
+
+            let dialog = container(
+                column![
+                    row![
+                        text("Create New Disk Image").size(fs.normal),
+                        Space::new().width(Length::Fill),
+                        button(text("Cancel").size(fs.small))
+                            .on_press(FileBrowserMessage::CloseCreateDisk)
+                            .padding([4, 10])
+                            .style(crate::styles::nav_button),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    rule::horizontal(1),
+                    row![
+                        text("Format:")
+                            .size(fs.normal)
+                            .color(dim)
+                            .width(Length::Fixed(80.0)),
+                        button(
+                            text(
+                                if self.create_disk_type == crate::ftp_ops::DiskCreateType::D64 {
+                                    "* D64"
+                                } else {
+                                    "  D64"
+                                }
+                            )
+                            .size(fs.small)
+                        )
+                        .on_press(FileBrowserMessage::CreateDiskTypeChanged(
+                            crate::ftp_ops::DiskCreateType::D64
+                        ))
+                        .padding([3, 8])
+                        .style(
+                            if self.create_disk_type == crate::ftp_ops::DiskCreateType::D64 {
+                                crate::styles::action_button
+                            } else {
+                                crate::styles::nav_button
+                            }
+                        ),
+                        button(
+                            text(
+                                if self.create_disk_type == crate::ftp_ops::DiskCreateType::D71 {
+                                    "* D71"
+                                } else {
+                                    "  D71"
+                                }
+                            )
+                            .size(fs.small)
+                        )
+                        .on_press(FileBrowserMessage::CreateDiskTypeChanged(
+                            crate::ftp_ops::DiskCreateType::D71
+                        ))
+                        .padding([3, 8])
+                        .style(
+                            if self.create_disk_type == crate::ftp_ops::DiskCreateType::D71 {
+                                crate::styles::action_button
+                            } else {
+                                crate::styles::nav_button
+                            }
+                        ),
+                        button(
+                            text(
+                                if self.create_disk_type == crate::ftp_ops::DiskCreateType::D81 {
+                                    "* D81"
+                                } else {
+                                    "  D81"
+                                }
+                            )
+                            .size(fs.small)
+                        )
+                        .on_press(FileBrowserMessage::CreateDiskTypeChanged(
+                            crate::ftp_ops::DiskCreateType::D81
+                        ))
+                        .padding([3, 8])
+                        .style(
+                            if self.create_disk_type == crate::ftp_ops::DiskCreateType::D81 {
+                                crate::styles::action_button
+                            } else {
+                                crate::styles::nav_button
+                            }
+                        ),
+                        text(format!("({})", self.create_disk_type))
+                            .size(fs.small)
+                            .color(dim),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        text("Name:")
+                            .size(fs.normal)
+                            .color(dim)
+                            .width(Length::Fixed(80.0)),
+                        iced::widget::text_input("DISK NAME", &self.create_disk_name)
+                            .on_input(FileBrowserMessage::CreateDiskNameChanged)
+                            .padding(6)
+                            .size(fs.small as f32)
+                            .width(Length::Fixed(200.0)),
+                        text(format!("{}/16 chars", self.create_disk_name.len()))
+                            .size(fs.small)
+                            .color(dim),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        text("ID:")
+                            .size(fs.normal)
+                            .color(dim)
+                            .width(Length::Fixed(80.0)),
+                        iced::widget::text_input("01 2A", &self.create_disk_id)
+                            .on_input(FileBrowserMessage::CreateDiskIdChanged)
+                            .padding(6)
+                            .size(fs.small as f32)
+                            .width(Length::Fixed(100.0)),
+                        text("2-char ID + DOS type").size(fs.small).color(dim),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        text("File:")
+                            .size(fs.normal)
+                            .color(dim)
+                            .width(Length::Fixed(80.0)),
+                        text(preview_filename).size(fs.normal),
+                    ]
+                    .spacing(6)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        Space::new().width(Length::Fill),
+                        button(text("Create").size(fs.small))
+                            .on_press(FileBrowserMessage::CreateDiskConfirm)
+                            .padding([6, 20])
+                            .style(crate::styles::action_button),
+                    ],
+                ]
+                .spacing(10)
+                .padding(15),
+            )
+            .style(crate::styles::section_style)
             .width(Length::Fill);
 
             column![

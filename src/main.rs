@@ -193,6 +193,7 @@ pub enum Message {
     FnCopy,
     FnRename,
     FnMkDir,
+    FnNewDisk,
     FnDelete,
     ToggleActivePane,
     NavigateUpActivePane,
@@ -800,6 +801,25 @@ impl Ultimate64Browser {
                 Pane::Right => self
                     .remote_browser
                     .update(RemoteBrowserMessage::ShowCreateDir, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
+
+            Message::FnNewDisk => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::ShowCreateDisk,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(
+                        RemoteBrowserMessage::ShowCreateDisk,
+                        self.connection.clone(),
+                    )
                     .map(Message::RemoteBrowser),
             },
 
@@ -2694,6 +2714,10 @@ impl Ultimate64Browser {
                     .style(crate::styles::nav_button),
                 button(text("F7 MkDir").size(small))
                     .on_press(Message::FnMkDir)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("New Disk").size(small))
+                    .on_press(Message::FnNewDisk)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
                 button(text("F8 Del").size(small))
