@@ -4,8 +4,8 @@
 
 use iced::{
     widget::{
-        button, column, container, pick_list, row, rule, scrollable, text, text_input, tooltip,
-        Space,
+        button, column, container, pick_list, progress_bar, row, rule, scrollable, text,
+        text_input, tooltip, Space,
     },
     window, Element, Length, Subscription, Task, Theme,
 };
@@ -92,6 +92,21 @@ pub fn main() -> iced::Result {
     log::info!("Platform: {}", std::env::consts::OS);
     log::info!("Arch: {}", std::env::consts::ARCH);
 
+    // Install a panic hook that suppresses the harmless "SendError { kind: Disconnected }"
+    // panic that occurs when background tasks (FTP transfers) try to send results back
+    // after the window/event loop has been closed. This is an Iced framework limitation —
+    // Task::perform futures can outlive the event loop on shutdown.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        if msg.contains("SendError") && msg.contains("Disconnected") {
+            // Silently ignore — app is shutting down, this is expected
+            log::debug!("Suppressed shutdown panic: {}", msg);
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+
     iced::daemon(
         Ultimate64Browser::new,
         Ultimate64Browser::update,
@@ -150,6 +165,8 @@ pub enum Message {
     CopyLocalToRemote, // Copy selected local file to Ultimate64
     CopyRemoteToLocal, // Copy selected remote file to local
     CopyComplete(Result<String, String>),
+    CopyCancel,
+    CopyProgressTick,
 
     // Music player
     MusicPlayer(MusicPlayerMessage),
@@ -330,6 +347,9 @@ pub struct Ultimate64Browser {
     // Device discovery
     is_discovering: bool,
     discovered_devices: Vec<DiscoveredDevice>,
+
+    /// Shared progress state for copy operations between panes
+    copy_progress: Arc<std::sync::Mutex<Option<crate::ftp_ops::TransferProgress>>>,
 }
 
 impl Ultimate64Browser {
@@ -392,6 +412,7 @@ impl Ultimate64Browser {
             rename_profile_name: String::new(),
             is_discovering: false,
             discovered_devices: Vec::new(),
+            copy_progress: Arc::new(std::sync::Mutex::new(None)),
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -931,258 +952,511 @@ impl Ultimate64Browser {
                     return Task::none();
                 }
 
-                // Separate files and directories
-                let files_to_copy: Vec<PathBuf> = items_to_copy
-                    .iter()
-                    .filter(|p| !p.is_dir())
-                    .cloned()
-                    .collect();
-                let dirs_to_copy: Vec<PathBuf> = items_to_copy
-                    .iter()
-                    .filter(|p| p.is_dir())
-                    .cloned()
-                    .collect();
-
-                if files_to_copy.is_empty() && dirs_to_copy.is_empty() {
-                    self.user_message =
-                        Some(UserMessage::Error("No valid items selected.".to_string()));
-                    return Task::none();
-                }
-
-                let remote_dest = self.remote_browser.get_current_path().to_string();
-
-                // Build commands for each operation
-                let mut commands: Vec<Task<Message>> = Vec::new();
-
-                // Handle directories via RemoteBrowser's UploadDirectory
-                for dir_path in dirs_to_copy {
-                    commands.push(
-                        self.remote_browser
-                            .update(
-                                RemoteBrowserMessage::UploadDirectory(
-                                    dir_path,
-                                    remote_dest.clone(),
-                                ),
-                                self.connection.clone(),
-                            )
-                            .map(Message::RemoteBrowser),
-                    );
-                }
-
-                // Handle files with batch upload
-                if !files_to_copy.is_empty() {
-                    if let Some(host) = &self.host_url {
-                        let host = host
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .to_string();
-                        let file_count = files_to_copy.len();
-                        let password = self.settings.connection.password.clone();
-                        let remote_dest_clone = remote_dest.clone();
-
-                        self.user_message = Some(UserMessage::Info(format!(
-                            "Uploading {} file(s) and {} folder(s) via FTP...",
-                            file_count,
-                            commands.len()
-                        )));
-
-                        commands.push(Task::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    use std::io::Cursor;
-                                    use std::path::PathBuf;
-                                    use std::time::Duration;
-                                    use suppaftp::FtpStream;
-
-                                    let addr = format!("{}:21", host);
-                                    let mut ftp = FtpStream::connect(&addr)
-                                        .map_err(|e| format!("FTP connect failed: {}", e))?;
-
-                                    ftp.get_ref()
-                                        .set_write_timeout(Some(Duration::from_secs(120)))
-                                        .ok();
-
-                                    // Login with configured password or anonymous
-                                    if let Some(ref pwd) = password {
-                                        if !pwd.is_empty() {
-                                            ftp.login("admin", pwd)
-                                                .map_err(|e| format!("FTP login failed: {}", e))?;
-                                        } else {
-                                            ftp.login("anonymous", "anonymous")
-                                                .map_err(|e| format!("FTP login failed: {}", e))?;
-                                        }
-                                    } else {
-                                        ftp.login("anonymous", "anonymous")
-                                            .map_err(|e| format!("FTP login failed: {}", e))?;
-                                    }
-
-                                    ftp.transfer_type(suppaftp::types::FileType::Binary)
-                                        .map_err(|e| format!("Set binary mode failed: {}", e))?;
-
-                                    ftp.cwd(&remote_dest_clone).map_err(|e| {
-                                        format!("Cannot access {}: {}", remote_dest_clone, e)
-                                    })?;
-
-                                    let mut uploaded = 0;
-                                    for local_path in &files_to_copy {
-                                        let local_path: &PathBuf = local_path;
-                                        let data =
-                                            std::fs::read(local_path.as_path()).map_err(|e| {
-                                                format!(
-                                                    "Cannot read {}: {}",
-                                                    local_path.display(),
-                                                    e
-                                                )
-                                            })?;
-
-                                        let filename = local_path
-                                            .file_name()
-                                            .and_then(|n: &std::ffi::OsStr| n.to_str())
-                                            .unwrap_or("file")
-                                            .to_string();
-
-                                        let mut cursor = Cursor::new(data);
-                                        ftp.put_file(&filename, &mut cursor).map_err(|e| {
-                                            format!("FTP upload {} failed: {}", filename, e)
-                                        })?;
-
-                                        uploaded += 1;
-                                    }
-
-                                    let _ = ftp.quit();
-
-                                    Ok(format!("Uploaded {} file(s)", uploaded))
-                                })
-                                .await
-                                .map_err(|e| e.to_string())?
-                            },
-                            Message::CopyComplete,
-                        ));
-                    } else {
+                let host = match &self.host_url {
+                    Some(h) => h
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .to_string(),
+                    None => {
                         self.user_message = Some(UserMessage::Error(
                             "Not connected to Ultimate64".to_string(),
                         ));
                         return Task::none();
                     }
-                } else {
-                    // Only directories being uploaded
-                    self.user_message = Some(UserMessage::Info(format!(
-                        "Uploading {} folder(s) via FTP...",
-                        commands.len()
-                    )));
+                };
+
+                let remote_dest = self.remote_browser.get_current_path().to_string();
+                let password = self.settings.connection.password.clone();
+                let progress = self.copy_progress.clone();
+
+                // Count total files (recursively walking directories)
+                let total_files: usize = items_to_copy
+                    .iter()
+                    .map(|p| {
+                        if p.is_dir() {
+                            walkdir::WalkDir::new(p)
+                                .min_depth(1)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                                .filter(|e| e.file_type().is_file())
+                                .count()
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
+
+                if let Ok(mut g) = progress.lock() {
+                    *g = Some(crate::ftp_ops::TransferProgress {
+                        current: 0,
+                        total: total_files,
+                        current_file: String::new(),
+                        operation: "Uploading".to_string(),
+                        done: false,
+                        cancelled: false,
+                        started_at: std::time::Instant::now(),
+                        bytes_transferred: 0,
+                        bytes_total: 0,
+                    });
                 }
 
-                if commands.is_empty() {
-                    self.user_message = Some(UserMessage::Error(
-                        "Not connected to Ultimate64".to_string(),
-                    ));
-                    return Task::none();
-                }
+                self.user_message = Some(UserMessage::Info(format!(
+                    "Uploading {} file(s) via FTP...",
+                    total_files
+                )));
 
-                return Task::batch(commands);
-            }
-            Message::CopyRemoteToLocal => {
-                let checked = self.remote_browser.get_checked_files();
-                if !checked.is_empty() {
-                    // Batch download checked files/directories
-                    let local_dest = self.left_browser.get_current_directory().clone();
-                    self.user_message = Some(UserMessage::Info(format!(
-                        "Downloading {} item(s) via FTP...",
-                        checked.len()
-                    )));
-                    return self
-                        .remote_browser
-                        .update(
-                            RemoteBrowserMessage::DownloadCheckedToLocal(local_dest),
-                            self.connection.clone(),
-                        )
-                        .map(Message::RemoteBrowser);
-                } else if let Some(remote_path) = self.remote_browser.get_selected_file() {
-                    // Fall back to single selected file
-                    if let Some(host) = &self.host_url {
-                        let host = host
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .to_string();
-                        let remote_path = remote_path.to_string();
-                        let local_dest = self.left_browser.get_current_directory().clone();
-                        let password = self.settings.connection.password.clone();
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            use std::io::Cursor;
+                            use std::time::Duration;
+                            use suppaftp::FtpStream;
 
-                        self.user_message =
-                            Some(UserMessage::Info("Downloading file via FTP...".to_string()));
+                            let addr = format!("{}:21", host);
+                            let mut ftp = FtpStream::connect(&addr)
+                                .map_err(|e| format!("FTP connect failed: {}", e))?;
 
-                        return Task::perform(
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    use std::io::Read;
-                                    use std::time::Duration;
-                                    use suppaftp::FtpStream;
+                            ftp.get_ref()
+                                .set_write_timeout(Some(Duration::from_secs(120)))
+                                .ok();
 
-                                    let addr = format!("{}:21", host);
-                                    let mut ftp = FtpStream::connect(&addr)
-                                        .map_err(|e| format!("FTP connect failed: {}", e))?;
+                            if let Some(ref pwd) = password {
+                                if !pwd.is_empty() {
+                                    ftp.login("admin", pwd)
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                } else {
+                                    ftp.login("anonymous", "anonymous")
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                }
+                            } else {
+                                ftp.login("anonymous", "anonymous")
+                                    .map_err(|e| format!("FTP login failed: {}", e))?;
+                            }
 
-                                    ftp.get_ref()
-                                        .set_read_timeout(Some(Duration::from_secs(60)))
-                                        .ok();
+                            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                                .map_err(|e| format!("Set binary mode failed: {}", e))?;
 
-                                    if let Some(ref pwd) = password {
-                                        if !pwd.is_empty() {
-                                            ftp.login("admin", pwd)
-                                                .map_err(|e| format!("FTP login failed: {}", e))?;
-                                        } else {
-                                            ftp.login("anonymous", "anonymous")
-                                                .map_err(|e| format!("FTP login failed: {}", e))?;
+                            let mut uploaded = 0usize;
+                            let mut errors: Vec<String> = Vec::new();
+
+                            for item_path in &items_to_copy {
+                                // Check for cancellation
+                                let is_cancelled = progress
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                    .unwrap_or(false);
+                                if is_cancelled {
+                                    break;
+                                }
+
+                                if item_path.is_dir() {
+                                    // Upload directory recursively
+                                    let dir_name = item_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("dir");
+                                    let base_remote = format!(
+                                        "{}/{}",
+                                        remote_dest.trim_end_matches('/'),
+                                        dir_name
+                                    );
+
+                                    for entry in walkdir::WalkDir::new(item_path).min_depth(0) {
+                                        // Check for cancellation inside dir walk
+                                        let is_cancelled = progress
+                                            .lock()
+                                            .ok()
+                                            .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                            .unwrap_or(false);
+                                        if is_cancelled {
+                                            break;
                                         }
-                                    } else {
-                                        ftp.login("anonymous", "anonymous")
-                                            .map_err(|e| format!("FTP login failed: {}", e))?;
+                                        let entry = match entry {
+                                            Ok(e) => e,
+                                            Err(e) => {
+                                                errors.push(format!("Walk error: {}", e));
+                                                continue;
+                                            }
+                                        };
+                                        let relative = match entry.path().strip_prefix(item_path) {
+                                            Ok(r) => r,
+                                            Err(_) => continue,
+                                        };
+                                        let remote_path = if relative.as_os_str().is_empty() {
+                                            base_remote.clone()
+                                        } else {
+                                            let rel_str =
+                                                relative.to_string_lossy().replace('\\', "/");
+                                            format!("{}/{}", base_remote, rel_str)
+                                        };
+
+                                        if entry.file_type().is_dir() {
+                                            let _ = ftp.mkdir(&remote_path);
+                                        } else if entry.file_type().is_file() {
+                                            let filename = entry
+                                                .path()
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .to_string();
+
+                                            if let Ok(mut g) = progress.lock() {
+                                                if let Some(ref mut p) = *g {
+                                                    p.current_file = filename.clone();
+                                                }
+                                            }
+
+                                            match std::fs::read(entry.path()) {
+                                                Ok(data) => {
+                                                    let (parent_dir, fname) =
+                                                        if let Some(pos) = remote_path.rfind('/') {
+                                                            (
+                                                                &remote_path[..pos],
+                                                                &remote_path[pos + 1..],
+                                                            )
+                                                        } else {
+                                                            ("/", remote_path.as_str())
+                                                        };
+                                                    if ftp.cwd(parent_dir).is_err() {
+                                                        errors.push(format!(
+                                                            "CWD {}: failed",
+                                                            parent_dir
+                                                        ));
+                                                        continue;
+                                                    }
+                                                    let mut cursor = Cursor::new(data);
+                                                    match ftp.put_file(fname, &mut cursor) {
+                                                        Ok(_) => {
+                                                            uploaded += 1;
+                                                            if let Ok(mut g) = progress.lock() {
+                                                                if let Some(ref mut p) = *g {
+                                                                    p.current = uploaded;
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => errors.push(format!(
+                                                            "Upload {}: {}",
+                                                            fname, e
+                                                        )),
+                                                    }
+                                                }
+                                                Err(e) => errors.push(format!(
+                                                    "Read {}: {}",
+                                                    entry.path().display(),
+                                                    e
+                                                )),
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Upload single file
+                                    let filename = item_path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("file")
+                                        .to_string();
+
+                                    if let Ok(mut g) = progress.lock() {
+                                        if let Some(ref mut p) = *g {
+                                            p.current_file = filename.clone();
+                                        }
                                     }
 
-                                    ftp.transfer_type(suppaftp::types::FileType::Binary)
-                                        .map_err(|e| format!("Set binary mode failed: {}", e))?;
+                                    // CWD to remote dest for loose files
+                                    ftp.cwd(&remote_dest).map_err(|e| {
+                                        format!("Cannot access {}: {}", remote_dest, e)
+                                    })?;
 
-                                    let mut reader = ftp
-                                        .retr_as_stream(&remote_path)
-                                        .map_err(|e| format!("FTP download failed: {}", e))?;
+                                    let data = std::fs::read(item_path).map_err(|e| {
+                                        format!("Cannot read {}: {}", item_path.display(), e)
+                                    })?;
+                                    let mut cursor = Cursor::new(data);
+                                    ftp.put_file(&filename, &mut cursor).map_err(|e| {
+                                        format!("FTP upload {} failed: {}", filename, e)
+                                    })?;
 
-                                    let mut data = Vec::new();
-                                    reader
-                                        .read_to_end(&mut data)
-                                        .map_err(|e| format!("Read error: {}", e))?;
+                                    uploaded += 1;
+                                    if let Ok(mut g) = progress.lock() {
+                                        if let Some(ref mut p) = *g {
+                                            p.current = uploaded;
+                                        }
+                                    }
+                                }
+                            }
 
-                                    ftp.finalize_retr_stream(reader)
-                                        .map_err(|e| format!("Transfer finalize error: {}", e))?;
+                            let was_cancelled = progress
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                .unwrap_or(false);
 
-                                    let _ = ftp.quit();
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.done = true;
+                                }
+                            }
 
-                                    let filename = remote_path.rsplit('/').next().unwrap_or("file");
-                                    let local_path = local_dest.join(filename);
+                            let _ = ftp.quit();
 
-                                    std::fs::write(&local_path, &data)
-                                        .map_err(|e| format!("Write error: {}", e))?;
+                            let mut msg = if was_cancelled {
+                                format!("Cancelled after {} file(s)", uploaded)
+                            } else {
+                                format!("Uploaded {} file(s)", uploaded)
+                            };
+                            if !errors.is_empty() {
+                                msg.push_str(&format!(" ({} errors)", errors.len()));
+                                for e in errors.iter().take(3) {
+                                    log::warn!("Upload error: {}", e);
+                                }
+                            }
+                            Ok(msg)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    },
+                    Message::CopyComplete,
+                );
+            }
+            Message::CopyRemoteToLocal => {
+                let (file_paths, dir_paths) = self.remote_browser.get_checked_files_and_dirs();
 
-                                    Ok(format!("Downloaded: {} ({} bytes)", filename, data.len()))
-                                })
-                                .await
-                                .map_err(|e| e.to_string())?
-                            },
-                            Message::CopyComplete,
-                        );
+                // Fall back to single selected file if nothing checked
+                let (file_paths, dir_paths) = if file_paths.is_empty() && dir_paths.is_empty() {
+                    if let Some(path) = self.remote_browser.get_selected_file() {
+                        (vec![path.to_string()], vec![])
                     } else {
+                        self.user_message = Some(UserMessage::Error(
+                            "No files selected. Use checkboxes to select files.".to_string(),
+                        ));
+                        return Task::none();
+                    }
+                } else {
+                    (file_paths, dir_paths)
+                };
+
+                let host = match &self.host_url {
+                    Some(h) => h
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .to_string(),
+                    None => {
                         self.user_message = Some(UserMessage::Error(
                             "Not connected to Ultimate64".to_string(),
                         ));
+                        return Task::none();
                     }
-                } else {
-                    self.user_message = Some(UserMessage::Error(
-                        "No files selected. Use checkboxes to select files.".to_string(),
-                    ));
+                };
+
+                let local_dest = self.left_browser.get_current_directory().clone();
+                let password = self.settings.connection.password.clone();
+                let progress = self.copy_progress.clone();
+
+                // Initial total is just file count; directories will be counted via FTP LIST
+                if let Ok(mut g) = progress.lock() {
+                    *g = Some(crate::ftp_ops::TransferProgress {
+                        current: 0,
+                        total: file_paths.len(),
+                        current_file: "counting files...".to_string(),
+                        operation: "Downloading".to_string(),
+                        done: false,
+                        cancelled: false,
+                        started_at: std::time::Instant::now(),
+                        bytes_transferred: 0,
+                        bytes_total: 0,
+                    });
+                }
+
+                self.user_message = Some(UserMessage::Info("Downloading via FTP...".to_string()));
+
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            use std::io::Read;
+                            use std::time::Duration;
+                            use suppaftp::FtpStream;
+
+                            let addr = format!("{}:21", host);
+                            let mut ftp = FtpStream::connect(&addr)
+                                .map_err(|e| format!("FTP connect failed: {}", e))?;
+
+                            ftp.get_ref()
+                                .set_read_timeout(Some(Duration::from_secs(60)))
+                                .ok();
+
+                            if let Some(ref pwd) = password {
+                                if !pwd.is_empty() {
+                                    ftp.login("admin", pwd)
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                } else {
+                                    ftp.login("anonymous", "anonymous")
+                                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                                }
+                            } else {
+                                ftp.login("anonymous", "anonymous")
+                                    .map_err(|e| format!("FTP login failed: {}", e))?;
+                            }
+
+                            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                                .map_err(|e| format!("Set binary mode failed: {}", e))?;
+
+                            let mut downloaded = 0usize;
+                            let mut errors: Vec<String> = Vec::new();
+
+                            // Count total files in directories via FTP LIST
+                            let mut dir_file_count = 0usize;
+                            for remote_dir in &dir_paths {
+                                dir_file_count +=
+                                    count_remote_files_recursive(&mut ftp, remote_dir);
+                            }
+                            // Update total with actual file count
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.total = file_paths.len() + dir_file_count;
+                                    p.current_file = String::new();
+                                }
+                            }
+
+                            // Download individual files
+                            for remote_path in &file_paths {
+                                let is_cancelled = progress
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                    .unwrap_or(false);
+                                if is_cancelled {
+                                    break;
+                                }
+
+                                let filename = remote_path.rsplit('/').next().unwrap_or("file");
+
+                                // Get file size for progress
+                                let file_size = ftp.size(remote_path).unwrap_or(0);
+
+                                if let Ok(mut g) = progress.lock() {
+                                    if let Some(ref mut p) = *g {
+                                        p.current_file = filename.to_string();
+                                        p.bytes_total += file_size as u64;
+                                    }
+                                }
+
+                                match ftp.retr_as_stream(remote_path) {
+                                    Ok(mut reader) => {
+                                        let mut data = Vec::new();
+                                        if let Err(e) = reader.read_to_end(&mut data) {
+                                            errors.push(format!("{}: {}", filename, e));
+                                            continue;
+                                        }
+                                        if let Err(e) = ftp.finalize_retr_stream(reader) {
+                                            errors.push(format!("{}: {}", filename, e));
+                                            continue;
+                                        }
+                                        let local_path = local_dest.join(filename);
+                                        if let Err(e) = std::fs::write(&local_path, &data) {
+                                            errors.push(format!("{}: {}", filename, e));
+                                            continue;
+                                        }
+                                        downloaded += 1;
+                                        if let Ok(mut g) = progress.lock() {
+                                            if let Some(ref mut p) = *g {
+                                                p.current = downloaded;
+                                                p.bytes_transferred += data.len() as u64;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        errors.push(format!("{}: {}", filename, e));
+                                    }
+                                }
+                            }
+
+                            // Download directories recursively
+                            for remote_dir in &dir_paths {
+                                let is_cancelled = progress
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                    .unwrap_or(false);
+                                if is_cancelled {
+                                    break;
+                                }
+
+                                let dir_name = remote_dir.rsplit('/').next().unwrap_or("dir");
+                                let local_dir = local_dest.join(dir_name);
+
+                                if let Ok(mut g) = progress.lock() {
+                                    if let Some(ref mut p) = *g {
+                                        p.current_file = format!("{}/", dir_name);
+                                    }
+                                }
+
+                                match download_directory_with_progress(
+                                    &mut ftp,
+                                    remote_dir,
+                                    &local_dir,
+                                    &progress,
+                                    &mut downloaded,
+                                ) {
+                                    Ok(files) => {
+                                        log::info!("Downloaded dir {}: {} files", dir_name, files);
+                                    }
+                                    Err(e) => {
+                                        errors.push(format!("{}: {}", dir_name, e));
+                                    }
+                                }
+                            }
+
+                            let was_cancelled = progress
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.as_ref().map(|p| p.cancelled))
+                                .unwrap_or(false);
+
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.done = true;
+                                }
+                            }
+
+                            let _ = ftp.quit();
+
+                            let mut msg = if was_cancelled {
+                                format!("Cancelled after {} item(s)", downloaded)
+                            } else {
+                                format!("Downloaded {} item(s)", downloaded)
+                            };
+                            if !errors.is_empty() {
+                                msg.push_str(&format!(" ({} errors)", errors.len()));
+                                for e in errors.iter().take(3) {
+                                    log::warn!("Download error: {}", e);
+                                }
+                            }
+                            Ok(msg)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                    },
+                    Message::CopyComplete,
+                );
+            }
+
+            Message::CopyCancel => {
+                if let Ok(mut g) = self.copy_progress.lock() {
+                    if let Some(ref mut p) = *g {
+                        p.cancelled = true;
+                    }
                 }
                 Task::none()
             }
-
+            Message::CopyProgressTick => {
+                // Just triggers a re-render so the progress bar updates
+                Task::none()
+            }
             Message::CopyComplete(result) => {
+                // Clear copy progress
+                if let Ok(mut g) = self.copy_progress.lock() {
+                    *g = None;
+                }
                 match result {
                     Ok(msg) => {
                         self.user_message = Some(UserMessage::Info(msg));
@@ -1765,6 +2039,17 @@ impl Ultimate64Browser {
                     // Main window was closed - clean up immediately and exit
                     log::info!("Main window closed: {:?}", id);
 
+                    // Cancel any in-progress copy transfer and clear it
+                    if let Ok(mut g) = self.copy_progress.lock() {
+                        if let Some(ref mut p) = *g {
+                            p.cancelled = true;
+                            p.done = true;
+                        }
+                    }
+
+                    // Cancel any remote browser transfer
+                    self.remote_browser.cancel_transfer();
+
                     // Stop streaming if active
                     if self.video_streaming.is_streaming {
                         self.video_streaming
@@ -2253,6 +2538,21 @@ impl Ultimate64Browser {
             Subscription::none()
         };
 
+        // Copy progress tick - poll every 250ms while a copy is in progress
+        let copy_progress_tick = {
+            let has_progress = self
+                .copy_progress
+                .lock()
+                .ok()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if has_progress {
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::CopyProgressTick)
+            } else {
+                Subscription::none()
+            }
+        };
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
@@ -2264,6 +2564,7 @@ impl Ultimate64Browser {
             keyboard_sub,
             window_events,
             status_check,
+            copy_progress_tick,
         ])
     }
 
@@ -2439,9 +2740,106 @@ impl Ultimate64Browser {
         .padding([5, 8])
         .width(Length::Fill);
 
+        let copy_progress_bar: Element<'_, Message> = {
+            let progress_data = self.copy_progress.lock().ok().and_then(|g| g.clone());
+            match progress_data {
+                Some(p) if !p.done => {
+                    let pct = if p.total > 0 {
+                        p.current as f32 / p.total as f32
+                    } else {
+                        0.0
+                    };
+                    // Build label with byte info if available
+                    let label = if p.bytes_total > 0 {
+                        format!(
+                            "{} {}/{} ({})",
+                            p.operation,
+                            p.current,
+                            p.total,
+                            crate::file_types::format_file_size(p.bytes_transferred),
+                        )
+                    } else {
+                        format!("{} {}/{}", p.operation, p.current, p.total)
+                    };
+
+                    // Calculate ETA based on bytes if available, else items
+                    let elapsed = p.started_at.elapsed();
+                    let eta_text = if p.bytes_transferred > 0 && p.bytes_total > 0 {
+                        let bytes_per_sec = p.bytes_transferred as f64 / elapsed.as_secs_f64();
+                        let remaining_bytes =
+                            p.bytes_total.saturating_sub(p.bytes_transferred) as f64;
+                        let remaining_secs = remaining_bytes / bytes_per_sec;
+                        if remaining_secs < 60.0 {
+                            format!(
+                                "{}/s ~{}s",
+                                crate::file_types::format_file_size(bytes_per_sec as u64),
+                                remaining_secs as u64
+                            )
+                        } else {
+                            format!(
+                                "{}/s ~{}m{}s",
+                                crate::file_types::format_file_size(bytes_per_sec as u64),
+                                remaining_secs as u64 / 60,
+                                remaining_secs as u64 % 60
+                            )
+                        }
+                    } else if p.current > 0 {
+                        let secs_per_item = elapsed.as_secs_f64() / p.current as f64;
+                        let remaining = p.total.saturating_sub(p.current) as f64 * secs_per_item;
+                        if remaining < 60.0 {
+                            format!("~{}s left", remaining as u64)
+                        } else {
+                            format!(
+                                "~{}m {}s left",
+                                remaining as u64 / 60,
+                                remaining as u64 % 60
+                            )
+                        }
+                    } else {
+                        "estimating...".to_string()
+                    };
+
+                    let file_display = if p.current_file.len() > 25 {
+                        format!(
+                            "...{}",
+                            &p.current_file[p.current_file.len().saturating_sub(22)..]
+                        )
+                    } else {
+                        p.current_file.clone()
+                    };
+
+                    container(
+                        row![
+                            text(label)
+                                .size(tiny)
+                                .color(iced::Color::from_rgb(0.4, 0.8, 0.4)),
+                            text(file_display)
+                                .size(tiny)
+                                .width(Length::Fixed(150.0))
+                                .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                            progress_bar(0.0..=1.0, pct).girth(6.0).length(Length::Fill),
+                            text(eta_text)
+                                .size(tiny)
+                                .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                            button(text("Cancel").size(tiny))
+                                .on_press(Message::CopyCancel)
+                                .padding([2, 8])
+                                .style(crate::styles::nav_button),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([3, 10])
+                    .into()
+                }
+                _ => Space::new().height(0).into(),
+            }
+        };
+
         column![
             row![left_pane, rule::vertical(1), right_pane].height(Length::Fill),
             rule::horizontal(1),
+            copy_progress_bar,
             function_bar,
         ]
         .into()
@@ -3146,4 +3544,122 @@ impl Drop for Ultimate64Browser {
             }
         }
     }
+}
+
+// ── FTP helper functions for copy operations ─────────────────────────────────
+
+/// Recursively count files in a remote directory via FTP LIST
+fn count_remote_files_recursive(ftp: &mut suppaftp::FtpStream, remote_path: &str) -> usize {
+    let entries = match ftp.list(Some(remote_path)) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+
+    let mut count = 0;
+    for line in &entries {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let name = parts[8..].join(" ");
+        if name == "." || name == ".." {
+            continue;
+        }
+        let is_dir = line.starts_with('d');
+        if is_dir {
+            let child = format!("{}/{}", remote_path.trim_end_matches('/'), name);
+            count += count_remote_files_recursive(ftp, &child);
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Download a remote directory recursively, updating shared progress per file
+fn download_directory_with_progress(
+    ftp: &mut suppaftp::FtpStream,
+    remote_path: &str,
+    local_path: &std::path::Path,
+    progress: &std::sync::Arc<std::sync::Mutex<Option<crate::ftp_ops::TransferProgress>>>,
+    downloaded: &mut usize,
+) -> Result<usize, String> {
+    use std::io::Read;
+
+    std::fs::create_dir_all(local_path)
+        .map_err(|e| format!("Create dir {}: {}", local_path.display(), e))?;
+
+    let entries = ftp
+        .list(Some(remote_path))
+        .map_err(|e| format!("List {}: {}", remote_path, e))?;
+
+    let mut files_count = 0;
+
+    for entry_line in &entries {
+        // Check cancellation
+        let is_cancelled = progress
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|p| p.cancelled))
+            .unwrap_or(false);
+        if is_cancelled {
+            break;
+        }
+
+        let parts: Vec<&str> = entry_line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let name = parts[8..].join(" ");
+        if name == "." || name == ".." {
+            continue;
+        }
+
+        let is_dir = entry_line.starts_with('d');
+        let child_remote = format!("{}/{}", remote_path.trim_end_matches('/'), name);
+        let child_local = local_path.join(&name);
+
+        if is_dir {
+            match download_directory_with_progress(
+                ftp,
+                &child_remote,
+                &child_local,
+                progress,
+                downloaded,
+            ) {
+                Ok(f) => files_count += f,
+                Err(e) => log::warn!("Skip dir {}: {}", child_remote, e),
+            }
+        } else {
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.current_file = name.clone();
+                }
+            }
+
+            match ftp.retr_as_stream(&child_remote) {
+                Ok(mut reader) => {
+                    let mut data = Vec::new();
+                    if reader.read_to_end(&mut data).is_ok() {
+                        let _ = ftp.finalize_retr_stream(reader);
+                        if std::fs::write(&child_local, &data).is_ok() {
+                            files_count += 1;
+                            *downloaded += 1;
+                            if let Ok(mut g) = progress.lock() {
+                                if let Some(ref mut p) = *g {
+                                    p.current = *downloaded;
+                                    p.bytes_transferred += data.len() as u64;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Skip file {}: {}", child_remote, e);
+                }
+            }
+        }
+    }
+
+    Ok(files_count)
 }

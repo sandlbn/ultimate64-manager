@@ -22,6 +22,11 @@ pub struct TransferProgress {
     pub current_file: String,
     pub operation: String, // "Downloading", "Uploading", "Deleting", etc.
     pub done: bool,
+    pub cancelled: bool,
+    pub started_at: std::time::Instant,
+    /// Optional byte-level progress for large file transfers
+    pub bytes_transferred: u64,
+    pub bytes_total: u64,
 }
 
 /// Disk format chosen in the create-disk dialog
@@ -650,6 +655,10 @@ pub async fn upload_directory_ftp(
                     current_file: String::new(),
                     operation: "Uploading".to_string(),
                     done: false,
+                    cancelled: false,
+                    started_at: std::time::Instant::now(),
+                    bytes_transferred: 0,
+                    bytes_total: 0,
                 });
             }
 
@@ -813,6 +822,10 @@ pub async fn download_batch_ftp(
             current_file: String::new(),
             operation: "Downloading".to_string(),
             done: false,
+            cancelled: false,
+            started_at: std::time::Instant::now(),
+            bytes_transferred: 0,
+            bytes_total: 0,
         });
     }
 

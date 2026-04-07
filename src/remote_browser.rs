@@ -331,6 +331,10 @@ impl RemoteBrowser {
                             current_file: filename,
                             operation: "Downloading".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -376,6 +380,10 @@ impl RemoteBrowser {
                             current_file: filename,
                             operation: "Uploading".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -866,6 +874,10 @@ impl RemoteBrowser {
                             current_file: String::new(),
                             operation: "Deleting".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -2296,9 +2308,37 @@ impl RemoteBrowser {
         self.checked_files.iter().cloned().collect()
     }
 
+    /// Get checked items split into (file_paths, dir_paths)
+    pub fn get_checked_files_and_dirs(&self) -> (Vec<String>, Vec<String>) {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for path in &self.checked_files {
+            if let Some(entry) = self.files.iter().find(|f| &f.path == path) {
+                if entry.is_dir {
+                    dirs.push(path.clone());
+                } else {
+                    files.push(path.clone());
+                }
+            } else {
+                files.push(path.clone()); // assume file if not found
+            }
+        }
+        (files, dirs)
+    }
+
     #[allow(dead_code)]
     pub fn clear_checked(&mut self) {
         self.checked_files.clear();
+    }
+
+    /// Cancel any in-progress transfer and mark it done
+    pub fn cancel_transfer(&self) {
+        if let Ok(mut g) = self.transfer_progress.lock() {
+            if let Some(ref mut p) = *g {
+                p.cancelled = true;
+                p.done = true;
+            }
+        }
     }
 
     pub fn subscription(&self) -> Subscription<RemoteBrowserMessage> {
