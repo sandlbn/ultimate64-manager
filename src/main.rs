@@ -174,11 +174,13 @@ pub enum Message {
     // Function bar actions
     FnView,
     FnCopy,
+    FnRename,
     FnMkDir,
     FnDelete,
     ToggleActivePane,
     NavigateUpActivePane,
     SelectAllActivePane,
+    SelectNoneActivePane,
     FilterChanged(String),
 
     // Errors
@@ -872,6 +874,51 @@ impl Ultimate64Browser {
                     .update(RemoteBrowserMessage::SelectAll, self.connection.clone())
                     .map(Message::RemoteBrowser),
             },
+
+            Message::SelectNoneActivePane => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::SelectNone,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::SelectNone, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
+
+            Message::FnRename => {
+                match self.active_pane {
+                    Pane::Left => {
+                        // Local rename not supported via function bar yet
+                        self.user_message = Some(UserMessage::Info(
+                            "Select a file and use your OS to rename local files".to_string(),
+                        ));
+                        Task::none()
+                    }
+                    Pane::Right => {
+                        // Rename the selected file on remote
+                        if let Some(ref selected) = self.remote_browser.selected_file {
+                            let path = selected.clone();
+                            return self
+                                .remote_browser
+                                .update(
+                                    RemoteBrowserMessage::RenameFile(path),
+                                    self.connection.clone(),
+                                )
+                                .map(Message::RemoteBrowser);
+                        }
+                        self.user_message = Some(UserMessage::Info(
+                            "Click a file first, then press F2 to rename".to_string(),
+                        ));
+                        Task::none()
+                    }
+                }
+            }
 
             Message::CopyLocalToRemote => {
                 // Copy checked local files and directories to Ultimate64
@@ -2070,7 +2117,8 @@ impl Ultimate64Browser {
             Tab::VideoViewer => {
                 if self.streaming_window_id.is_some() {
                     // Streaming is shown in separate window - show placeholder
-                    let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+                    let fs =
+                        crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
                     container(
                         column![
                             text("Video is displayed in separate window").size(fs.large + 2),
@@ -2088,7 +2136,9 @@ impl Ultimate64Browser {
                     .center_y(Length::Fill)
                     .into()
                 } else {
-                    self.video_streaming.view(self.settings.preferences.font_size).map(Message::Streaming)
+                    self.video_streaming
+                        .view(self.settings.preferences.font_size)
+                        .map(Message::Streaming)
                 }
             }
             Tab::MemoryEditor => self
@@ -2166,6 +2216,7 @@ impl Ultimate64Browser {
                         ))
                     }
                     // File browser shortcuts (TC-style)
+                    Key::Named(keyboard::key::Named::F2) => Some(Message::FnRename),
                     Key::Named(keyboard::key::Named::F3) => Some(Message::FnView),
                     Key::Named(keyboard::key::Named::F5) => Some(Message::FnCopy),
                     Key::Named(keyboard::key::Named::F7) => Some(Message::FnMkDir),
@@ -2238,7 +2289,8 @@ impl Ultimate64Browser {
             text("○ DISCONNECTED").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
         };
 
-        let device_text = text(self.status.device_info.as_deref().unwrap_or("No device")).size(fs.normal);
+        let device_text =
+            text(self.status.device_info.as_deref().unwrap_or("No device")).size(fs.normal);
 
         // Update notification on the right side
         let update_notification: Element<'_, Message> = if let Some(info) = &self.new_version {
@@ -2275,7 +2327,7 @@ impl Ultimate64Browser {
 
     fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Left pane - Local files
-        let left_pane = container(
+        let left_content = container(
             self.left_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::LeftBrowser),
@@ -2289,8 +2341,11 @@ impl Ultimate64Browser {
             crate::styles::inactive_pane_style
         });
 
+        let left_pane =
+            iced::widget::mouse_area(left_content).on_press(Message::ActivePaneChanged(Pane::Left));
+
         // Right pane - Ultimate64 files
-        let right_pane = container(
+        let right_content = container(
             self.remote_browser
                 .view(self.settings.preferences.font_size)
                 .map(Message::RemoteBrowser),
@@ -2304,6 +2359,9 @@ impl Ultimate64Browser {
             crate::styles::inactive_pane_style
         });
 
+        let right_pane = iced::widget::mouse_area(right_content)
+            .on_press(Message::ActivePaneChanged(Pane::Right));
+
         // Function bar at bottom
         let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let small = fs.small as f32;
@@ -2314,44 +2372,48 @@ impl Ultimate64Browser {
             Pane::Right => self.remote_browser.filter(),
         };
 
+        let copy_label = match self.active_pane {
+            Pane::Left => "F5 Copy \u{2192}",
+            Pane::Right => "F5 Copy \u{2190}",
+        };
+
         let function_bar = container(
             row![
+                button(text("F2 Ren").size(small))
+                    .on_press(Message::FnRename)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 button(text("F3 View").size(small))
                     .on_press(Message::FnView)
-                    .padding([4, 10])
+                    .padding([4, 8])
                     .style(crate::styles::nav_button),
-                button(
-                    text(match self.active_pane {
-                        Pane::Left => "F5 Copy \u{2192}",  // →
-                        Pane::Right => "F5 Copy \u{2190}", // ←
-                    })
-                    .size(small),
-                )
-                .on_press(Message::FnCopy)
-                .padding([4, 10])
-                .style(crate::styles::nav_button),
-                button(
-                    text(match self.active_pane {
-                        Pane::Left => "F7 MkDir (local)",
-                        Pane::Right => "F7 MkDir (remote)",
-                    })
-                    .size(small),
-                )
-                .on_press(Message::FnMkDir)
-                .padding([4, 10])
-                .style(crate::styles::nav_button),
-                button(
-                    text(match self.active_pane {
-                        Pane::Left => "F8 Delete (local)",
-                        Pane::Right => "F8 Delete (remote)",
-                    })
-                    .size(small),
-                )
-                .on_press(Message::FnDelete)
-                .padding([4, 10])
-                .style(crate::styles::nav_button),
+                button(text(copy_label).size(small))
+                    .on_press(Message::FnCopy)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("F7 MkDir").size(small))
+                    .on_press(Message::FnMkDir)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("F8 Del").size(small))
+                    .on_press(Message::FnDelete)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                text("|")
+                    .size(tiny)
+                    .color(iced::Color::from_rgb(0.4, 0.4, 0.45)),
+                button(text("Sel All").size(small))
+                    .on_press(Message::SelectAllActivePane)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("Sel None").size(small))
+                    .on_press(Message::SelectNoneActivePane)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 Space::new().width(Length::Fill),
-                text("Filter:").size(tiny),
+                text("Filter:")
+                    .size(tiny)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
                 text_input("filter...", active_filter)
                     .on_input(Message::FilterChanged)
                     .size(small)
@@ -2368,12 +2430,13 @@ impl Ultimate64Browser {
                 .width(Length::Fixed(150.0)),
                 button(text("Exec").size(tiny))
                     .on_press(Message::ExecuteTemplate)
-                    .padding([4, 8]),
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
             ]
-            .spacing(4)
+            .spacing(3)
             .align_y(iced::Alignment::Center),
         )
-        .padding([6, 10])
+        .padding([5, 8])
         .width(Length::Fill);
 
         column![
@@ -2451,7 +2514,9 @@ impl Ultimate64Browser {
         ];
         // Discovery button
         let discovery_button: Element<'_, Message> = if self.is_discovering {
-            button(text("Scanning...").size(fs.small)).padding([4, 10]).into()
+            button(text("Scanning...").size(fs.small))
+                .padding([4, 10])
+                .into()
         } else {
             tooltip(
                 button(text("🔍 Find Devices").size(fs.small))
@@ -2495,9 +2560,12 @@ impl Ultimate64Browser {
         let connection_section = column![
             text("CONNECTION SETTINGS").size(fs.header),
             Space::new().height(10),
-            row![text("Ultimate64 IP Address:").size(fs.large), discovery_button,]
-                .spacing(10)
-                .align_y(iced::Alignment::Center),
+            row![
+                text("Ultimate64 IP Address:").size(fs.large),
+                discovery_button,
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center),
             text_input("eg. 192.168.1.64", &self.host_input)
                 .on_input(Message::HostInputChanged)
                 .padding(10)
@@ -2518,7 +2586,8 @@ impl Ultimate64Browser {
             )
             .width(Length::Fixed(250.0)),]
             .spacing(10),
-            text("Controls how video/audio streaming communicates with the Ultimate64").size(fs.small),
+            text("Controls how video/audio streaming communicates with the Ultimate64")
+                .size(fs.small),
             Space::new().height(15),
             row![
                 tooltip(
@@ -2771,7 +2840,9 @@ impl Ultimate64Browser {
                 .into()
             } else {
                 row![
-                    text(format!("{}{}", prefix, message)).size(fs.normal).color(color),
+                    text(format!("{}{}", prefix, message))
+                        .size(fs.normal)
+                        .color(color),
                     tooltip(
                         button(text("X").size(fs.tiny))
                             .on_press(Message::DismissMessage)

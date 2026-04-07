@@ -1612,7 +1612,8 @@ impl CsdbBrowser {
                 column![
                     text("Top List").size(fs.large),
                     Space::new().height(20),
-                    text("No entries loaded. Select a category and click 'Top List'.").size(fs.normal),
+                    text("No entries loaded. Select a category and click 'Top List'.")
+                        .size(fs.normal),
                 ]
                 .spacing(10)
                 .align_x(iced::Alignment::Center),
@@ -1849,7 +1850,11 @@ impl CsdbBrowser {
             info_items.push(text(format!("Date: {}", date)).size(fs.small).into());
         }
         if let Some(platform) = &release.platform {
-            info_items.push(text(format!("Platform: {}", platform)).size(fs.small).into());
+            info_items.push(
+                text(format!("Platform: {}", platform))
+                    .size(fs.small)
+                    .into(),
+            );
         }
 
         let info_row = row(info_items).spacing(20);
@@ -2044,9 +2049,12 @@ impl CsdbBrowser {
                 .into()
             } else if self.screenshot_loading {
                 let placeholder = container(
-                    column![text("🖼").size(fs.icon), text("Loading preview…").size(fs.small),]
-                        .spacing(8)
-                        .align_x(iced::Alignment::Center),
+                    column![
+                        text("🖼").size(fs.icon),
+                        text("Loading preview…").size(fs.small),
+                    ]
+                    .spacing(8)
+                    .align_x(iced::Alignment::Center),
                 )
                 .width(Length::Fixed(390.0))
                 .height(Length::Fill)

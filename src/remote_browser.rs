@@ -1642,34 +1642,6 @@ impl RemoteBrowser {
                     .size(fs.large)
                     .into();
 
-                // ── Per-row rename and delete buttons ──────────────────────
-                let path_for_rename = entry.path.clone();
-                let path_for_delete = entry.path.clone();
-
-                let rename_btn = tooltip(
-                    button(text("Ren").size(tiny))
-                        .on_press(RemoteBrowserMessage::RenameFile(path_for_rename))
-                        .padding([2, 5])
-                        .style(crate::styles::nav_button),
-                    "Rename",
-                    tooltip::Position::Top,
-                )
-                .style(crate::styles::subtle_tooltip);
-
-                let delete_btn = tooltip(
-                    button(text("Del").size(tiny))
-                        .on_press(RemoteBrowserMessage::DeleteFile(path_for_delete))
-                        .padding([2, 5])
-                        .style(crate::styles::nav_button),
-                    if entry.is_dir {
-                        "Delete directory (recursive)"
-                    } else {
-                        "Delete file"
-                    },
-                    tooltip::Position::Top,
-                )
-                .style(crate::styles::subtle_tooltip);
-
                 let size_text: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     text("<DIR>").size(tiny).width(Length::Fixed(65.0)).into()
                 } else {
@@ -1685,9 +1657,6 @@ impl RemoteBrowser {
                     size_text,
                     text(type_label).size(tiny).width(Length::Fixed(35.0)),
                     action_button,
-                    Space::new().width(4),
-                    rename_btn,
-                    delete_btn,
                 ]
                 .spacing(4)
                 .align_y(iced::Alignment::Center)

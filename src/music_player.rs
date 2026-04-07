@@ -1510,11 +1510,13 @@ impl MusicPlayer {
                     match &entry.entry_type {
                         BrowserEntryType::Directory => {
                             // Directory entry - click to navigate
-                            row![button(text(format!("[DIR] {}", entry.name)).size(fs.normal))
-                                .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
-                                .padding([6, 8])
-                                .width(Length::Fill)
-                                .style(button::text),]
+                            row![
+                                button(text(format!("[DIR] {}", entry.name)).size(fs.normal))
+                                    .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
+                                    .padding([6, 8])
+                                    .width(Length::Fill)
+                                    .style(button::text),
+                            ]
                             .into()
                         }
                         BrowserEntryType::MusicFile(ft) => {
@@ -1537,7 +1539,8 @@ impl MusicPlayer {
                             let is_truncated = entry.name.chars().count() > max_name_len;
 
                             let file_button = button(
-                                text(format!("{}{} {}", icon, subsong_info, display)).size(fs.normal),
+                                text(format!("{}{} {}", icon, subsong_info, display))
+                                    .size(fs.normal),
                             )
                             .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
                             .padding([6, 8])
@@ -1731,7 +1734,6 @@ impl MusicPlayer {
                     let max_name_len = 40;
                     let name = truncate_string(&display_name, max_name_len);
                     let is_truncated = display_name.chars().count() > max_name_len;
-
 
                     let playlist_button = button(
                         text(format!(

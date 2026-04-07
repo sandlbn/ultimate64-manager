@@ -67,25 +67,27 @@ pub fn tooltip_style(_theme: &iced::Theme) -> container::Style {
     }
 }
 
-/// Active pane style — gray border to indicate which pane is active
+/// Active pane style — slightly lighter background to show focus
 pub fn active_pane_style(_theme: &iced::Theme) -> container::Style {
     container::Style {
-        background: None,
+        background: Some(iced::Background::Color(iced::Color::from_rgba(
+            1.0, 1.0, 1.0, 0.04,
+        ))),
         border: iced::Border {
-            color: iced::Color::from_rgb(0.55, 0.55, 0.58),
-            width: 2.0,
+            color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.12),
+            width: 1.0,
             radius: 0.0.into(),
         },
         ..Default::default()
     }
 }
 
-/// Inactive pane style — subtle border
+/// Inactive pane style — default dark background
 pub fn inactive_pane_style(_theme: &iced::Theme) -> container::Style {
     container::Style {
         background: None,
         border: iced::Border {
-            color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.08),
+            color: iced::Color::from_rgba(1.0, 1.0, 1.0, 0.04),
             width: 1.0,
             radius: 0.0.into(),
         },

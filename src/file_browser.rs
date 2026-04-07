@@ -750,7 +750,6 @@ impl FileBrowser {
             }
             FileBrowserMessage::DeleteConfirmed => {
                 if let Some(paths) = self.delete_pending.take() {
-                    let current_dir = self.current_directory.clone();
                     return Task::perform(
                         async move {
                             let mut deleted = 0;
@@ -884,11 +883,13 @@ impl FileBrowser {
 
         row![
             tooltip(
-                button(text("🔍 Browse").size(fs.small))
-                    .on_press(FileBrowserMessage::SelectDirectory)
+                button(text("🏠 Home").size(fs.small))
+                    .on_press(FileBrowserMessage::NavigateToPath(
+                        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
+                    ))
                     .padding([2, 6])
                     .style(crate::styles::nav_button),
-                "Choose a different folder",
+                "Go to home directory",
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),
@@ -902,13 +903,11 @@ impl FileBrowser {
             )
             .style(crate::styles::subtle_tooltip),
             tooltip(
-                button(text("🏠 Home").size(fs.small))
-                    .on_press(FileBrowserMessage::NavigateToPath(
-                        dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")),
-                    ))
+                button(text("🔍 Browse").size(fs.small))
+                    .on_press(FileBrowserMessage::SelectDirectory)
                     .padding([2, 6])
                     .style(crate::styles::nav_button),
-                "Go to home directory",
+                "Choose a different folder",
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),

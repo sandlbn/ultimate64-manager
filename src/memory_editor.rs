@@ -1738,7 +1738,11 @@ impl MemoryEditor {
         // Column headers
         let mut hdr_row = Row::new().push(text("ADDR").size(fs.tiny).width(Length::Fixed(50.0)));
         for i in 0..16u8 {
-            hdr_row = hdr_row.push(text(format!("{:X}", i)).size(fs.tiny).width(Length::Fixed(24.0)));
+            hdr_row = hdr_row.push(
+                text(format!("{:X}", i))
+                    .size(fs.tiny)
+                    .width(Length::Fixed(24.0)),
+            );
         }
         hdr_row = hdr_row
             .push(Space::new().width(Length::Fixed(10.0)))
@@ -1787,13 +1791,21 @@ impl MemoryEditor {
                 };
 
                 let byte_widget = if is_editing {
-                    container(text(byte_text.clone()).size(fs.tiny).color(iced::Color::BLACK))
-                        .style(editing_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(fs.tiny)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(editing_style)
+                    .width(Length::Fixed(width))
                 } else if is_match {
-                    container(text(byte_text.clone()).size(fs.tiny).color(iced::Color::BLACK))
-                        .style(highlight_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(fs.tiny)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(highlight_style)
+                    .width(Length::Fixed(width))
                 } else {
                     container(text(byte_text.clone()).size(fs.tiny)).width(Length::Fixed(width))
                 };
