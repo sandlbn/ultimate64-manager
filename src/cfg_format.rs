@@ -13,23 +13,8 @@
 
 use crate::device_profile::{ConfigTree, DeviceProfile, ProfileMode, SourceFormat};
 
-/// Known keys whose values are true integers (have min/max in the API).
-/// These get converted from strings to JSON numbers during CFG import.
-/// Keys that look numeric but are actually enums (like CPU Speed) or
-/// plain strings (like Listening Port) must NOT be listed here.
-const INTEGER_KEYS: &[&str] = &[
-    "Drive Bus ID",
-    "Bus ID",
-    "Soft Drive Bus ID",
-    "Loop Delay",
-    "Page height (default is 60)",
-    "Page top margin (default is 5)",
-    "Strip Intensity",
-    "LedStrip Length",
-    "Adjust Color Clock",
-    "Disk swap delay",
-    "DMA Load Mimics ID:",
-];
+// No hardcoded key lists — integer detection is done heuristically.
+// See `normalize_value` for the logic.
 
 /// Parse a .cfg file (INI-style) into a ConfigTree.
 ///
@@ -96,21 +81,28 @@ pub fn parse_cfg(input: &str) -> Result<ConfigTree, String> {
 
 /// Normalize a value string into a serde_json::Value.
 ///
-/// Known integer keys (with min/max in the API) are trimmed and parsed as numbers.
-/// All other values are preserved exactly as they appear after the `=` sign,
-/// because the Ultimate64 API uses exact string matching — values like
-/// `" 0 dB"` and `" 1"` have significant leading spaces.
-fn normalize_value(key: &str, raw_value: &str) -> serde_json::Value {
-    // Check if this is a known integer key
-    if INTEGER_KEYS.contains(&key) {
-        let trimmed = raw_value.trim();
-        if let Ok(n) = trimmed.parse::<i64>() {
+/// Values are preserved exactly as they appear after the `=` sign because the
+/// Ultimate64 API uses exact string matching — values like `" 0 dB"` and `" 1"`
+/// have significant leading spaces.
+///
+/// The only exception: values that are *purely* numeric with no surrounding
+/// whitespace (e.g. `"8"`, `"0"`, `"-100"`) are stored as JSON numbers.
+/// This avoids hardcoding a list of known integer keys that would break when
+/// the firmware schema changes.
+///
+/// Values like `" 1"` (leading space) or `"3000"` after whitespace are kept as
+/// strings because they may be enum values or have formatting significance.
+fn normalize_value(_key: &str, raw_value: &str) -> serde_json::Value {
+    // Only convert to number if the raw value (after =) is *exactly* a number
+    // with no leading/trailing whitespace — this means the .cfg had e.g. `Key=8`
+    // not `Key= 8` (which would be a string with a leading space).
+    if !raw_value.is_empty() && raw_value == raw_value.trim() {
+        if let Ok(n) = raw_value.parse::<i64>() {
             return serde_json::Value::Number(serde_json::Number::from(n));
         }
     }
 
-    // Preserve the raw value as-is (do NOT trim — leading spaces are significant
-    // for API enum values like " 0 dB", " 1", etc.)
+    // Preserve the raw value as-is (leading/trailing spaces are significant)
     serde_json::Value::String(raw_value.to_string())
 }
 
