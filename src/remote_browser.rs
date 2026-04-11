@@ -331,6 +331,10 @@ impl RemoteBrowser {
                             current_file: filename,
                             operation: "Downloading".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -376,6 +380,10 @@ impl RemoteBrowser {
                             current_file: filename,
                             operation: "Uploading".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -866,6 +874,10 @@ impl RemoteBrowser {
                             current_file: String::new(),
                             operation: "Deleting".to_string(),
                             done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
                         });
                     }
                     let host = host.clone();
@@ -1080,7 +1092,8 @@ impl RemoteBrowser {
     // ── Builder helper methods for Total Commander-style layout ──────────
 
     fn build_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
         let display_path = if self.current_path.len() > 35 {
             format!("...{}", &self.current_path[self.current_path.len() - 32..])
         } else {
@@ -1113,7 +1126,8 @@ impl RemoteBrowser {
     }
 
     fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
         let mut nav = row![tooltip(
             button(text("/").size(small))
                 .on_press(RemoteBrowserMessage::NavigateToPath("/".to_string()))
@@ -1164,8 +1178,9 @@ impl RemoteBrowser {
     }
 
     fn build_status_bar(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let tiny = (font_size.saturating_sub(3)).max(7);
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let tiny = fs.tiny;
+        let small = fs.small;
         let file_count = self.files.len();
         let checked_count = self.checked_files.len();
 
@@ -1208,7 +1223,8 @@ impl RemoteBrowser {
     }
 
     fn build_column_headers(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
 
         let name_indicator = if self.sort_column == crate::file_types::SortColumn::Name {
             self.sort_order.indicator()
@@ -1257,9 +1273,10 @@ impl RemoteBrowser {
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         // ── Delete confirm dialog — shown over everything else ─────────────
         if let Some(ref dp) = self.delete_pending {
@@ -1310,7 +1327,7 @@ impl RemoteBrowser {
 
         // ── Create directory dialog ────────────────────────────────────────
         if self.show_create_dir {
-            let small = (font_size.saturating_sub(2)).max(8);
+            let small = fs.small;
             let dialog = container(
                 column![
                     text("Create Directory").size(font_size),
@@ -1634,36 +1651,8 @@ impl RemoteBrowser {
                     .on_toggle(move |checked| {
                         RemoteBrowserMessage::ToggleFileCheck(path_for_check.clone(), checked)
                     })
-                    .size(14)
+                    .size(fs.large)
                     .into();
-
-                // ── Per-row rename and delete buttons ──────────────────────
-                let path_for_rename = entry.path.clone();
-                let path_for_delete = entry.path.clone();
-
-                let rename_btn = tooltip(
-                    button(text("Ren").size(tiny))
-                        .on_press(RemoteBrowserMessage::RenameFile(path_for_rename))
-                        .padding([2, 5])
-                        .style(crate::styles::nav_button),
-                    "Rename",
-                    tooltip::Position::Top,
-                )
-                .style(crate::styles::subtle_tooltip);
-
-                let delete_btn = tooltip(
-                    button(text("Del").size(tiny))
-                        .on_press(RemoteBrowserMessage::DeleteFile(path_for_delete))
-                        .padding([2, 5])
-                        .style(crate::styles::nav_button),
-                    if entry.is_dir {
-                        "Delete directory (recursive)"
-                    } else {
-                        "Delete file"
-                    },
-                    tooltip::Position::Top,
-                )
-                .style(crate::styles::subtle_tooltip);
 
                 let size_text: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     text("<DIR>").size(tiny).width(Length::Fixed(65.0)).into()
@@ -1680,9 +1669,6 @@ impl RemoteBrowser {
                     size_text,
                     text(type_label).size(tiny).width(Length::Fixed(35.0)),
                     action_button,
-                    Space::new().width(4),
-                    rename_btn,
-                    delete_btn,
                 ]
                 .spacing(4)
                 .align_y(iced::Alignment::Center)
@@ -1723,8 +1709,9 @@ impl RemoteBrowser {
         dp: &'a DeletePending,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
 
         let header = row![
             text("⚠ Confirm Delete").size(normal),
@@ -1796,9 +1783,10 @@ impl RemoteBrowser {
         rp: &'a RenamePending,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let original_name = rp
             .original_path
@@ -1919,9 +1907,10 @@ impl RemoteBrowser {
     }
 
     fn view_create_disk_dialog(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let header = row![
             text("💾 Create New Disk Image").size(normal),
@@ -2074,9 +2063,10 @@ impl RemoteBrowser {
         disk_info: &DiskInfo,
         font_size: u32,
     ) -> Element<'_, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         let header = row![
             text(format!("{} - ", disk_info.kind)).size(small),
@@ -2179,9 +2169,10 @@ impl RemoteBrowser {
         content: &'a ContentPreview,
         font_size: u32,
     ) -> Element<'a, RemoteBrowserMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let tiny = (font_size.saturating_sub(3)).max(7);
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let small = fs.small;
+        let normal = fs.normal;
+        let tiny = fs.tiny;
 
         match content {
             ContentPreview::Text {
@@ -2317,9 +2308,37 @@ impl RemoteBrowser {
         self.checked_files.iter().cloned().collect()
     }
 
+    /// Get checked items split into (file_paths, dir_paths)
+    pub fn get_checked_files_and_dirs(&self) -> (Vec<String>, Vec<String>) {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        for path in &self.checked_files {
+            if let Some(entry) = self.files.iter().find(|f| &f.path == path) {
+                if entry.is_dir {
+                    dirs.push(path.clone());
+                } else {
+                    files.push(path.clone());
+                }
+            } else {
+                files.push(path.clone()); // assume file if not found
+            }
+        }
+        (files, dirs)
+    }
+
     #[allow(dead_code)]
     pub fn clear_checked(&mut self) {
         self.checked_files.clear();
+    }
+
+    /// Cancel any in-progress transfer and mark it done
+    pub fn cancel_transfer(&self) {
+        if let Ok(mut g) = self.transfer_progress.lock() {
+            if let Some(ref mut p) = *g {
+                p.cancelled = true;
+                p.done = true;
+            }
+        }
     }
 
     pub fn subscription(&self) -> Subscription<RemoteBrowserMessage> {

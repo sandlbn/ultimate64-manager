@@ -759,17 +759,14 @@ impl ConfigEditor {
     }
 
     pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, ConfigEditorMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
-        let large = font_size + 2;
-        let header = font_size + 4;
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         // === LEFT PANE: Category list ===
         let category_header = container(
             column![
-                text("CATEGORIES").size(normal),
+                text("CATEGORIES").size(fs.normal),
                 row![tooltip(
-                    button(text("Load").size(small))
+                    button(text("Load").size(fs.small))
                         .on_press(ConfigEditorMessage::LoadCategories)
                         .padding([4, 8]),
                     "Fetch configuration categories from Ultimate64",
@@ -789,7 +786,7 @@ impl ConfigEditor {
                 } else {
                     "Connect to Ultimate64 first"
                 })
-                .size(normal),
+                .size(fs.normal),
             )
             .padding(10)
             .into()
@@ -807,7 +804,7 @@ impl ConfigEditor {
                         cat.clone()
                     };
 
-                    button(text(label).size(normal))
+                    button(text(label).size(fs.normal))
                         .on_press(ConfigEditorMessage::SelectCategory(cat.clone()))
                         .padding([6, 10])
                         .width(Length::Fill)
@@ -833,9 +830,9 @@ impl ConfigEditor {
         let flash_controls = container(
             column![
                 rule::horizontal(1),
-                text("FLASH MEMORY").size(small),
+                text("FLASH MEMORY").size(fs.small),
                 tooltip(
-                    button(text("Save to Flash").size(small))
+                    button(text("Save to Flash").size(fs.small))
                         .on_press(ConfigEditorMessage::SaveToFlash)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -844,7 +841,7 @@ impl ConfigEditor {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Load from Flash").size(small))
+                    button(text("Load from Flash").size(fs.small))
                         .on_press(ConfigEditorMessage::LoadFromFlash)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -853,7 +850,7 @@ impl ConfigEditor {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Reset to Default").size(small))
+                    button(text("Reset to Default").size(fs.small))
                         .on_press(ConfigEditorMessage::ResetToDefault)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -870,9 +867,9 @@ impl ConfigEditor {
         let preset_controls = container(
             column![
                 rule::horizontal(1),
-                text("PRESETS").size(small),
+                text("PRESETS").size(fs.small),
                 tooltip(
-                    button(text("Save Preset").size(small))
+                    button(text("Save Preset").size(fs.small))
                         .on_press(ConfigEditorMessage::SavePreset)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -881,7 +878,7 @@ impl ConfigEditor {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Load Preset").size(small))
+                    button(text("Load Preset").size(fs.small))
                         .on_press(ConfigEditorMessage::LoadPreset)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -898,9 +895,9 @@ impl ConfigEditor {
         let backup_controls = container(
             column![
                 rule::horizontal(1),
-                text("FULL BACKUP").size(small),
+                text("FULL BACKUP").size(fs.small),
                 tooltip(
-                    button(text("Save All Config").size(small))
+                    button(text("Save All Config").size(fs.small))
                         .on_press(ConfigEditorMessage::SaveAllConfig)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -909,7 +906,7 @@ impl ConfigEditor {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Restore All Config").size(small))
+                    button(text("Restore All Config").size(fs.small))
                         .on_press(ConfigEditorMessage::LoadAllConfig)
                         .padding([4, 8])
                         .width(Length::Fill),
@@ -945,20 +942,20 @@ impl ConfigEditor {
                             .as_deref()
                             .unwrap_or("Select a category")
                     )
-                    .size(large),
+                    .size(fs.large),
                     Space::new().width(Length::Fill),
                     if self.has_unsaved_changes {
                         text("* Modified")
-                            .size(small)
+                            .size(fs.small)
                             .color(iced::Color::from_rgb(0.9, 0.7, 0.0))
                     } else {
-                        text("").size(small)
+                        text("").size(fs.small)
                     },
                 ]
                 .align_y(iced::Alignment::Center),
                 row![
                     tooltip(
-                        button(text("Apply All").size(small))
+                        button(text("Apply All").size(fs.small))
                             .on_press(ConfigEditorMessage::SaveAllChanges)
                             .padding([4, 10])
                             .style(if self.has_unsaved_changes {
@@ -971,7 +968,7 @@ impl ConfigEditor {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Revert").size(small))
+                        button(text("Revert").size(fs.small))
                             .on_press(ConfigEditorMessage::RevertChanges)
                             .padding([4, 8]),
                         "Discard all pending changes",
@@ -979,7 +976,7 @@ impl ConfigEditor {
                     )
                     .style(container::bordered_box),
                     tooltip(
-                        button(text("Refresh").size(small))
+                        button(text("Refresh").size(fs.small))
                             .on_press(ConfigEditorMessage::RefreshCategory)
                             .padding([4, 8]),
                         "Reload current category from Ultimate64",
@@ -987,10 +984,10 @@ impl ConfigEditor {
                     )
                     .style(container::bordered_box),
                     Space::new().width(10),
-                    text("Filter:").size(small),
+                    text("Filter:").size(fs.small),
                     text_input("filter...", &self.search_filter)
                         .on_input(ConfigEditorMessage::SearchChanged)
-                        .size(normal as f32)
+                        .size(fs.normal as f32)
                         .width(Length::Fixed(120.0)),
                 ]
                 .spacing(5)
@@ -1002,11 +999,11 @@ impl ConfigEditor {
 
         let options_list: Element<'_, ConfigEditorMessage> = if self.current_items.is_empty() {
             container(if self.is_loading {
-                text("Loading...").size(normal)
+                text("Loading...").size(fs.normal)
             } else if self.selected_category.is_some() {
-                text("No items in this category").size(normal)
+                text("No items in this category").size(fs.normal)
             } else {
-                text("Select a category from the left").size(normal)
+                text("Select a category from the left").size(fs.normal)
             })
             .padding(20)
             .center_x(Length::Fill)
@@ -1051,26 +1048,26 @@ impl ConfigEditor {
             row![
                 if let Some(err) = &self.error_message {
                     text(err)
-                        .size(normal)
+                        .size(fs.normal)
                         .color(iced::Color::from_rgb(0.9, 0.3, 0.3))
                 } else if let Some(status) = &self.status_message {
-                    text(status).size(normal)
+                    text(status).size(fs.normal)
                 } else {
-                    text("").size(normal)
+                    text("").size(fs.normal)
                 },
                 Space::new().width(Length::Fill),
-                text(format!("{} items", self.current_items.len())).size(normal),
+                text(format!("{} items", self.current_items.len())).size(fs.normal),
                 Space::new().width(10),
                 if pending_count > 0 {
-                    text(format!("{} pending", pending_count)).size(normal)
+                    text(format!("{} pending", pending_count)).size(fs.normal)
                 } else {
-                    text("").size(normal)
+                    text("").size(fs.normal)
                 },
                 Space::new().width(10),
                 if self.is_loading {
-                    text("Loading...").size(normal)
+                    text("Loading...").size(fs.normal)
                 } else {
-                    text("").size(normal)
+                    text("").size(fs.normal)
                 },
             ]
             .align_y(iced::Alignment::Center),
@@ -1078,7 +1075,7 @@ impl ConfigEditor {
         .padding([5, 10]);
 
         column![
-            text("CONFIGURATION EDITOR").size(header),
+            text("CONFIGURATION EDITOR").size(fs.header),
             rule::horizontal(1),
             row![left_pane, rule::vertical(1), right_pane].height(Length::Fill),
             rule::horizontal(1),
@@ -1094,20 +1091,19 @@ impl ConfigEditor {
         opt: &'a ConfigOption,
         font_size: u32,
     ) -> Element<'a, ConfigEditorMessage> {
-        let small = (font_size.saturating_sub(2)).max(8);
-        let normal = font_size;
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         let is_modified = self.is_item_modified(&opt.category, &opt.name);
 
         let name_row = row![
-            text(&opt.name).size(normal),
+            text(&opt.name).size(fs.normal),
             Space::new().width(5),
             if is_modified {
                 text("*")
-                    .size(normal)
+                    .size(fs.normal)
                     .color(iced::Color::from_rgb(0.9, 0.7, 0.0))
             } else {
-                text("").size(normal)
+                text("").size(fs.normal)
             },
         ]
         .align_y(iced::Alignment::Center);
@@ -1115,13 +1111,13 @@ impl ConfigEditor {
         let default_text = if let Some(details) = &opt.details {
             if let Some(default) = &details.default {
                 text(format!("Default: {}", format_value(default)))
-                    .size(small)
+                    .size(fs.small)
                     .color(iced::Color::from_rgb(0.55, 0.55, 0.55))
             } else {
-                text("").size(small)
+                text("").size(fs.small)
             }
         } else {
-            text("").size(small)
+            text("").size(fs.small)
         };
 
         let category = opt.category.clone();
@@ -1144,14 +1140,14 @@ impl ConfigEditor {
                         .on_input(move |v| {
                             ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
                         })
-                        .size(normal as f32)
+                        .size(fs.normal as f32)
                         .width(Length::Fixed(250.0))
                         .into()
                 } else {
                     pick_list(options, current_value, move |v| {
                         ConfigEditorMessage::EnumValueChanged(cat.clone(), n.clone(), v)
                     })
-                    .text_size(normal)
+                    .text_size(fs.normal)
                     .width(Length::Fixed(250.0))
                     .into()
                 }
@@ -1187,10 +1183,10 @@ impl ConfigEditor {
                     .step(1.0)
                     .width(Length::Fixed(150.0)),
                     Space::new().width(10),
-                    text(format!("{}{}", current_value, unit)).size(normal),
+                    text(format!("{}{}", current_value, unit)).size(fs.normal),
                     Space::new().width(10),
                     text(format!("[{} - {}]", min, max))
-                        .size(small)
+                        .size(fs.small)
                         .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
                 ]
                 .spacing(5)
@@ -1212,9 +1208,9 @@ impl ConfigEditor {
                         .on_toggle(move |v| {
                             ConfigEditorMessage::BoolValueChanged(cat.clone(), n.clone(), v)
                         })
-                        .size(18),
+                        .size(fs.header),
                     Space::new().width(10),
-                    text(if current_value { "Yes" } else { "No" }).size(normal),
+                    text(if current_value { "Yes" } else { "No" }).size(fs.normal),
                 ]
                 .spacing(5)
                 .align_y(iced::Alignment::Center)
@@ -1230,7 +1226,7 @@ impl ConfigEditor {
                     .on_input(move |v| {
                         ConfigEditorMessage::StringValueChanged(cat.clone(), n.clone(), v)
                     })
-                    .size(normal as f32)
+                    .size(fs.normal as f32)
                     .width(Length::Fixed(250.0))
                     .into()
             }

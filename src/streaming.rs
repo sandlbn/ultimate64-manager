@@ -646,7 +646,8 @@ impl VideoStreaming {
     }
 
     /// Fullscreen view - video fills the entire available space with black letterboxing
-    pub fn view_fullscreen(&self) -> Element<'_, StreamingMessage> {
+    pub fn view_fullscreen(&self, font_size: u32) -> Element<'_, StreamingMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use cached handle - created once in FrameUpdate, not on every view()
             if let Some(ref handle) = self.current_handle {
@@ -668,13 +669,13 @@ impl VideoStreaming {
                     .into()
             } else {
                 text("Waiting for frames...")
-                    .size(20)
+                    .size(fs.header + 2)
                     .color(iced::Color::WHITE)
                     .into()
             }
         } else {
             text("Stream not active - press ESC to exit")
-                .size(20)
+                .size(fs.header + 2)
                 .color(iced::Color::WHITE)
                 .into()
         };
@@ -686,7 +687,7 @@ impl VideoStreaming {
             } else {
                 "⌨ Disabled"
             })
-            .size(12),
+            .size(fs.normal),
         )
         .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
         .padding([6, 12])
@@ -698,7 +699,7 @@ impl VideoStreaming {
 
         let exit_hint = container(
             row![
-                button(text("Exit Fullscreen (ESC or double-click)").size(12))
+                button(text("Exit Fullscreen (ESC or double-click)").size(fs.normal))
                     .on_press(StreamingMessage::ToggleFullscreen)
                     .padding([6, 12]),
                 keyboard_btn,
@@ -729,7 +730,8 @@ impl VideoStreaming {
     }
 
     /// Separate window view - similar to fullscreen but for dedicated streaming window
-    pub fn view_separate_window(&self) -> Element<'_, StreamingMessage> {
+    pub fn view_separate_window(&self, font_size: u32) -> Element<'_, StreamingMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
         let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
             // Use cached handle - created once in FrameUpdate, not on every view()
             if let Some(ref handle) = self.current_handle {
@@ -750,13 +752,13 @@ impl VideoStreaming {
                     .into()
             } else {
                 text("Waiting for frames...")
-                    .size(20)
+                    .size(fs.header + 2)
                     .color(iced::Color::WHITE)
                     .into()
             }
         } else {
             text("Stream not active")
-                .size(20)
+                .size(fs.header + 2)
                 .color(iced::Color::WHITE)
                 .into()
         };
@@ -768,7 +770,7 @@ impl VideoStreaming {
             } else {
                 "⌨ Disabled"
             })
-            .size(12),
+            .size(fs.normal),
         )
         .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
         .padding([6, 12])
@@ -778,7 +780,7 @@ impl VideoStreaming {
             button::secondary
         });
 
-        let fullscreen_btn = button(text("Fullscreen").size(12))
+        let fullscreen_btn = button(text("Fullscreen").size(fs.normal))
             .on_press(StreamingMessage::ToggleFullscreen)
             .padding([6, 12]);
 
@@ -806,7 +808,8 @@ impl VideoStreaming {
         .into()
     }
 
-    pub fn view(&self) -> Element<'_, StreamingMessage> {
+    pub fn view(&self, font_size: u32) -> Element<'_, StreamingMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
         // Video packets info
         let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
@@ -842,7 +845,7 @@ impl VideoStreaming {
                         "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
                         VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
                     ))
-                    .size(10),
+                    .size(fs.tiny),
                 ]
                 .spacing(5)
                 .align_x(iced::Alignment::Center)
@@ -855,19 +858,19 @@ impl VideoStreaming {
                     if let Some(frame) = &*frame_guard {
                         container(
                             column![
-                                text("RECEIVING FRAMES").size(16),
+                                text("RECEIVING FRAMES").size(fs.large + 2),
                                 text(format!(
                                     "{} bytes ({}x{})",
                                     frame.data.len(),
                                     frame.width,
                                     frame.height
                                 ))
-                                .size(12),
+                                .size(fs.normal),
                                 text(format!(
                                     "Video: {} | Audio: {}",
                                     video_packets, audio_packets
                                 ))
-                                .size(12),
+                                .size(fs.normal),
                             ]
                             .spacing(5)
                             .align_x(iced::Alignment::Center),
@@ -880,12 +883,12 @@ impl VideoStreaming {
                     } else {
                         container(
                             column![
-                                text("Waiting for frames...").size(14),
+                                text("Waiting for frames...").size(fs.large),
                                 text(format!(
                                     "Video: {} | Audio: {}",
                                     video_packets, audio_packets
                                 ))
-                                .size(12),
+                                .size(fs.normal),
                             ]
                             .spacing(5)
                             .align_x(iced::Alignment::Center),
@@ -897,7 +900,7 @@ impl VideoStreaming {
                         .into()
                     }
                 } else {
-                    container(text("Waiting for frames...").size(14))
+                    container(text("Waiting for frames...").size(fs.large))
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .center_x(Length::Fill)
@@ -917,11 +920,11 @@ impl VideoStreaming {
 
             container(
                 column![
-                    text("VIDEO STREAM INACTIVE").size(16),
+                    text("VIDEO STREAM INACTIVE").size(fs.large + 2),
                     Space::new().height(10),
-                    text(status_info.clone()).size(11),
+                    text(status_info.clone()).size(fs.small),
                     Space::new().height(5),
-                    text("Click START to begin streaming").size(11),
+                    text("Click START to begin streaming").size(fs.small),
                 ]
                 .align_x(iced::Alignment::Center),
             )
@@ -936,10 +939,10 @@ impl VideoStreaming {
 
         // Mode selection
         let mode_section = column![
-            text("Stream Mode").size(12),
+            text("Stream Mode").size(fs.normal),
             row![
                 tooltip(
-                    button(text("Unicast").size(11))
+                    button(text("Unicast").size(fs.small))
                         .on_press(StreamingMessage::StreamModeChanged(StreamMode::Unicast))
                         .padding([4, 8])
                         .style(if self.stream_mode == StreamMode::Unicast {
@@ -952,7 +955,7 @@ impl VideoStreaming {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Multicast").size(11))
+                    button(text("Multicast").size(fs.small))
                         .on_press(StreamingMessage::StreamModeChanged(StreamMode::Multicast))
                         .padding([4, 8])
                         .style(if self.stream_mode == StreamMode::Multicast {
@@ -968,12 +971,12 @@ impl VideoStreaming {
             .spacing(5),
             Space::new().height(5),
             row![
-                text("Port:").size(11),
+                text("Port:").size(fs.small),
                 tooltip(
                     text_input("11000", &self.listen_port)
                         .on_input(StreamingMessage::PortChanged)
                         .width(Length::Fixed(70.0))
-                        .size(11),
+                        .size(fs.small),
                     "Video port (audio uses port+1)",
                     tooltip::Position::Bottom,
                 )
@@ -986,10 +989,10 @@ impl VideoStreaming {
 
         // Scale mode selection
         let scale_section = column![
-            text("Video Scale").size(12),
+            text("Video Scale").size(fs.normal),
             row![
                 tooltip(
-                    button(text("2x").size(10))
+                    button(text("2x").size(fs.tiny))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Int2x {
@@ -1002,7 +1005,7 @@ impl VideoStreaming {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("3x").size(10))
+                    button(text("3x").size(fs.tiny))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int3x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Int3x {
@@ -1015,7 +1018,7 @@ impl VideoStreaming {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("Smooth").size(10))
+                    button(text("Smooth").size(fs.tiny))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scale2x {
@@ -1031,7 +1034,7 @@ impl VideoStreaming {
             .spacing(3),
             row![
                 tooltip(
-                    button(text("Scanlines").size(10))
+                    button(text("Scanlines").size(fs.tiny))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::Scanlines {
@@ -1044,7 +1047,7 @@ impl VideoStreaming {
                 )
                 .style(container::bordered_box),
                 tooltip(
-                    button(text("CRT").size(10))
+                    button(text("CRT").size(fs.tiny))
                         .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::CRT))
                         .padding([4, 6])
                         .style(if self.scale_mode == ScaleMode::CRT {
@@ -1064,7 +1067,7 @@ impl VideoStreaming {
                      // without streaming (REST API capture via screenshot_api module).
         let screenshot_button = {
             let can_screenshot = self.is_streaming || self.ultimate_host.is_some();
-            let btn = button(text("📸").size(11)).padding([6, 10]);
+            let btn = button(text("📸").size(fs.small)).padding([6, 10]);
             if can_screenshot {
                 btn.on_press(StreamingMessage::TakeScreenshot)
             } else {
@@ -1081,7 +1084,7 @@ impl VideoStreaming {
                     } else {
                         "⌨️ Disabled"
                     })
-                    .size(11),
+                    .size(fs.small),
                 )
                 .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
                 .padding([6, 10])
@@ -1096,7 +1099,7 @@ impl VideoStreaming {
             .style(container::bordered_box)
         } else {
             tooltip(
-                button(text("⌨ Disabled").size(11)).padding([6, 10]),
+                button(text("⌨ Disabled").size(fs.small)).padding([6, 10]),
                 "Start streaming first",
                 tooltip::Position::Bottom,
             )
@@ -1105,7 +1108,7 @@ impl VideoStreaming {
 
         // Separate window button
         let separate_window_button = tooltip(
-            button(text("⧉").size(11))
+            button(text("⧉").size(fs.small))
                 .on_press(StreamingMessage::OpenInSeparateWindow)
                 .padding([6, 10]),
             "Open video in separate window",
@@ -1114,11 +1117,11 @@ impl VideoStreaming {
         .style(container::bordered_box);
 
         let stream_controls = column![
-            text("Stream Control").size(12),
+            text("Stream Control").size(fs.normal),
             row![
                 if self.is_streaming {
                     tooltip(
-                        button(text("■ STOP").size(11))
+                        button(text("■ STOP").size(fs.small))
                             .on_press(StreamingMessage::StopStream)
                             .padding([6, 14]),
                         "Stop video stream",
@@ -1127,7 +1130,7 @@ impl VideoStreaming {
                     .style(container::bordered_box)
                 } else {
                     tooltip(
-                        button(text("▶ LIVE").size(11))
+                        button(text("▶ LIVE").size(fs.small))
                             .on_press(StreamingMessage::StartStream)
                             .padding([6, 14]),
                         "Start video stream",
@@ -1155,7 +1158,7 @@ impl VideoStreaming {
                         .label("🔊 Audio")
                         .on_toggle(StreamingMessage::AudioToggled)
                         .size(16)
-                        .text_size(11),
+                        .text_size(fs.small),
                     "Enable audio streaming (port+1)",
                     tooltip::Position::Bottom,
                 )
@@ -1174,22 +1177,22 @@ impl VideoStreaming {
             .iter()
             .rev()
             .take(10)
-            .map(|cmd| text(cmd).size(10).into())
+            .map(|cmd| text(cmd).size(fs.tiny).into())
             .collect();
 
         let command_section = column![
-            text("COMMAND PROMPT").size(12),
+            text("COMMAND PROMPT").size(fs.normal),
             row![
-                text("C64>").size(11),
+                text("C64>").size(fs.small),
                 text_input("Enter BASIC command...", &self.command_input)
                     .on_input(StreamingMessage::CommandInputChanged)
                     .on_submit(StreamingMessage::SendCommand)
                     .width(Length::Fill)
-                    .size(11),
+                    .size(fs.small),
             ]
             .spacing(5)
             .align_y(iced::Alignment::Center),
-            button(text("Send").size(11))
+            button(text("Send").size(fs.small))
                 .on_press(StreamingMessage::SendCommand)
                 .padding([4, 12])
                 .width(Length::Fill),
@@ -1229,7 +1232,7 @@ impl VideoStreaming {
         .height(Length::Fill);
 
         column![
-            text("VIC VIDEO STREAM").size(20),
+            text("VIC VIDEO STREAM").size(fs.header + 2),
             rule::horizontal(1),
             main_content,
         ]

@@ -1399,7 +1399,7 @@ impl MemoryEditor {
     // ── Controls bar ─────────────────────────────────────────────
 
     fn view_controls(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let sf = font_size.saturating_sub(2); // small font
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         // Address space picker
         let space_picker = pick_list(
@@ -1407,7 +1407,7 @@ impl MemoryEditor {
             Some(self.address_space),
             MemoryEditorMessage::AddressSpaceChanged,
         )
-        .text_size(sf)
+        .text_size(fs.small)
         .width(Length::Fixed(90.0));
 
         // Address input
@@ -1417,27 +1417,27 @@ impl MemoryEditor {
             "Address: $"
         };
         let address_row = row![
-            text(addr_prefix).size(sf),
+            text(addr_prefix).size(fs.small),
             text_input("0400", &self.address_input)
                 .on_input(MemoryEditorMessage::AddressInputChanged)
                 .width(Length::Fixed(70.0))
-                .size(sf),
+                .size(fs.small),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
         let length_row = row![
-            text("Length:").size(sf),
+            text("Length:").size(fs.small),
             text_input("256", &self.length_input)
                 .on_input(MemoryEditorMessage::LengthInputChanged)
                 .width(Length::Fixed(60.0))
-                .size(sf),
-            text("bytes").size(sf),
+                .size(fs.small),
+            text("bytes").size(fs.small),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
-        let read_btn_inner = button(text("Read").size(sf))
+        let read_btn_inner = button(text("Read").size(fs.small))
             .on_press_maybe(
                 if self.is_loading || self.address_space == AddressSpace::Reu {
                     None
@@ -1451,7 +1451,7 @@ impl MemoryEditor {
         {
             tooltip(
                 read_btn_inner,
-                container(text("REU read not supported by firmware").size(sf))
+                container(text("REU read not supported by firmware").size(fs.small))
                     .padding(6)
                     .style(tooltip_style),
                 tooltip::Position::Bottom,
@@ -1468,7 +1468,7 @@ impl MemoryEditor {
         )
         .placeholder("Quick Locations…")
         .width(Length::Fixed(200.0))
-        .text_size(sf);
+        .text_size(fs.small);
 
         let first_row = row![
             space_picker,
@@ -1486,13 +1486,13 @@ impl MemoryEditor {
 
         // Search + display mode row
         let search_row = row![
-            text("Search:").size(sf),
+            text("Search:").size(fs.small),
             text_input("Hex or ASCII", &self.search_input)
                 .on_input(MemoryEditorMessage::SearchInputChanged)
                 .on_submit(MemoryEditorMessage::PerformSearch)
                 .width(Length::Fixed(150.0))
-                .size(sf),
-            button(text("Find").size(sf))
+                .size(fs.small),
+            button(text("Find").size(fs.small))
                 .on_press_maybe(
                     if self.search_input.is_empty() || self.memory_data.is_none() {
                         None
@@ -1501,11 +1501,11 @@ impl MemoryEditor {
                     }
                 )
                 .padding([5, 10]),
-            button(text("Clear").size(sf))
+            button(text("Clear").size(fs.small))
                 .on_press(MemoryEditorMessage::ClearSearch)
                 .padding([5, 10]),
             Space::new().width(Length::Fixed(20.0)),
-            text("Display:").size(sf),
+            text("Display:").size(fs.small),
             pick_list(
                 vec![
                     DisplayMode::Hex,
@@ -1516,7 +1516,7 @@ impl MemoryEditor {
                 Some(self.display_mode),
                 MemoryEditorMessage::DisplayModeChanged,
             )
-            .text_size(sf)
+            .text_size(fs.small)
             .width(Length::Fixed(80.0)),
         ]
         .spacing(10)
@@ -1524,12 +1524,12 @@ impl MemoryEditor {
 
         // Fill + save/load row
         let fill_row = row![
-            text("Fill: $").size(sf),
+            text("Fill: $").size(fs.small),
             text_input("00", &self.fill_value_input)
                 .on_input(MemoryEditorMessage::FillValueChanged)
                 .width(Length::Fixed(40.0))
-                .size(sf),
-            button(text("Fill Range").size(sf))
+                .size(fs.small),
+            button(text("Fill Range").size(fs.small))
                 .on_press_maybe(if self.is_loading {
                     None
                 } else {
@@ -1537,14 +1537,14 @@ impl MemoryEditor {
                 })
                 .padding([5, 10]),
             Space::new().width(Length::Fixed(15.0)),
-            button(text("Save Dump…").size(sf))
+            button(text("Save Dump…").size(fs.small))
                 .on_press_maybe(if self.is_loading || self.memory_data.is_none() {
                     None
                 } else {
                     Some(MemoryEditorMessage::SaveDump)
                 })
                 .padding([5, 10]),
-            button(text("Load Dump…").size(sf))
+            button(text("Load Dump…").size(fs.small))
                 .on_press_maybe(if self.is_loading {
                     None
                 } else {
@@ -1557,14 +1557,14 @@ impl MemoryEditor {
 
         // Undo / Redo / Watch row
         let undo_row = row![
-            button(text("⟲ Undo").size(sf))
+            button(text("⟲ Undo").size(fs.small))
                 .on_press_maybe(if self.undo_stack.is_empty() {
                     None
                 } else {
                     Some(MemoryEditorMessage::Undo)
                 })
                 .padding([5, 10]),
-            button(text("⟳ Redo").size(sf))
+            button(text("⟳ Redo").size(fs.small))
                 .on_press_maybe(if self.redo_stack.is_empty() {
                     None
                 } else {
@@ -1576,7 +1576,7 @@ impl MemoryEditor {
                 self.undo_stack.len(),
                 self.redo_stack.len()
             ))
-            .size(sf),
+            .size(fs.small),
             Space::new().width(Length::Fixed(20.0)),
             button(
                 text(if self.watch_active {
@@ -1584,7 +1584,7 @@ impl MemoryEditor {
                 } else {
                     "👁 Watch"
                 })
-                .size(sf)
+                .size(fs.small)
             )
             .on_press_maybe(if self.memory_data.is_none() {
                 None
@@ -1599,7 +1599,7 @@ impl MemoryEditor {
             .padding([5, 10]),
             Space::new().width(Length::Fixed(20.0)),
             // Raw-socket DMA tools
-            button(text("Write ROM…").size(sf))
+            button(text("Write ROM…").size(fs.small))
                 .on_press(MemoryEditorMessage::KernalWriteClicked)
                 .padding([5, 10]),
             button(
@@ -1608,7 +1608,7 @@ impl MemoryEditor {
                 } else {
                     "Flash Info"
                 })
-                .size(sf)
+                .size(fs.small)
             )
             .on_press(MemoryEditorMessage::ReadFlashInfo)
             .padding([5, 10]),
@@ -1617,7 +1617,7 @@ impl MemoryEditor {
         .align_y(iced::Alignment::Center);
 
         // Bookmark row
-        let bm_row = self.view_bookmark_bar(sf);
+        let bm_row = self.view_bookmark_bar(fs.small);
 
         // Status / write-to-device row
         let status_row: Element<'_, MemoryEditorMessage> = if self.pending_load_data.is_some() {
@@ -1630,10 +1630,10 @@ impl MemoryEditor {
                         .unwrap_or(0),
                     self.current_address
                 ))
-                .size(sf)
+                .size(fs.small)
                 .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
                 Space::new().width(Length::Fixed(10.0)),
-                button(text("Write to Device").size(sf))
+                button(text("Write to Device").size(fs.small))
                     .on_press_maybe(if self.is_loading {
                         None
                     } else {
@@ -1649,9 +1649,9 @@ impl MemoryEditor {
         } else {
             row![
                 if let Some(msg) = &self.status_message {
-                    text(msg).size(sf)
+                    text(msg).size(fs.small)
                 } else {
-                    text("").size(sf)
+                    text("").size(fs.small)
                 },
                 Space::new().width(Length::Fill),
             ]
@@ -1707,8 +1707,7 @@ impl MemoryEditor {
     // ── Memory hex display ───────────────────────────────────────
 
     fn view_memory_display(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let sf = font_size.saturating_sub(2);
-        let mf = font_size.saturating_sub(3);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         let Some(data) = &self.memory_data else {
             return Space::new().width(Length::Fill).height(Length::Fill).into();
@@ -1722,12 +1721,12 @@ impl MemoryEditor {
                 data.len(),
                 watch_label
             ))
-            .size(sf),
+            .size(fs.small),
             Space::new().width(Length::Fill),
-            button(text("Refresh").size(sf))
+            button(text("Refresh").size(fs.small))
                 .on_press(MemoryEditorMessage::RefreshMemory)
                 .padding([5, 10]),
-            button(text("Close").size(sf))
+            button(text("Close").size(fs.small))
                 .on_press(MemoryEditorMessage::ClearMemoryView)
                 .padding([5, 10]),
         ]
@@ -1737,13 +1736,17 @@ impl MemoryEditor {
         let mut rows: Vec<Element<'_, MemoryEditorMessage>> = Vec::new();
 
         // Column headers
-        let mut hdr_row = Row::new().push(text("ADDR").size(mf).width(Length::Fixed(50.0)));
+        let mut hdr_row = Row::new().push(text("ADDR").size(fs.tiny).width(Length::Fixed(50.0)));
         for i in 0..16u8 {
-            hdr_row = hdr_row.push(text(format!("{:X}", i)).size(mf).width(Length::Fixed(24.0)));
+            hdr_row = hdr_row.push(
+                text(format!("{:X}", i))
+                    .size(fs.tiny)
+                    .width(Length::Fixed(24.0)),
+            );
         }
         hdr_row = hdr_row
             .push(Space::new().width(Length::Fixed(10.0)))
-            .push(text("ASCII").size(mf));
+            .push(text("ASCII").size(fs.tiny));
         rows.push(hdr_row.spacing(2).into());
 
         // Data rows
@@ -1753,7 +1756,7 @@ impl MemoryEditor {
 
             let mut data_row = Row::new().push(
                 text(format!("{:04X}", row_addr))
-                    .size(mf)
+                    .size(fs.tiny)
                     .width(Length::Fixed(50.0))
                     .color(iced::Color::from_rgb(0.4, 0.5, 0.9)),
             );
@@ -1788,15 +1791,23 @@ impl MemoryEditor {
                 };
 
                 let byte_widget = if is_editing {
-                    container(text(byte_text.clone()).size(mf).color(iced::Color::BLACK))
-                        .style(editing_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(fs.tiny)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(editing_style)
+                    .width(Length::Fixed(width))
                 } else if is_match {
-                    container(text(byte_text.clone()).size(mf).color(iced::Color::BLACK))
-                        .style(highlight_style)
-                        .width(Length::Fixed(width))
+                    container(
+                        text(byte_text.clone())
+                            .size(fs.tiny)
+                            .color(iced::Color::BLACK),
+                    )
+                    .style(highlight_style)
+                    .width(Length::Fixed(width))
                 } else {
-                    container(text(byte_text.clone()).size(mf)).width(Length::Fixed(width))
+                    container(text(byte_text.clone()).size(fs.tiny)).width(Length::Fixed(width))
                 };
 
                 let tip = format!(
@@ -1815,7 +1826,7 @@ impl MemoryEditor {
                         .on_press(MemoryEditorMessage::ByteClicked(offset))
                         .padding(0)
                         .style(button::text),
-                    container(text(tip).size(sf))
+                    container(text(tip).size(fs.small))
                         .padding(6)
                         .style(tooltip_style),
                     tooltip::Position::Bottom,
@@ -1833,7 +1844,7 @@ impl MemoryEditor {
                 .collect();
             data_row = data_row.push(
                 text(ascii)
-                    .size(mf)
+                    .size(fs.tiny)
                     .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
             );
 
@@ -1853,7 +1864,7 @@ impl MemoryEditor {
                     text(format!("Edit byte at ${:04X}", address)).size(font_size),
                     rule::horizontal(1),
                     row![
-                        text("Current:").size(sf),
+                        text("Current:").size(fs.small),
                         text(format!(
                             "${:02X} ({}) '{}'",
                             edit.original_value,
@@ -1864,23 +1875,23 @@ impl MemoryEditor {
                                 '.'
                             }
                         ))
-                        .size(sf),
+                        .size(fs.small),
                     ]
                     .spacing(10),
                     row![
-                        text("New value (0–255):").size(sf),
+                        text("New value (0–255):").size(fs.small),
                         text_input("0", &edit.new_value_input)
                             .on_input(MemoryEditorMessage::WriteByteValueChanged)
                             .on_submit(MemoryEditorMessage::WriteByteConfirm)
                             .width(Length::Fixed(80.0))
-                            .size(sf),
+                            .size(fs.small),
                     ]
                     .spacing(10),
                     row![
-                        button(text("Write").size(sf))
+                        button(text("Write").size(fs.small))
                             .on_press(MemoryEditorMessage::WriteByteConfirm)
                             .padding([5, 15]),
-                        button(text("Cancel").size(sf))
+                        button(text("Cancel").size(fs.small))
                             .on_press(MemoryEditorMessage::WriteByteCancel)
                             .padding([5, 15]),
                     ]
@@ -1916,8 +1927,7 @@ impl MemoryEditor {
     // ── Flash inspector view ──────────────────────────────────────
 
     fn view_flash_inspector(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let sf = font_size.saturating_sub(2);
-        let mf = font_size.saturating_sub(3);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
         let Some(fi) = &self.flash_info else {
             return Space::new().into();
@@ -1930,9 +1940,9 @@ impl MemoryEditor {
                 fi.page_size,
                 (fi.page_count as u64 * fi.page_size as u64) / 1024
             ))
-            .size(sf),
+            .size(fs.small),
             Space::new().width(Length::Fill),
-            button(text("Close Flash").size(sf))
+            button(text("Close Flash").size(fs.small))
                 .on_press(MemoryEditorMessage::ClearMemoryView)
                 .padding([5, 10]),
         ]
@@ -1940,12 +1950,12 @@ impl MemoryEditor {
         .align_y(iced::Alignment::Center);
 
         let page_controls = row![
-            text("Page:").size(sf),
+            text("Page:").size(fs.small),
             text_input("0", &self.flash_page_input)
                 .on_input(MemoryEditorMessage::FlashPageChanged)
                 .width(Length::Fixed(60.0))
-                .size(sf),
-            button(text("Read Page").size(sf))
+                .size(fs.small),
+            button(text("Read Page").size(fs.small))
                 .on_press_maybe(
                     self.flash_page_input
                         .parse::<u32>()
@@ -1967,14 +1977,14 @@ impl MemoryEditor {
                         let row_addr = (ri * 16) as u32;
                         let mut dr = Row::new().push(
                             text(format!("{:06X}", row_addr))
-                                .size(mf)
+                                .size(fs.tiny)
                                 .width(Length::Fixed(60.0))
                                 .color(iced::Color::from_rgb(0.5, 0.6, 0.9)),
                         );
                         for &b in chunk {
                             dr = dr.push(
                                 text(format!("{:02X}", b))
-                                    .size(mf)
+                                    .size(fs.tiny)
                                     .width(Length::Fixed(24.0)),
                             );
                         }
@@ -1985,11 +1995,11 @@ impl MemoryEditor {
                         .into()
                 } else {
                     text(format!("Page {} not yet fetched — click 'Read Page'", pg))
-                        .size(sf)
+                        .size(fs.small)
                         .into()
                 }
             } else {
-                text("Enter a page number above").size(sf).into()
+                text("Enter a page number above").size(fs.small).into()
             };
 
         column![
@@ -2006,11 +2016,11 @@ impl MemoryEditor {
     // ── Quick locations grid ──────────────────────────────────────
 
     fn view_quick_locations(&self, font_size: u32) -> Element<'_, MemoryEditorMessage> {
-        let sf = font_size.saturating_sub(2);
+        let fs = crate::styles::FontSizes::from_base(font_size);
 
-        let title = text("Common C64 Memory Locations").size(font_size + 2);
+        let title = text("Common C64 Memory Locations").size(fs.large);
         let subtitle = text("Click a location to view its contents")
-            .size(sf)
+            .size(fs.small)
             .color(iced::Color::from_rgb(0.6, 0.6, 0.6));
 
         let mut rows: Vec<Element<'_, MemoryEditorMessage>> = Vec::new();
@@ -2020,16 +2030,16 @@ impl MemoryEditor {
                 let card = button(
                     container(
                         column![
-                            text(location.name).size(sf).color(iced::Color::BLACK),
+                            text(location.name).size(fs.small).color(iced::Color::BLACK),
                             text(location.description)
-                                .size(sf.saturating_sub(2))
+                                .size(fs.tiny)
                                 .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             row![
                                 text(format!("${:04X}", location.address))
-                                    .size(sf)
+                                    .size(fs.small)
                                     .color(iced::Color::from_rgb(0.2, 0.3, 0.7)),
                                 text(format!("{} bytes", location.length))
-                                    .size(sf.saturating_sub(2))
+                                    .size(fs.tiny)
                                     .color(iced::Color::from_rgb(0.3, 0.3, 0.3)),
                             ]
                             .spacing(10),
