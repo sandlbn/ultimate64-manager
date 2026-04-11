@@ -41,6 +41,12 @@ pub struct ProfileEntry {
     pub screenshot_path: Option<PathBuf>,
 }
 
+/// Stored baseline data: config values + optional schema (valid values, ranges).
+pub struct StoredBaseline {
+    pub config: crate::device_profile::ConfigTree,
+    pub schema: Option<crate::device_profile::ConfigSchema>,
+}
+
 /// Manages a git-backed repository of device profiles.
 pub struct ProfileRepo {
     /// Root path of the repository
@@ -271,11 +277,12 @@ impl ProfileRepo {
         Ok(())
     }
 
-    /// Save a baseline configuration.
+    /// Save a baseline configuration with optional schema (valid values, ranges).
     pub fn save_baseline(
         &mut self,
         name: &str,
         config: &crate::device_profile::ConfigTree,
+        schema: Option<&crate::device_profile::ConfigSchema>,
     ) -> Result<PathBuf, String> {
         self.ensure_initialized()?;
 
@@ -287,15 +294,18 @@ impl ProfileRepo {
         let path = baselines_dir.join(&filename);
 
         #[derive(serde::Serialize)]
-        struct Baseline {
+        struct BaselineFile<'a> {
             name: String,
-            config: crate::device_profile::ConfigTree,
+            config: &'a crate::device_profile::ConfigTree,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            schema: Option<&'a crate::device_profile::ConfigSchema>,
             saved_at: String,
         }
 
-        let baseline = Baseline {
+        let baseline = BaselineFile {
             name: name.to_string(),
-            config: config.clone(),
+            config,
+            schema,
             saved_at: chrono::Utc::now().to_rfc3339(),
         };
 
@@ -307,8 +317,8 @@ impl ProfileRepo {
         Ok(path)
     }
 
-    /// Load a baseline configuration.
-    pub fn load_baseline(&self, name: &str) -> Result<crate::device_profile::ConfigTree, String> {
+    /// Load a baseline configuration + schema.
+    pub fn load_baseline(&self, name: &str) -> Result<StoredBaseline, String> {
         let filename = format!("{}.json", crate::device_profile::slugify(name));
         let path = self.root.join("baselines").join(&filename);
 
@@ -316,13 +326,18 @@ impl ProfileRepo {
             .map_err(|e| format!("Failed to read baseline: {}", e))?;
 
         #[derive(serde::Deserialize)]
-        struct Baseline {
+        struct BaselineFile {
             config: crate::device_profile::ConfigTree,
+            #[serde(default)]
+            schema: Option<crate::device_profile::ConfigSchema>,
         }
 
-        let baseline: Baseline =
+        let baseline: BaselineFile =
             serde_json::from_str(&json).map_err(|e| format!("Failed to parse baseline: {}", e))?;
-        Ok(baseline.config)
+        Ok(StoredBaseline {
+            config: baseline.config,
+            schema: baseline.schema,
+        })
     }
 
     /// List available baselines.

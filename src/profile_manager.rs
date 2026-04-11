@@ -25,6 +25,42 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// ─── Remote file picker state (for path-like config fields) ──────
+/// Why: some config keys (e.g. "REU Preload Image") point to paths on the
+/// device filesystem. The user shouldn't have to type them manually — the
+/// picker lets them FTP-browse the device and pick a file.
+pub struct RemotePickerState {
+    /// The config category the picker is writing into (e.g. "C64 and Cartridge Settings")
+    pub target_category: String,
+    /// The config key being edited (e.g. "REU Preload Image")
+    pub target_key: String,
+    /// Current FTP path being browsed
+    pub current_path: String,
+    /// Manual path input (for jumping to hidden mount points like /USB0/)
+    pub path_input: String,
+    /// File listing for the current path
+    pub entries: Vec<crate::ftp_ops::RemoteFileEntry>,
+    /// Loading state
+    pub is_loading: bool,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+// ─── Popular categories (quick-pick shortcuts for per-game profiles) ──────
+// These are common Ultimate64 configuration categories that users typically
+// want to tweak for specific games/demos. Ordered by typical use frequency.
+const POPULAR_CATEGORIES: &[&str] = &[
+    "U64 Specific Settings",      // PAL/NTSC, CPU speed, badline timing
+    "SID Sockets Configuration",  // Enable/disable SID chips
+    "UltiSID Configuration",      // SID filter curves, resonance
+    "SID Addressing",             // SID chip addresses
+    "Audio Mixer",                // Volume levels
+    "Drive A Settings",           // Drive A enable/type
+    "Drive B Settings",           // Drive B enable/type
+    "C64 and Cartridge Settings", // REU, cartridge prefs
+    "LED Strip Settings",         // Visual effects
+];
+
 // ─── Messages ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -62,9 +98,34 @@ pub enum ProfileManagerMessage {
 
     // Profile editing — config (reuses config editor widget patterns)
     SelectConfigCategory(String),
+    /// Deselect the current config category to return to the category picker
+    DeselectConfigCategory,
     ConfigValueChanged(String, String, serde_json::Value),
     AddCategory(String),
+    /// Add a category to the profile (empty — user picks keys to override)
+    AddCategoryFromSchema(String),
+    /// Add a single key within a category, using its baseline/default value
+    AddKeyFromSchema(String, String),
+    /// Add every key from the baseline for a category (Add All shortcut)
+    AddAllKeysFromSchema(String),
+
+    // ── Remote FTP picker (for path-like config fields) ──
+    /// Open the picker for a specific category/key, starting at a default path
+    OpenRemotePicker(String, String, String),
+    /// Navigate to a different path within the picker
+    RemotePickerNavigate(String),
+    /// Manual path entry changed
+    RemotePickerPathInputChanged(String),
+    /// Submit manual path (Enter pressed or Go button)
+    RemotePickerGoToPath,
+    /// Received a file listing
+    RemotePickerListed(Result<(String, Vec<crate::ftp_ops::RemoteFileEntry>), String>),
+    /// User picked a file — write its path into the config field and close
+    RemotePickerSelect(String),
+    /// Close the picker without selecting
+    RemotePickerClose,
     RemoveCategory(String),
+    RemoveKey(String, String),
     NewCategoryInput(String),
     SearchChanged(String),
 
@@ -110,11 +171,14 @@ pub enum ProfileManagerMessage {
 
     // Screenshot capture from streaming frame buffer
     CaptureScreenshot,
+    /// Open a file dialog to pick an image from disk (PNG/JPG/etc.)
+    PickImage,
+    /// The user picked an image file — decode and store as pending screenshot
+    PickImageSelected(Option<PathBuf>),
 
     // Baseline — captured once from device, stored in repo, loaded at startup
     SnapshotBaseline,
-    BaselineSnapshotted(Result<(ConfigTree, String), String>),
-    BaselineLoadedFromDisk(Option<ConfigTree>),
+    BaselineSnapshotted(Result<(ConfigTree, crate::device_profile::ConfigSchema), String>),
     ToggleDiffView,
 
     // Git operations
@@ -161,8 +225,16 @@ pub struct ProfileManager {
     // Captured screenshot PNG bytes (held in memory until profile is saved)
     pending_screenshot: Option<Vec<u8>>,
 
+    // Where the current profile was loaded from, so we can delete the old
+    // directory on rename (change of name -> change of id -> new dir).
+    original_profile_dir: Option<PathBuf>,
+
+    // Remote file picker popup state
+    remote_picker: Option<RemotePickerState>,
+
     // Baseline for diff view
     baseline_config: Option<ConfigTree>,
+    config_schema: Option<crate::device_profile::ConfigSchema>,
     show_diff: bool,
 
     // UI state
@@ -178,26 +250,32 @@ impl ProfileManager {
         let repo_root = ProfileRepo::default_path().unwrap_or_else(|| PathBuf::from("."));
         let repo_initialized = repo_root.join(".git").is_dir();
 
-        // Try to load stored baseline from repo at startup
-        let baseline_config = if repo_initialized {
+        // Try to load stored baseline + schema from repo at startup
+        let (baseline_config, config_schema) = if repo_initialized {
             let repo = ProfileRepo::new(repo_root.clone());
             match repo.load_baseline("default") {
-                Ok(config) => {
-                    let count: usize = config.values().map(|v| v.len()).sum();
+                Ok(stored) => {
+                    let count: usize = stored.config.values().map(|v| v.len()).sum();
+                    let schema_count: usize = stored
+                        .schema
+                        .as_ref()
+                        .map(|s| s.values().map(|v| v.len()).sum())
+                        .unwrap_or(0);
                     log::info!(
-                        "Loaded stored baseline: {} categories, {} settings",
-                        config.len(),
-                        count
+                        "Loaded stored baseline: {} categories, {} settings, {} schema entries",
+                        stored.config.len(),
+                        count,
+                        schema_count,
                     );
-                    Some(config)
+                    (Some(stored.config), stored.schema)
                 }
                 Err(_) => {
                     log::info!("No stored baseline found — snapshot device to create one");
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let has_baseline = baseline_config.is_some();
@@ -233,7 +311,10 @@ impl ProfileManager {
             tags_input: String::new(),
             streaming_frame: None,
             pending_screenshot: None,
+            original_profile_dir: None,
+            remote_picker: None,
             baseline_config,
+            config_schema,
             show_diff: false,
             view_mode: ViewMode::ProfileList,
             is_loading: false,
@@ -335,6 +416,8 @@ impl ProfileManager {
                 self.current_profile = Some(profile);
                 self.tags_input.clear();
                 self.save_category = "uncategorized".to_string();
+                self.original_profile_dir = None; // brand new — nothing to replace
+                self.pending_screenshot = None;
                 self.is_dirty = true;
                 self.view_mode = ViewMode::ProfileEditor;
                 self.status_message = Some("New empty profile created".to_string());
@@ -346,6 +429,8 @@ impl ProfileManager {
                     let orig_name = entry.name.clone();
                     // Inherit the category from the source profile
                     self.save_category = entry.category.clone();
+                    // Clone is a brand new profile — don't treat it as renaming the original
+                    self.original_profile_dir = None;
                     self.is_loading = true;
                     self.status_message = Some(format!("Cloning '{}'...", orig_name));
                     Task::perform(profile_repo::load_profile_async(path), move |result| {
@@ -524,6 +609,8 @@ impl ProfileManager {
                     let path = entry.path.clone();
                     // Remember the category so Save puts it back in the right place
                     self.save_category = entry.category.clone();
+                    // Remember the original directory so Save can clean up on rename
+                    self.original_profile_dir = path.parent().map(|p| p.to_path_buf());
                     self.is_loading = true;
                     self.status_message = Some(format!("Loading '{}'...", entry.name));
                     Task::perform(
@@ -609,6 +696,11 @@ impl ProfileManager {
                 self.search_filter.clear();
                 Task::none()
             }
+            ProfileManagerMessage::DeselectConfigCategory => {
+                self.selected_config_category = None;
+                self.search_filter.clear();
+                Task::none()
+            }
             ProfileManagerMessage::ConfigValueChanged(category, key, value) => {
                 if let Some(profile) = &mut self.current_profile {
                     profile
@@ -627,10 +719,170 @@ impl ProfileManager {
             ProfileManagerMessage::AddCategory(name) => {
                 if !name.is_empty() {
                     if let Some(profile) = &mut self.current_profile {
-                        profile.config.entry(name).or_default();
+                        profile.config.entry(name.clone()).or_default();
                         self.is_dirty = true;
+                        self.selected_config_category = Some(name);
                     }
                     self.new_category_input.clear();
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::AddCategoryFromSchema(name) => {
+                // Add category as empty — user will pick individual keys to override
+                if let Some(profile) = &mut self.current_profile {
+                    profile.config.entry(name.clone()).or_default();
+                    self.is_dirty = true;
+                    self.selected_config_category = Some(name);
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::AddAllKeysFromSchema(category) => {
+                // "Add all" shortcut: copy every baseline key in this category
+                if let Some(profile) = &mut self.current_profile {
+                    let entry = profile.config.entry(category.clone()).or_default();
+                    if let Some(baseline) = &self.baseline_config {
+                        if let Some(base_items) = baseline.get(&category) {
+                            for (k, v) in base_items {
+                                entry.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    self.is_dirty = true;
+                }
+                Task::none()
+            }
+
+            // ── Remote FTP picker ──
+            ProfileManagerMessage::OpenRemotePicker(category, key, start_path) => {
+                let host = match host_url.clone() {
+                    Some(h) => h,
+                    None => {
+                        self.error_message = Some("Not connected to device".to_string());
+                        return Task::none();
+                    }
+                };
+                // Resolve starting directory: if start_path is a file path, browse its parent
+                let initial = if start_path.is_empty() {
+                    "/".to_string()
+                } else if start_path.ends_with('/') {
+                    start_path
+                } else {
+                    // Treat as file path — browse its parent directory
+                    match start_path.rsplit_once('/') {
+                        Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+                        _ => "/".to_string(),
+                    }
+                };
+                self.remote_picker = Some(RemotePickerState {
+                    target_category: category,
+                    target_key: key,
+                    current_path: initial.clone(),
+                    path_input: initial.clone(),
+                    entries: Vec::new(),
+                    is_loading: true,
+                    error: None,
+                });
+                let bare = crate::profile_api::bare_host_pub(&host).to_string();
+                let path = initial.clone();
+                Task::perform(
+                    async move {
+                        let entries =
+                            crate::ftp_ops::fetch_files_ftp(bare, path.clone(), password).await?;
+                        Ok::<_, String>((path, entries))
+                    },
+                    ProfileManagerMessage::RemotePickerListed,
+                )
+            }
+            ProfileManagerMessage::RemotePickerNavigate(path) => {
+                let host = match host_url.clone() {
+                    Some(h) => h,
+                    None => return Task::none(),
+                };
+                if let Some(picker) = &mut self.remote_picker {
+                    picker.is_loading = true;
+                    picker.current_path = path.clone();
+                    picker.path_input = path.clone();
+                    picker.error = None;
+                }
+                let bare = crate::profile_api::bare_host_pub(&host).to_string();
+                Task::perform(
+                    async move {
+                        let entries =
+                            crate::ftp_ops::fetch_files_ftp(bare, path.clone(), password).await?;
+                        Ok::<_, String>((path, entries))
+                    },
+                    ProfileManagerMessage::RemotePickerListed,
+                )
+            }
+            ProfileManagerMessage::RemotePickerPathInputChanged(input) => {
+                if let Some(picker) = &mut self.remote_picker {
+                    picker.path_input = input;
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::RemotePickerGoToPath => {
+                let path = match &self.remote_picker {
+                    Some(p) => p.path_input.clone(),
+                    None => return Task::none(),
+                };
+                // Route through RemotePickerNavigate so the state is updated consistently
+                return self.update(
+                    ProfileManagerMessage::RemotePickerNavigate(path),
+                    host_url,
+                    password,
+                    connection,
+                );
+            }
+            ProfileManagerMessage::RemotePickerListed(result) => {
+                if let Some(picker) = &mut self.remote_picker {
+                    picker.is_loading = false;
+                    match result {
+                        Ok((path, entries)) => {
+                            picker.current_path = path;
+                            picker.entries = entries;
+                            picker.error = None;
+                        }
+                        Err(e) => {
+                            picker.error = Some(e);
+                            picker.entries.clear();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::RemotePickerSelect(path) => {
+                if let Some(picker) = self.remote_picker.take() {
+                    if let Some(profile) = &mut self.current_profile {
+                        profile
+                            .config
+                            .entry(picker.target_category)
+                            .or_default()
+                            .insert(picker.target_key, serde_json::Value::String(path));
+                        self.is_dirty = true;
+                    }
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::RemotePickerClose => {
+                self.remote_picker = None;
+                Task::none()
+            }
+            ProfileManagerMessage::AddKeyFromSchema(category, key) => {
+                if let Some(profile) = &mut self.current_profile {
+                    // Use the baseline value (captured from the device)
+                    let value = self
+                        .baseline_config
+                        .as_ref()
+                        .and_then(|b| b.get(&category))
+                        .and_then(|c| c.get(&key))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::String(String::new()));
+                    profile
+                        .config
+                        .entry(category)
+                        .or_default()
+                        .insert(key, value);
+                    self.is_dirty = true;
                 }
                 Task::none()
             }
@@ -639,6 +891,15 @@ impl ProfileManager {
                     profile.config.remove(&name);
                     if self.selected_config_category.as_ref() == Some(&name) {
                         self.selected_config_category = None;
+                    }
+                    self.is_dirty = true;
+                }
+                Task::none()
+            }
+            ProfileManagerMessage::RemoveKey(category, key) => {
+                if let Some(profile) = &mut self.current_profile {
+                    if let Some(items) = profile.config.get_mut(&category) {
+                        items.remove(&key);
                     }
                     self.is_dirty = true;
                 }
@@ -767,8 +1028,11 @@ impl ProfileManager {
             ProfileManagerMessage::BrowseCartridge => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
-                        .set_title("Select Cartridge Image")
-                        .add_filter("Cartridge images", &["crt"])
+                        .set_title("Select Cartridge / Program")
+                        .add_filter("Cart / program / music", &["crt", "prg", "sid"])
+                        .add_filter("Cartridge", &["crt"])
+                        .add_filter("Program", &["prg"])
+                        .add_filter("SID music", &["sid"])
                         .add_filter("All files", &["*"])
                         .pick_file()
                         .await
@@ -836,6 +1100,21 @@ impl ProfileManager {
                     let category = self.save_category.clone();
                     let original_cfg = self.original_cfg_content.clone();
                     let screenshot_data = self.pending_screenshot.take();
+                    // If the profile was loaded from an existing directory and
+                    // its id/category changed (rename), we need to delete the
+                    // old directory so we don't leave a stale duplicate.
+                    let old_dir = {
+                        let new_cat = if category.is_empty() {
+                            "uncategorized".to_string()
+                        } else {
+                            category.clone()
+                        };
+                        let new_dir = root.join("profiles").join(&new_cat).join(&profile.id);
+                        self.original_profile_dir
+                            .as_ref()
+                            .filter(|p| **p != new_dir)
+                            .cloned()
+                    };
                     Task::perform(
                         async move {
                             // Save profile
@@ -849,19 +1128,64 @@ impl ProfileManager {
                             .await?;
 
                             // Write pending screenshot if any
+                            let cat = if category.is_empty() {
+                                "uncategorized".to_string()
+                            } else {
+                                category
+                            };
+                            let new_profile_dir =
+                                root.join("profiles").join(&cat).join(&profile.id);
+
                             if let Some(png_bytes) = screenshot_data {
-                                let cat = if category.is_empty() {
-                                    "uncategorized".to_string()
-                                } else {
-                                    category
-                                };
-                                let profile_dir =
-                                    root.join("profiles").join(&cat).join(&profile.id);
-                                let dest = profile_dir.join("screenshot.png");
+                                let dest = new_profile_dir.join("screenshot.png");
                                 tokio::fs::write(&dest, &png_bytes)
                                     .await
                                     .map_err(|e| format!("Failed to save screenshot: {}", e))?;
                                 log::info!("Saved screenshot to {}", dest.display());
+                            }
+
+                            // Rename: migrate the old directory's extra files
+                            // (screenshot, original.cfg) to the new location
+                            // and delete the old directory + commit.
+                            if let Some(old) = old_dir {
+                                if old.exists() && old != new_profile_dir {
+                                    // Copy over screenshot.png if present and not already in new
+                                    let old_ss = old.join("screenshot.png");
+                                    let new_ss = new_profile_dir.join("screenshot.png");
+                                    if old_ss.exists() && !new_ss.exists() {
+                                        let _ = tokio::fs::copy(&old_ss, &new_ss).await;
+                                    }
+                                    // Copy over original.cfg if present and not already in new
+                                    let old_cfg = old.join("original.cfg");
+                                    let new_cfg = new_profile_dir.join("original.cfg");
+                                    if old_cfg.exists() && !new_cfg.exists() {
+                                        let _ = tokio::fs::copy(&old_cfg, &new_cfg).await;
+                                    }
+                                    // Delete the old directory and commit the rename
+                                    let root_for_delete = root.clone();
+                                    let old_name = old
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    tokio::task::spawn_blocking(move || {
+                                        let mut repo =
+                                            crate::profile_repo::ProfileRepo::new(root_for_delete);
+                                        if let Err(e) = std::fs::remove_dir_all(&old) {
+                                            log::warn!(
+                                                "Failed to remove old profile dir {}: {}",
+                                                old.display(),
+                                                e
+                                            );
+                                        }
+                                        let _ = repo.commit(&format!(
+                                            "Rename profile: {} -> {}",
+                                            old_name, profile.id
+                                        ));
+                                    })
+                                    .await
+                                    .map_err(|e| format!("Task error: {}", e))?;
+                                }
                             }
 
                             Ok(result)
@@ -880,6 +1204,18 @@ impl ProfileManager {
                         self.status_message = Some(msg);
                         self.is_dirty = false;
                         self.error_message = None;
+                        // After a successful save the profile now lives at
+                        // <root>/profiles/<category>/<id>/, so subsequent saves
+                        // of the same profile should NOT trigger rename cleanup.
+                        if let Some(profile) = &self.current_profile {
+                            let cat = if self.save_category.is_empty() {
+                                "uncategorized".to_string()
+                            } else {
+                                self.save_category.clone()
+                            };
+                            self.original_profile_dir =
+                                Some(self.repo_root.join("profiles").join(&cat).join(&profile.id));
+                        }
                         return self.update(
                             ProfileManagerMessage::RefreshProfiles,
                             host_url,
@@ -1226,6 +1562,70 @@ impl ProfileManager {
                 }
                 Task::none()
             }
+            ProfileManagerMessage::PickImage => {
+                if self.current_profile.is_none() {
+                    self.error_message = Some("No profile loaded".to_string());
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Pick a profile image")
+                            .add_filter("Images", &["png", "jpg", "jpeg", "gif", "bmp", "webp"])
+                            .add_filter("All files", &["*"])
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    ProfileManagerMessage::PickImageSelected,
+                )
+            }
+            ProfileManagerMessage::PickImageSelected(path) => {
+                let Some(path) = path else {
+                    return Task::none();
+                };
+                // Decode via the `image` crate and re-encode as PNG so the
+                // profile always has a consistent `screenshot.png` regardless
+                // of the source format.
+                match image::open(&path) {
+                    Ok(img) => {
+                        // Downscale to a reasonable thumbnail size if huge
+                        // (keeps the repo small; profile lists show 48x36).
+                        let max_dim = 1024u32;
+                        let img = if img.width() > max_dim || img.height() > max_dim {
+                            img.resize(max_dim, max_dim, image::imageops::FilterType::Lanczos3)
+                        } else {
+                            img
+                        };
+                        let mut png_bytes: Vec<u8> = Vec::new();
+                        match img.write_to(
+                            &mut std::io::Cursor::new(&mut png_bytes),
+                            image::ImageOutputFormat::Png,
+                        ) {
+                            Ok(()) => {
+                                self.pending_screenshot = Some(png_bytes);
+                                if let Some(profile) = &mut self.current_profile {
+                                    profile.metadata.screenshot = "screenshot.png".to_string();
+                                    self.is_dirty = true;
+                                }
+                                self.status_message = Some(format!(
+                                    "Image loaded from {} (save to persist)",
+                                    path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+                                ));
+                                self.error_message = None;
+                            }
+                            Err(e) => {
+                                self.error_message =
+                                    Some(format!("Failed to encode as PNG: {}", e));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to load image: {}", e));
+                    }
+                }
+                Task::none()
+            }
 
             // ── Baseline ──
             // Snapshot device config, store as "default" baseline in repo, keep in memory
@@ -1233,31 +1633,29 @@ impl ProfileManager {
                 if let Some(host) = host_url {
                     self.is_loading = true;
                     self.status_message =
-                        Some("Snapshotting device config as baseline (one-time)...".to_string());
+                        Some("Snapshotting device config + schema (one-time)...".to_string());
                     let root = self.repo_root.clone();
                     Task::perform(
                         async move {
-                            // Read all config from device
-                            let config = profile_api::read_current_config(host, password).await?;
-                            let count: usize = config.values().map(|v| v.len()).sum();
+                            // Read all config + schema from device
+                            let (config, schema) =
+                                profile_api::read_current_config(host, password).await?;
 
-                            // Save to repo
+                            // Save to repo (config + schema together)
                             tokio::task::spawn_blocking({
                                 let config = config.clone();
+                                let schema = schema.clone();
                                 move || {
                                     let mut repo = ProfileRepo::new(root);
-                                    repo.save_baseline("default", &config)?;
-                                    repo.commit("Snapshot device baseline")?;
+                                    repo.save_baseline("default", &config, Some(&schema))?;
+                                    repo.commit("Snapshot device baseline + schema")?;
                                     Ok::<(), String>(())
                                 }
                             })
                             .await
                             .map_err(|e| format!("Task error: {}", e))??;
 
-                            Ok((
-                                config,
-                                format!("Baseline saved: {} categories, {} settings", count, count),
-                            ))
+                            Ok((config, schema))
                         },
                         ProfileManagerMessage::BaselineSnapshotted,
                     )
@@ -1269,24 +1667,23 @@ impl ProfileManager {
             ProfileManagerMessage::BaselineSnapshotted(result) => {
                 self.is_loading = false;
                 match result {
-                    Ok((config, msg)) => {
+                    Ok((config, schema)) => {
                         let count: usize = config.values().map(|v| v.len()).sum();
+                        let schema_count: usize = schema.values().map(|v| v.len()).sum();
                         self.status_message = Some(format!(
-                            "Baseline stored: {} categories, {} settings",
+                            "Baseline stored: {} categories, {} settings, {} schema entries",
                             config.len(),
-                            count
+                            count,
+                            schema_count,
                         ));
                         self.baseline_config = Some(config);
+                        self.config_schema = Some(schema);
                         self.error_message = None;
                     }
                     Err(e) => {
                         self.error_message = Some(format!("Baseline snapshot failed: {}", e));
                     }
                 }
-                Task::none()
-            }
-            ProfileManagerMessage::BaselineLoadedFromDisk(config) => {
-                self.baseline_config = config;
                 Task::none()
             }
             ProfileManagerMessage::ToggleDiffView => {
@@ -1360,6 +1757,11 @@ impl ProfileManager {
     pub fn view(&self, is_connected: bool, font_size: u32) -> Element<'_, ProfileManagerMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
 
+        // Remote picker takes over the whole view when open
+        if self.remote_picker.is_some() {
+            return self.view_remote_picker(fs);
+        }
+
         let content: Element<'_, ProfileManagerMessage> = match self.view_mode {
             ViewMode::ProfileList => self.view_profile_list(is_connected, fs),
             ViewMode::ProfileEditor => self.view_profile_editor(is_connected, fs),
@@ -1376,6 +1778,198 @@ impl ProfileManager {
             .into()
     }
 
+    /// Render the FTP file picker view (full-screen takeover when active).
+    fn view_remote_picker(
+        &self,
+        fs: crate::styles::FontSizes,
+    ) -> Element<'_, ProfileManagerMessage> {
+        let picker = match &self.remote_picker {
+            Some(p) => p,
+            None => return Space::new().into(),
+        };
+
+        // Header with target info + close button
+        let header = container(
+            row![
+                column![
+                    text(format!(
+                        "Select file for: [{}] {}",
+                        picker.target_category, picker.target_key
+                    ))
+                    .size(fs.normal),
+                    text(&picker.current_path)
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                ]
+                .spacing(3),
+                Space::new().width(Length::Fill),
+                button(text("Cancel").size(fs.small))
+                    .on_press(ProfileManagerMessage::RemotePickerClose)
+                    .padding([4, 10])
+                    .style(button::danger),
+            ]
+            .spacing(10)
+            .height(Length::Shrink)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(10);
+
+        // Row 1: Up / root / refresh / manual path input
+        let parent_path = match picker.current_path.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent.to_string(),
+            _ => "/".to_string(),
+        };
+        let nav_row_1 = row![
+            tooltip(
+                button(text("↑ Up").size(fs.small))
+                    .on_press_maybe(if picker.current_path != "/" {
+                        Some(ProfileManagerMessage::RemotePickerNavigate(parent_path))
+                    } else {
+                        None
+                    })
+                    .padding([4, 10]),
+                "Go to parent directory",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            button(text("/").size(fs.small))
+                .on_press(ProfileManagerMessage::RemotePickerNavigate("/".to_string()))
+                .padding([4, 10]),
+            tooltip(
+                button(text("Refresh").size(fs.small))
+                    .on_press(ProfileManagerMessage::RemotePickerNavigate(
+                        picker.current_path.clone(),
+                    ))
+                    .padding([4, 10]),
+                "Re-list current directory (useful after plugging in USB)",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            text_input("Type path, e.g. /USB0/games", &picker.path_input)
+                .on_input(ProfileManagerMessage::RemotePickerPathInputChanged)
+                .on_submit(ProfileManagerMessage::RemotePickerGoToPath)
+                .size(fs.small as f32)
+                .width(Length::Fill),
+            tooltip(
+                button(text("Go").size(fs.small))
+                    .on_press(ProfileManagerMessage::RemotePickerGoToPath)
+                    .padding([4, 10]),
+                "Navigate to typed path — use this for /USB0/, /USB1/, /SD/, /Flash/\n(hidden mount points that FTP doesn't list until mounted)",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+        ]
+        .spacing(5)
+        .height(Length::Shrink)
+        .align_y(iced::Alignment::Center);
+
+        // Row 2: Quick-jump buttons for common mount points.
+        // Ultimate firmware hides un-inserted USB from the root listing, so
+        // users need a way to jump directly. These are the canonical paths
+        // returned by the device's REST API (/v1/drives shows partition paths).
+        let quick_jumps = ["/Flash", "/SD", "/Temp", "/USB0", "/USB1", "/USB2", "/USB3"];
+        let mut jump_row_items: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
+        jump_row_items.push(
+            text("Quick jump:")
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6))
+                .into(),
+        );
+        for jp in quick_jumps {
+            jump_row_items.push(
+                button(text(jp).size(fs.tiny))
+                    .on_press(ProfileManagerMessage::RemotePickerNavigate(jp.to_string()))
+                    .padding([2, 6])
+                    .style(button::text)
+                    .into(),
+            );
+        }
+        let nav_row_2 = Row::with_children(jump_row_items)
+            .spacing(4)
+            .height(Length::Shrink)
+            .align_y(iced::Alignment::Center);
+
+        let nav = container(column![nav_row_1, nav_row_2].spacing(4)).padding([0, 10]);
+
+        // File listing
+        let listing: Element<'_, ProfileManagerMessage> = if picker.is_loading {
+            container(text("Loading...").size(fs.normal))
+                .padding(20)
+                .center_x(Length::Fill)
+                .into()
+        } else if let Some(err) = &picker.error {
+            container(
+                text(format!("Error: {}", err))
+                    .size(fs.normal)
+                    .color(iced::Color::from_rgb(0.9, 0.3, 0.3)),
+            )
+            .padding(20)
+            .into()
+        } else if picker.entries.is_empty() {
+            container(
+                text("(empty)")
+                    .size(fs.normal)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+            )
+            .padding(20)
+            .center_x(Length::Fill)
+            .into()
+        } else {
+            let mut rows: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
+            for entry in &picker.entries {
+                let icon = if entry.is_dir { "📁" } else { "📄" };
+                let label = format!("{}  {}", icon, entry.name);
+                let path = entry.path.clone();
+                let msg = if entry.is_dir {
+                    ProfileManagerMessage::RemotePickerNavigate(path)
+                } else {
+                    ProfileManagerMessage::RemotePickerSelect(path)
+                };
+                let size_text = if entry.is_dir {
+                    String::new()
+                } else {
+                    crate::file_types::format_file_size(entry.size)
+                };
+                rows.push(
+                    button(
+                        row![
+                            text(label).size(fs.normal).width(Length::Fill),
+                            text(size_text)
+                                .size(fs.tiny)
+                                .color(iced::Color::from_rgb(0.5, 0.5, 0.55)),
+                        ]
+                        .spacing(10)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .on_press(msg)
+                    .padding([4, 10])
+                    .width(Length::Fill)
+                    .style(button::text)
+                    .into(),
+                );
+            }
+            scrollable(
+                Column::with_children(rows)
+                    .spacing(2)
+                    .padding(iced::Padding::new(5.0).right(15.0)),
+            )
+            .height(Length::Fill)
+            .into()
+        };
+
+        column![
+            header,
+            rule::horizontal(1),
+            nav,
+            rule::horizontal(1),
+            listing
+        ]
+        .spacing(4)
+        .height(Length::Fill)
+        .padding(10)
+        .into()
+    }
+
     // ── Profile List View ──
 
     fn view_profile_list(
@@ -1383,6 +1977,7 @@ impl ProfileManager {
         is_connected: bool,
         fs: crate::styles::FontSizes,
     ) -> Element<'_, ProfileManagerMessage> {
+        let has_baseline = self.baseline_config.is_some();
         let mut toolbar_items: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
 
         if !self.repo_initialized {
@@ -1396,27 +1991,33 @@ impl ProfileManager {
 
         toolbar_items.push(
             button(text("New").size(fs.small))
-                .on_press(ProfileManagerMessage::NewProfile)
+                .on_press_maybe(has_baseline.then_some(ProfileManagerMessage::NewProfile))
                 .padding([4, 8])
                 .into(),
         );
+        // Import .cfg / .json hidden for now — workflow is still rough;
+        // baseline snapshot + manual editing is the primary flow.
         toolbar_items.push(
-            button(text("Import .cfg").size(fs.small))
-                .on_press(ProfileManagerMessage::ImportCfg)
-                .padding([4, 8])
-                .into(),
-        );
-        toolbar_items.push(
-            button(text("Import .json").size(fs.small))
-                .on_press(ProfileManagerMessage::ImportJson)
-                .padding([4, 8])
-                .into(),
-        );
-        toolbar_items.push(
-            button(text("Snapshot Device").size(fs.small))
-                .on_press_maybe(is_connected.then_some(ProfileManagerMessage::SnapshotFromDevice))
-                .padding([4, 8])
-                .into(),
+            tooltip(
+                button(text("Snapshot Baseline").size(fs.small))
+                    .on_press_maybe(
+                        is_connected.then_some(ProfileManagerMessage::SnapshotBaseline),
+                    )
+                    .padding([4, 8])
+                    .style(if has_baseline {
+                        button::secondary
+                    } else {
+                        button::primary
+                    }),
+                if has_baseline {
+                    "Re-read all device config + schema. Needed when firmware changes."
+                } else {
+                    "Read all device config + schema. REQUIRED before creating or applying profiles."
+                },
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box)
+            .into(),
         );
         toolbar_items.push(Space::new().width(Length::Fill).into());
         toolbar_items.push(
@@ -1511,8 +2112,8 @@ impl ProfileManager {
                             .padding([4, 8]),
                         button(text("Run").size(fs.small))
                             .on_press_maybe(
-                                is_connected
-                                    .then_some(ProfileManagerMessage::ApplyProfileFromList(i))
+                                (is_connected && has_baseline)
+                                    .then_some(ProfileManagerMessage::ApplyProfileFromList(i),),
                             )
                             .padding([4, 8])
                             .style(button::success),
@@ -1554,10 +2155,43 @@ impl ProfileManager {
             .into()
         };
 
-        column![toolbar, rule::horizontal(1), profile_list, history_panel]
-            .spacing(3)
-            .height(Length::Fill)
+        // Prominent banner when no baseline — guides the user to snapshot first
+        let banner: Element<'_, ProfileManagerMessage> = if !has_baseline {
+            container(
+                row![
+                    text("⚠").size(fs.large),
+                    column![
+                        text("No baseline captured yet.").size(fs.normal),
+                        text(if is_connected {
+                            "Click 'Snapshot Baseline' to read the device's current config and schema — required before creating or running profiles."
+                        } else {
+                            "Connect to the device, then click 'Snapshot Baseline' to capture the current config and schema."
+                        })
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.75, 0.75, 0.8)),
+                    ]
+                    .spacing(3),
+                ]
+                .spacing(10)
+                .align_y(iced::Alignment::Center),
+            )
+            .padding(10)
+            .style(container::bordered_box)
             .into()
+        } else {
+            Space::new().height(0).into()
+        };
+
+        column![
+            toolbar,
+            rule::horizontal(1),
+            banner,
+            profile_list,
+            history_panel,
+        ]
+        .spacing(3)
+        .height(Length::Fill)
+        .into()
     }
 
     // ── Profile Editor View ──
@@ -1590,10 +2224,24 @@ impl ProfileManager {
                 } else {
                     button::secondary
                 }),
-            button(text("Apply").size(fs.small))
-                .on_press_maybe(is_connected.then_some(ProfileManagerMessage::ApplyProfile))
-                .padding([4, 8])
-                .style(button::success),
+            tooltip(
+                button(text("Apply").size(fs.small))
+                    .on_press_maybe(
+                        (is_connected && self.baseline_config.is_some())
+                            .then_some(ProfileManagerMessage::ApplyProfile),
+                    )
+                    .padding([4, 8])
+                    .style(button::success),
+                if self.baseline_config.is_none() {
+                    "Snapshot the baseline first"
+                } else if !is_connected {
+                    "Not connected to device"
+                } else {
+                    "Compute diff against baseline and apply to device"
+                },
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
             rule::vertical(1),
             button(text("Export .cfg").size(fs.small))
                 .on_press(ProfileManagerMessage::ExportCfg)
@@ -1618,7 +2266,15 @@ impl ProfileManager {
                         is_connected.then_some(ProfileManagerMessage::CaptureScreenshot)
                     )
                     .padding([4, 8]),
-                "Capture current C64 screen as profile thumbnail",
+                "Capture current C64 screen as profile thumbnail (requires streaming)",
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            tooltip(
+                button(text("Pick Image").size(fs.small))
+                    .on_press(ProfileManagerMessage::PickImage)
+                    .padding([4, 8]),
+                "Pick an image file (PNG/JPG/etc.) as the profile thumbnail",
                 tooltip::Position::Bottom,
             )
             .style(container::bordered_box),
@@ -1682,17 +2338,27 @@ impl ProfileManager {
                     .on_input(ProfileManagerMessage::EditDescription)
                     .size(fs.small as f32),
                 row![
-                    text_input("category", &self.save_category)
-                        .on_input(ProfileManagerMessage::EditCategory)
-                        .size(fs.small as f32)
-                        .width(Length::Fill),
-                    pick_list(
-                        vec!["Full".to_string(), "Overlay".to_string()],
-                        Some(profile.profile_mode.to_string()),
-                        ProfileManagerMessage::SetProfileMode,
+                    tooltip(
+                        text_input("category", &self.save_category)
+                            .on_input(ProfileManagerMessage::EditCategory)
+                            .size(fs.small as f32)
+                            .width(Length::Fill),
+                        "Repository folder (e.g. games, demos, music).\nUsed to organize profiles on disk.",
+                        tooltip::Position::Bottom,
                     )
-                    .text_size(fs.small)
-                    .width(Length::Fixed(80.0)),
+                    .style(container::bordered_box),
+                    tooltip(
+                        pick_list(
+                            vec!["Full".to_string(), "Overlay".to_string()],
+                            Some(profile.profile_mode.to_string()),
+                            ProfileManagerMessage::SetProfileMode,
+                        )
+                        .text_size(fs.small)
+                        .width(Length::Fixed(80.0)),
+                        "Full: complete snapshot of all device settings.\nOverlay: only settings that override the baseline.\n\nOverlay is preferred for per-game/per-demo profiles —\nsmaller, safer, won't touch unrelated settings.",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(container::bordered_box),
                 ]
                 .spacing(3),
                 text_input("tags (comma-separated)", &self.tags_input)
@@ -1802,7 +2468,8 @@ impl ProfileManager {
         )
         .padding(8);
 
-        // Baseline
+        // Baseline status
+        let has_schema = self.config_schema.is_some();
         let baseline_info = if let Some(bl) = &self.baseline_config {
             let count: usize = bl.values().map(|v| v.len()).sum();
             format!("{} cat, {} settings", bl.len(), count)
@@ -1810,26 +2477,34 @@ impl ProfileManager {
             "Not captured".to_string()
         };
 
-        let baseline_section = container(
-            column![
-                text("BASELINE").size(fs.tiny),
-                button(text("Snapshot Baseline").size(fs.small))
-                    .on_press(ProfileManagerMessage::SnapshotBaseline)
-                    .padding([3, 6])
-                    .width(Length::Fill),
-                if self.baseline_config.is_some() {
-                    text(baseline_info)
-                        .size(fs.tiny)
-                        .color(iced::Color::from_rgb(0.3, 0.8, 0.3))
-                } else {
-                    text(baseline_info)
-                        .size(fs.tiny)
-                        .color(iced::Color::from_rgb(0.9, 0.5, 0.3))
-                },
-            ]
-            .spacing(4),
-        )
-        .padding(8);
+        let mut baseline_col = column![
+            text("BASELINE").size(fs.tiny),
+            button(text("Snapshot Baseline").size(fs.small))
+                .on_press(ProfileManagerMessage::SnapshotBaseline)
+                .padding([3, 6])
+                .width(Length::Fill),
+            if self.baseline_config.is_some() {
+                text(baseline_info)
+                    .size(fs.tiny)
+                    .color(iced::Color::from_rgb(0.3, 0.8, 0.3))
+            } else {
+                text(baseline_info)
+                    .size(fs.tiny)
+                    .color(iced::Color::from_rgb(0.9, 0.5, 0.3))
+            },
+        ]
+        .spacing(4);
+
+        // Warn if baseline is captured but schema is missing (old baseline file)
+        if self.baseline_config.is_some() && !has_schema {
+            baseline_col = baseline_col.push(
+                text("⚠ No schema — re-snapshot for dropdowns")
+                    .size(fs.tiny)
+                    .color(iced::Color::from_rgb(0.95, 0.6, 0.3)),
+            );
+        }
+
+        let baseline_section = container(baseline_col).padding(8);
 
         container(
             scrollable(
@@ -1952,10 +2627,15 @@ impl ProfileManager {
                 ]
                 .spacing(4)
                 .align_y(iced::Alignment::Center),
-                // Cartridge
-                text("Cartridge").size(fs.tiny),
+                // Cartridge / program (accepts .crt, .prg, .sid)
+                tooltip(
+                    text("Cart / Program").size(fs.tiny),
+                    "Accepts .crt (cartridge), .prg (program), or .sid (music).\nLocal files are uploaded; device paths run directly.",
+                    tooltip::Position::Top,
+                )
+                .style(container::bordered_box),
                 row![
-                    text_input("cartridge path...", cart_path)
+                    text_input(".crt / .prg / .sid path...", cart_path)
                         .on_input(ProfileManagerMessage::CartridgePathChanged)
                         .size(fs.small as f32)
                         .width(Length::Fill),
@@ -1988,7 +2668,7 @@ impl ProfileManager {
                 text(
                     self.selected_config_category
                         .as_deref()
-                        .unwrap_or("Select a category")
+                        .unwrap_or("Add Categories")
                 )
                 .size(fs.large),
                 Space::new().width(Length::Fill),
@@ -2004,54 +2684,13 @@ impl ProfileManager {
         )
         .padding(10);
 
-        let items_view: Element<'_, ProfileManagerMessage> = if let Some(cat_name) =
-            &self.selected_config_category
-        {
-            if let Some(items) = profile.config.get(cat_name) {
-                let filter_lower = self.search_filter.to_lowercase();
-                let mut sorted_keys: Vec<_> = items.keys().collect();
-                sorted_keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-
-                let filtered: Vec<_> = sorted_keys
-                    .into_iter()
-                    .filter(|k| filter_lower.is_empty() || k.to_lowercase().contains(&filter_lower))
-                    .collect();
-
-                let diff_items = self.get_diff_for_category(cat_name);
-
-                let item_views: Vec<Element<'_, ProfileManagerMessage>> = filtered
-                    .iter()
-                    .map(|key| {
-                        let value = items.get(*key).unwrap();
-                        let is_diff = diff_items
-                            .as_ref()
-                            .map(|d| d.contains_key(*key))
-                            .unwrap_or(false);
-                        self.view_config_item(cat_name, key, value, is_diff, fs)
-                    })
-                    .collect();
-
-                scrollable(
-                    Column::with_children(item_views)
-                        .spacing(8)
-                        .padding(iced::Padding::new(10.0).right(15.0)),
-                )
-                .height(Length::Fill)
-                .into()
-            } else {
-                container(text("Category is empty").size(fs.normal))
-                    .padding(20)
-                    .into()
-            }
-        } else {
-            container(text("Select a config category from the left panel").size(fs.normal))
-                .padding(20)
-                .center_x(Length::Fill)
-                .into()
+        let body: Element<'_, ProfileManagerMessage> = match &self.selected_config_category {
+            Some(cat_name) => self.view_category_contents(profile, cat_name, fs),
+            None => self.view_category_picker(profile, fs),
         };
 
         container(
-            column![header, rule::horizontal(1), items_view]
+            column![header, rule::horizontal(1), body]
                 .spacing(0)
                 .height(Length::Fill),
         )
@@ -2059,8 +2698,386 @@ impl ProfileManager {
         .into()
     }
 
-    /// Render a single config key/value editor — reuses the same widget patterns
-    /// as config_editor.rs view_option.
+    /// Show the contents of a selected category: unified list of all baseline
+    /// keys, each either editable (in profile) or addable (with + button).
+    fn view_category_contents<'a>(
+        &'a self,
+        profile: &'a DeviceProfile,
+        cat_name: &'a str,
+        fs: crate::styles::FontSizes,
+    ) -> Element<'a, ProfileManagerMessage> {
+        let filter_lower = self.search_filter.to_lowercase();
+        static EMPTY_MAP: std::sync::OnceLock<HashMap<String, serde_json::Value>> =
+            std::sync::OnceLock::new();
+        let empty_map = EMPTY_MAP.get_or_init(HashMap::new);
+        let items = profile.config.get(cat_name).unwrap_or(empty_map);
+        let diff_items = self.get_diff_for_category(cat_name);
+
+        // Build the full key list from the baseline (borrows of 'a — long enough
+        // to return Elements that reference them)
+        let all_keys: Vec<&'a String> = if let Some(baseline) = &self.baseline_config {
+            if let Some(base_items) = baseline.get(cat_name) {
+                let mut keys: Vec<&String> = base_items.keys().collect();
+                keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                keys
+            } else {
+                let mut keys: Vec<&String> = items.keys().collect();
+                keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                keys
+            }
+        } else {
+            let mut keys: Vec<&String> = items.keys().collect();
+            keys.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            keys
+        };
+
+        let filtered_keys: Vec<&'a String> = all_keys
+            .into_iter()
+            .filter(|k| filter_lower.is_empty() || k.to_lowercase().contains(&filter_lower))
+            .collect();
+
+        let in_profile_count = filtered_keys
+            .iter()
+            .filter(|k| items.contains_key(k.as_str()))
+            .count();
+        let total_count = filtered_keys.len();
+
+        let mut item_views: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
+
+        // Top toolbar: Back + Add All + counts
+        let toolbar = row![
+            button(
+                row![
+                    text("←").size(fs.normal),
+                    text("All Categories").size(fs.small),
+                ]
+                .spacing(6)
+                .align_y(iced::Alignment::Center),
+            )
+            .on_press(ProfileManagerMessage::DeselectConfigCategory)
+            .padding([4, 10])
+            .style(button::text),
+            Space::new().width(Length::Fill),
+            text(format!("{} / {} in profile", in_profile_count, total_count))
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+            Space::new().width(10),
+            tooltip(
+                button(text("+ Add All").size(fs.small))
+                    .on_press(ProfileManagerMessage::AddAllKeysFromSchema(
+                        cat_name.to_string(),
+                    ))
+                    .padding([4, 10])
+                    .style(button::primary),
+                "Add every key from the baseline to this category",
+                tooltip::Position::Left,
+            )
+            .style(container::bordered_box),
+        ]
+        .spacing(5)
+        .height(Length::Shrink)
+        .align_y(iced::Alignment::Center);
+
+        item_views.push(container(toolbar).padding([4, 8]).into());
+
+        // Empty state
+        if filtered_keys.is_empty() {
+            if self.baseline_config.is_none() {
+                item_views.push(
+                    container(
+                        text("No baseline captured.\nClick 'Snapshot Baseline' to populate available keys.")
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                    )
+                    .padding(20)
+                    .into(),
+                );
+            } else {
+                item_views.push(
+                    container(
+                        text("No keys match the filter.")
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                    )
+                    .padding(20)
+                    .into(),
+                );
+            }
+        }
+
+        // Unified rendering — each key is either in profile (editable) or available (add)
+        for key_ref in filtered_keys.iter() {
+            let key_str: &'a str = key_ref.as_str();
+            if let Some(value) = items.get(key_str) {
+                // In profile — render editor + remove button
+                let is_diff = diff_items
+                    .as_ref()
+                    .map(|d| d.contains_key(key_str))
+                    .unwrap_or(false);
+                let item = self.view_config_item(cat_name, key_str, value, is_diff, fs);
+                let cat = cat_name.to_string();
+                let k = key_str.to_string();
+                item_views.push(
+                    row![
+                        item,
+                        button(text("x").size(fs.tiny))
+                            .on_press(ProfileManagerMessage::RemoveKey(cat, k))
+                            .padding([2, 6])
+                            .style(button::danger),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Alignment::Center)
+                    .into(),
+                );
+            } else {
+                // Not in profile — render a single-line "Add" row with baseline hint
+                let hint = self
+                    .baseline_config
+                    .as_ref()
+                    .and_then(|b| b.get(cat_name))
+                    .and_then(|c| c.get(key_str))
+                    .map(|v| config_api::format_value(v))
+                    .unwrap_or_else(|| "—".to_string());
+                let cat = cat_name.to_string();
+                let k = key_str.to_string();
+                item_views.push(
+                    container(
+                        row![
+                            text(key_str)
+                                .size(fs.small)
+                                .color(iced::Color::from_rgb(0.65, 0.65, 0.7))
+                                .width(Length::Fill),
+                            text(format!("baseline: {}", hint))
+                                .size(fs.tiny)
+                                .color(iced::Color::from_rgb(0.5, 0.5, 0.55)),
+                            button(text("+").size(fs.small))
+                                .on_press(ProfileManagerMessage::AddKeyFromSchema(cat, k))
+                                .padding([2, 10]),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center),
+                    )
+                    .padding([4, 10])
+                    .style(container::bordered_box)
+                    .into(),
+                );
+            }
+        }
+
+        scrollable(
+            Column::with_children(item_views)
+                .spacing(6)
+                .padding(iced::Padding::new(10.0).right(15.0)),
+        )
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Show a picker to add categories to the profile — popular shortcuts
+    /// at the top, then the full list of categories from the baseline.
+    fn view_category_picker<'a>(
+        &'a self,
+        profile: &'a DeviceProfile,
+        fs: crate::styles::FontSizes,
+    ) -> Element<'a, ProfileManagerMessage> {
+        let filter_lower = self.search_filter.to_lowercase();
+
+        let available_cats: Vec<&String> = if let Some(baseline) = &self.baseline_config {
+            let mut v: Vec<&String> = baseline.keys().collect();
+            v.sort();
+            v
+        } else {
+            Vec::new()
+        };
+
+        let mut sections: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
+
+        // Intro text
+        sections.push(
+            container(
+                column![
+                    text("Click a category to add it to the profile.")
+                        .size(fs.normal)
+                        .color(iced::Color::from_rgb(0.75, 0.75, 0.8)),
+                    text("Added categories get populated with baseline values — edit or delete keys as needed.")
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+                ]
+                .spacing(3),
+            )
+            .padding([8, 10])
+            .into(),
+        );
+
+        // Popular section
+        let popular_available: Vec<&&str> = POPULAR_CATEGORIES
+            .iter()
+            .filter(|name| {
+                !profile.config.contains_key(**name)
+                    && (filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower))
+                    && (available_cats.is_empty()
+                        || available_cats.iter().any(|c| c.as_str() == **name))
+            })
+            .collect();
+
+        if !popular_available.is_empty() {
+            sections.push(
+                container(
+                    text("POPULAR")
+                        .size(fs.tiny)
+                        .color(iced::Color::from_rgb(0.5, 0.6, 0.75)),
+                )
+                .padding([8, 10])
+                .into(),
+            );
+            for name in popular_available {
+                let name_str = name.to_string();
+                sections.push(
+                    container(
+                        button(
+                            row![
+                                text("★")
+                                    .size(fs.normal)
+                                    .color(iced::Color::from_rgb(0.9, 0.7, 0.2)),
+                                text(*name).size(fs.normal).width(Length::Fill),
+                                text("Add")
+                                    .size(fs.tiny)
+                                    .color(iced::Color::from_rgb(0.5, 0.8, 0.5)),
+                            ]
+                            .spacing(8)
+                            .align_y(iced::Alignment::Center),
+                        )
+                        .on_press(ProfileManagerMessage::AddCategoryFromSchema(name_str))
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(button::text),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // All baseline categories section (filtered)
+        let other_cats: Vec<&String> = available_cats
+            .iter()
+            .filter(|name| {
+                !profile.config.contains_key(name.as_str())
+                    && !POPULAR_CATEGORIES.contains(&name.as_str())
+                    && (filter_lower.is_empty() || name.to_lowercase().contains(&filter_lower))
+            })
+            .copied()
+            .collect();
+
+        if !other_cats.is_empty() {
+            sections.push(
+                container(
+                    text("ALL CATEGORIES")
+                        .size(fs.tiny)
+                        .color(iced::Color::from_rgb(0.5, 0.6, 0.75)),
+                )
+                .padding([12, 10])
+                .into(),
+            );
+            for name in other_cats {
+                let name_str = name.clone();
+                let item_count = self
+                    .baseline_config
+                    .as_ref()
+                    .and_then(|b| b.get(name))
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                sections.push(
+                    container(
+                        button(
+                            row![
+                                text(name).size(fs.normal).width(Length::Fill),
+                                text(format!("{} keys", item_count))
+                                    .size(fs.tiny)
+                                    .color(iced::Color::from_rgb(0.5, 0.5, 0.55)),
+                                text("Add")
+                                    .size(fs.tiny)
+                                    .color(iced::Color::from_rgb(0.5, 0.8, 0.5)),
+                            ]
+                            .spacing(8)
+                            .align_y(iced::Alignment::Center),
+                        )
+                        .on_press(ProfileManagerMessage::AddCategoryFromSchema(name_str))
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(button::text),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // No baseline? Tell the user
+        if available_cats.is_empty() {
+            sections.push(
+                container(
+                    column![
+                        text("No baseline captured yet.")
+                            .size(fs.normal)
+                            .color(iced::Color::from_rgb(0.9, 0.6, 0.4)),
+                        text("Click 'Snapshot Baseline' to read the device's")
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                        text("current configuration — this populates the list of")
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                        text("available categories and keys for profile editing.")
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
+                    ]
+                    .spacing(3),
+                )
+                .padding(20)
+                .into(),
+            );
+        }
+
+        scrollable(
+            Column::with_children(sections)
+                .spacing(2)
+                .padding(iced::Padding::new(4.0).right(15.0)),
+        )
+        .height(Length::Fill)
+        .into()
+    }
+
+    /// Look up the schema for a specific config key.
+    fn get_item_schema(
+        &self,
+        category: &str,
+        key: &str,
+    ) -> Option<&crate::device_profile::ItemSchema> {
+        self.config_schema.as_ref()?.get(category)?.get(key)
+    }
+
+    /// Heuristic: does this config key look like a device filesystem path?
+    /// Checks the key name for common path-related words, or the current value
+    /// for a leading slash (typical of device paths like /Usb0/... or /Flash/...).
+    fn is_path_field(key: &str, value: &serde_json::Value) -> bool {
+        let lower = key.to_lowercase();
+        let name_hints = lower.contains("path")
+            || lower.contains("image")
+            || lower.contains("file")
+            || lower.contains("dir")
+            || lower.contains("directory");
+        if name_hints {
+            return true;
+        }
+        // Fall back to checking if the value looks like an absolute device path
+        if let Some(s) = value.as_str() {
+            let trimmed = s.trim_start();
+            return trimmed.starts_with('/');
+        }
+        false
+    }
+
+    /// Render a single config key/value editor. If the baseline captured a
+    /// schema for this key, the widget uses it (pick_list for enums, slider
+    /// for integers). Otherwise falls back to a heuristic text/toggle widget.
     fn view_config_item<'a>(
         &'a self,
         category: &'a str,
@@ -2071,6 +3088,7 @@ impl ProfileManager {
     ) -> Element<'a, ProfileManagerMessage> {
         let cat = category.to_string();
         let k = key.to_string();
+        let item_schema = self.get_item_schema(category, key);
 
         let name_color = if is_diff && self.show_diff {
             iced::Color::from_rgb(0.9, 0.7, 0.0)
@@ -2081,13 +3099,150 @@ impl ProfileManager {
         let name_row =
             row![text(key).size(fs.normal).color(name_color),].align_y(iced::Alignment::Center);
 
-        // Determine the best widget for this value
-        let control: Element<'_, ProfileManagerMessage> = match value {
+        // Schema-driven widget selection
+        let control: Element<'_, ProfileManagerMessage> = if let Some(schema) = item_schema {
+            if let Some(options) = schema.options.as_ref().filter(|o| !o.is_empty()) {
+                // Enum — dropdown with exact API-valid values
+                let current_str = match value {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                };
+                let cat2 = cat.clone();
+                let k2 = k.clone();
+                pick_list(options.clone(), current_str, move |v| {
+                    ProfileManagerMessage::ConfigValueChanged(
+                        cat2.clone(),
+                        k2.clone(),
+                        serde_json::Value::String(v),
+                    )
+                })
+                .text_size(fs.normal)
+                .width(Length::Fixed(260.0))
+                .into()
+            } else if let (Some(min), Some(max)) = (schema.min, schema.max) {
+                // Integer with range — slider
+                let current = match value {
+                    serde_json::Value::Number(n) => n.as_i64().unwrap_or(min),
+                    serde_json::Value::String(s) => s.trim().parse::<i64>().unwrap_or(min),
+                    _ => min,
+                };
+                let unit = schema
+                    .format
+                    .as_deref()
+                    .map(|f| {
+                        if f.contains("dB") {
+                            " dB"
+                        } else if f.ends_with('%') {
+                            "%"
+                        } else if f.contains("ppm") {
+                            " ppm"
+                        } else {
+                            ""
+                        }
+                    })
+                    .unwrap_or("");
+                let cat2 = cat.clone();
+                let k2 = k.clone();
+                row![
+                    iced::widget::slider(min as f64..=max as f64, current as f64, move |v| {
+                        ProfileManagerMessage::ConfigValueChanged(
+                            cat2.clone(),
+                            k2.clone(),
+                            serde_json::json!(v as i64),
+                        )
+                    })
+                    .step(1.0)
+                    .width(Length::Fixed(160.0)),
+                    Space::new().width(8),
+                    text(format!("{}{}", current, unit)).size(fs.normal),
+                    Space::new().width(5),
+                    text(format!("[{}..{}]", min, max))
+                        .size(fs.tiny)
+                        .color(iced::Color::from_rgb(0.5, 0.5, 0.5)),
+                ]
+                .spacing(3)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                self.view_config_item_fallback(&cat, &k, value, fs)
+            }
+        } else {
+            self.view_config_item_fallback(&cat, &k, value, fs)
+        };
+
+        // Show baseline diff value if available
+        let diff_hint: Element<'_, ProfileManagerMessage> = if is_diff && self.show_diff {
+            if let Some(baseline) = &self.baseline_config {
+                if let Some(base_val) = baseline.get(category).and_then(|c| c.get(key)) {
+                    text(format!("baseline: {}", config_api::format_value(base_val)))
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.5, 0.7, 0.5))
+                        .into()
+                } else {
+                    text("(new key)")
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.5, 0.7, 0.5))
+                        .into()
+                }
+            } else {
+                Space::new().height(0).into()
+            }
+        } else {
+            Space::new().height(0).into()
+        };
+
+        // Add an FTP Browse button for path-like fields
+        let control_row: Element<'_, ProfileManagerMessage> = if Self::is_path_field(key, value) {
+            let current_path = value.as_str().unwrap_or("").to_string();
+            let cat_b = cat.clone();
+            let k_b = k.clone();
+            row![
+                control,
+                tooltip(
+                    button(text("Browse…").size(fs.tiny))
+                        .on_press(ProfileManagerMessage::OpenRemotePicker(
+                            cat_b,
+                            k_b,
+                            current_path,
+                        ))
+                        .padding([2, 8]),
+                    "Browse the device filesystem via FTP",
+                    tooltip::Position::Left,
+                )
+                .style(container::bordered_box),
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .into()
+        } else {
+            control
+        };
+
+        container(column![name_row, control_row, diff_hint].spacing(3))
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(container::bordered_box)
+            .into()
+    }
+
+    /// Fallback widget when no schema is available — heuristic based on value type.
+    fn view_config_item_fallback<'a>(
+        &'a self,
+        cat: &str,
+        k: &str,
+        value: &'a serde_json::Value,
+        fs: crate::styles::FontSizes,
+    ) -> Element<'a, ProfileManagerMessage> {
+        let cat = cat.to_string();
+        let k = k.to_string();
+
+        match value {
             serde_json::Value::Number(n) => {
                 let current = n.as_i64().unwrap_or(0);
                 let cat2 = cat.clone();
                 let k2 = k.clone();
-                row![text_input("", &current.to_string())
+                text_input("", &current.to_string())
                     .on_input(move |v| {
                         let parsed = v.parse::<i64>().unwrap_or(current);
                         ProfileManagerMessage::ConfigValueChanged(
@@ -2097,36 +3252,15 @@ impl ProfileManager {
                         )
                     })
                     .size(fs.normal as f32)
-                    .width(Length::Fixed(100.0)),]
-                .into()
-            }
-            serde_json::Value::Bool(b) => {
-                let cat2 = cat.clone();
-                let k2 = k.clone();
-                row![
-                    toggler(*b)
-                        .on_toggle(move |v| {
-                            ProfileManagerMessage::ConfigValueChanged(
-                                cat2.clone(),
-                                k2.clone(),
-                                serde_json::Value::Bool(v),
-                            )
-                        })
-                        .size(fs.header),
-                    text(if *b { "Yes" } else { "No" }).size(fs.normal),
-                ]
-                .spacing(5)
-                .align_y(iced::Alignment::Center)
-                .into()
+                    .width(Length::Fixed(120.0))
+                    .into()
             }
             _ => {
-                // String or anything else — borrow from value when possible
                 let current_str: &str = match value {
                     serde_json::Value::String(s) => s.as_str(),
                     serde_json::Value::Null => "",
                     _ => "",
                 };
-                // For non-string JSON values, format as string
                 let formatted;
                 let display_str = if current_str.is_empty()
                     && !matches!(
@@ -2139,23 +3273,28 @@ impl ProfileManager {
                     current_str
                 };
 
-                // Check for boolean-like strings
                 let lower = display_str.to_lowercase();
-                if matches!(
-                    lower.as_str(),
-                    "enabled" | "disabled" | "yes" | "no" | "on" | "off"
-                ) {
-                    let is_on = matches!(lower.as_str(), "enabled" | "yes" | "on");
+                let bool_pair: Option<(&str, &str)> = match lower.as_str() {
+                    "enabled" | "disabled" => Some(("Enabled", "Disabled")),
+                    "yes" | "no" => Some(("Yes", "No")),
+                    "on" | "off" => Some(("On", "Off")),
+                    "true" | "false" => Some(("true", "false")),
+                    _ => None,
+                };
+                if let Some((on_val, off_val)) = bool_pair {
+                    let is_on = matches!(lower.as_str(), "enabled" | "yes" | "on" | "true");
                     let cat2 = cat.clone();
                     let k2 = k.clone();
+                    let on_s = on_val.to_string();
+                    let off_s = off_val.to_string();
                     row![
                         toggler(is_on)
                             .on_toggle(move |v| {
-                                let str_val = if v { "Yes" } else { "No" };
+                                let str_val = if v { on_s.clone() } else { off_s.clone() };
                                 ProfileManagerMessage::ConfigValueChanged(
                                     cat2.clone(),
                                     k2.clone(),
-                                    serde_json::Value::String(str_val.to_string()),
+                                    serde_json::Value::String(str_val),
                                 )
                             })
                             .size(fs.header),
@@ -2180,34 +3319,7 @@ impl ProfileManager {
                         .into()
                 }
             }
-        };
-
-        // Show baseline diff value if available
-        let diff_hint: Element<'_, ProfileManagerMessage> = if is_diff && self.show_diff {
-            if let Some(baseline) = &self.baseline_config {
-                if let Some(base_val) = baseline.get(category).and_then(|c| c.get(key)) {
-                    text(format!("baseline: {}", config_api::format_value(base_val)))
-                        .size(fs.small)
-                        .color(iced::Color::from_rgb(0.5, 0.7, 0.5))
-                        .into()
-                } else {
-                    text("(new key)")
-                        .size(fs.small)
-                        .color(iced::Color::from_rgb(0.5, 0.7, 0.5))
-                        .into()
-                }
-            } else {
-                Space::new().height(0).into()
-            }
-        } else {
-            Space::new().height(0).into()
-        };
-
-        container(column![name_row, control, diff_hint].spacing(3))
-            .padding([8, 10])
-            .width(Length::Fill)
-            .style(container::bordered_box)
-            .into()
+        }
     }
 
     // ── Diff View ──

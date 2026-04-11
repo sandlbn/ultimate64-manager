@@ -186,6 +186,22 @@ async fn mount_and_run(
 
         let device_num = if drive == "a" { "8" } else { "9" };
 
+        // Pre-reset: make sure the machine is in a known state BEFORE mounting.
+        // After apply_profile changes config, the device may have a cartridge
+        // loaded, be showing the Ultimate menu, or be running a previous program.
+        // A clean reset here guarantees the follow-up LOAD/RUN reaches BASIC.
+        {
+            let conn_pre = conn.clone();
+            tokio::task::spawn_blocking(move || {
+                let c = conn_pre.blocking_lock();
+                c.reset().map_err(|e| format!("Pre-reset failed: {}", e))
+            })
+            .await
+            .map_err(|e| format!("Task error: {}", e))??;
+            // Give the machine time to boot to BASIC before uploading the disk
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
         if is_device_path(path) {
             // Device path: mount via REST, then run sequence via crate
             crate::api::mount_disk(bare_host(host), path, drive, "readonly", password.clone())
@@ -196,6 +212,7 @@ async fn mount_and_run(
             let fname = filename.clone();
             tokio::task::spawn_blocking(move || {
                 let c = conn.blocking_lock();
+                // Second reset: re-enter BASIC with the mounted disk visible
                 c.reset().map_err(|e| format!("Reset failed: {}", e))?;
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 let load_cmd = format!("load \"*\",{},1\n", dev);
@@ -230,7 +247,7 @@ async fn mount_and_run(
                 )
                 .map_err(|e| format!("Upload+mount failed: {}", e))?;
                 std::thread::sleep(std::time::Duration::from_millis(500));
-                // Reset + LOAD + RUN
+                // Second reset: re-enter BASIC with the mounted disk visible
                 c.reset().map_err(|e| format!("Reset failed: {}", e))?;
                 std::thread::sleep(std::time::Duration::from_secs(3));
                 let load_cmd = format!("load \"*\",{},1\n", dev);
@@ -319,30 +336,97 @@ async fn apply_mounts(
 
     if let Some(mount) = &profile.mounts.cartridge {
         if !mount.path.is_empty() {
-            if is_device_path(&mount.path) {
-                results.push(
-                    crate::api::run_crt(bare_host(host), &mount.path, password.clone()).await,
-                );
-            } else {
-                results.push(Err(
-                    "Local cartridge upload not yet supported — use a device path like /Usb0/carts/game.crt".to_string()
-                ));
-            }
+            results.push(
+                run_program_entry(host, &mount.path, password.clone(), connection.clone()).await,
+            );
         }
     }
 
     results
 }
 
-/// Read full current device config as a ConfigTree (for baseline capture).
+/// Run a program from the "cartridge" slot — accepts any runnable file type.
+///
+/// For device paths, uses the REST runners API (works for .prg / .crt).
+/// For local files, reads the bytes and calls the ultimate64 crate's
+/// corresponding method based on extension:
+/// - `.crt` → `conn.run_crt(&data)`
+/// - `.prg` → `conn.run_prg(&data)`
+/// - `.sid` → `conn.sid_play(&data, None)`
+async fn run_program_entry(
+    host: &str,
+    path: &str,
+    password: Option<String>,
+    connection: Option<Arc<Mutex<Rest>>>,
+) -> Result<String, String> {
+    if is_device_path(path) {
+        // Route through the existing REST runners based on extension
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "prg" => crate::api::run_prg(bare_host(host), path, password).await,
+            "sid" => crate::api::sidplay(bare_host(host), path, password).await,
+            _ => crate::api::run_crt(bare_host(host), path, password).await,
+        }
+    } else {
+        let local_path = Path::new(path);
+        if !local_path.exists() {
+            return Err(format!("Local file not found: {}", path));
+        }
+        let conn = connection
+            .ok_or_else(|| "Cannot upload local file without device connection".to_string())?;
+        let path_buf = local_path.to_path_buf();
+        let filename = local_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string();
+        let ext = local_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+
+        tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&path_buf)
+                .map_err(|e| format!("Failed to read {}: {}", path_buf.display(), e))?;
+            let c = conn.blocking_lock();
+            match ext.as_deref() {
+                Some("crt") => c
+                    .run_crt(&data)
+                    .map(|_| format!("Running cartridge: {}", filename))
+                    .map_err(|e| format!("run_crt failed: {}", e)),
+                Some("prg") => c
+                    .run_prg(&data)
+                    .map(|_| format!("Running PRG: {}", filename))
+                    .map_err(|e| format!("run_prg failed: {}", e)),
+                Some("sid") => c
+                    .sid_play(&data, None)
+                    .map(|_| format!("Playing SID: {}", filename))
+                    .map_err(|e| format!("sid_play failed: {}", e)),
+                other => Err(format!(
+                    "Unsupported file type '{}' for cartridge slot — use .crt, .prg, or .sid",
+                    other.unwrap_or("(none)"),
+                )),
+            }
+        })
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
+    }
+}
+
+/// Read full current device config + schema (valid enum values, ranges).
 /// This is the ONLY time we read from the device — done once and stored.
 pub async fn read_current_config(
     host: String,
     password: Option<String>,
-) -> Result<ConfigTree, String> {
+) -> Result<(ConfigTree, crate::device_profile::ConfigSchema), String> {
     let categories = config_api::fetch_categories(host.clone(), password.clone()).await?;
 
     let mut config = ConfigTree::new();
+    let mut schema = crate::device_profile::ConfigSchema::new();
 
     for (i, category) in categories.iter().enumerate() {
         log::info!(
@@ -356,10 +440,26 @@ pub async fn read_current_config(
         {
             Ok((_cat, items)) => {
                 let mut cat_map = HashMap::new();
+                let mut schema_map = HashMap::new();
                 for item in items {
-                    cat_map.insert(item.name, item.current_value);
+                    cat_map.insert(item.name.clone(), item.current_value);
+                    if let Some(details) = item.details {
+                        schema_map.insert(
+                            item.name,
+                            crate::device_profile::ItemSchema {
+                                options: details.options,
+                                min: details.min,
+                                max: details.max,
+                                format: details.format,
+                                default: details.default,
+                            },
+                        );
+                    }
                 }
                 config.insert(category.clone(), cat_map);
+                if !schema_map.is_empty() {
+                    schema.insert(category.clone(), schema_map);
+                }
             }
             Err(e) => {
                 log::error!("Failed to fetch category '{}': {}", category, e);
@@ -369,7 +469,12 @@ pub async fn read_current_config(
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
 
-    Ok(config)
+    log::info!(
+        "Snapshot complete: {} categories, {} schema entries",
+        config.len(),
+        schema.values().map(|v| v.len()).sum::<usize>()
+    );
+    Ok((config, schema))
 }
 
 /// Read current config and create a DeviceProfile from it.
@@ -378,7 +483,7 @@ pub async fn snapshot_current_config(
     name: String,
     password: Option<String>,
 ) -> Result<DeviceProfile, String> {
-    let config = read_current_config(host, password).await?;
+    let (config, _schema) = read_current_config(host, password).await?;
     let id = crate::device_profile::slugify(&name);
     let mut profile = DeviceProfile::new(&id, &name);
     profile.config = config;

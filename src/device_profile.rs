@@ -46,6 +46,31 @@ pub struct DeviceProfile {
 /// Configuration tree: category name -> (key name -> value)
 pub type ConfigTree = HashMap<String, HashMap<String, serde_json::Value>>;
 
+/// Schema for a single config item — valid values, ranges, defaults.
+/// Captured from the device API during baseline snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemSchema {
+    /// Valid enum values (if this is a pick-list item)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    /// Minimum value (if integer)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<i64>,
+    /// Maximum value (if integer)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<i64>,
+    /// Display format (e.g. "%d", "%d ppm")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Default value from device
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// Full schema: category -> key -> ItemSchema. Captured once from the API
+/// and stored alongside the baseline for offline use.
+pub type ConfigSchema = HashMap<String, HashMap<String, ItemSchema>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileMode {
