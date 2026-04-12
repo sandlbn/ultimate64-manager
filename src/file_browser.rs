@@ -2112,14 +2112,23 @@ impl FileBrowser {
                             None
                         };
 
-                        // Filter: show directories and relevant file types
-                        // Including text files and images for preview
+                        // Filter: show directories, all device-relevant files,
+                        // plus text/image/PDF files for preview.
                         let ext_str = extension.as_deref().unwrap_or("");
                         if is_dir
                             || crate::file_types::is_disk_image(ext_str)
                             || crate::file_types::is_runnable(ext_str)
                             || crate::file_types::is_zip_file(ext_str)
-                            || matches!(ext_str, "mod" | "tap" | "t64")
+                            || matches!(
+                                ext_str,
+                                "mod" | "xm" | "s3m"        // tracker music
+                                | "tap" | "t64"             // tape formats
+                                | "reu"                     // REU images
+                                | "rom" | "bin"             // ROM / binary
+                                | "cfg"                     // Ultimate config
+                                | "u2l" | "u2p" | "u2r" | "u64" | "ue2" // firmware updates
+                                | "p00" | "seq" // C64 program variants
+                            )
                             || crate::file_types::is_text_file(&name)
                             || crate::file_types::is_image_file(&name)
                             || crate::file_types::is_pdf_file(&name)
