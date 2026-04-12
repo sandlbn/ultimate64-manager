@@ -45,6 +45,7 @@ pub async fn apply_profile(
 
     // Step 2: Apply the diff
     let diff_count: usize = diff.values().map(|v| v.len()).sum();
+    let needs_reboot = requires_reboot(&diff);
     if diff_count == 0 {
         log::info!(
             "Profile '{}': no changes needed, device already matches",
@@ -53,13 +54,32 @@ pub async fn apply_profile(
         steps.push("No changes needed".to_string());
     } else {
         log::info!(
-            "Profile '{}': applying {} changed settings across {} categories",
+            "Profile '{}': applying {} changed settings across {} categories{}",
             profile.name,
             diff_count,
-            diff.len()
+            diff.len(),
+            if needs_reboot { " (reboot required)" } else { "" },
         );
         let result = config_api::apply_all_config(host.clone(), diff, password.clone()).await?;
         steps.push(result);
+    }
+
+    // Step 2b: If the diff contains ROM changes, a full reboot is needed
+    // (not just a C64 reset) because ROM loading happens at Ultimate boot.
+    if needs_reboot && diff_count > 0 {
+        log::info!("ROM/firmware settings changed — rebooting Ultimate...");
+        let reboot_url = format!("{}/v1/machine:reboot", host);
+        let client = crate::net_utils::build_device_client(10)?;
+        let request =
+            crate::net_utils::with_password(client.put(&reboot_url), password.as_deref());
+        match request.send().await {
+            Ok(_) => {
+                steps.push("Rebooted (ROM change)".to_string());
+                // Give the Ultimate time to fully reboot before mounting media
+                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            }
+            Err(e) => log::warn!("Reboot request failed (may still succeed): {}", e),
+        }
     }
 
     // Step 3: Mount media
@@ -71,8 +91,8 @@ pub async fn apply_profile(
         }
     }
 
-    // Step 4: Reset if requested
-    if profile.launch.reset_after_apply {
+    // Step 4: Reset if requested (skip if we already rebooted for ROM changes)
+    if profile.launch.reset_after_apply && !needs_reboot {
         log::info!("Resetting machine after profile apply...");
         let reset_url = format!("{}/v1/machine:reset", host);
         let client = crate::net_utils::build_device_client(5)?;
@@ -101,6 +121,37 @@ fn bare_host(host_url: &str) -> &str {
         .strip_prefix("http://")
         .or_else(|| host_url.strip_prefix("https://"))
         .unwrap_or(host_url)
+}
+
+/// Check if the diff contains settings that require a full Ultimate reboot
+/// (not just a C64 reset). ROM changes are loaded at Ultimate boot time,
+/// so they only take effect after reboot.
+fn requires_reboot(diff: &ConfigTree) -> bool {
+    for (category, items) in diff {
+        for key in items.keys() {
+            let lower_key = key.to_lowercase();
+            let lower_cat = category.to_lowercase();
+            // ROM file paths — loaded at boot
+            if lower_key.contains("rom") && (lower_key.contains("kernal")
+                || lower_key.contains("basic")
+                || lower_key.contains("char")
+                || lower_key.contains("1541")
+                || lower_key.contains("1571")
+                || lower_key.contains("1581"))
+            {
+                return true;
+            }
+            // "ROM for XXXX mode" pattern in drive settings
+            if lower_key.starts_with("rom for ") {
+                return true;
+            }
+            // Cartridge changes may also need reboot
+            if lower_key == "cartridge" && lower_cat.contains("cartridge") {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Check if a path is a device-side path (on the Ultimate64 filesystem).
@@ -448,6 +499,7 @@ pub async fn read_current_config(
                             item.name,
                             crate::device_profile::ItemSchema {
                                 options: details.options,
+                                presets: details.presets,
                                 min: details.min,
                                 max: details.max,
                                 format: details.format,

@@ -3168,6 +3168,63 @@ impl ProfileManager {
                 .spacing(3)
                 .align_y(iced::Alignment::Center)
                 .into()
+            } else if let Some(presets) = schema
+                .presets
+                .as_ref()
+                .filter(|p| !p.is_empty())
+            {
+                // Presets: text input + preset dropdown + Browse button.
+                // Unlike enums, the user CAN type a custom path.
+                let current_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => config_api::format_value(value),
+                };
+                let cat2 = cat.clone();
+                let k2 = k.clone();
+                let cat3 = cat.clone();
+                let k3 = k.clone();
+                let cat4 = cat.clone();
+                let k4 = k.clone();
+                let current_for_browse = current_str.clone();
+                row![
+                    text_input("path or filename...", &current_str)
+                        .on_input(move |v| {
+                            ProfileManagerMessage::ConfigValueChanged(
+                                cat2.clone(),
+                                k2.clone(),
+                                serde_json::Value::String(v),
+                            )
+                        })
+                        .size(fs.normal as f32)
+                        .width(Length::Fill),
+                    pick_list(
+                        presets.clone(),
+                        if presets.contains(&current_str) {
+                            Some(current_str)
+                        } else {
+                            None
+                        },
+                        move |v| {
+                            ProfileManagerMessage::ConfigValueChanged(
+                                cat3.clone(),
+                                k3.clone(),
+                                serde_json::Value::String(v),
+                            )
+                        },
+                    )
+                    .text_size(fs.small)
+                    .width(Length::Fixed(100.0)),
+                    button(text("Browse…").size(fs.tiny))
+                        .on_press(ProfileManagerMessage::OpenRemotePicker(
+                            cat4,
+                            k4,
+                            current_for_browse,
+                        ))
+                        .padding([2, 8]),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+                .into()
             } else {
                 self.view_config_item_fallback(&cat, &k, value, fs)
             }
