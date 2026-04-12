@@ -21,8 +21,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **FTP File Transfer** – Upload/download files via FTP with multi-file selection
 - **Remote Directory Browser** – Browse the Ultimate filesystem without mounting disks
 - **Disk Image Viewer** – Display **D64/D71 directory contents** (C64-style listing)
-- **Disk Management** – Mount D64, D71, D81, G64, G71 images to Drive A/B
-- **Run Programs** – Direct load and run for PRG and CRT files
+- **Disk Management** – Mount D64, D71, D81, G64, G71, G81 images to Drive A/B
+- **Run Programs** – Direct load and run for PRG, CRT, and SID files
+- **Supported File Types** – D64, D71, D81, G64, G71, G81, PRG, P00, CRT, SID, MOD, XM, S3M, TAP, T64, REU, ROM, BIN, CFG, ZIP, and firmware updates (U2L, U2P, U2R, U64, UE2)
 - **Music Player** – Play SID and MOD files with playlist support
   - Shuffle and repeat modes
   - Subsong navigation for multi-tune SID files
@@ -42,7 +43,16 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Click-to-edit bytes
 - **Configuration Editor** – Edit Ultimate configuration settings
 - **Device Discovery** – Automatic network discovery of Ultimate devices
-- **Configuration Profiles** – Save and load configuration profiles
+- **Device Profiles** – Git-backed per-game/per-demo configuration profiles
+  - Overlay mode: override only the settings you need
+  - Import from native .cfg files or JSON backups
+  - One-click apply with automatic diff (only changed settings sent)
+  - Media mounts: disk images, cartridges, PRG files
+  - Autoload: mount + reset + LOAD + RUN in one click
+  - Schema-driven dropdowns and sliders from device API
+  - Screenshot / image thumbnails per profile
+  - FTP file picker for device filesystem paths
+  - See [PROFILES.md](PROFILES.md) for full documentation
 - **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC and menus
