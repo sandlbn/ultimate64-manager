@@ -231,14 +231,6 @@ Click **Snapshot Baseline** while connected to the device. This is required befo
 
 The baseline file was saved before schema capture was added. Click **Snapshot Baseline** to refresh it. After that, config keys will show proper dropdowns and sliders.
 
-### Settings rejected by the device (400 Bad Request)
-
-This usually means a value doesn't match the device's expected format. Common causes:
-
-- The baseline was captured before a value-preservation fix. Re-snapshot.
-- Boolean values using the wrong pair (e.g. "Yes" vs "Enabled"). The editor now preserves the original pair.
-- Leading spaces in values (e.g. `" 0 dB"` not `"0 dB"`). The parser now preserves these.
-
 ### USB not showing in FTP picker
 
 The Ultimate firmware only lists mounted USB volumes in the FTP root directory. Use the quick-jump buttons (`/USB0`, `/USB1`, etc.) or type the path manually and click **Go**.

@@ -117,6 +117,7 @@ fn is_device_path(path: &str) -> bool {
 }
 
 /// Enable a drive via the config API if it's currently disabled.
+/// Only fetches the single "Drive" key, not the entire category.
 async fn ensure_drive_enabled(host: &str, drive: &str, password: Option<String>) {
     let category = if drive == "a" {
         "Drive A Settings"
@@ -124,20 +125,20 @@ async fn ensure_drive_enabled(host: &str, drive: &str, password: Option<String>)
         "Drive B Settings"
     };
 
-    // Check current state
-    match config_api::fetch_category_items(host.to_string(), category.to_string(), password.clone())
-        .await
+    // Fetch only the "Drive" key (not all 13 items in the category)
+    match config_api::fetch_item_details(
+        host.to_string(),
+        category.to_string(),
+        "Drive".to_string(),
+        password.clone(),
+    )
+    .await
     {
-        Ok((_cat, items)) => {
-            let is_enabled = items
-                .iter()
-                .find(|i| i.name == "Drive")
-                .map(|i| {
-                    i.current_value
-                        .as_str()
-                        .map(|s| s.to_lowercase() != "disabled")
-                        .unwrap_or(true)
-                })
+        Ok((_name, details)) => {
+            let is_enabled = details
+                .current
+                .as_str()
+                .map(|s| s.to_lowercase() != "disabled")
                 .unwrap_or(true);
 
             if !is_enabled {
@@ -153,7 +154,6 @@ async fn ensure_drive_enabled(host: &str, drive: &str, password: Option<String>)
                     Ok(_) => log::info!("Drive {} enabled", drive),
                     Err(e) => log::warn!("Failed to enable drive {}: {}", drive, e),
                 }
-                // Let the device settle after config change
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }

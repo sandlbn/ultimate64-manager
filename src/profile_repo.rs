@@ -129,8 +129,8 @@ impl ProfileRepo {
             if output.status.success() {
                 let gitignore = "# OS files\n.DS_Store\nThumbs.db\n\n# Temp files\n*.tmp\n*.bak\n";
                 std::fs::write(self.root.join(".gitignore"), gitignore).ok();
-                self.git_add(".");
-                self.git_commit("Initialize profile repository");
+                let _ = self.git_add(".");
+                let _ = self.git_commit("Initialize profile repository");
             } else {
                 log::warn!(
                     "git init failed (profiles will work without versioning): {}",

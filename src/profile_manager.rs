@@ -2004,11 +2004,7 @@ impl ProfileManager {
                         is_connected.then_some(ProfileManagerMessage::SnapshotBaseline),
                     )
                     .padding([4, 8])
-                    .style(if has_baseline {
-                        button::secondary
-                    } else {
-                        button::primary
-                    }),
+                    .style(crate::styles::baseline_button),
                 if has_baseline {
                     "Re-read all device config + schema. Needed when firmware changes."
                 } else {
@@ -2058,11 +2054,18 @@ impl ProfileManager {
 
                     let mut row_items: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
 
-                    // Thumbnail if screenshot exists
+                    // Thumbnail — always reserve the same width so columns align
                     if let Some(ref ss_path) = entry.screenshot_path {
                         let handle = iced::widget::image::Handle::from_path(ss_path);
                         row_items.push(
                             iced::widget::image(handle)
+                                .width(Length::Fixed(48.0))
+                                .height(Length::Fixed(36.0))
+                                .into(),
+                        );
+                    } else {
+                        row_items.push(
+                            Space::new()
                                 .width(Length::Fixed(48.0))
                                 .height(Length::Fixed(36.0))
                                 .into(),
@@ -2482,7 +2485,8 @@ impl ProfileManager {
             button(text("Snapshot Baseline").size(fs.small))
                 .on_press(ProfileManagerMessage::SnapshotBaseline)
                 .padding([3, 6])
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .style(crate::styles::baseline_button),
             if self.baseline_config.is_some() {
                 text(baseline_info)
                     .size(fs.tiny)
@@ -3332,7 +3336,8 @@ impl ProfileManager {
             Space::new().width(10),
             button(text("Snapshot Baseline").size(fs.small))
                 .on_press(ProfileManagerMessage::SnapshotBaseline)
-                .padding([4, 8]),
+                .padding([4, 8])
+                .style(crate::styles::baseline_button),
         ]
         .spacing(5);
 
