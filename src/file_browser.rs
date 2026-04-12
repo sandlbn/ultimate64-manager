@@ -1727,12 +1727,17 @@ impl FileBrowser {
             ""
         } else {
             match entry.extension.as_deref() {
-                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => "DSK",
-                Some("prg") => "PRG",
+                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71")
+                | Some("g81") => "DSK",
+                Some("prg") | Some("p00") | Some("seq") | Some("usr") | Some("rel") => "PRG",
                 Some("crt") => "CRT",
                 Some("sid") => "SID",
-                Some("mod") => "MOD",
+                Some("mod") | Some("xm") | Some("s3m") => "MOD",
                 Some("tap") | Some("t64") => "TAP",
+                Some("reu") => "REU",
+                Some("rom") | Some("bin") => "ROM",
+                Some("cfg") => "CFG",
+                Some("u2l") | Some("u2p") | Some("u2r") | Some("u64") | Some("ue2") => "UPD",
                 Some("txt") | Some("atxt") | Some("nfo") | Some("diz") => "TXT",
                 Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("bmp") => "IMG",
                 Some("pdf") => "PDF",
@@ -1765,7 +1770,8 @@ impl FileBrowser {
             Space::new().width(0).into()
         } else {
             match entry.extension.as_deref() {
-                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71") => {
+                Some("d64") | Some("d71") | Some("d81") | Some("g64") | Some("g71")
+                | Some("g81") => {
                     let drive = match self.selected_drive {
                         DriveOption::A => "A",
                         DriveOption::B => "B",
