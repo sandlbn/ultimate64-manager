@@ -18,11 +18,13 @@ use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
+mod cfg_format;
 mod config_api;
 mod config_editor;
 mod config_presets;
 mod csdb;
 mod csdb_browser;
+mod device_profile;
 mod dir_preview;
 mod discovery;
 mod disk_image;
@@ -37,6 +39,9 @@ mod net_utils;
 mod pdf_preview;
 mod petscii;
 mod port64;
+mod profile_api;
+mod profile_manager;
+mod profile_repo;
 mod profiles;
 mod remote_browser;
 mod screenshot_api;
@@ -57,6 +62,7 @@ use discovery::DiscoveredDevice;
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
 use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
+use profile_manager::{ProfileManager as DeviceProfileManager, ProfileManagerMessage};
 use profiles::ProfileManager;
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
 use settings::{AppSettings, ConnectionSettings, StreamControlMethod};
@@ -174,6 +180,9 @@ pub enum Message {
     // Configuration editor
     ConfigEditor(ConfigEditorMessage),
 
+    // Device profile manager
+    DeviceProfileManager(ProfileManagerMessage),
+
     // Connection
     HostInputChanged(String),
     PasswordInputChanged(String),
@@ -267,6 +276,7 @@ pub enum Tab {
     MemoryEditor,
     Monitor,
     Configuration,
+    Profiles,
     CsdbBrowser,
     Settings,
 }
@@ -280,6 +290,7 @@ impl std::fmt::Display for Tab {
             Tab::MemoryEditor => write!(f, "Memory Editor"),
             Tab::Monitor => write!(f, "HW Monitor"),
             Tab::Configuration => write!(f, "Configuration"),
+            Tab::Profiles => write!(f, "Profiles"),
             Tab::CsdbBrowser => write!(f, "CSDb"),
             Tab::Settings => write!(f, "Settings"),
         }
@@ -341,8 +352,10 @@ pub struct Ultimate64Browser {
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
 
-    // Profile management
+    // Profile management (app settings profiles)
     profile_manager: ProfileManager,
+    // Device profile manager (Ultimate64 config profiles)
+    device_profile_manager: DeviceProfileManager,
     new_profile_name: String,
     rename_profile_name: String,
     // Device discovery
@@ -409,6 +422,7 @@ impl Ultimate64Browser {
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
             profile_manager,
+            device_profile_manager: DeviceProfileManager::new(),
             new_profile_name: String::new(),
             rename_profile_name: String::new(),
             is_discovering: false,
@@ -1604,6 +1618,20 @@ impl Ultimate64Browser {
                 )
                 .map(Message::ConfigEditor),
 
+            Message::DeviceProfileManager(msg) => {
+                // Provide streaming frame buffer for screenshot capture
+                self.device_profile_manager
+                    .set_streaming_frame(self.video_streaming.frame_buffer.clone());
+                self.device_profile_manager
+                    .update(
+                        msg,
+                        self.host_url.clone(),
+                        self.settings.connection.password.clone(),
+                        self.connection.clone(),
+                    )
+                    .map(Message::DeviceProfileManager)
+            }
+
             Message::HostInputChanged(value) => {
                 self.host_input = value;
                 Task::none()
@@ -2405,6 +2433,7 @@ impl Ultimate64Browser {
                 self.tab_button("MEMORY", Tab::MemoryEditor),
                 self.tab_button("MONITOR", Tab::Monitor),
                 self.tab_button("CONFIG", Tab::Configuration),
+                self.tab_button("PROFILES", Tab::Profiles),
                 self.tab_button("CSDB", Tab::CsdbBrowser),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
@@ -2458,6 +2487,10 @@ impl Ultimate64Browser {
                 .config_editor
                 .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::ConfigEditor),
+            Tab::Profiles => self
+                .device_profile_manager
+                .view(self.status.connected, self.settings.preferences.font_size)
+                .map(Message::DeviceProfileManager),
             Tab::CsdbBrowser => self
                 .csdb_browser
                 .view(self.settings.preferences.font_size, self.status.connected)
