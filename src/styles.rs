@@ -161,6 +161,40 @@ pub fn action_button(_theme: &iced::Theme, status: button::Status) -> button::St
     }
 }
 
+/// Warm/orange button for "Snapshot Baseline" — visually distinct from
+/// regular actions so the user notices when a re-snapshot is needed.
+pub fn baseline_button(_theme: &iced::Theme, status: button::Status) -> button::Style {
+    let base = button::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba(
+            0.85, 0.55, 0.2, 0.35,
+        ))),
+        text_color: iced::Color::from_rgb(0.95, 0.8, 0.55),
+        border: iced::Border {
+            color: iced::Color::from_rgba(0.9, 0.6, 0.3, 0.4),
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        shadow: iced::Shadow::default(),
+        snap: false,
+    };
+    match status {
+        button::Status::Hovered => button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.85, 0.55, 0.2, 0.55,
+            ))),
+            text_color: iced::Color::WHITE,
+            ..base
+        },
+        button::Status::Pressed => button::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.85, 0.55, 0.2, 0.7,
+            ))),
+            ..base
+        },
+        _ => base,
+    }
+}
+
 /// Subtle tooltip container — dark, blends with dark theme
 pub fn subtle_tooltip(_theme: &iced::Theme) -> container::Style {
     container::Style {

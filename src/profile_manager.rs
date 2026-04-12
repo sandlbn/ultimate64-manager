@@ -2004,11 +2004,7 @@ impl ProfileManager {
                         is_connected.then_some(ProfileManagerMessage::SnapshotBaseline),
                     )
                     .padding([4, 8])
-                    .style(if has_baseline {
-                        button::secondary
-                    } else {
-                        button::primary
-                    }),
+                    .style(crate::styles::baseline_button),
                 if has_baseline {
                     "Re-read all device config + schema. Needed when firmware changes."
                 } else {
@@ -2058,11 +2054,18 @@ impl ProfileManager {
 
                     let mut row_items: Vec<Element<'_, ProfileManagerMessage>> = Vec::new();
 
-                    // Thumbnail if screenshot exists
+                    // Thumbnail — always reserve the same width so columns align
                     if let Some(ref ss_path) = entry.screenshot_path {
                         let handle = iced::widget::image::Handle::from_path(ss_path);
                         row_items.push(
                             iced::widget::image(handle)
+                                .width(Length::Fixed(48.0))
+                                .height(Length::Fixed(36.0))
+                                .into(),
+                        );
+                    } else {
+                        row_items.push(
+                            Space::new()
                                 .width(Length::Fixed(48.0))
                                 .height(Length::Fixed(36.0))
                                 .into(),
@@ -2482,7 +2485,8 @@ impl ProfileManager {
             button(text("Snapshot Baseline").size(fs.small))
                 .on_press(ProfileManagerMessage::SnapshotBaseline)
                 .padding([3, 6])
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .style(crate::styles::baseline_button),
             if self.baseline_config.is_some() {
                 text(baseline_info)
                     .size(fs.tiny)
@@ -3164,6 +3168,63 @@ impl ProfileManager {
                 .spacing(3)
                 .align_y(iced::Alignment::Center)
                 .into()
+            } else if let Some(presets) = schema
+                .presets
+                .as_ref()
+                .filter(|p| !p.is_empty())
+            {
+                // Presets: text input + preset dropdown + Browse button.
+                // Unlike enums, the user CAN type a custom path.
+                let current_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => config_api::format_value(value),
+                };
+                let cat2 = cat.clone();
+                let k2 = k.clone();
+                let cat3 = cat.clone();
+                let k3 = k.clone();
+                let cat4 = cat.clone();
+                let k4 = k.clone();
+                let current_for_browse = current_str.clone();
+                row![
+                    text_input("path or filename...", &current_str)
+                        .on_input(move |v| {
+                            ProfileManagerMessage::ConfigValueChanged(
+                                cat2.clone(),
+                                k2.clone(),
+                                serde_json::Value::String(v),
+                            )
+                        })
+                        .size(fs.normal as f32)
+                        .width(Length::Fill),
+                    pick_list(
+                        presets.clone(),
+                        if presets.contains(&current_str) {
+                            Some(current_str)
+                        } else {
+                            None
+                        },
+                        move |v| {
+                            ProfileManagerMessage::ConfigValueChanged(
+                                cat3.clone(),
+                                k3.clone(),
+                                serde_json::Value::String(v),
+                            )
+                        },
+                    )
+                    .text_size(fs.small)
+                    .width(Length::Fixed(100.0)),
+                    button(text("Browse…").size(fs.tiny))
+                        .on_press(ProfileManagerMessage::OpenRemotePicker(
+                            cat4,
+                            k4,
+                            current_for_browse,
+                        ))
+                        .padding([2, 8]),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+                .into()
             } else {
                 self.view_config_item_fallback(&cat, &k, value, fs)
             }
@@ -3332,7 +3393,8 @@ impl ProfileManager {
             Space::new().width(10),
             button(text("Snapshot Baseline").size(fs.small))
                 .on_press(ProfileManagerMessage::SnapshotBaseline)
-                .padding([4, 8]),
+                .padding([4, 8])
+                .style(crate::styles::baseline_button),
         ]
         .spacing(5);
 

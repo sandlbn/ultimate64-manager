@@ -151,6 +151,17 @@ pub async fn fetch_category_items(
                                 })
                             });
 
+                        // Check for "presets" — suggested values for path-like fields
+                        // (e.g. ROM files). Unlike "values", custom input is allowed.
+                        let presets = item_obj.get("presets").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .filter(|s| !s.is_empty()) // skip empty preset entries
+                                    .collect()
+                            })
+                        });
+
                         let details = ConfigItemDetails {
                             current: current.clone(),
                             min: item_obj.get("min").and_then(|v| v.as_i64()),
@@ -161,6 +172,7 @@ pub async fn fetch_category_items(
                                 .map(|s| s.to_string()),
                             default: item_obj.get("default").cloned(),
                             options,
+                            presets,
                         };
 
                         // Determine option type from details
@@ -247,7 +259,6 @@ pub async fn fetch_item_details(
             if let Some(cat_obj) = cat_value.as_object() {
                 for (_item_key, item_value) in cat_obj {
                     if let Some(item_obj) = item_value.as_object() {
-                        // Check for "options" or "values" (API uses "values" for enums)
                         let options = item_obj
                             .get("options")
                             .or_else(|| item_obj.get("values"))
@@ -258,6 +269,15 @@ pub async fn fetch_item_details(
                                         .collect()
                                 })
                             });
+
+                        let presets = item_obj.get("presets").and_then(|v| {
+                            v.as_array().map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                    .filter(|s| !s.is_empty())
+                                    .collect()
+                            })
+                        });
 
                         let details = ConfigItemDetails {
                             current: item_obj
@@ -272,6 +292,7 @@ pub async fn fetch_item_details(
                                 .map(|s| s.to_string()),
                             default: item_obj.get("default").cloned(),
                             options,
+                            presets,
                         };
 
                         log::debug!(

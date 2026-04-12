@@ -50,9 +50,12 @@ pub type ConfigTree = HashMap<String, HashMap<String, serde_json::Value>>;
 /// Captured from the device API during baseline snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemSchema {
-    /// Valid enum values (if this is a pick-list item)
+    /// Fixed enum values (from API `values` field) — must pick from this list
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
+    /// Suggested presets (from API `presets` field) — can pick OR type a custom path
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<String>>,
     /// Minimum value (if integer)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<i64>,

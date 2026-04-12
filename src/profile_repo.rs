@@ -47,19 +47,41 @@ pub struct StoredBaseline {
     pub schema: Option<crate::device_profile::ConfigSchema>,
 }
 
-/// Manages a git-backed repository of device profiles.
+/// Manages a profile repository with optional git versioning.
+/// If git is not installed, profiles still work — you just lose
+/// version history, diffing, and push/pull.
 pub struct ProfileRepo {
     /// Root path of the repository
     root: PathBuf,
-    /// Whether the repo has been initialized
+    /// Whether the repo directory structure has been initialized
     initialized: bool,
+    /// Whether the `git` binary is available on this system
+    git_available: bool,
 }
 
 impl ProfileRepo {
     /// Create a new ProfileRepo at the given root path.
     pub fn new(root: PathBuf) -> Self {
-        let initialized = root.join(".git").is_dir();
-        Self { root, initialized }
+        // The repo is "initialized" if the directory structure exists,
+        // regardless of whether git was used.
+        let initialized = root.join(".git").is_dir() || root.join("profiles").is_dir();
+        let git_available = Self::check_git_available();
+        Self {
+            root,
+            initialized,
+            git_available,
+        }
+    }
+
+    /// Check if git is installed and usable.
+    fn check_git_available() -> bool {
+        std::process::Command::new("git")
+            .args(["--version"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     /// Get the default repository path inside the app config directory.
@@ -81,40 +103,46 @@ impl ProfileRepo {
         self.initialized
     }
 
-    /// Initialize the git repository if it doesn't exist.
+    /// Initialize the profile repository.
+    /// Creates the directory structure. If git is available, also initializes
+    /// a git repo for versioning. Works fine without git — profiles are just
+    /// stored as plain files.
     pub fn init(&mut self) -> Result<(), String> {
         if self.initialized {
             return Ok(());
         }
 
-        // Create directory structure
+        // Create directory structure (always — this is what makes profiles work)
         std::fs::create_dir_all(self.root.join("profiles"))
             .map_err(|e| format!("Failed to create profiles dir: {}", e))?;
         std::fs::create_dir_all(self.root.join("baselines"))
             .map_err(|e| format!("Failed to create baselines dir: {}", e))?;
 
-        // Initialize git repo
-        let output = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&self.root)
-            .output()
-            .map_err(|e| format!("Failed to run git init: {}", e))?;
+        // Initialize git repo if git is available
+        if self.git_available {
+            let output = std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(&self.root)
+                .output()
+                .map_err(|e| format!("Failed to run git init: {}", e))?;
 
-        if !output.status.success() {
-            return Err(format!(
-                "git init failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
+            if output.status.success() {
+                let gitignore = "# OS files\n.DS_Store\nThumbs.db\n\n# Temp files\n*.tmp\n*.bak\n";
+                std::fs::write(self.root.join(".gitignore"), gitignore).ok();
+                let _ = self.git_add(".");
+                let _ = self.git_commit("Initialize profile repository");
+            } else {
+                log::warn!(
+                    "git init failed (profiles will work without versioning): {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        } else {
+            log::info!(
+                "git not found — profiles will work without version history. \
+                 Install git for versioning, diffs, and remote sync."
+            );
         }
-
-        // Create initial .gitignore
-        let gitignore = "# OS files\n.DS_Store\nThumbs.db\n\n# Temp files\n*.tmp\n*.bak\n";
-        std::fs::write(self.root.join(".gitignore"), gitignore)
-            .map_err(|e| format!("Failed to write .gitignore: {}", e))?;
-
-        // Initial commit
-        self.git_add(".")?;
-        self.git_commit("Initialize profile repository")?;
 
         self.initialized = true;
         log::info!("Profile repository initialized at {}", self.root.display());
@@ -362,8 +390,11 @@ impl ProfileRepo {
 
     // === Git operations ===
 
-    /// Commit current changes to the repository.
+    /// Commit current changes to the repository. No-op without git.
     pub fn commit(&mut self, message: &str) -> Result<(), String> {
+        if !self.git_available {
+            return Ok(());
+        }
         self.ensure_initialized()?;
         self.git_add(".")?;
 
@@ -377,8 +408,11 @@ impl ProfileRepo {
         self.git_commit(message)
     }
 
-    /// Get git status.
+    /// Get git status. Returns empty string without git.
     pub fn git_status(&self) -> Result<String, String> {
+        if !self.git_available {
+            return Ok(String::new());
+        }
         let output = std::process::Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&self.root)
@@ -388,8 +422,11 @@ impl ProfileRepo {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// Get git log (last N commits).
+    /// Get git log (last N commits). Returns empty without git.
     pub fn git_log(&self, count: usize) -> Result<Vec<String>, String> {
+        if !self.git_available {
+            return Ok(vec!["(git not installed — no history)".to_string()]);
+        }
         let output = std::process::Command::new("git")
             .args(["log", &format!("-{}", count), "--oneline", "--no-decorate"])
             .current_dir(&self.root)
@@ -400,8 +437,11 @@ impl ProfileRepo {
         Ok(log_text.lines().map(|l| l.to_string()).collect())
     }
 
-    /// Pull from remote (if configured).
+    /// Pull from remote (if configured). No-op without git.
     pub fn pull(&self) -> Result<String, String> {
+        if !self.git_available {
+            return Err("git is not installed".to_string());
+        }
         let output = std::process::Command::new("git")
             .args(["pull", "--rebase"])
             .current_dir(&self.root)
@@ -418,8 +458,11 @@ impl ProfileRepo {
         }
     }
 
-    /// Push to remote (if configured).
+    /// Push to remote (if configured). No-op without git.
     pub fn push(&self) -> Result<String, String> {
+        if !self.git_available {
+            return Err("git is not installed".to_string());
+        }
         let output = std::process::Command::new("git")
             .args(["push"])
             .current_dir(&self.root)
@@ -436,9 +479,9 @@ impl ProfileRepo {
         }
     }
 
-    /// Check if a remote is configured.
+    /// Check if a remote is configured. False without git.
     pub fn has_remote(&self) -> bool {
-        if !self.initialized {
+        if !self.initialized || !self.git_available {
             return false;
         }
         std::process::Command::new("git")
@@ -458,7 +501,11 @@ impl ProfileRepo {
         Ok(())
     }
 
+    /// Run `git add`. No-op if git is not available.
     fn git_add(&self, path: &str) -> Result<(), String> {
+        if !self.git_available {
+            return Ok(());
+        }
         let output = std::process::Command::new("git")
             .args(["add", path])
             .current_dir(&self.root)
@@ -475,7 +522,11 @@ impl ProfileRepo {
         }
     }
 
+    /// Run `git commit`. No-op if git is not available.
     fn git_commit(&self, message: &str) -> Result<(), String> {
+        if !self.git_available {
+            return Ok(());
+        }
         let output = std::process::Command::new("git")
             .args(["commit", "-m", message])
             .current_dir(&self.root)

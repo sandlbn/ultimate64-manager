@@ -25,8 +25,12 @@ pub struct ConfigItemDetails {
     pub format: Option<String>,
     #[serde(default)]
     pub default: Option<serde_json::Value>,
+    /// Fixed enum values (from API `values` field) — must pick from this list
     #[serde(default)]
     pub options: Option<Vec<String>>,
+    /// Suggested presets (from API `presets` field) — can pick OR type custom path
+    #[serde(default)]
+    pub presets: Option<Vec<String>>,
 }
 
 /// Parsed configuration option for UI display
