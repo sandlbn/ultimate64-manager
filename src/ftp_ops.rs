@@ -55,6 +55,28 @@ pub struct RemoteFileEntry {
     pub path: String,
 }
 
+/// `std::io::Read` wrapper that ticks `bytes_transferred` on the shared
+/// TransferProgress as bytes flow. Lets the UI progress bar update during a
+/// single large upload instead of jumping 0 → 100% when the file finishes.
+pub struct ProgressReader<R: std::io::Read> {
+    pub inner: R,
+    pub progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
+}
+
+impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            if let Ok(mut g) = self.progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.bytes_transferred = p.bytes_transferred.saturating_add(n as u64);
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
 // ─── Delete via FTP ───────────────────────────────────────────────────────────
 
 /// Delete a list of remote paths. Directories are deleted recursively.

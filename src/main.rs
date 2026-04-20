@@ -173,6 +173,8 @@ pub enum Message {
     CopyComplete(Result<String, String>),
     CopyCancel,
     CopyProgressTick,
+    CopyOverwriteConfirm, // User confirmed overwriting existing remote files
+    CopyOverwriteCancel,  // User cancelled the overwrite prompt
 
     // Music player
     MusicPlayer(MusicPlayerMessage),
@@ -364,6 +366,18 @@ pub struct Ultimate64Browser {
 
     /// Shared progress state for copy operations between panes
     copy_progress: Arc<std::sync::Mutex<Option<crate::ftp_ops::TransferProgress>>>,
+
+    /// If set, a local→remote copy is waiting for the user to confirm
+    /// overwriting existing files on the device.
+    pending_copy: Option<PendingCopy>,
+}
+
+/// Staged local→remote copy, held while we ask the user whether to overwrite.
+#[derive(Debug, Clone)]
+struct PendingCopy {
+    items: Vec<std::path::PathBuf>,
+    remote_dest: String,
+    conflicts: Vec<String>,
 }
 
 impl Ultimate64Browser {
@@ -428,6 +442,7 @@ impl Ultimate64Browser {
             is_discovering: false,
             discovered_devices: Vec::new(),
             copy_progress: Arc::new(std::sync::Mutex::new(None)),
+            pending_copy: None,
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -976,7 +991,11 @@ impl Ultimate64Browser {
             }
 
             Message::CopyLocalToRemote => {
-                // Copy checked local files and directories to Ultimate64
+                // Copy checked local files and directories to Ultimate64.
+                // Before kicking off the FTP upload, check which top-level
+                // destination names already exist on the device — if any do,
+                // stash the operation in `pending_copy` and let the overwrite
+                // dialog gate the actual transfer.
                 let items_to_copy = self.left_browser.get_checked_files();
 
                 if items_to_copy.is_empty() {
@@ -985,6 +1004,49 @@ impl Ultimate64Browser {
                     ));
                     return Task::none();
                 }
+
+                if self.host_url.is_none() {
+                    self.user_message = Some(UserMessage::Error(
+                        "Not connected to Ultimate64".to_string(),
+                    ));
+                    return Task::none();
+                }
+
+                let remote_dest = self.remote_browser.get_current_path().to_string();
+                let existing: std::collections::HashSet<&str> = self
+                    .remote_browser
+                    .files
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect();
+                let conflicts: Vec<String> = items_to_copy
+                    .iter()
+                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+                    .filter(|n| existing.contains(n))
+                    .map(String::from)
+                    .collect();
+
+                self.pending_copy = Some(PendingCopy {
+                    items: items_to_copy,
+                    remote_dest,
+                    conflicts: conflicts.clone(),
+                });
+                if conflicts.is_empty() {
+                    return Task::done(Message::CopyOverwriteConfirm);
+                }
+                Task::none()
+            }
+            Message::CopyOverwriteCancel => {
+                self.pending_copy = None;
+                Task::none()
+            }
+            Message::CopyOverwriteConfirm => {
+                let pending = match self.pending_copy.take() {
+                    Some(p) => p,
+                    None => return Task::none(),
+                };
+                let items_to_copy = pending.items;
+                let remote_dest = pending.remote_dest;
 
                 let host = match &self.host_url {
                     Some(h) => h
@@ -999,26 +1061,31 @@ impl Ultimate64Browser {
                     }
                 };
 
-                let remote_dest = self.remote_browser.get_current_path().to_string();
                 let password = self.settings.connection.password.clone();
                 let progress = self.copy_progress.clone();
 
-                // Count total files (recursively walking directories)
-                let total_files: usize = items_to_copy
-                    .iter()
-                    .map(|p| {
-                        if p.is_dir() {
-                            walkdir::WalkDir::new(p)
-                                .min_depth(1)
-                                .into_iter()
-                                .filter_map(|e| e.ok())
-                                .filter(|e| e.file_type().is_file())
-                                .count()
-                        } else {
-                            1
+                // Count total files and bytes (recursively walking directories)
+                let mut total_files: usize = 0;
+                let mut total_bytes: u64 = 0;
+                for p in &items_to_copy {
+                    if p.is_dir() {
+                        for e in walkdir::WalkDir::new(p)
+                            .min_depth(1)
+                            .into_iter()
+                            .filter_map(|e| e.ok())
+                        {
+                            if e.file_type().is_file() {
+                                total_files += 1;
+                                total_bytes = total_bytes
+                                    .saturating_add(e.metadata().map(|m| m.len()).unwrap_or(0));
+                            }
                         }
-                    })
-                    .sum();
+                    } else {
+                        total_files += 1;
+                        total_bytes = total_bytes
+                            .saturating_add(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
+                    }
+                }
 
                 if let Ok(mut g) = progress.lock() {
                     *g = Some(crate::ftp_ops::TransferProgress {
@@ -1030,7 +1097,7 @@ impl Ultimate64Browser {
                         cancelled: false,
                         started_at: std::time::Instant::now(),
                         bytes_transferred: 0,
-                        bytes_total: 0,
+                        bytes_total: total_bytes,
                     });
                 }
 
@@ -1159,8 +1226,13 @@ impl Ultimate64Browser {
                                                         ));
                                                         continue;
                                                     }
-                                                    let mut cursor = Cursor::new(data);
-                                                    match ftp.put_file(fname, &mut cursor) {
+                                                    let cursor = Cursor::new(data);
+                                                    let mut reader =
+                                                        crate::ftp_ops::ProgressReader {
+                                                            inner: cursor,
+                                                            progress: progress.clone(),
+                                                        };
+                                                    match ftp.put_file(fname, &mut reader) {
                                                         Ok(_) => {
                                                             uploaded += 1;
                                                             if let Ok(mut g) = progress.lock() {
@@ -1205,8 +1277,12 @@ impl Ultimate64Browser {
                                     let data = std::fs::read(item_path).map_err(|e| {
                                         format!("Cannot read {}: {}", item_path.display(), e)
                                     })?;
-                                    let mut cursor = Cursor::new(data);
-                                    ftp.put_file(&filename, &mut cursor).map_err(|e| {
+                                    let cursor = Cursor::new(data);
+                                    let mut reader = crate::ftp_ops::ProgressReader {
+                                        inner: cursor,
+                                        progress: progress.clone(),
+                                    };
+                                    ftp.put_file(&filename, &mut reader).map_err(|e| {
                                         format!("FTP upload {} failed: {}", filename, e)
                                     })?;
 
@@ -2430,6 +2506,14 @@ impl Ultimate64Browser {
                 .map(Message::Streaming);
         }
 
+        // Overwrite-confirmation dialog — shown when a local→remote copy would
+        // clobber existing files on the device.
+        if let Some(ref pending) = self.pending_copy {
+            if !pending.conflicts.is_empty() {
+                return self.view_overwrite_dialog(pending);
+            }
+        }
+
         // Tab bar with retro style
         let tabs = container(
             row![
@@ -2647,6 +2731,67 @@ impl Ultimate64Browser {
             .into()
     }
 
+    fn view_overwrite_dialog(&self, pending: &PendingCopy) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let n = pending.conflicts.len();
+        let header = if n == 1 {
+            format!("Overwrite 1 file in {}?", pending.remote_dest)
+        } else {
+            format!("Overwrite {} files in {}?", n, pending.remote_dest)
+        };
+
+        let mut list_col = column![].spacing(2);
+        for name in pending.conflicts.iter().take(8) {
+            list_col = list_col.push(
+                text(format!("  • {}", name))
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
+            );
+        }
+        if n > 8 {
+            list_col = list_col.push(
+                text(format!("  … and {} more", n - 8))
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
+            );
+        }
+
+        container(
+            column![
+                text("⚠ Overwrite existing files")
+                    .size(fs.large)
+                    .color(iced::Color::from_rgb(1.0, 0.6, 0.3)),
+                Space::new().height(8),
+                text(header).size(fs.normal),
+                Space::new().height(6),
+                list_col,
+                Space::new().height(12),
+                text("Existing files with the same name will be replaced.")
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.9, 0.5, 0.5)),
+                Space::new().height(16),
+                row![
+                    button(text("Cancel").size(fs.normal))
+                        .on_press(Message::CopyOverwriteCancel)
+                        .padding([6, 20])
+                        .style(button::secondary),
+                    Space::new().width(12),
+                    button(text("Overwrite").size(fs.normal))
+                        .on_press(Message::CopyOverwriteConfirm)
+                        .padding([6, 20])
+                        .style(button::danger),
+                ]
+                .align_y(iced::Alignment::Center),
+            ]
+            .align_x(iced::Alignment::Center)
+            .spacing(2),
+        )
+        .padding(40)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    }
+
     fn view_connection_bar(&self) -> Element<'_, Message> {
         let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let status_indicator = if self.status.connected {
@@ -2813,7 +2958,9 @@ impl Ultimate64Browser {
             let progress_data = self.copy_progress.lock().ok().and_then(|g| g.clone());
             match progress_data {
                 Some(p) if !p.done => {
-                    let pct = if p.total > 0 {
+                    let pct = if p.bytes_total > 0 {
+                        (p.bytes_transferred as f32 / p.bytes_total as f32).min(1.0)
+                    } else if p.total > 0 {
                         p.current as f32 / p.total as f32
                     } else {
                         0.0
