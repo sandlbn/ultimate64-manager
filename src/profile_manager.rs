@@ -166,8 +166,15 @@ pub enum ProfileManagerMessage {
 
     // Apply to device
     ApplyProfile,
+    /// Apply with pre-clean mode: 0=direct, 1=reboot first, 2=load flash defaults first
+    ApplyProfileConfirmed(u8),
     ApplyProfileFromList(usize),
+    ApplyProfileFromListConfirmed(usize, u8),
     ApplyProfileComplete(Result<String, String>),
+    /// Show/hide the apply confirmation dialog
+    ShowApplyDialog,
+    ShowApplyDialogForList(usize),
+    DismissApplyDialog,
 
     // Screenshot capture from streaming frame buffer
     CaptureScreenshot,
@@ -239,7 +246,9 @@ pub struct ProfileManager {
 
     // UI state
     view_mode: ViewMode,
-    is_loading: bool,
+    pub is_loading: bool,
+    /// Pending apply confirmation: None = no dialog, Some(None) = from editor, Some(Some(idx)) = from list
+    apply_confirm: Option<Option<usize>>,
     status_message: Option<String>,
     error_message: Option<String>,
     git_history: Vec<String>,
@@ -318,6 +327,7 @@ impl ProfileManager {
             show_diff: false,
             view_mode: ViewMode::ProfileList,
             is_loading: false,
+            apply_confirm: None,
             status_message: Some(if has_baseline {
                 "Baseline loaded from repository".to_string()
             } else {
@@ -1401,7 +1411,38 @@ impl ProfileManager {
             }
 
             // ── Apply to device ──
+            // Show confirmation dialog first — user chooses Apply or Reboot & Apply
             ProfileManagerMessage::ApplyProfile => {
+                if self.is_loading {
+                    return Task::none();
+                }
+                self.apply_confirm = Some(None); // from editor
+                Task::none()
+            }
+            ProfileManagerMessage::ShowApplyDialog => {
+                if self.is_loading {
+                    return Task::none();
+                }
+                self.apply_confirm = Some(None);
+                Task::none()
+            }
+            ProfileManagerMessage::ShowApplyDialogForList(index) => {
+                if self.is_loading {
+                    return Task::none();
+                }
+                self.apply_confirm = Some(Some(index));
+                Task::none()
+            }
+            ProfileManagerMessage::DismissApplyDialog => {
+                self.apply_confirm = None;
+                Task::none()
+            }
+            ProfileManagerMessage::ApplyProfileConfirmed(pre_clean_mode) => {
+                self.apply_confirm = None;
+                if self.is_loading {
+                    log::warn!("Apply already in progress — ignoring duplicate submit");
+                    return Task::none();
+                }
                 let host = match host_url {
                     Some(h) => h,
                     None => {
@@ -1420,33 +1461,53 @@ impl ProfileManager {
                     Some(b) => b.clone(),
                     None => {
                         self.error_message = Some(
-                            "No baseline stored. Click 'Snapshot Baseline' first to capture the device's current config."
-                                .to_string(),
+                            "No baseline stored. Click 'Snapshot Baseline' first.".to_string(),
                         );
                         return Task::none();
                     }
                 };
 
-                // Compute diff locally — instant, no device reads
                 let diff = device_profile::diff_configs(&baseline, &profile.config);
                 let diff_count: usize = diff.values().map(|v| v.len()).sum();
+                let mode_label = match pre_clean_mode {
+                    1 => "Rebooting then ",
+                    2 => "Loading flash defaults then ",
+                    _ => "",
+                };
 
                 self.is_loading = true;
                 self.status_message = Some(format!(
-                    "Applying '{}' — {} settings to change...",
-                    profile.name, diff_count
+                    "{}Applying '{}' — {} settings to change...",
+                    mode_label, profile.name, diff_count
                 ));
 
                 let conn = connection.clone();
                 Task::perform(
                     async move {
-                        profile_api::apply_profile(host, &profile, diff, password, conn).await
+                        profile_api::apply_profile(
+                            host,
+                            &profile,
+                            diff,
+                            password,
+                            conn,
+                            pre_clean_mode,
+                        )
+                        .await
                     },
                     ProfileManagerMessage::ApplyProfileComplete,
                 )
             }
             ProfileManagerMessage::ApplyProfileFromList(index) => {
-                // Load profile from repo and apply directly without entering editor
+                // Show dialog for list-based apply
+                self.apply_confirm = Some(Some(index));
+                Task::none()
+            }
+            ProfileManagerMessage::ApplyProfileFromListConfirmed(index, pre_clean_mode) => {
+                self.apply_confirm = None;
+                if self.is_loading {
+                    log::warn!("Apply already in progress — ignoring duplicate submit");
+                    return Task::none();
+                }
                 if let Some(entry) = self.profiles.get(index) {
                     let host = match host_url {
                         Some(h) => h,
@@ -1466,21 +1527,28 @@ impl ProfileManager {
 
                     let path = entry.path.clone();
                     let name = entry.name.clone();
+                    let mode_label = match pre_clean_mode {
+                        1 => "Rebooting then ",
+                        2 => "Loading flash then ",
+                        _ => "",
+                    };
                     self.is_loading = true;
-                    self.status_message = Some(format!("Running '{}'...", name));
+                    self.status_message = Some(format!("{}Running '{}'...", mode_label, name));
 
                     let conn = connection.clone();
                     Task::perform(
                         async move {
                             let profile = profile_repo::load_profile_async(path).await?;
                             let diff = device_profile::diff_configs(&baseline, &profile.config);
-                            let diff_count: usize = diff.values().map(|v| v.len()).sum();
-                            log::info!(
-                                "Running '{}' from list: {} settings to change",
-                                profile.name,
-                                diff_count
-                            );
-                            profile_api::apply_profile(host, &profile, diff, password, conn).await
+                            profile_api::apply_profile(
+                                host,
+                                &profile,
+                                diff,
+                                password,
+                                conn,
+                                pre_clean_mode,
+                            )
+                            .await
                         },
                         ProfileManagerMessage::ApplyProfileComplete,
                     )
@@ -1762,6 +1830,11 @@ impl ProfileManager {
             return self.view_remote_picker(fs);
         }
 
+        // Apply confirmation dialog takes over the whole view
+        if let Some(ref list_index) = self.apply_confirm {
+            return self.view_apply_dialog(*list_index, fs);
+        }
+
         let content: Element<'_, ProfileManagerMessage> = match self.view_mode {
             ViewMode::ProfileList => self.view_profile_list(is_connected, fs),
             ViewMode::ProfileEditor => self.view_profile_editor(is_connected, fs),
@@ -1776,6 +1849,78 @@ impl ProfileManager {
             .spacing(0)
             .height(Length::Fill)
             .into()
+    }
+
+    /// Render the apply confirmation dialog.
+    /// `list_index`: None = apply from editor, Some(idx) = apply from list row
+    fn view_apply_dialog(
+        &self,
+        list_index: Option<usize>,
+        fs: crate::styles::FontSizes,
+    ) -> Element<'_, ProfileManagerMessage> {
+        let profile_name = if let Some(idx) = list_index {
+            self.profiles
+                .get(idx)
+                .map(|e| e.name.as_str())
+                .unwrap_or("?")
+        } else {
+            self.current_profile
+                .as_ref()
+                .map(|p| p.name.as_str())
+                .unwrap_or("?")
+        };
+
+        let apply_msg = if let Some(idx) = list_index {
+            ProfileManagerMessage::ApplyProfileFromListConfirmed(idx, 0)
+        } else {
+            ProfileManagerMessage::ApplyProfileConfirmed(0)
+        };
+
+        let flash_apply_msg = if let Some(idx) = list_index {
+            ProfileManagerMessage::ApplyProfileFromListConfirmed(idx, 2)
+        } else {
+            ProfileManagerMessage::ApplyProfileConfirmed(2)
+        };
+
+        container(
+            column![
+                text(format!("Apply profile: {}", profile_name)).size(fs.large),
+                Space::new().height(10),
+                text("Choose how to apply:").size(fs.normal),
+                Space::new().height(10),
+                tooltip(
+                    button(text("Apply").size(fs.normal))
+                        .on_press(apply_msg)
+                        .padding([8, 20])
+                        .width(Length::Fixed(320.0))
+                        .style(button::success),
+                    "Apply the profile settings directly.\nMount+reset handles any previously loaded cartridge.",
+                    tooltip::Position::Right,
+                )
+                .style(container::bordered_box),
+                Space::new().height(5),
+                tooltip(
+                    button(text("Load Flash Defaults & Apply").size(fs.normal))
+                        .on_press(flash_apply_msg)
+                        .padding([8, 20])
+                        .width(Length::Fixed(320.0))
+                        .style(button::primary),
+                    "Restore saved flash config first (clears runtime changes),\nthen apply the profile.",
+                    tooltip::Position::Right,
+                )
+                .style(container::bordered_box),
+                Space::new().height(15),
+                button(text("Cancel").size(fs.small))
+                    .on_press(ProfileManagerMessage::DismissApplyDialog)
+                    .padding([6, 16]),
+            ]
+            .spacing(5)
+            .align_x(iced::Alignment::Center),
+        )
+        .padding(40)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
     }
 
     /// Render the FTP file picker view (full-screen takeover when active).
@@ -3168,11 +3313,7 @@ impl ProfileManager {
                 .spacing(3)
                 .align_y(iced::Alignment::Center)
                 .into()
-            } else if let Some(presets) = schema
-                .presets
-                .as_ref()
-                .filter(|p| !p.is_empty())
-            {
+            } else if let Some(presets) = schema.presets.as_ref().filter(|p| !p.is_empty()) {
                 // Presets: text input + preset dropdown + Browse button.
                 // Unlike enums, the user CAN type a custom path.
                 let current_str = match value {
@@ -3232,6 +3373,12 @@ impl ProfileManager {
             self.view_config_item_fallback(&cat, &k, value, fs)
         };
 
+        // Track whether the schema-driven control already includes a Browse button
+        // (presets have one built-in). If so, skip the is_path_field wrapper.
+        let has_browse_already = item_schema
+            .map(|s| s.presets.as_ref().map_or(false, |p| !p.is_empty()))
+            .unwrap_or(false);
+
         // Show baseline diff value if available
         let diff_hint: Element<'_, ProfileManagerMessage> = if is_diff && self.show_diff {
             if let Some(baseline) = &self.baseline_config {
@@ -3253,32 +3400,34 @@ impl ProfileManager {
             Space::new().height(0).into()
         };
 
-        // Add an FTP Browse button for path-like fields
-        let control_row: Element<'_, ProfileManagerMessage> = if Self::is_path_field(key, value) {
-            let current_path = value.as_str().unwrap_or("").to_string();
-            let cat_b = cat.clone();
-            let k_b = k.clone();
-            row![
-                control,
-                tooltip(
-                    button(text("Browse…").size(fs.tiny))
-                        .on_press(ProfileManagerMessage::OpenRemotePicker(
-                            cat_b,
-                            k_b,
-                            current_path,
-                        ))
-                        .padding([2, 8]),
-                    "Browse the device filesystem via FTP",
-                    tooltip::Position::Left,
-                )
-                .style(container::bordered_box),
-            ]
-            .spacing(4)
-            .align_y(iced::Alignment::Center)
-            .into()
-        } else {
-            control
-        };
+        // Add an FTP Browse button for path-like fields (unless the schema
+        // already provided one via the presets branch)
+        let control_row: Element<'_, ProfileManagerMessage> =
+            if !has_browse_already && Self::is_path_field(key, value) {
+                let current_path = value.as_str().unwrap_or("").to_string();
+                let cat_b = cat.clone();
+                let k_b = k.clone();
+                row![
+                    control,
+                    tooltip(
+                        button(text("Browse…").size(fs.tiny))
+                            .on_press(ProfileManagerMessage::OpenRemotePicker(
+                                cat_b,
+                                k_b,
+                                current_path,
+                            ))
+                            .padding([2, 8]),
+                        "Browse the device filesystem via FTP",
+                        tooltip::Position::Left,
+                    )
+                    .style(container::bordered_box),
+                ]
+                .spacing(4)
+                .align_y(iced::Alignment::Center)
+                .into()
+            } else {
+                control
+            };
 
         container(column![name_row, control_row, diff_hint].spacing(3))
             .padding([8, 10])
