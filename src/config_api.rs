@@ -536,8 +536,9 @@ pub async fn apply_all_config(
             ));
         }
 
-        // Extra delay after network categories to let the device finish reconfiguring
-        let delay = if is_network_category { 3000 } else { 1500 };
+        // Delay between categories to avoid overwhelming the device's HTTP server.
+        // The Ultimate64's embedded web server can't handle rapid-fire requests.
+        let delay = if is_network_category { 3000 } else { 2000 };
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     }
 

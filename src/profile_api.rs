@@ -26,14 +26,48 @@ use ultimate64::Rest;
 /// 2. Send the diff settings via REST API
 /// 3. Mount media according to profile mounts
 /// 4. Optionally reset machine
+/// Pre-clean modes for profile apply.
+/// 0 = direct (no pre-clean), 1 = full reboot, 2 = load flash defaults + reset.
 pub async fn apply_profile(
     host: String,
     profile: &DeviceProfile,
     diff: ConfigTree,
     password: Option<String>,
     connection: Option<Arc<Mutex<Rest>>>,
+    pre_clean_mode: u8,
 ) -> Result<String, String> {
     let mut steps = Vec::new();
+
+    // Track whether Step 0 already did a reboot — if so, skip the ROM-change
+    // reboot later (double reboots back-to-back hang the device).
+    let already_rebooted = pre_clean_mode == 1;
+
+    match pre_clean_mode {
+        1 => {
+            // Legacy "Reboot & Apply" mode — the UI no longer exposes this
+            // because REST reboot on this firmware is unpredictable (0s-3min
+            // recovery, or hang requiring power-cycle). If still called,
+            // fire-and-forget with a warning; don't block waiting.
+            log::info!("Pre-apply reboot requested (fire-and-forget)...");
+            let _ = crate::api::reboot_machine_async(&host, password.as_deref()).await;
+            steps.push("Reboot sent — device may be offline briefly".to_string());
+        }
+        2 => {
+            // Load flash defaults — fast way to restore saved config without rebooting.
+            // Clears any runtime config changes from previous profiles.
+            log::info!("Loading flash defaults before applying profile...");
+            match config_api::flash_operation(host.clone(), "load_from_flash", password.clone())
+                .await
+            {
+                Ok(_) => steps.push("Loaded flash defaults".to_string()),
+                Err(e) => log::warn!("load_from_flash failed: {}", e),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        }
+        _ => {
+            // Direct apply — no pre-clean
+        }
+    }
 
     // Step 1: Restore flash baseline if requested
     if profile.launch.restore_baseline_first {
@@ -58,27 +92,33 @@ pub async fn apply_profile(
             profile.name,
             diff_count,
             diff.len(),
-            if needs_reboot { " (reboot required)" } else { "" },
+            if needs_reboot {
+                " (reboot required)"
+            } else {
+                ""
+            },
         );
         let result = config_api::apply_all_config(host.clone(), diff, password.clone()).await?;
         steps.push(result);
+        // Let the device settle after config changes before more requests
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
 
-    // Step 2b: If the diff contains ROM changes, a full reboot is needed
-    // (not just a C64 reset) because ROM loading happens at Ultimate boot.
-    if needs_reboot && diff_count > 0 {
-        log::info!("ROM/firmware settings changed — rebooting Ultimate...");
-        let reboot_url = format!("{}/v1/machine:reboot", host);
-        let client = crate::net_utils::build_device_client(10)?;
-        let request =
-            crate::net_utils::with_password(client.put(&reboot_url), password.as_deref());
-        match request.send().await {
-            Ok(_) => {
-                steps.push("Rebooted (ROM change)".to_string());
-                // Give the Ultimate time to fully reboot before mounting media
-                tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            }
-            Err(e) => log::warn!("Reboot request failed (may still succeed): {}", e),
+    // Step 2b: If the diff contains ROM changes, the Ultimate needs to reboot
+    // (ROM loading happens at Ultimate boot, not at C64 reset). We send the
+    // reboot request but DON'T wait for the device to come back — on this
+    // firmware, post-reboot recovery can take 0s or 3+ minutes unpredictably,
+    // and blocking the app that long locks out the UI and makes users click
+    // Apply again (which makes things worse). Fire-and-forget + warn the user.
+    if needs_reboot && diff_count > 0 && !already_rebooted {
+        log::info!(
+            "ROM/firmware settings changed — sending reboot (device will be offline briefly)..."
+        );
+        match crate::api::reboot_machine_async(&host, password.as_deref()).await {
+            Ok(_) => steps.push(
+                "Reboot sent for ROM change — device may take up to 3 min to come back".to_string(),
+            ),
+            Err(e) => log::warn!("Reboot request failed: {}", e),
         }
     }
 
@@ -126,18 +166,61 @@ fn bare_host(host_url: &str) -> &str {
 /// Check if the diff contains settings that require a full Ultimate reboot
 /// (not just a C64 reset). ROM changes are loaded at Ultimate boot time,
 /// so they only take effect after reboot.
+/// Wait for the Ultimate to be fully ready to accept POST requests after a reboot.
+///
+/// Uses a 2-stage check:
+/// - Stage 1: GET /v1/configs returns 200 (HTTP server is up)
+/// - Stage 2: A probe POST succeeds without "connection closed" (config
+///   subsystem is initialized — POST handlers actually work)
+///
+/// This avoids the bug where GET succeeds ~15s after reboot but POST still
+/// closes connections for another 5-10s because the config subsystem is
+/// still initializing.
+async fn wait_for_device_ready(host: &str, password: Option<&str>) {
+    log::info!("Waiting for device HTTP to come back (up to 3 min)...");
+    let get_url = format!("{}/v1/configs", host);
+
+    // Stage 1: GET /v1/configs works (HTTP server is up).
+    // Some reboots (when a disk is mounted or a cart was active) can take
+    // 2-3 minutes before HTTP responds. 60 × 3s = 180s max.
+    let mut http_up = false;
+    for attempt in 1..=60 {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        if let Ok(client) = crate::net_utils::build_device_client(3) {
+            let req = crate::net_utils::with_password(client.get(&get_url), password);
+            if req.send().await.is_ok() {
+                log::info!("HTTP server up (~{}s)", attempt * 3);
+                http_up = true;
+                break;
+            }
+        }
+    }
+    if !http_up {
+        log::warn!("HTTP server did not come back after 3 min — continuing anyway");
+        return;
+    }
+
+    // Small settle — once GET works, POST usually works too. The earlier
+    // "POST probe" stage turned out to be unreliable (config endpoint can
+    // succeed while writemem still fails, and vice-versa), so we drop it
+    // and let the downstream retries (writemem_async, apply_all_config)
+    // handle the residual settling window.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+}
+
 fn requires_reboot(diff: &ConfigTree) -> bool {
     for (category, items) in diff {
         for key in items.keys() {
             let lower_key = key.to_lowercase();
             let lower_cat = category.to_lowercase();
             // ROM file paths — loaded at boot
-            if lower_key.contains("rom") && (lower_key.contains("kernal")
-                || lower_key.contains("basic")
-                || lower_key.contains("char")
-                || lower_key.contains("1541")
-                || lower_key.contains("1571")
-                || lower_key.contains("1581"))
+            if lower_key.contains("rom")
+                && (lower_key.contains("kernal")
+                    || lower_key.contains("basic")
+                    || lower_key.contains("char")
+                    || lower_key.contains("1541")
+                    || lower_key.contains("1571")
+                    || lower_key.contains("1581"))
             {
                 return true;
             }
@@ -205,7 +288,8 @@ async fn ensure_drive_enabled(host: &str, drive: &str, password: Option<String>)
                     Ok(_) => log::info!("Drive {} enabled", drive),
                     Err(e) => log::warn!("Failed to enable drive {}: {}", drive, e),
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                // Let the device settle after config change
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             }
         }
         Err(e) => log::warn!("Could not check drive {} state: {}", drive, e),
@@ -214,104 +298,60 @@ async fn ensure_drive_enabled(host: &str, drive: &str, password: Option<String>)
 
 /// Mount and optionally autoload (run) a disk on a drive.
 ///
-/// When autoload=true: enable drive, upload/mount, reset, LOAD"*",N,1, RUN
+/// When autoload=true: enable drive, (probe/recover cart), upload/mount, reset, LOAD"*",N,1, RUN
 /// When autoload=false: just upload/mount
 ///
-/// Handles both local files (upload via crate) and device paths (REST API).
+/// All REST calls go through the pool-free client — see [api::reset_machine_async] etc.
 async fn mount_and_run(
     host: &str,
     path: &str,
     drive: &str,
     autoload: bool,
     password: Option<String>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    _connection: Option<Arc<Mutex<Rest>>>,
 ) -> Result<String, String> {
     let filename = path.rsplit('/').next().unwrap_or(path).to_string();
+    let pwd = password.as_deref();
 
-    // Step 1: Enable drive if needed
+    // Step 1: Enable drive if needed (includes its own settle delay)
     ensure_drive_enabled(host, drive, password.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     if autoload {
-        // Full run sequence: mount + reset + LOAD + RUN
-        let conn = connection.ok_or_else(|| "Autoload requires device connection".to_string())?;
-
         let device_num = if drive == "a" { "8" } else { "9" };
 
-        // Pre-reset: make sure the machine is in a known state BEFORE mounting.
-        // After apply_profile changes config, the device may have a cartridge
-        // loaded, be showing the Ultimate menu, or be running a previous program.
-        // A clean reset here guarantees the follow-up LOAD/RUN reaches BASIC.
-        {
-            let conn_pre = conn.clone();
-            tokio::task::spawn_blocking(move || {
-                let c = conn_pre.blocking_lock();
-                c.reset().map_err(|e| format!("Pre-reset failed: {}", e))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))??;
-            // Give the machine time to boot to BASIC before uploading the disk
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        }
-
+        // Mount the disk first. Any prior cartridge keeps running — that's fine,
+        // the reset below unloads it. Mount itself doesn't need writemem.
         if is_device_path(path) {
-            // Device path: mount via REST, then run sequence via crate
             crate::api::mount_disk(bare_host(host), path, drive, "readonly", password.clone())
                 .await?;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-            let dev = device_num.to_string();
-            let fname = filename.clone();
-            tokio::task::spawn_blocking(move || {
-                let c = conn.blocking_lock();
-                // Second reset: re-enter BASIC with the mounted disk visible
-                c.reset().map_err(|e| format!("Reset failed: {}", e))?;
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let load_cmd = format!("load \"*\",{},1\n", dev);
-                c.type_text(&load_cmd)
-                    .map_err(|e| format!("Type LOAD failed: {}", e))?;
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                c.type_text("run\n")
-                    .map_err(|e| format!("Type RUN failed: {}", e))?;
-                Ok(format!("Mounted and running: {}", fname))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))?
         } else {
-            // Local file: upload+mount via crate, then run sequence
             let local_path = Path::new(path);
             if !local_path.exists() {
                 return Err(format!("Local file not found: {}", path));
             }
-            let path_buf = local_path.to_path_buf();
-            let drive_str = drive.to_string();
-            let dev = device_num.to_string();
-            let fname = filename.clone();
-
-            tokio::task::spawn_blocking(move || {
-                let c = conn.blocking_lock();
-                // Upload and mount
-                c.mount_disk_image(
-                    &path_buf,
-                    drive_str,
-                    ultimate64::drives::MountMode::ReadOnly,
-                    false,
-                )
-                .map_err(|e| format!("Upload+mount failed: {}", e))?;
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                // Second reset: re-enter BASIC with the mounted disk visible
-                c.reset().map_err(|e| format!("Reset failed: {}", e))?;
-                std::thread::sleep(std::time::Duration::from_secs(3));
-                let load_cmd = format!("load \"*\",{},1\n", dev);
-                c.type_text(&load_cmd)
-                    .map_err(|e| format!("Type LOAD failed: {}", e))?;
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                c.type_text("run\n")
-                    .map_err(|e| format!("Type RUN failed: {}", e))?;
-                Ok(format!("Uploaded and running: {}", fname))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))?
+            crate::api::upload_mount_disk_async(host, local_path, drive, "readonly", pwd).await?;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Reset — this unloads any running cartridge AND puts the machine at
+        // the BASIC prompt with the mounted disk visible. Verified empirically:
+        // after `run_crt` + `reset`, cartridge is gone and writemem works.
+        crate::api::reset_machine_async(host, pwd).await?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // Type LOAD"*",N,1 then RUN. writemem_async retries transient errors
+        // (Empty reply / Connection reset — usually brief DMA contention).
+        let load_cmd = format!("load \"*\",{},1\n", device_num);
+        crate::api::type_text_async(host, &load_cmd, pwd)
+            .await
+            .map_err(|e| format!("Type LOAD failed: {}", e))?;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        crate::api::type_text_async(host, "run\n", pwd)
+            .await
+            .map_err(|e| format!("Type RUN failed: {}", e))?;
+
+        Ok(format!("Mounted and running: {}", filename))
     } else {
         // Just mount, no autoload
         if is_device_path(path) {
@@ -321,25 +361,8 @@ async fn mount_and_run(
             if !local_path.exists() {
                 return Err(format!("Local file not found: {}", path));
             }
-            let conn = connection
-                .ok_or_else(|| "Cannot upload local file without device connection".to_string())?;
-            let path_buf = local_path.to_path_buf();
-            let drive_str = drive.to_string();
-            let fname = filename.clone();
-
-            tokio::task::spawn_blocking(move || {
-                let c = conn.blocking_lock();
-                c.mount_disk_image(
-                    &path_buf,
-                    drive_str,
-                    ultimate64::drives::MountMode::ReadWrite,
-                    false,
-                )
-                .map_err(|e| format!("Upload+mount failed: {}", e))?;
-                Ok(format!("Uploaded and mounted: {}", fname))
-            })
-            .await
-            .map_err(|e| format!("Task error: {}", e))?
+            crate::api::upload_mount_disk_async(host, local_path, drive, "readwrite", pwd).await?;
+            Ok(format!("Uploaded and mounted: {}", filename))
         }
     }
 }
@@ -408,10 +431,10 @@ async fn run_program_entry(
     host: &str,
     path: &str,
     password: Option<String>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    _connection: Option<Arc<Mutex<Rest>>>,
 ) -> Result<String, String> {
+    let pwd = password.as_deref();
     if is_device_path(path) {
-        // Route through the existing REST runners based on extension
         let ext = Path::new(path)
             .extension()
             .and_then(|s| s.to_str())
@@ -427,9 +450,6 @@ async fn run_program_entry(
         if !local_path.exists() {
             return Err(format!("Local file not found: {}", path));
         }
-        let conn = connection
-            .ok_or_else(|| "Cannot upload local file without device connection".to_string())?;
-        let path_buf = local_path.to_path_buf();
         let filename = local_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -439,32 +459,24 @@ async fn run_program_entry(
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_lowercase());
-
-        tokio::task::spawn_blocking(move || {
-            let data = std::fs::read(&path_buf)
-                .map_err(|e| format!("Failed to read {}: {}", path_buf.display(), e))?;
-            let c = conn.blocking_lock();
-            match ext.as_deref() {
-                Some("crt") => c
-                    .run_crt(&data)
-                    .map(|_| format!("Running cartridge: {}", filename))
-                    .map_err(|e| format!("run_crt failed: {}", e)),
-                Some("prg") => c
-                    .run_prg(&data)
-                    .map(|_| format!("Running PRG: {}", filename))
-                    .map_err(|e| format!("run_prg failed: {}", e)),
-                Some("sid") => c
-                    .sid_play(&data, None)
-                    .map(|_| format!("Playing SID: {}", filename))
-                    .map_err(|e| format!("sid_play failed: {}", e)),
-                other => Err(format!(
-                    "Unsupported file type '{}' for cartridge slot — use .crt, .prg, or .sid",
-                    other.unwrap_or("(none)"),
-                )),
-            }
-        })
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+        let data = tokio::fs::read(local_path)
+            .await
+            .map_err(|e| format!("Failed to read {}: {}", local_path.display(), e))?;
+        match ext.as_deref() {
+            Some("crt") => crate::api::upload_runner_async(host, "run_crt", data, pwd)
+                .await
+                .map(|_| format!("Running cartridge: {}", filename)),
+            Some("prg") => crate::api::upload_runner_async(host, "run_prg", data, pwd)
+                .await
+                .map(|_| format!("Running PRG: {}", filename)),
+            Some("sid") => crate::api::upload_runner_async(host, "sidplay", data, pwd)
+                .await
+                .map(|_| format!("Playing SID: {}", filename)),
+            other => Err(format!(
+                "Unsupported file type '{}' for cartridge slot — use .crt, .prg, or .sid",
+                other.unwrap_or("(none)"),
+            )),
+        }
     }
 }
 

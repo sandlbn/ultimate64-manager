@@ -1860,25 +1860,31 @@ impl Ultimate64Browser {
                         self.status = status;
                     }
                     Err(e) => {
-                        log::error!("Status update failed: {}", e);
+                        log::warn!("Status update failed (device may be rebooting): {}", e);
                         if self.remote_browser.is_transferring() {
                             log::debug!("Ignoring status failure during active transfer");
                             return Task::none();
                         }
-
-                        // Only show error if we were previously connected (lost connection)
-                        if self.status.connected {
-                            self.user_message =
-                                Some(UserMessage::Error(format!("Connection lost: {}", e)));
-                            // Stop streaming if connection is lost
-                            if self.video_streaming.is_streaming {
-                                let _ = self
-                                    .video_streaming
-                                    .update(StreamingMessage::StopStream, None);
-                            }
+                        // Ignore status failures during profile operations — the
+                        // device may be rebooting or applying config, which
+                        // legitimately takes it offline for 15-30 seconds.
+                        if self.device_profile_manager.is_loading {
+                            log::debug!("Ignoring status failure during profile operation");
+                            return Task::none();
                         }
+
+                        // Mark as disconnected silently. The next status tick
+                        // will either find it back online (and show "Connected")
+                        // or fail again — in which case we've already moved past
+                        // the reboot window.
                         self.status.connected = false;
                         self.status.device_info = None;
+                        // Stop streaming only if it was running
+                        if self.video_streaming.is_streaming {
+                            let _ = self
+                                .video_streaming
+                                .update(StreamingMessage::StopStream, None);
+                        }
                     }
                 }
                 Task::none()
@@ -2433,7 +2439,8 @@ impl Ultimate64Browser {
                 self.tab_button("MEMORY", Tab::MemoryEditor),
                 self.tab_button("MONITOR", Tab::Monitor),
                 self.tab_button("CONFIG", Tab::Configuration),
-                self.tab_button("PROFILES", Tab::Profiles),
+                // PROFILES tab hidden — feature is WIP. Re-enable when ready.
+                // self.tab_button("PROFILES", Tab::Profiles),
                 self.tab_button("CSDB", Tab::CsdbBrowser),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
@@ -2584,8 +2591,13 @@ impl Ultimate64Browser {
             }
         });
 
-        // Periodic connection check every 60 seconds (only when connected and not transferring)
-        let status_check = if self.status.connected && !self.remote_browser.is_transferring() {
+        // Periodic connection check every 60 seconds
+        // Suppressed while transferring or applying profiles to avoid
+        // overwhelming the device's HTTP server
+        let status_check = if self.status.connected
+            && !self.remote_browser.is_transferring()
+            && !self.device_profile_manager.is_loading
+        {
             iced::time::every(Duration::from_secs(60)).map(|_| Message::RefreshStatus)
         } else {
             Subscription::none()

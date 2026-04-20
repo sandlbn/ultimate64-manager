@@ -26,9 +26,21 @@ pub fn resolve_host(host: &str, port: u16) -> std::io::Result<SocketAddr> {
 }
 
 /// Build a reqwest client configured for Ultimate64 device communication.
+///
+/// Why the explicit no-pooling / no-keepalive settings:
+/// The Ultimate's embedded HTTP server closes TCP connections aggressively
+/// to conserve memory. reqwest's default connection pool keeps idle
+/// connections alive and tries to reuse them — but if the server has
+/// already closed the connection, reqwest only notices when the send times
+/// out (10s silent failure). Forcing a fresh connection per request
+/// eliminates this and matches curl's behavior (which works reliably).
 pub fn build_device_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .pool_max_idle_per_host(0)
+        .tcp_keepalive(None)
+        .http1_only()
         .build()
         .map_err(|e| format!("HTTP client error: {}", e))
 }
