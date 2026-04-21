@@ -45,7 +45,7 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Device Discovery** – Automatic network discovery of Ultimate devices
 - **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
-- **Remote Keyboard Input** – For BASIC and menus
+- **Remote Keyboard Input** – For BASIC only
 - **CSDb Browser** – Search and browse releases from CSDb.dk
   - Search by category (All, Releases, Groups, SIDs)
   - Browse latest releases
