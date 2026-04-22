@@ -39,6 +39,7 @@ export RUSTFLAGS = \
 # =========================
 # Linux (AppImage)
 # =========================
+APP        := Ultimate64Manager
 BINNAME    := ultimate64-manager
 APPDIR     := $(CURDIR)/AppDir
 ICON_PNG   ?= icons/icon.png
