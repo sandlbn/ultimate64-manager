@@ -956,7 +956,10 @@ impl Assembly64Client {
         let arr: Vec<WireCompoType> = resp.json().await?;
         Ok(arr
             .into_iter()
-            .map(|c| CompoType { id: c.id, name: c.name })
+            .map(|c| CompoType {
+                id: c.id,
+                name: c.name,
+            })
             .collect())
     }
 }

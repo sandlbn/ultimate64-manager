@@ -11,6 +11,16 @@ use iced::{
 };
 use net_utils::REST_TIMEOUT_SECS;
 use std::path::PathBuf;
+
+/// Background status poll cadence when the device is reachable.
+const STATUS_POLL_NORMAL_SECS: u64 = 60;
+/// Faster poll cadence used during a transient outage window so a 2-3s
+/// reboot is recovered well before the user sees "Not connected".
+const STATUS_POLL_RETRY_SECS: u64 = 2;
+/// How many consecutive failed polls we tolerate before flipping the UI to
+/// "Not connected". With [`STATUS_POLL_RETRY_SECS`] = 2s, this gives ~6s of
+/// grace before disconnect — comfortably covers a normal reboot.
+const MAX_TRANSIENT_STATUS_FAILURES: u8 = 3;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
@@ -338,6 +348,10 @@ pub struct Ultimate64Browser {
     connection: Option<Arc<TokioMutex<Rest>>>,
     host_url: Option<String>, // Store host URL for direct HTTP requests
     status: StatusInfo,
+    /// Count of back-to-back failed status polls. We only flip the UI to
+    /// "Not connected" once it crosses [`MAX_TRANSIENT_STATUS_FAILURES`],
+    /// so a 2-3 second reboot blip doesn't show as a disconnect.
+    consecutive_status_failures: u8,
 
     // User messages (errors and info)
     user_message: Option<UserMessage>,
@@ -432,6 +446,7 @@ impl Ultimate64Browser {
                 device_info: None,
                 mounted_disks: Vec::new(),
             },
+            consecutive_status_failures: 0,
             user_message: None,
             video_streaming: VideoStreaming::new(),
             assembly64_browser: Assembly64Browser::new(),
@@ -1773,6 +1788,7 @@ impl Ultimate64Browser {
                 self.status.connected = false;
                 self.status.device_info = None;
                 self.status.mounted_disks.clear();
+                self.consecutive_status_failures = 0;
                 self.remote_browser.set_host(None, None);
                 // Clear telnet host for video streaming control
                 self.video_streaming.set_ultimate_host(None);
@@ -1942,6 +1958,15 @@ impl Ultimate64Browser {
                             status.device_info,
                             status.mounted_disks.len()
                         );
+                        // Recovered from a transient outage — log it so the
+                        // user can correlate with reboot events.
+                        if self.consecutive_status_failures > 0 {
+                            log::info!(
+                                "Status recovered after {} failed poll(s)",
+                                self.consecutive_status_failures
+                            );
+                        }
+                        self.consecutive_status_failures = 0;
                         // Show connected message when first connecting
                         if !self.status.connected && status.connected {
                             self.user_message = Some(UserMessage::Info(format!(
@@ -1952,7 +1977,6 @@ impl Ultimate64Browser {
                         self.status = status;
                     }
                     Err(e) => {
-                        log::warn!("Status update failed (device may be rebooting): {}", e);
                         if self.remote_browser.is_transferring() {
                             log::debug!("Ignoring status failure during active transfer");
                             return Task::none();
@@ -1965,10 +1989,27 @@ impl Ultimate64Browser {
                             return Task::none();
                         }
 
-                        // Mark as disconnected silently. The next status tick
-                        // will either find it back online (and show "Connected")
-                        // or fail again — in which case we've already moved past
-                        // the reboot window.
+                        self.consecutive_status_failures =
+                            self.consecutive_status_failures.saturating_add(1);
+
+                        // Tolerate brief outages (reboots typically settle in
+                        // 2-3 seconds) — keep the UI showing "Connected" and
+                        // let the subscription poll back at the faster cadence.
+                        if self.consecutive_status_failures < MAX_TRANSIENT_STATUS_FAILURES {
+                            log::debug!(
+                                "Status poll failed ({} of {}): {}",
+                                self.consecutive_status_failures,
+                                MAX_TRANSIENT_STATUS_FAILURES,
+                                e
+                            );
+                            return Task::none();
+                        }
+
+                        log::warn!(
+                            "Status update failed {} times — marking disconnected: {}",
+                            self.consecutive_status_failures,
+                            e
+                        );
                         self.status.connected = false;
                         self.status.device_info = None;
                         // Stop streaming only if it was running
@@ -2698,7 +2739,15 @@ impl Ultimate64Browser {
             && !self.remote_browser.is_transferring()
             && !self.device_profile_manager.is_loading
         {
-            iced::time::every(Duration::from_secs(60)).map(|_| Message::RefreshStatus)
+            // During an outage window (1..MAX failures) poll fast so a 2-3s
+            // reboot recovers before the user notices; otherwise idle at the
+            // normal background cadence.
+            let interval_secs = if self.consecutive_status_failures > 0 {
+                STATUS_POLL_RETRY_SECS
+            } else {
+                STATUS_POLL_NORMAL_SECS
+            };
+            iced::time::every(Duration::from_secs(interval_secs)).map(|_| Message::RefreshStatus)
         } else {
             Subscription::none()
         };

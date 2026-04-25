@@ -503,9 +503,8 @@ impl Assembly64Browser {
         // the dropdowns are usable on the very first run.
         let presets = load_cached_presets().unwrap_or_else(Presets::baseline);
         let category_registry = load_cached_categories().unwrap_or_default();
-        let compo_type_registry = CompoTypeRegistry::new(
-            load_cached_compo_types().unwrap_or_default(),
-        );
+        let compo_type_registry =
+            CompoTypeRegistry::new(load_cached_compo_types().unwrap_or_default());
 
         let user_agent = format!("{}/{}", USER_AGENT_FALLBACK, env!("CARGO_PKG_VERSION"));
 
@@ -1339,6 +1338,21 @@ impl Assembly64Browser {
         )
     }
 
+    fn spawn_metadata(&self, item_id: String, category_id: u16) -> Task<Assembly64BrowserMessage> {
+        let user_agent = self.user_agent.clone();
+        Task::perform(
+            async move {
+                let client =
+                    Assembly64Client::with_defaults(&user_agent).map_err(|e| e.to_string())?;
+                client
+                    .metadata(&item_id, category_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            Assembly64BrowserMessage::EntryMetadataLoaded,
+        )
+    }
+
     fn dispatch_action(&self, action: AsmPendingAction) -> Task<Assembly64BrowserMessage> {
         use Assembly64BrowserMessage as M;
         match action {
@@ -2025,19 +2039,25 @@ impl Assembly64Browser {
         .align_y(iced::Alignment::Center)
         .padding([4, 0]);
 
-        // Optional CSDB scene-comments link for CSDB-derived entries.
+        // CSDB scene-comments link for CSDB-derived entries. Reserve a
+        // fixed-width slot for non-CSDB entries too so the ★/Open columns
+        // line up vertically across rows of mixed sources.
+        const CSDB_COL_WIDTH: f32 = 60.0;
         if let Some(url) = entry.csdb_release_url() {
             row_widget = row_widget.push(
                 tooltip(
                     button(text("CSDB").size(fs.tiny))
                         .on_press(Assembly64BrowserMessage::OpenInBrowser(url))
                         .padding([4, 6])
+                        .width(Length::Fixed(CSDB_COL_WIDTH))
                         .style(button::text),
                     "Open release page on csdb.dk",
                     tooltip::Position::Left,
                 )
                 .style(container::bordered_box),
             );
+        } else {
+            row_widget = row_widget.push(Space::new().width(Length::Fixed(CSDB_COL_WIDTH)));
         }
 
         row_widget.into()
@@ -2188,22 +2208,43 @@ impl Assembly64Browser {
         .spacing(5)
         .align_y(iced::Alignment::Center);
 
+        // ── primary info row: group, release date, rating, when added ──
         let mut info: Vec<Element<'_, Assembly64BrowserMessage>> = Vec::new();
         if let Some(g) = &entry.group {
             info.push(text(format!("Group: {}", g)).size(fs.small).into());
         }
-        if let Some(y) = entry.year {
-            info.push(text(format!("Year: {}", y)).size(fs.small).into());
-        }
-        if let Some(r) = entry.rating {
+        // Prefer the precise `released` date over the bare year — many
+        // entries have one or the other but the date is always richer.
+        if let Some(released) = &entry.released {
             info.push(
-                text(format!("Rating: {} {}", r, rating_stars(Some(r))))
+                text(format!("Released: {}", released))
                     .size(fs.small)
                     .into(),
             );
+        } else if let Some(y) = entry.year {
+            info.push(text(format!("Year: {}", y)).size(fs.small).into());
+        }
+        if let Some(r) = entry.rating {
+            // Show site_rating in parens when it adds precision (e.g.
+            // "9 ★★★★★★★★★☆ (9.7)" — averages over multiple votes).
+            let detail = match entry.site_rating {
+                Some(sr) if (sr - r as f32).abs() >= 0.1 => format!(" ({:.1})", sr),
+                _ => String::new(),
+            };
+            info.push(
+                text(format!("Rating: {} {}{}", r, rating_stars(Some(r)), detail))
+                    .size(fs.small)
+                    .into(),
+            );
+        } else if let Some(sr) = entry.site_rating {
+            info.push(text(format!("Rating: {:.1}", sr)).size(fs.small).into());
         }
         if let Some(u) = &entry.updated {
-            info.push(text(format!("Added: {}", u)).size(fs.small).into());
+            // Server returns "yyyy-mm-dd HH:MM:SS.SSSSSS" from /search/meta
+            // but just "yyyy-mm-dd" from /search/aql — trim to the date so
+            // the row stays compact.
+            let date_only = u.split_whitespace().next().unwrap_or(u);
+            info.push(text(format!("Added: {}", date_only)).size(fs.small).into());
         }
         if let Some(url) = entry.csdb_release_url() {
             info.push(
@@ -2215,6 +2256,57 @@ impl Assembly64Browser {
         }
 
         let info_row = row(info).spacing(20);
+
+        // ── secondary row: compo / event / place / sceners ──
+        // Only rendered when at least one of these fields is present, so
+        // the detail view stays clean for entries that lack scene metadata.
+        let mut extras: Vec<Element<'_, Assembly64BrowserMessage>> = Vec::new();
+        if let Some(event) = &entry.event {
+            let prefix = match entry.place {
+                Some(p) => format!("#{} at {}", p, event),
+                None => format!("At {}", event),
+            };
+            extras.push(text(prefix).size(fs.small).into());
+        } else if let Some(p) = entry.place {
+            extras.push(text(format!("Place #{}", p)).size(fs.small).into());
+        }
+        if let Some(compo_id) = entry.compo {
+            // Only surface the compo-type label when it's known — otherwise
+            // a stale `compo 28` placeholder adds noise.
+            let label = self.compo_type_registry.label(compo_id);
+            if !label.starts_with("compo ") {
+                extras.push(
+                    text(format!("Compo: {}", label))
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.7, 0.7, 0.5))
+                        .into(),
+                );
+            }
+        }
+        if let Some(handle) = &entry.handle {
+            // Sceners are often a long comma-separated list — clip for the
+            // header row; a tooltip surfaces the full thing.
+            let display = truncate(handle, 60);
+            extras.push(
+                tooltip(
+                    text(format!("Sceners: {}", display))
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.6, 0.7, 0.85)),
+                    text(handle).size(fs.small),
+                    tooltip::Position::Bottom,
+                )
+                .style(container::bordered_box)
+                .into(),
+            );
+        }
+        let extras_row: Element<'_, Assembly64BrowserMessage> = if extras.is_empty() {
+            Space::new().height(0).into()
+        } else {
+            row(extras)
+                .spacing(20)
+                .align_y(iced::Alignment::Center)
+                .into()
+        };
 
         let filter_row = row![
             text("Filter:").size(fs.small),
@@ -2326,6 +2418,7 @@ impl Assembly64Browser {
             header,
             rule::horizontal(1),
             info_row,
+            extras_row,
             rule::horizontal(1),
             content_area,
         ]
@@ -2645,6 +2738,34 @@ impl Assembly64Browser {
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+/// Overlay `meta` (full record from `/search/meta`) on top of `base` (search-
+/// result stub). Server fields win where they're present; the existing fields
+/// stay if the server didn't provide them. We preserve `name` from `base`
+/// because the search-result name is what the user clicked — keeping it
+/// stable avoids a flicker mid-load.
+fn merge_entry(base: AsmEntry, meta: AsmEntry) -> AsmEntry {
+    AsmEntry {
+        item_id: base.item_id,
+        category_id: base.category_id,
+        name: if base.name.is_empty() {
+            meta.name
+        } else {
+            base.name
+        },
+        group: meta.group.or(base.group),
+        handle: meta.handle.or(base.handle),
+        year: meta.year.or(base.year),
+        rating: meta.rating.or(base.rating),
+        site_rating: meta.site_rating.or(base.site_rating),
+        updated: meta.updated.or(base.updated),
+        released: meta.released.or(base.released),
+        event: meta.event.or(base.event),
+        place: meta.place.or(base.place),
+        compo: meta.compo.or(base.compo),
+        site_category: meta.site_category.or(base.site_category),
+    }
+}
 
 fn truncate(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
