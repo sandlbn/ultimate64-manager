@@ -18,7 +18,7 @@ use ultimate64::{drives::MountMode, Rest};
 /// Stable ID for the main file-list scrollable widget
 const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
 
-use crate::csdb::{extract_zip_to_dir, MAX_ZIP_EXTRACT_BYTES};
+use crate::archive::{extract_zip_to_dir, MAX_ZIP_EXTRACT_BYTES};
 use crate::dir_preview::{self, ContentPreview};
 use crate::disk_image::{self, DiskInfo, FileType};
 use crate::net_utils::REST_TIMEOUT_SECS;

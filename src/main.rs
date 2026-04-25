@@ -18,12 +18,14 @@ use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
+mod archive;
+mod assembly64;
+mod assembly64_browser;
 mod cfg_format;
 mod config_api;
 mod config_editor;
 mod config_presets;
-mod csdb;
-mod csdb_browser;
+mod csdb_screenshots;
 mod device_profile;
 mod dir_preview;
 mod discovery;
@@ -56,8 +58,8 @@ mod templates;
 mod version_check;
 mod video_scaling;
 
+use assembly64_browser::{Assembly64Browser, Assembly64BrowserMessage};
 use config_editor::{ConfigEditor, ConfigEditorMessage};
-use csdb_browser::{CsdbBrowser, CsdbBrowserMessage};
 use discovery::DiscoveredDevice;
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
@@ -248,8 +250,8 @@ pub enum Message {
     // Version check
     VersionCheck(VersionCheckMessage),
     OpenReleasePage,
-    // CSDb Browser
-    CsdbBrowser(CsdbBrowserMessage),
+    // Assembly64 Browser
+    Assembly64Browser(Assembly64BrowserMessage),
     // Separate streaming window management
     OpenStreamingWindow,
     StreamingWindowOpened(iced::window::Id),
@@ -279,7 +281,7 @@ pub enum Tab {
     Monitor,
     Configuration,
     Profiles,
-    CsdbBrowser,
+    Assembly64,
     Settings,
 }
 
@@ -293,7 +295,7 @@ impl std::fmt::Display for Tab {
             Tab::Monitor => write!(f, "HW Monitor"),
             Tab::Configuration => write!(f, "Configuration"),
             Tab::Profiles => write!(f, "Profiles"),
-            Tab::CsdbBrowser => write!(f, "CSDb"),
+            Tab::Assembly64 => write!(f, "Assembly64"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -349,7 +351,7 @@ pub struct Ultimate64Browser {
     video_streaming: VideoStreaming,
     // Update notification
     new_version: Option<NewVersionInfo>,
-    csdb_browser: CsdbBrowser,
+    assembly64_browser: Assembly64Browser,
     // Separate streaming window
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
@@ -432,7 +434,7 @@ impl Ultimate64Browser {
             },
             user_message: None,
             video_streaming: VideoStreaming::new(),
-            csdb_browser: CsdbBrowser::new(),
+            assembly64_browser: Assembly64Browser::new(),
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
             profile_manager,
@@ -585,17 +587,31 @@ impl Ultimate64Browser {
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
-                // Auto-load latest releases when CSDb tab is first opened
-                if tab == Tab::CsdbBrowser && !self.csdb_browser.has_content() {
-                    return self
-                        .csdb_browser
+                // Auto-load latest entries when Assembly64 tab is first opened.
+                // Also kick off a background refresh of the dropdown
+                // presets and category map (one-shot per session).
+                if tab == Tab::Assembly64 && !self.assembly64_browser.has_content() {
+                    let host = Some(self.settings.connection.host.clone());
+                    let pwd = self.settings.connection.password.clone();
+                    let refresh = self
+                        .assembly64_browser
                         .update(
-                            CsdbBrowserMessage::RefreshLatest,
+                            Assembly64BrowserMessage::RefreshPresets,
                             self.connection.clone(),
-                            Some(self.settings.connection.host.clone()),
-                            self.settings.connection.password.clone(),
+                            host.clone(),
+                            pwd.clone(),
                         )
-                        .map(Message::CsdbBrowser);
+                        .map(Message::Assembly64Browser);
+                    let search = self
+                        .assembly64_browser
+                        .update(
+                            Assembly64BrowserMessage::SearchSubmit,
+                            self.connection.clone(),
+                            host,
+                            pwd,
+                        )
+                        .map(Message::Assembly64Browser);
+                    return Task::batch([refresh, search]);
                 }
                 Task::none()
             }
@@ -1888,15 +1904,15 @@ impl Ultimate64Browser {
                 }
                 Task::none()
             }
-            Message::CsdbBrowser(msg) => self
-                .csdb_browser
+            Message::Assembly64Browser(msg) => self
+                .assembly64_browser
                 .update(
                     msg,
                     self.connection.clone(),
                     Some(self.settings.connection.host.clone()),
                     self.settings.connection.password.clone(),
                 )
-                .map(Message::CsdbBrowser),
+                .map(Message::Assembly64Browser),
             Message::RefreshAfterConnect => {
                 // Refresh both status and remote browser after connection
                 let status_cmd = if let Some(conn) = &self.connection {
@@ -2525,7 +2541,7 @@ impl Ultimate64Browser {
                 self.tab_button("CONFIG", Tab::Configuration),
                 // PROFILES tab hidden — feature is WIP. Re-enable when ready.
                 // self.tab_button("PROFILES", Tab::Profiles),
-                self.tab_button("CSDB", Tab::CsdbBrowser),
+                self.tab_button("ASSEMBLY64", Tab::Assembly64),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -2582,10 +2598,10 @@ impl Ultimate64Browser {
                 .device_profile_manager
                 .view(self.status.connected, self.settings.preferences.font_size)
                 .map(Message::DeviceProfileManager),
-            Tab::CsdbBrowser => self
-                .csdb_browser
+            Tab::Assembly64 => self
+                .assembly64_browser
                 .view(self.settings.preferences.font_size, self.status.connected)
-                .map(Message::CsdbBrowser),
+                .map(Message::Assembly64Browser),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)

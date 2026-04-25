@@ -391,8 +391,3 @@ fn send_stop_command_rest_only(
 fn send_stop_command_binary_only(ultimate_ip: &str, stream_cmd: u8) -> std::io::Result<()> {
     send_stop_command_binary(ultimate_ip, stream_cmd)
 }
-
-// ============================================================================
-// Utility Functions
-// ============================================================================
-// get_local_ip() and resolve_host() are now in crate::net_utils
