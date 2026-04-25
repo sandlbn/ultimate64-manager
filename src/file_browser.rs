@@ -431,23 +431,39 @@ impl FileBrowser {
             FileBrowserMessage::NavigateToAssemblyDir => {
                 if let Some(config_dir) = dirs::config_dir() {
                     let base = config_dir.join("ultimate64-manager");
-                    // Best-effort: if the user has a leftover `CSDB/` from
-                    // before the Assembly64 migration and no `Assembly64/`
-                    // yet, rename in place so favorites stay visible.
-                    migrate_csdb_to_assembly(&base);
-
+                    let outcome = migrate_csdb_to_assembly(&base);
                     let asm_dir = base.join("Assembly64");
-                    if asm_dir.exists() {
-                        self.load_directory(&asm_dir);
-                        self.current_directory = asm_dir;
-                        self.checked_files.clear();
-                        self.last_entered_child = None;
-                    } else {
-                        self.status_message = Some(format!(
-                            "Assembly64 folder not found: {}",
-                            asm_dir.display()
-                        ));
+
+                    // Create the folder if neither it nor a CSDB legacy
+                    // exists — clicking the button should always navigate
+                    // somewhere reasonable, even on a clean install.
+                    if !asm_dir.exists() {
+                        if let Err(e) = std::fs::create_dir_all(&asm_dir) {
+                            self.status_message = Some(format!(
+                                "Could not create Assembly64 folder: {}",
+                                e
+                            ));
+                            return Task::none();
+                        }
                     }
+
+                    self.load_directory(&asm_dir);
+                    self.current_directory = asm_dir;
+                    self.checked_files.clear();
+                    self.last_entered_child = None;
+                    self.status_message = Some(match outcome {
+                        MigrationOutcome::Renamed => {
+                            "Migrated CSDB downloads to Assembly64".to_string()
+                        }
+                        MigrationOutcome::BothExisted => {
+                            "Both CSDB and Assembly64 folders exist — merge manually if needed"
+                                .to_string()
+                        }
+                        MigrationOutcome::Failed(kind) => {
+                            format!("Could not migrate CSDB folder ({:?})", kind)
+                        }
+                        MigrationOutcome::Nothing => String::new(),
+                    });
                 } else {
                     self.status_message = Some("Could not determine config directory".to_string());
                 }
@@ -2330,20 +2346,56 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
     }
 }
 
-/// One-shot migration: if the legacy `CSDB/` download folder exists under
-/// `~/.config/ultimate64-manager/` and there's no `Assembly64/` yet, rename
-/// it in place. This preserves the user's prior CSDB downloads when they
-/// upgrade to the Assembly64 browser. If both folders exist we leave them
-/// alone — automatic merging risks overwriting files.
-pub fn migrate_csdb_to_assembly(base: &std::path::Path) {
-    let old = base.join("CSDB");
+/// Outcome of the one-shot CSDB → Assembly64 folder migration.
+#[derive(Debug, Clone, Copy)]
+pub enum MigrationOutcome {
+    /// No legacy folder found — nothing to do (clean install or already migrated).
+    Nothing,
+    /// `CSDB/` was renamed to `Assembly64/`.
+    Renamed,
+    /// Both folders existed; we left them alone to avoid overwriting files.
+    BothExisted,
+    /// `rename` failed at the filesystem level.
+    Failed(std::io::ErrorKind),
+}
+
+/// One-shot migration of the legacy `CSDB/` downloads folder to
+/// `Assembly64/` so users upgrading from the old browser keep their prior
+/// downloads under the new toolbar shortcut.
+///
+/// Tries common case variants (`CSDB`, `csdb`, `Csdb`, `CSDb`) since macOS
+/// filesystems are typically case-insensitive but case-preserving — the
+/// stored name depends on whichever variant created the folder originally.
+/// Returns the [`MigrationOutcome`] so callers can surface it.
+pub fn migrate_csdb_to_assembly(base: &std::path::Path) -> MigrationOutcome {
     let new = base.join("Assembly64");
-    if !old.exists() || new.exists() {
-        return;
+    let mut found_old: Option<std::path::PathBuf> = None;
+    for variant in ["CSDB", "csdb", "Csdb", "CSDb"] {
+        let candidate = base.join(variant);
+        if candidate.exists() {
+            found_old = Some(candidate);
+            break;
+        }
+    }
+    let Some(old) = found_old else {
+        return MigrationOutcome::Nothing;
+    };
+    if new.exists() {
+        log::info!(
+            "Both {} and Assembly64 exist — skipping migration (manually merge if needed)",
+            old.display()
+        );
+        return MigrationOutcome::BothExisted;
     }
     match std::fs::rename(&old, &new) {
-        Ok(()) => log::info!("Migrated CSDB downloads folder to Assembly64"),
-        Err(e) => log::warn!("Could not migrate CSDB → Assembly64 folder: {}", e),
+        Ok(()) => {
+            log::info!("Migrated {} → {}", old.display(), new.display());
+            MigrationOutcome::Renamed
+        }
+        Err(e) => {
+            log::warn!("Could not migrate {} → Assembly64: {}", old.display(), e);
+            MigrationOutcome::Failed(e.kind())
+        }
     }
 }
 
