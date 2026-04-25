@@ -29,8 +29,34 @@ use ultimate64::Rest;
 use crate::archive::{extract_zip_to_dir, runnable_extracted_files, ExtractedFile, ExtractedZip};
 use crate::assembly64::{
     rating_stars, AsmEntry, AsmFile, Assembly64Client, AssemblyError, CategoryRegistry, Choice,
-    Presets, RatingFilter, RecencyFilter, SearchForm, SortOrder, DEFAULT_PAGE_SIZE,
+    CompoType, Presets, RatingFilter, RecencyFilter, SearchForm, SortOrder, DEFAULT_PAGE_SIZE,
 };
+
+/// Live compo-type id → label map. Falls back to a numeric placeholder
+/// (`compo 28`) when an id isn't in the table — keeps the UI unbroken.
+#[derive(Debug, Clone, Default)]
+pub struct CompoTypeRegistry {
+    map: std::collections::HashMap<u16, String>,
+}
+
+impl CompoTypeRegistry {
+    pub fn new(types: Vec<CompoType>) -> Self {
+        Self {
+            map: types.into_iter().map(|c| (c.id, c.name)).collect(),
+        }
+    }
+
+    pub fn label(&self, id: u16) -> String {
+        self.map
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("compo {}", id))
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (u16, &str)> {
+        self.map.iter().map(|(k, v)| (*k, v.as_str()))
+    }
+}
 
 const HTTP_TIMEOUT_SECS: u64 = 30;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 120;
@@ -202,6 +228,10 @@ fn categories_cache_path() -> Option<PathBuf> {
     Some(config_dir()?.join("assembly64_categories.json"))
 }
 
+fn compo_types_cache_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("assembly64_compotypes.json"))
+}
+
 fn load_persisted() -> PersistedState {
     let path = match persistence_path() {
         Some(p) => p,
@@ -275,16 +305,40 @@ fn save_cached_categories(registry: &CategoryRegistry) {
     }
 }
 
+fn load_cached_compo_types() -> Option<Vec<CompoType>> {
+    let path = compo_types_cache_path()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&s).ok()
+}
+
+fn save_cached_compo_types(types: &[CompoType]) {
+    let Some(path) = compo_types_cache_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(types) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Messages
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub enum Assembly64BrowserMessage {
-    // Server-driven preset / category metadata refresh.
+    // Server-driven preset / category / compo-type metadata refresh.
     RefreshPresets,
     PresetsLoaded(Result<Presets, String>),
     CategoriesLoaded(Result<CategoryRegistry, String>),
+    CompoTypesLoaded(Result<Vec<CompoType>, String>),
+
+    // Per-entry metadata for the detail view (handle / event / place / compo).
+    /// Returned for the (item_id, category_id) embedded in the request —
+    /// dropped if the user navigated away before it arrived.
+    EntryMetadataLoaded(Result<AsmEntry, String>),
 
     // Search form
     FreeTextChanged(String),
@@ -410,10 +464,11 @@ pub struct Assembly64Browser {
 
     file_filter: FileFilter,
 
-    // Server-driven dropdown contents and id→label map. Populated from
+    // Server-driven dropdown contents and id→label maps. Populated from
     // disk cache on startup, refreshed from the API on first tab open.
     presets: Presets,
     category_registry: CategoryRegistry,
+    compo_type_registry: CompoTypeRegistry,
     presets_loaded_from_server: bool,
 
     // Status
@@ -448,6 +503,9 @@ impl Assembly64Browser {
         // the dropdowns are usable on the very first run.
         let presets = load_cached_presets().unwrap_or_else(Presets::baseline);
         let category_registry = load_cached_categories().unwrap_or_default();
+        let compo_type_registry = CompoTypeRegistry::new(
+            load_cached_compo_types().unwrap_or_default(),
+        );
 
         let user_agent = format!("{}/{}", USER_AGENT_FALLBACK, env!("CARGO_PKG_VERSION"));
 
@@ -472,6 +530,7 @@ impl Assembly64Browser {
             file_filter: FileFilter::Runnable,
             presets,
             category_registry,
+            compo_type_registry,
             presets_loaded_from_server: false,
             status_message: None,
             is_loading: false,
@@ -535,7 +594,16 @@ impl Assembly64Browser {
                     },
                     M::CategoriesLoaded,
                 );
-                Task::batch([presets_task, categories_task])
+                let user_agent = self.user_agent.clone();
+                let compo_types_task = Task::perform(
+                    async move {
+                        let client = Assembly64Client::with_defaults(&user_agent)
+                            .map_err(|e| e.to_string())?;
+                        client.compo_types().await.map_err(|e| e.to_string())
+                    },
+                    M::CompoTypesLoaded,
+                );
+                Task::batch([presets_task, categories_task, compo_types_task])
             }
             M::PresetsLoaded(result) => {
                 match result {
@@ -583,6 +651,36 @@ impl Assembly64Browser {
                         log::warn!("Assembly64 categories refresh failed: {}", e);
                     }
                 }
+                Task::none()
+            }
+            M::CompoTypesLoaded(result) => {
+                match result {
+                    Ok(types) => {
+                        save_cached_compo_types(&types);
+                        self.compo_type_registry = CompoTypeRegistry::new(types);
+                    }
+                    Err(e) => {
+                        log::warn!("Assembly64 compo types refresh failed: {}", e);
+                    }
+                }
+                Task::none()
+            }
+            M::EntryMetadataLoaded(result) => {
+                if let Ok(meta) = result {
+                    // Drop stale responses if the user navigated away.
+                    if let Some(current) = &self.selected_entry {
+                        if current.item_id == meta.item_id
+                            && current.category_id == meta.category_id
+                        {
+                            // Merge: server fields fill in any gaps left by
+                            // the search-result stub. Where both sides have
+                            // a value, the server (meta) wins.
+                            self.selected_entry = Some(merge_entry(current.clone(), meta));
+                        }
+                    }
+                }
+                // Errors are non-fatal — detail view still has the search-
+                // result fields. Just log.
                 Task::none()
             }
 
@@ -763,6 +861,8 @@ impl Assembly64Browser {
                     released: None,
                     event: None,
                     place: None,
+                    compo: None,
+                    site_category: None,
                 };
                 self.selected_entry = Some(entry);
                 self.entry_files.clear();
@@ -773,8 +873,9 @@ impl Assembly64Browser {
                 self.screenshot_handle = None;
                 self.screenshot_loading = true;
                 let load_files = self.spawn_load_files(item_id.clone(), category_id);
-                let load_shot = self.spawn_screenshot(item_id, category_id);
-                Task::batch([load_files, load_shot])
+                let load_shot = self.spawn_screenshot(item_id.clone(), category_id);
+                let load_meta = self.spawn_metadata(item_id, category_id);
+                Task::batch([load_files, load_shot, load_meta])
             }
 
             // ── external link ───────────────────────────────────────────
@@ -801,8 +902,9 @@ impl Assembly64Browser {
                 self.screenshot_handle = None;
                 self.screenshot_loading = true;
                 let load_files = self.spawn_load_files(item_id.clone(), category_id);
-                let load_shot = self.spawn_screenshot(item_id, category_id);
-                Task::batch([load_files, load_shot])
+                let load_shot = self.spawn_screenshot(item_id.clone(), category_id);
+                let load_meta = self.spawn_metadata(item_id, category_id);
+                Task::batch([load_files, load_shot, load_meta])
             }
             M::EntryFilesLoaded(result) => {
                 self.is_loading = false;

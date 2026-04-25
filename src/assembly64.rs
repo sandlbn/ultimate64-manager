@@ -82,6 +82,11 @@ pub struct AsmEntry {
     pub event: Option<String>,
     /// Place in the compo, when applicable.
     pub place: Option<u16>,
+    /// Numeric compo-type id — matches `/search/compotypes`.
+    pub compo: Option<u16>,
+    /// Aggregated Assembly64 category id, distinct from the source-specific
+    /// `category_id`. Useful for "show similar" navigation.
+    pub site_category: Option<u16>,
 }
 
 impl AsmEntry {
@@ -646,6 +651,10 @@ struct WireEntry {
     event: Option<String>,
     #[serde(default)]
     place: Option<u16>,
+    #[serde(default)]
+    compo: Option<u16>,
+    #[serde(default, rename = "siteCategory")]
+    site_category: Option<u16>,
 }
 
 impl From<WireEntry> for AsmEntry {
@@ -663,6 +672,11 @@ impl From<WireEntry> for AsmEntry {
             released: w.released.filter(|s| !s.is_empty()),
             event: w.event.filter(|s| !s.is_empty()),
             place: w.place.filter(|&p| p > 0),
+            // The server uses compo id 0 for "C64 DEMO" — a real value, not
+            // a sentinel — so don't filter it out the way we do for `year`
+            // or `place`. Caller decides whether to look it up.
+            compo: w.compo,
+            site_category: w.site_category.filter(|&c| c > 0),
         }
     }
 }
@@ -910,6 +924,41 @@ impl Assembly64Client {
             "unrecognised /search/categories response shape".into(),
         ))
     }
+
+    /// Fetch full metadata for one entry — same shape as a search hit but
+    /// guaranteed to be complete. Used by the detail view when the source
+    /// stub (e.g. a favorite re-opened across sessions) lacks fields like
+    /// `handle`, `event`, or `site_rating`.
+    pub async fn metadata(
+        &self,
+        item_id: &str,
+        category_id: u16,
+    ) -> Result<AsmEntry, AssemblyError> {
+        let url = format!("{}/search/meta/{}/{}", self.base, item_id, category_id);
+        let resp = self.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(AssemblyError::Http(status));
+        }
+        let wire: WireEntry = resp.json().await?;
+        Ok(AsmEntry::from(wire))
+    }
+
+    /// Fetch the compo-type id → label table from `/search/compotypes`.
+    /// Stable enough to cache for the lifetime of the app.
+    pub async fn compo_types(&self) -> Result<Vec<CompoType>, AssemblyError> {
+        let url = format!("{}/search/compotypes", self.base);
+        let resp = self.get(&url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(AssemblyError::Http(status));
+        }
+        let arr: Vec<WireCompoType> = resp.json().await?;
+        Ok(arr
+            .into_iter()
+            .map(|c| CompoType { id: c.id, name: c.name })
+            .collect())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -929,6 +978,21 @@ struct WirePresetValue {
     /// Only populated for `subcat` rows.
     #[serde(default)]
     id: Option<u16>,
+}
+
+/// One compo-type row from `/search/compotypes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompoType {
+    pub id: u16,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireCompoType {
+    #[serde(default)]
+    id: u16,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1197,6 +1261,8 @@ mod tests {
             released: None,
             event: None,
             place: None,
+            compo: None,
+            site_category: None,
         }
     }
 
