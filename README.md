@@ -46,13 +46,14 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC only
-- **CSDb Browser** – Search and browse releases from CSDb.dk
-  - Search by category (All, Releases, Groups, SIDs)
-  - Browse latest releases
-  - View release details and file listings
-  - Run PRG, CRT, SID, and disk images directly
-  - Mount disk images with drive/mode selection
-  - Download files to local storage
+- **Assembly64 Browser** – Search the Assembly64 API (aggregates CSDB, HVSC, c64.org, OneLoad64, Gamebase64 and more)
+  - Filter by type, source, rating, recency, and sort order — no AQL knowledge required
+  - Save named searches and star favorites for one-click recall
+  - View release details with screenshot preview (CSDB-sourced entries) and file listings
+  - Run PRG, CRT, SID, and disk images directly on the device
+  - Mount disk images with drive (8/9) and mode (RO/RW) selection
+  - Extract ZIPs and run/mount their contents
+  - Open original CSDB release pages in the browser for scene comments
   
 ## Keyboard Shortcuts
 
