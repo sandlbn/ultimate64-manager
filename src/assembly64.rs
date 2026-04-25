@@ -552,7 +552,15 @@ impl SearchForm {
             if trimmed.contains(':') {
                 parts.push(trimmed.to_string());
             } else {
-                parts.push(format!("name:*{}*", trimmed));
+                // Multi-word terms must use `*` as the separator inside the
+                // `name:*…*` wildcard — the server's AQL parser rejects a
+                // literal space between two words (HTTP 463), even though
+                // entries with spaces in their names are common ("Bubble
+                // Bobble" etc.). Collapsing runs of whitespace to a single
+                // `*` matches space, underscore, hyphen, or any other
+                // separator the title might use.
+                let glued = trimmed.split_whitespace().collect::<Vec<_>>().join("*");
+                parts.push(format!("name:*{}*", glued));
             }
         }
         // The `aqlKey` from /search/aql/presets is the *value* half of a
@@ -1102,6 +1110,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(form.compose_aql(), "name:*elite* sort:updated order:desc");
+    }
+
+    #[test]
+    fn compose_aql_glues_multi_word_with_wildcard() {
+        // The server returns HTTP 463 for a literal space inside the name
+        // wildcard (`name:*bubble bobble*`), so multi-word input must be
+        // glued with `*` to match the title regardless of separator.
+        let form = SearchForm {
+            free_text: "bubble bobble".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            form.compose_aql(),
+            "name:*bubble*bobble* sort:updated order:desc"
+        );
+
+        // Whitespace runs collapse cleanly.
+        let form = SearchForm {
+            free_text: "  space   invaders  64 ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            form.compose_aql(),
+            "name:*space*invaders*64* sort:updated order:desc"
+        );
     }
 
     #[test]
