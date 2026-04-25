@@ -404,6 +404,13 @@ impl Ultimate64Browser {
         let settings = profile_manager.active_settings().clone();
         log::info!("Active profile: {}", profile_manager.active_profile);
 
+        // One-shot rename of the legacy `CSDB/` downloads folder to
+        // `Assembly64/` so users upgrading from the old browser keep their
+        // prior downloads under the new toolbar shortcut.
+        if let Some(cfg) = dirs::config_dir() {
+            file_browser::migrate_csdb_to_assembly(&cfg.join("ultimate64-manager"));
+        }
+
         // Create music player with configured starting directory
         let mut music_player =
             MusicPlayer::new(settings.default_paths.music_player_start_dir.clone());

@@ -49,7 +49,7 @@ pub enum FileBrowserMessage {
     /// Internal: tracks current scroll offset so NavigateUp can restore it
     Scrolled(Viewport),
     FilterChanged(String),
-    NavigateToCsdbDir,
+    NavigateToAssemblyDir,
     // ZIP extraction: extract archive to a sibling subfolder then navigate there
     ExtractZip(PathBuf),
     ZipExtracted(Result<PathBuf, String>),
@@ -428,17 +428,25 @@ impl FileBrowser {
                 self.filter = value;
                 Task::none()
             }
-            FileBrowserMessage::NavigateToCsdbDir => {
+            FileBrowserMessage::NavigateToAssemblyDir => {
                 if let Some(config_dir) = dirs::config_dir() {
-                    let csdb_dir = config_dir.join("ultimate64-manager").join("CSDB");
-                    if csdb_dir.exists() {
-                        self.load_directory(&csdb_dir);
-                        self.current_directory = csdb_dir;
+                    let base = config_dir.join("ultimate64-manager");
+                    // Best-effort: if the user has a leftover `CSDB/` from
+                    // before the Assembly64 migration and no `Assembly64/`
+                    // yet, rename in place so favorites stay visible.
+                    migrate_csdb_to_assembly(&base);
+
+                    let asm_dir = base.join("Assembly64");
+                    if asm_dir.exists() {
+                        self.load_directory(&asm_dir);
+                        self.current_directory = asm_dir;
                         self.checked_files.clear();
                         self.last_entered_child = None;
                     } else {
-                        self.status_message =
-                            Some(format!("CSDb folder not found: {}", csdb_dir.display()));
+                        self.status_message = Some(format!(
+                            "Assembly64 folder not found: {}",
+                            asm_dir.display()
+                        ));
                     }
                 } else {
                     self.status_message = Some("Could not determine config directory".to_string());
@@ -967,11 +975,11 @@ impl FileBrowser {
             )
             .style(crate::styles::subtle_tooltip),
             tooltip(
-                button(text("CSDb").size(fs.small))
-                    .on_press(FileBrowserMessage::NavigateToCsdbDir)
+                button(text("Assembly64").size(fs.small))
+                    .on_press(FileBrowserMessage::NavigateToAssemblyDir)
                     .padding([2, 6])
                     .style(crate::styles::nav_button),
-                "Go to CSDb downloads folder",
+                "Go to Assembly64 downloads folder",
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),
@@ -2319,6 +2327,23 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
         Ok(Ok(inner)) => inner,
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("Load timed out - device may be offline".to_string()),
+    }
+}
+
+/// One-shot migration: if the legacy `CSDB/` download folder exists under
+/// `~/.config/ultimate64-manager/` and there's no `Assembly64/` yet, rename
+/// it in place. This preserves the user's prior CSDB downloads when they
+/// upgrade to the Assembly64 browser. If both folders exist we leave them
+/// alone — automatic merging risks overwriting files.
+pub fn migrate_csdb_to_assembly(base: &std::path::Path) {
+    let old = base.join("CSDB");
+    let new = base.join("Assembly64");
+    if !old.exists() || new.exists() {
+        return;
+    }
+    match std::fs::rename(&old, &new) {
+        Ok(()) => log::info!("Migrated CSDB downloads folder to Assembly64"),
+        Err(e) => log::warn!("Could not migrate CSDB → Assembly64 folder: {}", e),
     }
 }
 
