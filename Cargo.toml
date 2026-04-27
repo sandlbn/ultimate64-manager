@@ -1,13 +1,13 @@
 [package]
 name = "ultimate64-manager"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Ultimate64 Manager - Control your Ultimate64/Ultimate-II+"
 authors = ["Marcin Spoczynski"]
 license = "MIT"
 
 [dependencies]
-iced = { version = "0.14.0", features = ["tokio", "image", "canvas"] }
+iced = { version = "0.14.0", features = ["tokio", "image", "canvas", "advanced"] }
 tokio = { version = "1", features = ["full"] }
 ultimate64 = "0.5.5"
 anyhow = "1.0"
