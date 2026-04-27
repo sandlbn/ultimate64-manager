@@ -31,6 +31,8 @@ mod api;
 mod archive;
 mod assembly64;
 mod assembly64_browser;
+mod basic_editor;
+mod basic_tokenizer;
 mod cfg_format;
 mod config_api;
 mod config_editor;
@@ -69,6 +71,7 @@ mod version_check;
 mod video_scaling;
 
 use assembly64_browser::{Assembly64Browser, Assembly64BrowserMessage};
+use basic_editor::{BasicEditor, BasicEditorMessage};
 use config_editor::{ConfigEditor, ConfigEditorMessage};
 use discovery::DiscoveredDevice;
 use file_browser::{FileBrowser, FileBrowserMessage};
@@ -262,6 +265,8 @@ pub enum Message {
     OpenReleasePage,
     // Assembly64 Browser
     Assembly64Browser(Assembly64BrowserMessage),
+    // BASIC editor
+    BasicEditor(BasicEditorMessage),
     // Separate streaming window management
     OpenStreamingWindow,
     StreamingWindowOpened(iced::window::Id),
@@ -292,6 +297,7 @@ pub enum Tab {
     Configuration,
     Profiles,
     Assembly64,
+    BasicEditor,
     Settings,
 }
 
@@ -306,6 +312,7 @@ impl std::fmt::Display for Tab {
             Tab::Configuration => write!(f, "Configuration"),
             Tab::Profiles => write!(f, "Profiles"),
             Tab::Assembly64 => write!(f, "Assembly64"),
+            Tab::BasicEditor => write!(f, "BASIC"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -366,6 +373,7 @@ pub struct Ultimate64Browser {
     // Update notification
     new_version: Option<NewVersionInfo>,
     assembly64_browser: Assembly64Browser,
+    basic_editor: BasicEditor,
     // Separate streaming window
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
@@ -457,6 +465,7 @@ impl Ultimate64Browser {
             user_message: None,
             video_streaming: VideoStreaming::new(),
             assembly64_browser: Assembly64Browser::new(),
+            basic_editor: BasicEditor::new(),
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
             profile_manager,
@@ -1936,6 +1945,14 @@ impl Ultimate64Browser {
                     self.settings.connection.password.clone(),
                 )
                 .map(Message::Assembly64Browser),
+            Message::BasicEditor(msg) => self
+                .basic_editor
+                .update(
+                    msg,
+                    Some(self.settings.connection.host.clone()),
+                    self.settings.connection.password.clone(),
+                )
+                .map(Message::BasicEditor),
             Message::RefreshAfterConnect => {
                 // Refresh both status and remote browser after connection
                 let status_cmd = if let Some(conn) = &self.connection {
@@ -2590,6 +2607,7 @@ impl Ultimate64Browser {
                 // PROFILES tab hidden — feature is WIP. Re-enable when ready.
                 // self.tab_button("PROFILES", Tab::Profiles),
                 self.tab_button("ASSEMBLY64", Tab::Assembly64),
+                self.tab_button("BASIC", Tab::BasicEditor),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -2650,6 +2668,10 @@ impl Ultimate64Browser {
                 .assembly64_browser
                 .view(self.settings.preferences.font_size, self.status.connected)
                 .map(Message::Assembly64Browser),
+            Tab::BasicEditor => self
+                .basic_editor
+                .view(self.settings.preferences.font_size, self.status.connected)
+                .map(Message::BasicEditor),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)

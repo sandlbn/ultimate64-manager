@@ -439,10 +439,8 @@ impl FileBrowser {
                     // somewhere reasonable, even on a clean install.
                     if !asm_dir.exists() {
                         if let Err(e) = std::fs::create_dir_all(&asm_dir) {
-                            self.status_message = Some(format!(
-                                "Could not create Assembly64 folder: {}",
-                                e
-                            ));
+                            self.status_message =
+                                Some(format!("Could not create Assembly64 folder: {}", e));
                             return Task::none();
                         }
                     }
