@@ -1111,6 +1111,15 @@ impl RemoteBrowser {
             .style(crate::styles::subtle_tooltip),
             text(display_path).size(small).width(Length::Fill),
             tooltip(
+                button(text("📁+").size(small))
+                    .on_press(RemoteBrowserMessage::ShowCreateDir)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                "Create a new folder on the device",
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip),
+            tooltip(
                 button(text("⟳").size(small))
                     .on_press(RemoteBrowserMessage::RefreshFiles)
                     .padding([2, 6])

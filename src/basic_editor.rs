@@ -12,7 +12,7 @@ use iced::advanced::text::highlighter::Format;
 use iced::advanced::text::Highlighter as HighlighterTrait;
 use iced::widget::{
     button, column, container, row, rule, scrollable, text,
-    text_editor::{self, Action, Content},
+    text_editor::{Action, Content},
     tooltip, Space,
 };
 use iced::{Color, Element, Font, Length, Task};
