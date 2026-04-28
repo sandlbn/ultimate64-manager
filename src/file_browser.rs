@@ -1006,6 +1006,15 @@ impl FileBrowser {
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),
+            tooltip(
+                button(text("📁+ New").size(fs.small))
+                    .on_press(FileBrowserMessage::ShowCreateDir)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                "Create a new folder in the current directory",
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip),
         ]
         .spacing(3)
         .align_y(iced::Alignment::Center)
