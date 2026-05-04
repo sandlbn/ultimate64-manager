@@ -44,6 +44,7 @@ mod discovery;
 mod disk_image;
 mod file_browser;
 mod file_types;
+mod folder_favorites;
 mod ftp_ops;
 mod memory_editor;
 mod mod_info;

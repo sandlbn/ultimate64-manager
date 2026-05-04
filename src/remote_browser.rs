@@ -106,6 +106,19 @@ pub enum RemoteBrowserMessage {
     /// Async mkdir finished
     CreateDirComplete(Result<String, String>),
 
+    // ── Favorites ────────────────────────────────────────────────────────
+    /// Toggle the *current* path in/out of favorites (toolbar star).
+    ToggleCurrentFavorite,
+    /// Toggle an arbitrary device path — fired from the inline context
+    /// menu's explicit ★/☆ button. Auto-closes the context menu.
+    ToggleFavorite(String),
+    /// Navigate to a favorite chosen from the toolbar dropdown.
+    NavigateToFavorite(String),
+    /// Right-click on a folder row — opens the inline context menu.
+    OpenContextMenu(String),
+    /// Click on the context menu's Cancel button.
+    CloseContextMenu,
+
     // ── Sort ─────────────────────────────────────────────────────────────
     /// Change sort column (or toggle order if same column)
     SortBy(crate::file_types::SortColumn),
@@ -179,7 +192,20 @@ pub struct RemoteBrowser {
     pub selected_drive: DriveOption,
     // Cached root directory names for quick nav
     root_dirs: Vec<String>,
+    /// Persisted favorite folders on the device. Star button toggles the
+    /// current path; the dropdown navigates to a saved one; right-click on
+    /// a folder row opens a context menu over that folder.
+    favorites: Vec<String>,
+    /// When set, the file list renders an inline action bar (★ toggle +
+    /// Cancel) under the row whose path matches.
+    context_menu_for: Option<String>,
+    /// Path we just tried to open via the favorites dropdown. If the
+    /// resulting `FilesLoaded` is an Err, that favorite is auto-removed —
+    /// keeps the dropdown from filling up with broken entries.
+    pending_favorite_check: Option<String>,
 }
+
+const FAVORITES_FILE: &str = "remote_favorites.json";
 
 impl Default for RemoteBrowser {
     fn default() -> Self {
@@ -215,6 +241,9 @@ impl Default for RemoteBrowser {
             sort_order: crate::file_types::SortOrder::Ascending,
             selected_drive: DriveOption::A,
             root_dirs: Vec::new(),
+            favorites: crate::folder_favorites::load(FAVORITES_FILE),
+            context_menu_for: None,
+            pending_favorite_check: None,
         }
     }
 }
@@ -278,8 +307,28 @@ impl RemoteBrowser {
                         self.sort_files();
                         self.is_connected = true;
                         self.status_message = Some(format!("{} items", self.files.len()));
+                        // Successful navigation means the favorite is fine.
+                        self.pending_favorite_check = None;
                     }
                     Err(e) => {
+                        // If the failed listing was a favorite the user just
+                        // picked, treat it as "stale" and remove from the
+                        // dropdown — keeps the list useful over time. Note
+                        // that transient device-offline errors will also
+                        // remove favorites; that's a known trade-off the
+                        // user can re-add the entry from the new path.
+                        if let Some(stale) = self.pending_favorite_check.take() {
+                            if stale == self.current_path {
+                                let label = remote_basename(&stale);
+                                self.favorites.retain(|p| *p != stale);
+                                self.persist_favorites();
+                                self.status_message = Some(format!(
+                                    "Removed missing favorite: {} ({}) — {}",
+                                    label, stale, e
+                                ));
+                                return Task::none();
+                            }
+                        }
                         self.status_message = Some(format!("{}", e));
                     }
                 }
@@ -1058,6 +1107,71 @@ impl RemoteBrowser {
                 }
                 Task::none()
             }
+
+            // ── Favorites ────────────────────────────────────────────────
+            RemoteBrowserMessage::ToggleCurrentFavorite => {
+                let path = self.current_path.clone();
+                let now_fav = self.toggle_favorite_path(path);
+                self.status_message = Some(
+                    if now_fav {
+                        "★ Added to favorites"
+                    } else {
+                        "Removed from favorites"
+                    }
+                    .to_string(),
+                );
+                Task::none()
+            }
+            RemoteBrowserMessage::ToggleFavorite(path) => {
+                let label = remote_basename(&path);
+                let now_fav = self.toggle_favorite_path(path);
+                self.context_menu_for = None;
+                self.status_message = Some(if now_fav {
+                    format!("★ {}", label)
+                } else {
+                    format!("Removed: {}", label)
+                });
+                Task::none()
+            }
+            RemoteBrowserMessage::OpenContextMenu(path) => {
+                self.context_menu_for = Some(path);
+                Task::none()
+            }
+            RemoteBrowserMessage::CloseContextMenu => {
+                self.context_menu_for = None;
+                Task::none()
+            }
+            RemoteBrowserMessage::NavigateToFavorite(path) => {
+                // Mark this favorite as "under test" — if the listing fails
+                // we'll know it's the one to drop, and the result handler
+                // can act without us threading more state through Task.
+                self.pending_favorite_check = Some(path.clone());
+                self.current_path = path;
+                self.checked_files.clear();
+                self.update(RemoteBrowserMessage::RefreshFiles, _connection)
+            }
+        }
+    }
+
+    fn persist_favorites(&self) {
+        crate::folder_favorites::save(FAVORITES_FILE, &self.favorites);
+    }
+
+    fn is_favorite(&self, path: &str) -> bool {
+        self.favorites.iter().any(|p| p == path)
+    }
+
+    /// Toggle a path in the favorites list. Returns whether the path is now
+    /// favorited (true) or just got removed (false).
+    fn toggle_favorite_path(&mut self, path: String) -> bool {
+        if let Some(pos) = self.favorites.iter().position(|p| *p == path) {
+            self.favorites.remove(pos);
+            self.persist_favorites();
+            false
+        } else {
+            self.favorites.push(path);
+            self.persist_favorites();
+            true
         }
     }
 
@@ -1099,7 +1213,9 @@ impl RemoteBrowser {
         } else {
             self.current_path.clone()
         };
-        row![
+
+        let mut items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
+        items.push(
             tooltip(
                 button(text("⬆").size(font_size))
                     .on_press(RemoteBrowserMessage::NavigateUp)
@@ -1108,8 +1224,50 @@ impl RemoteBrowser {
                 "Go to parent folder",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
-            text(display_path).size(small).width(Length::Fill),
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        items.push(text(display_path).size(small).width(Length::Fill).into());
+
+        // ── Favorites: ★ for current path + dropdown when non-empty ──
+        let is_fav = self.is_favorite(&self.current_path);
+        items.push(
+            tooltip(
+                button(text(if is_fav { "★" } else { "☆" }).size(small))
+                    .on_press(RemoteBrowserMessage::ToggleCurrentFavorite)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                if is_fav {
+                    "Remove this folder from favorites"
+                } else {
+                    "Add this folder to favorites"
+                },
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        if !self.favorites.is_empty() {
+            let choices: Vec<RemoteFavoriteChoice> = self
+                .favorites
+                .iter()
+                .map(|p| RemoteFavoriteChoice {
+                    label: remote_favorite_label(p),
+                    path: p.clone(),
+                })
+                .collect();
+            items.push(
+                iced::widget::pick_list(choices, None::<RemoteFavoriteChoice>, |c| {
+                    RemoteBrowserMessage::NavigateToFavorite(c.path)
+                })
+                .placeholder(format!("⭐ Favorites ({})", self.favorites.len()))
+                .text_size(small)
+                .padding([2, 6])
+                .into(),
+            );
+        }
+
+        items.push(
             tooltip(
                 button(text("📁+").size(small))
                     .on_press(RemoteBrowserMessage::ShowCreateDir)
@@ -1118,7 +1276,10 @@ impl RemoteBrowser {
                 "Create a new folder on the device",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        items.push(
             tooltip(
                 button(text("⟳").size(small))
                     .on_press(RemoteBrowserMessage::RefreshFiles)
@@ -1127,11 +1288,14 @@ impl RemoteBrowser {
                 "Refresh file listing",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
-        ]
-        .spacing(5)
-        .align_y(iced::Alignment::Center)
-        .into()
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+
+        iced::widget::Row::with_children(items)
+            .spacing(5)
+            .align_y(iced::Alignment::Center)
+            .into()
     }
 
     fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
@@ -1229,6 +1393,49 @@ impl RemoteBrowser {
         }
 
         items.into()
+    }
+
+    /// Inline context menu rendered directly under the right-clicked folder
+    /// row. Two explicit actions: ★ toggle favorite, ✕ cancel.
+    fn view_context_menu(&self, path: &str, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let is_fav = self.is_favorite(path);
+        let toggle_label = if is_fav {
+            "☆ Remove from Favorites"
+        } else {
+            "★ Add to Favorites"
+        };
+        let label = remote_basename(path);
+        let menu = row![
+            text(format!("→ {}", label))
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+            Space::new().width(Length::Fill),
+            button(text(toggle_label).size(fs.small))
+                .on_press(RemoteBrowserMessage::ToggleFavorite(path.to_string()))
+                .padding([3, 8]),
+            button(text("✕ Cancel").size(fs.small))
+                .on_press(RemoteBrowserMessage::CloseContextMenu)
+                .padding([3, 8])
+                .style(iced::widget::button::text),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .padding([3, 10]);
+        container(menu)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.18, 0.20, 0.28, 0.95,
+                ))),
+                border: iced::Border {
+                    color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.5),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .into()
     }
 
     fn build_column_headers(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
@@ -1683,7 +1890,22 @@ impl RemoteBrowser {
                 .align_y(iced::Alignment::Center)
                 .padding([2, 4]);
 
-                items.push(file_row.into());
+                // Right-click on a directory row opens an inline context
+                // menu — the favorite toggle is a separate explicit click,
+                // so a stray right-click never alters favorites.
+                let row_element: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
+                    iced::widget::mouse_area(file_row)
+                        .on_right_press(RemoteBrowserMessage::OpenContextMenu(entry.path.clone()))
+                        .into()
+                } else {
+                    file_row.into()
+                };
+                items.push(row_element);
+                if let Some(target) = &self.context_menu_for {
+                    if target == &entry.path {
+                        items.push(self.view_context_menu(target, font_size));
+                    }
+                }
             }
 
             scrollable(
@@ -2378,6 +2600,44 @@ impl RemoteBrowser {
 }
 
 // ─── Existing helpers (unchanged) ────────────────────────────────────────────
+
+/// `pick_list` row for a favorited remote folder. Shows the basename;
+/// `path` carries the full device path so navigation works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteFavoriteChoice {
+    label: String,
+    path: String,
+}
+
+impl std::fmt::Display for RemoteFavoriteChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Last `/`-separated segment of a remote path, or "/" for the root.
+fn remote_basename(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    match trimmed.rfind('/') {
+        Some(idx) => trimmed[idx + 1..].to_string(),
+        None => trimmed.to_string(),
+    }
+}
+
+/// Compose the dropdown row label for a remote favorite. Keeps the basename
+/// up front (easy to scan) and appends the full device path so two
+/// "Music" entries under different mounts are distinguishable.
+fn remote_favorite_label(path: &str) -> String {
+    let basename = remote_basename(path);
+    if basename == path {
+        basename
+    } else {
+        format!("{} — {}", basename, path)
+    }
+}
 
 fn get_file_icon(name: &str) -> &'static str {
     crate::file_types::get_file_icon(name)
