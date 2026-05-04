@@ -11,7 +11,7 @@
 use iced::advanced::text::highlighter::Format;
 use iced::advanced::text::Highlighter as HighlighterTrait;
 use iced::widget::{
-    button, column, container, row, rule, scrollable, text,
+    button, column, container, row, rule, text,
     text_editor::{Action, Content},
     tooltip, Space,
 };
@@ -306,10 +306,16 @@ impl BasicEditor {
         )
         .padding([4, 8]);
 
+        // Don't wrap `text_editor` in `scrollable` — the widget already
+        // owns its own scroll viewport. Double-wrapping was triggering
+        // `iced_tiny_skia` to panic in `Build rounded rectangle path` on
+        // Linux when the inner rounded background got sized below 2× its
+        // corner radius. Letting text_editor fill the column directly
+        // sidesteps the issue.
         column![
             toolbar,
             rule::horizontal(1),
-            scrollable(editor).height(Length::Fill),
+            editor,
             rule::horizontal(1),
             status,
         ]
