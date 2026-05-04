@@ -81,6 +81,19 @@ pub enum FileBrowserMessage {
     CreateDirNameChanged(String),
     CreateDirConfirm,
     CreateDirCancel,
+    // Favorites
+    /// Toggle the *current* directory in/out of favorites (toolbar star).
+    ToggleCurrentFavorite,
+    /// Toggle an arbitrary folder — fired from the inline context menu's
+    /// explicit ★/☆ button. Auto-closes the context menu.
+    ToggleFavorite(PathBuf),
+    /// Navigate to a favorite chosen from the toolbar dropdown.
+    NavigateToFavorite(PathBuf),
+    /// Right-click on a folder row — opens the inline context menu.
+    OpenContextMenu(PathBuf),
+    /// Click on the context menu's Cancel button or anywhere else that
+    /// dismisses the popup.
+    CloseContextMenu,
     // Local disk image creation
     ShowCreateDisk,
     CloseCreateDisk,
@@ -173,7 +186,17 @@ pub struct FileBrowser {
     create_disk_name: String,
     create_disk_id: String,
     create_disk_type: crate::ftp_ops::DiskCreateType,
+    /// Persisted favorite folders. The toolbar dropdown lists them; the
+    /// star button toggles the current directory; right-click on any
+    /// folder row opens a context menu over that folder.
+    favorites: Vec<PathBuf>,
+    /// When set, the file list renders a small inline action bar (★ toggle
+    /// + Cancel) directly under the row whose path matches. Right-click on
+    /// a folder row sets this; clicking either action clears it.
+    context_menu_for: Option<PathBuf>,
 }
+
+const FAVORITES_FILE: &str = "local_favorites.json";
 
 impl FileBrowser {
     /// Create a new FileBrowser with an optional starting directory.
@@ -212,9 +235,33 @@ impl FileBrowser {
             create_disk_name: "NEWDISK".to_string(),
             create_disk_id: "01 2A".to_string(),
             create_disk_type: crate::ftp_ops::DiskCreateType::D64,
+            favorites: crate::folder_favorites::load(FAVORITES_FILE),
+            context_menu_for: None,
         };
         browser.load_directory(&initial_dir);
         browser
+    }
+
+    fn persist_favorites(&self) {
+        crate::folder_favorites::save(FAVORITES_FILE, &self.favorites);
+    }
+
+    fn is_favorite(&self, path: &std::path::Path) -> bool {
+        self.favorites.iter().any(|p| p == path)
+    }
+
+    /// Toggle a path in the favorites list. Returns whether the path is now
+    /// favorited (true) or just got removed (false).
+    fn toggle_favorite_path(&mut self, path: PathBuf) -> bool {
+        if let Some(pos) = self.favorites.iter().position(|p| *p == path) {
+            self.favorites.remove(pos);
+            self.persist_favorites();
+            false
+        } else {
+            self.favorites.push(path);
+            self.persist_favorites();
+            true
+        }
     }
 
     pub fn update(
@@ -865,6 +912,64 @@ impl FileBrowser {
                 Task::none()
             }
 
+            // ── Favorites ────────────────────────────────────────────────
+            FileBrowserMessage::ToggleCurrentFavorite => {
+                let current = self.current_directory.clone();
+                let now_fav = self.toggle_favorite_path(current);
+                self.status_message = Some(
+                    if now_fav {
+                        "★ Added to favorites"
+                    } else {
+                        "Removed from favorites"
+                    }
+                    .to_string(),
+                );
+                Task::none()
+            }
+            FileBrowserMessage::ToggleFavorite(path) => {
+                let label = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_else(|| path.to_str().unwrap_or(""))
+                    .to_string();
+                let now_fav = self.toggle_favorite_path(path);
+                self.context_menu_for = None;
+                self.status_message = Some(if now_fav {
+                    format!("★ {}", label)
+                } else {
+                    format!("Removed: {}", label)
+                });
+                Task::none()
+            }
+            FileBrowserMessage::OpenContextMenu(path) => {
+                self.context_menu_for = Some(path);
+                Task::none()
+            }
+            FileBrowserMessage::CloseContextMenu => {
+                self.context_menu_for = None;
+                Task::none()
+            }
+            FileBrowserMessage::NavigateToFavorite(path) => {
+                // Stale-favorite cleanup: if the folder no longer exists,
+                // drop it from the list so the dropdown stays useful.
+                if !path.exists() {
+                    let label = favorite_label(&path);
+                    self.favorites.retain(|p| *p != path);
+                    self.persist_favorites();
+                    self.status_message = Some(format!(
+                        "Removed missing favorite: {} ({})",
+                        label,
+                        path.display()
+                    ));
+                    return Task::none();
+                }
+                self.load_directory(&path);
+                self.current_directory = path;
+                self.checked_files.clear();
+                self.last_entered_child = None;
+                Task::none()
+            }
+
             // ── Local create disk image ──────────────────────────────────
             FileBrowserMessage::ShowCreateDisk => {
                 self.show_create_disk = true;
@@ -976,7 +1081,8 @@ impl FileBrowser {
     fn build_quick_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
 
-        row![
+        let mut items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+        items.push(
             tooltip(
                 button(text("🏠 Home").size(fs.small))
                     .on_press(FileBrowserMessage::NavigateToPath(
@@ -987,7 +1093,10 @@ impl FileBrowser {
                 "Go to home directory",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        items.push(
             tooltip(
                 button(text("Assembly64").size(fs.small))
                     .on_press(FileBrowserMessage::NavigateToAssemblyDir)
@@ -996,7 +1105,10 @@ impl FileBrowser {
                 "Go to Assembly64 downloads folder",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        items.push(
             tooltip(
                 button(text("🔍 Browse").size(fs.small))
                     .on_press(FileBrowserMessage::SelectDirectory)
@@ -1005,7 +1117,10 @@ impl FileBrowser {
                 "Choose a different folder",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        items.push(
             tooltip(
                 button(text("📁+ New").size(fs.small))
                     .on_press(FileBrowserMessage::ShowCreateDir)
@@ -1014,11 +1129,54 @@ impl FileBrowser {
                 "Create a new folder in the current directory",
                 tooltip::Position::Bottom,
             )
-            .style(crate::styles::subtle_tooltip),
-        ]
-        .spacing(3)
-        .align_y(iced::Alignment::Center)
-        .into()
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+
+        // ── Favorites: ★ toggle for current dir, plus dropdown when there
+        // are any saved. The dropdown disappears when the list is empty so
+        // the toolbar isn't dragged down by an empty placeholder.
+        let is_fav = self.is_favorite(&self.current_directory);
+        items.push(
+            tooltip(
+                button(text(if is_fav { "★" } else { "☆" }).size(fs.small))
+                    .on_press(FileBrowserMessage::ToggleCurrentFavorite)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                if is_fav {
+                    "Remove this folder from favorites"
+                } else {
+                    "Add this folder to favorites"
+                },
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+        if !self.favorites.is_empty() {
+            let choices: Vec<FavoriteChoice> = self
+                .favorites
+                .iter()
+                .map(|p| FavoriteChoice {
+                    label: favorite_label(p),
+                    path: p.clone(),
+                })
+                .collect();
+            items.push(
+                iced::widget::pick_list(choices, None::<FavoriteChoice>, |c| {
+                    FileBrowserMessage::NavigateToFavorite(c.path)
+                })
+                .placeholder(format!("⭐ Favorites ({})", self.favorites.len()))
+                .text_size(fs.small)
+                .padding([2, 6])
+                .into(),
+            );
+        }
+
+        iced::widget::Row::with_children(items)
+            .spacing(3)
+            .align_y(iced::Alignment::Center)
+            .into()
     }
 
     /// Build the status bar: file count | selection | Drive picker
@@ -1463,6 +1621,14 @@ impl FileBrowser {
                     file_list.push(rule::horizontal(1).into());
                 }
                 file_list.push(self.view_file_entry(*entry, font_size));
+                // Inline context menu rendered directly under the row that
+                // was right-clicked, so the user can act with one obvious
+                // explicit click and never accidentally favorite a folder.
+                if let Some(target) = &self.context_menu_for {
+                    if *target == entry.path {
+                        file_list.push(self.view_context_menu(target, font_size));
+                    }
+                }
             }
 
             let scrollable_list = scrollable(
@@ -2033,7 +2199,7 @@ impl FileBrowser {
 
         // Highlight the previously-visited child directory or currently selected file
         // using a subtle coloured background (reverse video feel)
-        if is_last_visited || is_selected {
+        let row_element: Element<'_, FileBrowserMessage> = if is_last_visited || is_selected {
             container(file_row)
                 .width(Length::Fill)
                 .style(|_theme| container::Style {
@@ -2050,7 +2216,70 @@ impl FileBrowser {
                 .into()
         } else {
             file_row.into()
+        };
+
+        // Right-click on a directory row opens an inline context menu —
+        // the actual favorite toggle is a separate explicit click, so the
+        // user can never accidentally favorite a folder by mis-clicking.
+        // Files don't get the wrapper since favoriting individual files
+        // isn't a thing here.
+        if entry.is_dir {
+            iced::widget::mouse_area(row_element)
+                .on_right_press(FileBrowserMessage::OpenContextMenu(entry.path.clone()))
+                .into()
+        } else {
+            row_element
         }
+    }
+
+    /// Inline context menu rendered directly under the right-clicked folder
+    /// row. Two explicit actions: ★ toggle favorite, ✕ cancel.
+    fn view_context_menu(
+        &self,
+        path: &std::path::Path,
+        font_size: u32,
+    ) -> Element<'_, FileBrowserMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let is_fav = self.is_favorite(path);
+        let toggle_label = if is_fav {
+            "☆ Remove from Favorites"
+        } else {
+            "★ Add to Favorites"
+        };
+        let label = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_else(|| path.to_str().unwrap_or(""));
+        let menu = row![
+            text(format!("→ {}", label))
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+            Space::new().width(Length::Fill),
+            button(text(toggle_label).size(fs.small))
+                .on_press(FileBrowserMessage::ToggleFavorite(path.to_path_buf()))
+                .padding([3, 8]),
+            button(text("✕ Cancel").size(fs.small))
+                .on_press(FileBrowserMessage::CloseContextMenu)
+                .padding([3, 8])
+                .style(iced::widget::button::text),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center)
+        .padding([3, 10]);
+        container(menu)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.18, 0.20, 0.28, 0.95,
+                ))),
+                border: iced::Border {
+                    color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.5),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fill)
+            .into()
     }
 
     /// Execute a pending mount/run action directly (drive already confirmed enabled).
@@ -2374,6 +2603,56 @@ pub enum MigrationOutcome {
 /// filesystems are typically case-insensitive but case-preserving — the
 /// stored name depends on whichever variant created the folder originally.
 /// Returns the [`MigrationOutcome`] so callers can surface it.
+/// `pick_list` row for a favorited folder. Shows the basename when there is
+/// one, falls back to the full path for things like `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FavoriteChoice {
+    label: String,
+    path: PathBuf,
+}
+
+impl std::fmt::Display for FavoriteChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+/// Shorten a local path for display in the favorites dropdown. Replaces the
+/// home directory with `~` and prepends the basename so two favorites that
+/// share a basename ("Music", "games") are still trivially distinguishable.
+///
+/// Examples:
+///   /Users/marcin/Music                → Music — ~/Music
+///   /Users/marcin/Projects/foo/games   → games — ~/Projects/foo/games
+///   /Volumes/SD                        → SD — /Volumes/SD
+fn favorite_label(p: &std::path::Path) -> String {
+    let basename = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| p.display().to_string());
+    let full = compress_home(p);
+    if basename == full {
+        basename
+    } else {
+        format!("{} — {}", basename, full)
+    }
+}
+
+/// Replace the user's home directory prefix with `~` so favorite labels in
+/// the dropdown don't waste space on `/Users/marcin/...` boilerplate.
+fn compress_home(p: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(rest) = p.strip_prefix(&home) {
+            if rest.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", rest.display());
+        }
+    }
+    p.display().to_string()
+}
+
 pub fn migrate_csdb_to_assembly(base: &std::path::Path) -> MigrationOutcome {
     let new = base.join("Assembly64");
     let mut found_old: Option<std::path::PathBuf> = None;
