@@ -2617,26 +2617,19 @@ impl std::fmt::Display for FavoriteChoice {
     }
 }
 
-/// Shorten a local path for display in the favorites dropdown. Replaces the
-/// home directory with `~` and prepends the basename so two favorites that
-/// share a basename ("Music", "games") are still trivially distinguishable.
+/// Display string for the favorites dropdown — just the path, with the
+/// user's home directory compressed to `~` so the entry stays compact. The
+/// path tail already disambiguates collisions (two "Music" folders differ
+/// in their prefix), so the basename prefix that used to live here was just
+/// duplicating the tail uglily ("Music — ~/Music").
 ///
 /// Examples:
-///   /Users/marcin/Music                → Music — ~/Music
-///   /Users/marcin/Projects/foo/games   → games — ~/Projects/foo/games
-///   /Volumes/SD                        → SD — /Volumes/SD
+///   /Users/marcin                       → ~
+///   /Users/marcin/Music                 → ~/Music
+///   /Users/marcin/Projects/foo/games    → ~/Projects/foo/games
+///   /Volumes/SD                         → /Volumes/SD
 fn favorite_label(p: &std::path::Path) -> String {
-    let basename = p
-        .file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| p.display().to_string());
-    let full = compress_home(p);
-    if basename == full {
-        basename
-    } else {
-        format!("{} — {}", basename, full)
-    }
+    compress_home(p)
 }
 
 /// Replace the user's home directory prefix with `~` so favorite labels in

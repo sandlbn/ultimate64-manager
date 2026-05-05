@@ -2627,15 +2627,14 @@ fn remote_basename(path: &str) -> String {
     }
 }
 
-/// Compose the dropdown row label for a remote favorite. Keeps the basename
-/// up front (easy to scan) and appends the full device path so two
-/// "Music" entries under different mounts are distinguishable.
+/// Display string for the favorites dropdown — just the device path. The
+/// path tail already disambiguates collisions (two "Music" folders differ
+/// in their prefix), so a "basename — path" prefix duplicated the tail.
 fn remote_favorite_label(path: &str) -> String {
-    let basename = remote_basename(path);
-    if basename == path {
-        basename
+    if path.is_empty() {
+        "/".to_string()
     } else {
-        format!("{} — {}", basename, path)
+        path.to_string()
     }
 }
 
