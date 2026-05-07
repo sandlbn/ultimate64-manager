@@ -10,6 +10,7 @@
 
 use iced::advanced::text::highlighter::Format;
 use iced::advanced::text::Highlighter as HighlighterTrait;
+use iced::task::Handle;
 use iced::widget::{
     button, column, container, row, rule, text,
     text_editor::{Action, Content},
@@ -21,7 +22,11 @@ use std::path::PathBuf;
 
 use crate::basic_tokenizer::{self, ProgramError};
 
-const SEND_TIMEOUT_SECS: u64 = 30;
+/// Hard cap on how long a Send & Run can wait for the device. The combined
+/// reqwest connect (5s) + transfer budget needs to feel "interactive" — if
+/// the C64 isn't responding, the user wants the failure message *now*, not
+/// a 30-second freeze. 10 seconds is plenty for a few-KB PRG.
+const SEND_TIMEOUT_SECS: u64 = 10;
 
 /// One-shot starter program so the empty editor isn't intimidating.
 const STARTER_PROGRAM: &str = "10 PRINT \"{CLR}HELLO ULTIMATE64\"\n20 GOTO 10\n";
@@ -31,6 +36,10 @@ pub enum BasicEditorMessage {
     Edit(Action),
     Validate,
     SendAndRun,
+    /// User clicked Cancel while a Send & Run was in flight. Aborts the
+    /// in-progress task and resets sending state immediately so the UI
+    /// stops looking frozen — no waiting for the 10s timeout.
+    SendCancel,
     SendCompleted(Result<String, String>),
     NewProgram,
     OpenFile,
@@ -43,6 +52,9 @@ pub struct BasicEditor {
     content: Content,
     last_validation: Option<Result<Vec<u16>, Vec<ProgramError>>>,
     is_sending: bool,
+    /// Handle to the in-flight Send & Run task. Stashed so the Cancel
+    /// button can abort the future without waiting for the timeout.
+    send_handle: Option<Handle>,
     status_message: Option<String>,
     current_file: Option<PathBuf>,
 }
@@ -59,6 +71,7 @@ impl BasicEditor {
             content: Content::with_text(STARTER_PROGRAM),
             last_validation: None,
             is_sending: false,
+            send_handle: None,
             status_message: None,
             current_file: None,
         }
@@ -115,7 +128,7 @@ impl BasicEditor {
                 };
                 self.is_sending = true;
                 self.status_message = Some(format!("Sending {} bytes to device…", bytes.len()));
-                Task::perform(
+                let send_task = Task::perform(
                     async move {
                         let host_url = if host.starts_with("http") {
                             host
@@ -132,14 +145,33 @@ impl BasicEditor {
                             ),
                         )
                         .await
-                        .map_err(|_| "Send timed out".to_string())?
+                        .map_err(|_| {
+                            format!(
+                                "Send timed out after {}s — device offline?",
+                                SEND_TIMEOUT_SECS
+                            )
+                        })?
                         .map(|_| "Running on device".to_string())
                     },
                     M::SendCompleted,
-                )
+                );
+                // Make the send abortable so the Cancel button can drop the
+                // future immediately without waiting for the timeout.
+                let (task, handle) = send_task.abortable();
+                self.send_handle = Some(handle);
+                task
+            }
+            M::SendCancel => {
+                if let Some(h) = self.send_handle.take() {
+                    h.abort();
+                }
+                self.is_sending = false;
+                self.status_message = Some("Send cancelled".into());
+                Task::none()
             }
             M::SendCompleted(result) => {
                 self.is_sending = false;
+                self.send_handle = None;
                 self.status_message = Some(match result {
                     Ok(s) => s,
                     Err(e) => format!("Send failed: {}", e),
@@ -359,18 +391,27 @@ fn send_button<'a>(
     on_press: BasicEditorMessage,
     size: u32,
 ) -> Element<'a, BasicEditorMessage> {
-    let label = if is_sending {
-        "Sending…"
+    // While a send is in flight, the same button slot becomes the Cancel
+    // action — keeps the toolbar layout stable AND gives the user an
+    // out without waiting for the 10s timeout when the device is silent.
+    let (label, message, hint) = if is_sending {
+        (
+            "✕ Cancel",
+            BasicEditorMessage::SendCancel,
+            "Cancel the in-flight send",
+        )
     } else {
-        "▶ Send & Run"
+        (
+            "▶ Send & Run",
+            on_press,
+            "Tokenize the program and run it on the Ultimate64",
+        )
     };
-    let mut btn = button(text(label).size(size)).padding([6, 14]);
-    if !is_sending {
-        btn = btn.on_press(on_press);
-    }
     tooltip(
-        btn,
-        "Tokenize the program and run it on the Ultimate64",
+        button(text(label).size(size))
+            .on_press(message)
+            .padding([6, 14]),
+        hint,
         tooltip::Position::Bottom,
     )
     .style(container::bordered_box)
