@@ -16,10 +16,14 @@ use crate::port64;
 // ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Length is u32 throughout the editor: the C64 has 64 KB = 65536 bytes
+/// total, which doesn't fit in u16 (max 65535). Storing as u32 lets the user
+/// dump the entire address space in one request, matching what the REST API
+/// already accepts (`?length=65536` works on the device).
 pub struct MemoryLocation {
     pub name: &'static str,
     pub address: u16,
-    pub length: u16,
+    pub length: u32,
     pub description: &'static str,
 }
 
@@ -270,7 +274,7 @@ impl std::fmt::Display for DisplayMode {
 pub struct Bookmark {
     pub label: String,
     pub address: u32, // u32 to cover REU 24-bit space too
-    pub length: u16,
+    pub length: u32,
     pub space: BookmarkSpace,
 }
 
@@ -441,7 +445,7 @@ struct EditingByte {
 pub struct MemoryEditor {
     // Address / length / space
     current_address: u32, // u32 covers both C64 (16-bit) and REU (24-bit)
-    display_length: u16,
+    display_length: u32,
     address_space: AddressSpace,
 
     // Input fields
@@ -577,10 +581,21 @@ impl MemoryEditor {
             }
 
             MemoryEditorMessage::LengthInputChanged(value) => {
-                let filtered: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
+                // Accept decimal *and* hex: `1024`, `$400`, `0x400`, `400h`.
+                // Hex letters in plain digits also flip to hex
+                // (`100` is decimal 100; `1ff` is hex 0x1FF) — same
+                // behavior as the address field. Cap at 65536 (= one full
+                // C64 address space) since the REST API rejects bigger.
+                let filtered: String = value
+                    .chars()
+                    .filter(|c| {
+                        c.is_ascii_hexdigit()
+                            || matches!(c, '$' | 'x' | 'X' | 'h' | 'H')
+                    })
+                    .collect();
                 self.length_input = filtered;
-                if let Ok(len) = self.length_input.parse::<u16>() {
-                    if len > 0 {
+                if let Some(len) = parse_length_input(&self.length_input) {
+                    if (1..=0x10000).contains(&len) {
                         self.display_length = len;
                     }
                 }
@@ -2092,6 +2107,42 @@ fn tooltip_style(theme: &iced::Theme) -> container::Style {
     crate::styles::tooltip_style(theme)
 }
 
+/// Parse a length entered by the user. Hex when prefixed with `$` / `0x` /
+/// `0X`, suffixed with `h` / `H`, OR contains any a-f / A-F digit; decimal
+/// otherwise. Trailing/leading whitespace is forgiven. Returns `None` for
+/// empty / unparseable input so the caller can keep the previous value.
+///
+/// Examples:
+///   `1024`  → Some(1024)        decimal
+///   `$400`  → Some(0x400 = 1024)
+///   `0xff`  → Some(0xFF)
+///   `400h`  → Some(0x400)
+///   `1FF`   → Some(0x1FF)        auto-hex (contains `F`)
+///   ``      → None
+fn parse_length_input(input: &str) -> Option<u32> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (digits, force_hex) = if let Some(r) = trimmed.strip_prefix('$') {
+        (r, true)
+    } else if let Some(r) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        (r, true)
+    } else if let Some(r) = trimmed.strip_suffix('h').or_else(|| trimmed.strip_suffix('H')) {
+        (r, true)
+    } else {
+        (trimmed, false)
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    if force_hex || digits.chars().any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit()) {
+        u32::from_str_radix(digits, 16).ok()
+    } else {
+        digits.parse::<u32>().ok()
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  REST async helpers (delegated to crate::api)
 // ─────────────────────────────────────────────────────────────────
@@ -2099,7 +2150,7 @@ fn tooltip_style(theme: &iced::Theme) -> container::Style {
 async fn read_memory_async(
     connection: Arc<TokioMutex<Rest>>,
     address: u16,
-    length: u16,
+    length: u32,
 ) -> Result<Vec<u8>, String> {
     crate::api::read_memory_async(connection, address, length).await
 }
@@ -2115,7 +2166,7 @@ async fn write_byte_async(
 async fn fill_memory_async(
     connection: Arc<TokioMutex<Rest>>,
     address: u16,
-    length: u16,
+    length: u32,
     value: u8,
 ) -> Result<(), String> {
     crate::api::fill_memory_async(connection, address, length, value).await
@@ -2127,4 +2178,58 @@ async fn write_memory_async(
     data: Vec<u8>,
 ) -> Result<(), String> {
     crate::api::write_memory_async(connection, address, data).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_length_input;
+
+    #[test]
+    fn parse_decimal() {
+        assert_eq!(parse_length_input("256"), Some(256));
+        assert_eq!(parse_length_input("65536"), Some(65536));
+        assert_eq!(parse_length_input("  100  "), Some(100));
+    }
+
+    #[test]
+    fn parse_hex_with_dollar() {
+        assert_eq!(parse_length_input("$100"), Some(0x100));
+        assert_eq!(parse_length_input("$FF"), Some(0xFF));
+        assert_eq!(parse_length_input("$10000"), Some(0x10000));
+    }
+
+    #[test]
+    fn parse_hex_with_0x() {
+        assert_eq!(parse_length_input("0x100"), Some(0x100));
+        assert_eq!(parse_length_input("0XFF"), Some(0xFF));
+    }
+
+    #[test]
+    fn parse_hex_with_suffix() {
+        assert_eq!(parse_length_input("100h"), Some(0x100));
+        assert_eq!(parse_length_input("FFh"), Some(0xFF));
+        assert_eq!(parse_length_input("FFH"), Some(0xFF));
+    }
+
+    #[test]
+    fn parse_auto_hex_when_letters_present() {
+        // No prefix/suffix, but contains hex letters → treated as hex.
+        assert_eq!(parse_length_input("FF"), Some(0xFF));
+        assert_eq!(parse_length_input("1ff"), Some(0x1FF));
+    }
+
+    #[test]
+    fn parse_invalid_returns_none() {
+        assert_eq!(parse_length_input(""), None);
+        assert_eq!(parse_length_input("$"), None);
+        assert_eq!(parse_length_input("garbage"), None);
+    }
+
+    #[test]
+    fn parse_full_64k_works() {
+        // Regression for the bug where length 65536 couldn't fit in u16.
+        assert_eq!(parse_length_input("65536"), Some(65536));
+        assert_eq!(parse_length_input("$10000"), Some(0x10000));
+        assert_eq!(parse_length_input("10000h"), Some(0x10000));
+    }
 }

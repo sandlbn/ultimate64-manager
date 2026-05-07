@@ -203,7 +203,45 @@ pub async fn run_disk(
 /// Maximum bytes per REST write chunk (mirrors the C++ SOCKET_BUFFER_SIZE guard).
 const RAW_CHUNK: usize = 256;
 
+/// Maximum bytes per single memory read request. Stays well under u16::MAX
+/// so the underlying `read_mem(u16, u16)` call from the ultimate64 crate
+/// never overflows, and keeps each round-trip's response size predictable.
+const READ_CHUNK: usize = 0x8000; // 32 KB
+
 pub async fn read_memory_async(
+    connection: Arc<Mutex<Rest>>,
+    address: u16,
+    length: u32,
+) -> Result<Vec<u8>, String> {
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Single u16-fit read fast-path — no extra round-trip overhead and
+    // matches what the editor used to do before u32-widening.
+    if length <= u16::MAX as u32 {
+        return read_chunk(connection, address, length as u16).await;
+    }
+
+    // Larger reads (specifically `length == 65536`) need to be split: the
+    // ultimate64 crate's read_mem signature is `(u16, u16)` so it can't
+    // express 65536 directly. Walk the address space in 32 KB chunks; the
+    // C64 wraps modulo 65536 so an oversized read will safely loop back to
+    // earlier addresses if the user did something exotic.
+    let mut out = Vec::with_capacity(length as usize);
+    let mut remaining = length;
+    let mut cursor = address;
+    while remaining > 0 {
+        let take = remaining.min(READ_CHUNK as u32) as u16;
+        let bytes = read_chunk(connection.clone(), cursor, take).await?;
+        out.extend_from_slice(&bytes);
+        cursor = cursor.wrapping_add(take);
+        remaining -= take as u32;
+    }
+    Ok(out)
+}
+
+async fn read_chunk(
     connection: Arc<Mutex<Rest>>,
     address: u16,
     length: u16,
@@ -248,7 +286,7 @@ pub async fn write_byte_async(
 pub async fn fill_memory_async(
     connection: Arc<Mutex<Rest>>,
     address: u16,
-    length: u16,
+    length: u32,
     value: u8,
 ) -> Result<(), String> {
     let result = tokio::time::timeout(
@@ -256,14 +294,17 @@ pub async fn fill_memory_async(
         tokio::task::spawn_blocking(move || {
             let conn = connection.blocking_lock();
             let fill_data: Vec<u8> = vec![value; RAW_CHUNK];
-            let mut offset = 0u16;
+            // Walk in u32 to support length == 65536 (full address space).
+            // The device address itself stays u16; `wrapping_add` matches
+            // C64 semantics where memory wraps at the 64 KB boundary.
+            let mut offset: u32 = 0;
             while offset < length {
                 let remaining = (length - offset) as usize;
                 let write_size = remaining.min(RAW_CHUNK);
-                let current_addr = address.wrapping_add(offset);
+                let current_addr = address.wrapping_add(offset as u16);
                 conn.write_mem(current_addr, &fill_data[..write_size])
                     .map_err(|e| format!("Fill failed at ${:04X}: {}", current_addr, e))?;
-                offset += write_size as u16;
+                offset += write_size as u32;
             }
             Ok(())
         }),
