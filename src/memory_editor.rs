@@ -588,10 +588,7 @@ impl MemoryEditor {
                 // C64 address space) since the REST API rejects bigger.
                 let filtered: String = value
                     .chars()
-                    .filter(|c| {
-                        c.is_ascii_hexdigit()
-                            || matches!(c, '$' | 'x' | 'X' | 'h' | 'H')
-                    })
+                    .filter(|c| c.is_ascii_hexdigit() || matches!(c, '$' | 'x' | 'X' | 'h' | 'H'))
                     .collect();
                 self.length_input = filtered;
                 if let Some(len) = parse_length_input(&self.length_input) {
@@ -2126,9 +2123,15 @@ fn parse_length_input(input: &str) -> Option<u32> {
     }
     let (digits, force_hex) = if let Some(r) = trimmed.strip_prefix('$') {
         (r, true)
-    } else if let Some(r) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    } else if let Some(r) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         (r, true)
-    } else if let Some(r) = trimmed.strip_suffix('h').or_else(|| trimmed.strip_suffix('H')) {
+    } else if let Some(r) = trimmed
+        .strip_suffix('h')
+        .or_else(|| trimmed.strip_suffix('H'))
+    {
         (r, true)
     } else {
         (trimmed, false)
@@ -2136,7 +2139,11 @@ fn parse_length_input(input: &str) -> Option<u32> {
     if digits.is_empty() {
         return None;
     }
-    if force_hex || digits.chars().any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit()) {
+    if force_hex
+        || digits
+            .chars()
+            .any(|c| c.is_ascii_hexdigit() && !c.is_ascii_digit())
+    {
         u32::from_str_radix(digits, 16).ok()
     } else {
         digits.parse::<u32>().ok()

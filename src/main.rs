@@ -286,6 +286,77 @@ pub enum Message {
     StartDiscovery,
     DiscoveryComplete(Vec<discovery::DiscoveredDevice>),
     SelectDiscoveredDevice(discovery::DiscoveredDevice),
+    // Drag-and-drop from the OS
+    /// Window OS told us a file was dropped on the app — opens a small
+    /// dialog asking the user what to do with it (run / mount / open / upload).
+    FileDropped(PathBuf),
+    /// User picked an action button in the drop dialog.
+    DropAction(DropAction),
+    /// User dismissed the drop dialog without choosing.
+    DropCancel,
+    /// Async drop action finished — surface the result message.
+    DropCompleted(Result<String, String>),
+}
+
+/// Action chosen from the drag-and-drop dialog.
+#[derive(Debug, Clone)]
+pub enum DropAction {
+    /// Send the file to the device's run_prg / run_crt / sidplay runner.
+    /// `runner` is one of those three literal names.
+    RunOnDevice { path: PathBuf, runner: &'static str },
+    /// Mount a disk image on the active drive (RO).
+    MountDisk { path: PathBuf },
+    /// Load text into the BASIC editor and switch to that tab.
+    OpenInBasicEditor { path: PathBuf },
+    /// FTP-upload the file to the remote browser's current path.
+    UploadToRemote { path: PathBuf },
+}
+
+impl DropAction {
+    /// Status-line text to display while this action is in flight.
+    pub fn status_label(&self) -> String {
+        match self {
+            DropAction::RunOnDevice { runner, .. } => format!("Running via {}", runner),
+            DropAction::MountDisk { .. } => "Mounting disk".into(),
+            DropAction::OpenInBasicEditor { .. } => "Opening in BASIC editor".into(),
+            DropAction::UploadToRemote { .. } => "Uploading to remote".into(),
+        }
+    }
+
+    /// Set of buttons appropriate for a dropped file with this lowercase
+    /// extension. `Upload to remote` and `Cancel` are always present
+    /// (they're added by the view); this returns just the type-specific
+    /// actions in the order they should appear.
+    pub fn available_for(ext: &str, path: &std::path::Path) -> Vec<DropAction> {
+        let p = path.to_path_buf();
+        match ext {
+            "prg" => vec![DropAction::RunOnDevice {
+                path: p,
+                runner: "run_prg",
+            }],
+            "crt" => vec![DropAction::RunOnDevice {
+                path: p,
+                runner: "run_crt",
+            }],
+            "sid" => vec![DropAction::RunOnDevice {
+                path: p,
+                runner: "sidplay",
+            }],
+            "d64" | "d71" | "d81" | "g64" | "g71" => vec![DropAction::MountDisk { path: p }],
+            "bas" | "txt" => vec![DropAction::OpenInBasicEditor { path: p }],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Button label for the dialog.
+    pub fn button_label(&self) -> &'static str {
+        match self {
+            DropAction::RunOnDevice { .. } => "▶ Run on device",
+            DropAction::MountDisk { .. } => "💾 Mount on Drive A:RO",
+            DropAction::OpenInBasicEditor { .. } => "📝 Open in BASIC editor",
+            DropAction::UploadToRemote { .. } => "📤 Upload to remote",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +446,12 @@ pub struct Ultimate64Browser {
     new_version: Option<NewVersionInfo>,
     assembly64_browser: Assembly64Browser,
     basic_editor: BasicEditor,
+    /// File the OS dropped on our window — when `Some`, the view renders
+    /// a centered modal asking the user what to do with it.
+    pending_drop: Option<PathBuf>,
+    /// True while a drop action is sending data to the device — disables
+    /// the dialog buttons so a slow upload can't be triggered twice.
+    drop_in_flight: bool,
     // Separate streaming window
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
@@ -467,6 +544,8 @@ impl Ultimate64Browser {
             video_streaming: VideoStreaming::new(),
             assembly64_browser: Assembly64Browser::new(),
             basic_editor: BasicEditor::new(),
+            pending_drop: None,
+            drop_in_flight: false,
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
             profile_manager,
@@ -2287,6 +2366,151 @@ impl Ultimate64Browser {
                     Task::none()
                 }
             }
+            // ── Drag-and-drop from the OS ───────────────────────────────
+            Message::FileDropped(path) => {
+                // If a drop is already pending or one is in flight, ignore
+                // the new one — the user can re-drop after dismissing the
+                // dialog. Avoids the dialog stacking on accidental drops.
+                if self.pending_drop.is_none() && !self.drop_in_flight {
+                    log::info!("File dropped: {}", path.display());
+                    self.pending_drop = Some(path);
+                }
+                Task::none()
+            }
+            Message::DropCancel => {
+                self.pending_drop = None;
+                Task::none()
+            }
+            Message::DropAction(action) => {
+                self.pending_drop = None;
+                self.drop_in_flight = true;
+                self.user_message = Some(UserMessage::Info(format!("{}…", action.status_label())));
+                let host_url = format!("http://{}", self.settings.connection.host);
+                let password = self.settings.connection.password.clone();
+                let remote_path = self.remote_browser.current_path.clone();
+                match action {
+                    DropAction::RunOnDevice { path, runner } => Task::perform(
+                        async move {
+                            let bytes = tokio::fs::read(&path)
+                                .await
+                                .map_err(|e| format!("Read failed: {}", e))?;
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(30),
+                                api::upload_runner_async(
+                                    &host_url,
+                                    runner,
+                                    bytes,
+                                    password.as_deref(),
+                                ),
+                            )
+                            .await
+                            .map_err(|_| "Send timed out — device offline?".to_string())?
+                            .map(|_| {
+                                format!(
+                                    "Sent {} via {}",
+                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+                                    runner
+                                )
+                            })
+                        },
+                        Message::DropCompleted,
+                    ),
+                    DropAction::MountDisk { path } => {
+                        let drive = "a"; // dropped images mount on the active drive A
+                        Task::perform(
+                            async move {
+                                tokio::time::timeout(
+                                    std::time::Duration::from_secs(30),
+                                    api::upload_mount_disk_async(
+                                        &host_url,
+                                        &path,
+                                        drive,
+                                        "readonly",
+                                        password.as_deref(),
+                                    ),
+                                )
+                                .await
+                                .map_err(|_| "Mount timed out — device offline?".to_string())?
+                                .map(|_| {
+                                    format!(
+                                        "Mounted {} on Drive A (RO)",
+                                        path.file_name().and_then(|s| s.to_str()).unwrap_or("disk")
+                                    )
+                                })
+                            },
+                            Message::DropCompleted,
+                        )
+                    }
+                    DropAction::OpenInBasicEditor { path } => {
+                        // Local file load — no network. Switch to the BASIC
+                        // tab and reuse the editor's existing OpenCompleted
+                        // message so it gets the same treatment as Open .bas.
+                        self.active_tab = Tab::BasicEditor;
+                        Task::perform(
+                            async move {
+                                let text = tokio::fs::read_to_string(&path)
+                                    .await
+                                    .map_err(|e| format!("Read failed: {}", e))?;
+                                Ok::<_, String>((path, text))
+                            },
+                            |result| {
+                                Message::BasicEditor(BasicEditorMessage::OpenCompleted(result))
+                            },
+                        )
+                    }
+                    DropAction::UploadToRemote { path } => {
+                        let progress = self.remote_browser.transfer_progress_handle();
+                        // FTP connect needs a bare host, no scheme — the
+                        // user-configured host might include `http://`.
+                        let host = self
+                            .settings
+                            .connection
+                            .host
+                            .trim_start_matches("http://")
+                            .trim_start_matches("https://")
+                            .trim_end_matches('/')
+                            .to_string();
+                        // `upload_file_ftp` only treats `remote_dest` as a
+                        // directory when it ends with `/`. The remote
+                        // browser's `current_path` is `/SD` (no trailing
+                        // slash) once the user navigates anywhere, so we
+                        // append one explicitly to avoid an empty CWD.
+                        let dest = if remote_path.ends_with('/') {
+                            remote_path
+                        } else {
+                            format!("{}/", remote_path)
+                        };
+                        Task::perform(
+                            async move {
+                                ftp_ops::upload_file_ftp(
+                                    host,
+                                    path.clone(),
+                                    dest,
+                                    password,
+                                    progress,
+                                )
+                                .await
+                                .map(|_| {
+                                    format!(
+                                        "Uploaded {}",
+                                        path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
+                                    )
+                                })
+                            },
+                            Message::DropCompleted,
+                        )
+                    }
+                }
+            }
+            Message::DropCompleted(result) => {
+                self.drop_in_flight = false;
+                self.user_message = Some(match result {
+                    Ok(msg) => UserMessage::Info(msg),
+                    Err(e) => UserMessage::Error(e),
+                });
+                Task::none()
+            }
+
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -2596,6 +2820,12 @@ impl Ultimate64Browser {
             }
         }
 
+        // Drag-and-drop action dialog — shown when the OS dropped a file
+        // on the window and the user hasn't picked an action yet.
+        if let Some(ref dropped) = self.pending_drop {
+            return self.view_drop_dialog(dropped);
+        }
+
         // Tab bar with retro style
         let tabs = container(
             row![
@@ -2753,13 +2983,13 @@ impl Ultimate64Browser {
             }
         });
 
-        // Window close event listener for streaming window
-        let window_events = iced::event::listen_with(|event, _status, id| {
-            if let iced::Event::Window(iced::window::Event::Closed) = event {
-                Some(Message::WindowClosed(id))
-            } else {
-                None
+        // Window-level event listener: streaming-window close + OS file drops.
+        let window_events = iced::event::listen_with(|event, _status, id| match event {
+            iced::Event::Window(iced::window::Event::Closed) => Some(Message::WindowClosed(id)),
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                Some(Message::FileDropped(path))
             }
+            _ => None,
         });
 
         // Periodic connection check every 60 seconds
@@ -2823,6 +3053,89 @@ impl Ultimate64Browser {
             } else {
                 button::secondary
             })
+            .into()
+    }
+
+    /// Centered modal dialog shown when the OS dropped a file on our window.
+    /// Renders a button per applicable action (Run / Mount / Open / Upload)
+    /// with the always-available Cancel.
+    fn view_drop_dialog(&self, path: &PathBuf) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let basename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let size_label = std::fs::metadata(path)
+            .ok()
+            .map(|m| crate::file_types::format_file_size(m.len()))
+            .unwrap_or_else(|| "?".to_string());
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+
+        let header = text(format!("Dropped: {}  ({})", basename, size_label)).size(fs.normal);
+        let path_line = text(path.display().to_string())
+            .size(fs.tiny)
+            .color(iced::Color::from_rgb(0.55, 0.55, 0.6));
+
+        // Per-extension actions (may be empty for unknown types).
+        let mut button_col = column![].spacing(8);
+        for action in DropAction::available_for(&ext, path) {
+            let label = action.button_label();
+            button_col = button_col.push(
+                button(text(label).size(fs.normal))
+                    .on_press(Message::DropAction(action))
+                    .padding([6, 14])
+                    .width(Length::Fill),
+            );
+        }
+        // Upload to remote — always available.
+        button_col = button_col.push(
+            button(
+                text(DropAction::UploadToRemote { path: path.clone() }.button_label())
+                    .size(fs.normal),
+            )
+            .on_press(Message::DropAction(DropAction::UploadToRemote {
+                path: path.clone(),
+            }))
+            .padding([6, 14])
+            .width(Length::Fill),
+        );
+        button_col = button_col.push(
+            button(text("✕ Cancel").size(fs.normal))
+                .on_press(Message::DropCancel)
+                .padding([6, 14])
+                .width(Length::Fill)
+                .style(iced::widget::button::text),
+        );
+
+        let dialog = container(
+            column![header, path_line, Space::new().height(8), button_col]
+                .spacing(6)
+                .padding(20),
+        )
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.18, 0.20, 0.28, 0.98,
+            ))),
+            border: iced::Border {
+                color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.7),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .width(Length::Fixed(420.0));
+
+        container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(20)
             .into()
     }
 
@@ -3952,4 +4265,86 @@ fn download_directory_with_progress(
     }
 
     Ok(files_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DropAction;
+    use std::path::PathBuf;
+
+    fn p(name: &str) -> PathBuf {
+        PathBuf::from(name)
+    }
+
+    #[test]
+    fn drop_actions_for_prg_offers_run() {
+        let actions = DropAction::available_for("prg", &p("game.prg"));
+        assert!(
+            matches!(actions[0], DropAction::RunOnDevice { runner, .. } if runner == "run_prg")
+        );
+    }
+
+    #[test]
+    fn drop_actions_for_crt_offers_run_crt() {
+        let actions = DropAction::available_for("crt", &p("cart.crt"));
+        assert!(
+            matches!(actions[0], DropAction::RunOnDevice { runner, .. } if runner == "run_crt")
+        );
+    }
+
+    #[test]
+    fn drop_actions_for_sid_offers_sidplay() {
+        let actions = DropAction::available_for("sid", &p("song.sid"));
+        assert!(
+            matches!(actions[0], DropAction::RunOnDevice { runner, .. } if runner == "sidplay")
+        );
+    }
+
+    #[test]
+    fn drop_actions_for_disk_offers_mount() {
+        for ext in ["d64", "d71", "d81", "g64", "g71"] {
+            let actions = DropAction::available_for(ext, &p(&format!("disk.{}", ext)));
+            assert!(
+                matches!(actions[0], DropAction::MountDisk { .. }),
+                "ext {} expected MountDisk",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn drop_actions_for_bas_offers_open_in_editor() {
+        let actions = DropAction::available_for("bas", &p("hello.bas"));
+        assert!(matches!(actions[0], DropAction::OpenInBasicEditor { .. }));
+    }
+
+    #[test]
+    fn drop_actions_for_unknown_extension_is_empty() {
+        // The view appends Upload-to-remote + Cancel itself; the per-type
+        // list stays empty for unknown types so the dialog isn't cluttered.
+        let actions = DropAction::available_for("zip", &p("foo.zip"));
+        assert!(actions.is_empty());
+        let actions = DropAction::available_for("", &p("README"));
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn drop_action_status_labels_are_unique() {
+        // Sanity: each action has a distinct human label so the status bar
+        // is meaningful regardless of which one fired.
+        let labels: Vec<String> = vec![
+            DropAction::RunOnDevice {
+                path: p("a"),
+                runner: "run_prg",
+            }
+            .status_label(),
+            DropAction::MountDisk { path: p("a") }.status_label(),
+            DropAction::OpenInBasicEditor { path: p("a") }.status_label(),
+            DropAction::UploadToRemote { path: p("a") }.status_label(),
+        ];
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "status labels must be unique");
+    }
 }
