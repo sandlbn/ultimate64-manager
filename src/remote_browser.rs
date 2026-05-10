@@ -2563,6 +2563,15 @@ impl RemoteBrowser {
     }
 
     /// Cancel any in-progress transfer and mark it done
+    /// Hand out a clone of the transfer-progress handle so external upload
+    /// tasks (e.g. drag-and-drop) can publish progress through the same
+    /// channel the regular upload UI watches.
+    pub fn transfer_progress_handle(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<Option<TransferProgress>>> {
+        self.transfer_progress.clone()
+    }
+
     pub fn cancel_transfer(&self) {
         if let Ok(mut g) = self.transfer_progress.lock() {
             if let Some(ref mut p) = *g {

@@ -94,6 +94,9 @@ pub enum FileBrowserMessage {
     /// Click on the context menu's Cancel button or anywhere else that
     /// dismisses the popup.
     CloseContextMenu,
+    /// Open the OS file manager with `path` selected — fired from the
+    /// context menu. Auto-closes the menu on success.
+    RevealInFileManager(PathBuf),
     // Local disk image creation
     ShowCreateDisk,
     CloseCreateDisk,
@@ -949,6 +952,18 @@ impl FileBrowser {
                 self.context_menu_for = None;
                 Task::none()
             }
+            FileBrowserMessage::RevealInFileManager(path) => {
+                self.context_menu_for = None;
+                match reveal_in_file_manager(&path) {
+                    Ok(()) => {
+                        self.status_message = Some(format!("Revealed: {}", path.display()));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Could not reveal: {}", e));
+                    }
+                }
+                Task::none()
+            }
             FileBrowserMessage::NavigateToFavorite(path) => {
                 // Stale-favorite cleanup: if the folder no longer exists,
                 // drop it from the list so the dropdown stays useful.
@@ -1120,18 +1135,8 @@ impl FileBrowser {
             .style(crate::styles::subtle_tooltip)
             .into(),
         );
-        items.push(
-            tooltip(
-                button(text("📁+ New").size(fs.small))
-                    .on_press(FileBrowserMessage::ShowCreateDir)
-                    .padding([2, 6])
-                    .style(crate::styles::nav_button),
-                "Create a new folder in the current directory",
-                tooltip::Position::Bottom,
-            )
-            .style(crate::styles::subtle_tooltip)
-            .into(),
-        );
+        // (No `📁+ New` here — the bottom function-key bar already has
+        // `F7 MkDir`, which routes to the same `ShowCreateDir` handler.)
 
         // ── Favorites: ★ toggle for current dir, plus dropdown when there
         // are any saved. The dropdown disappears when the list is empty so
@@ -2219,53 +2224,74 @@ impl FileBrowser {
         };
 
         // Right-click on a directory row opens an inline context menu —
-        // the actual favorite toggle is a separate explicit click, so the
-        // user can never accidentally favorite a folder by mis-clicking.
-        // Files don't get the wrapper since favoriting individual files
-        // isn't a thing here.
-        if entry.is_dir {
-            iced::widget::mouse_area(row_element)
-                .on_right_press(FileBrowserMessage::OpenContextMenu(entry.path.clone()))
-                .into()
-        } else {
-            row_element
-        }
+        // Both file and folder rows get a right-click context menu now.
+        // The actual menu contents differ by type — see `view_context_menu`
+        // — so this wrapper is generic.
+        iced::widget::mouse_area(row_element)
+            .on_right_press(FileBrowserMessage::OpenContextMenu(entry.path.clone()))
+            .into()
     }
 
     /// Inline context menu rendered directly under the right-clicked folder
-    /// row. Two explicit actions: ★ toggle favorite, ✕ cancel.
+    /// row. Folder rows get [★ toggle favorite] [📂 Reveal] [✕ Cancel];
+    /// file rows get [📂 Reveal] [✕ Cancel] (favoriting individual files
+    /// isn't a concept here).
     fn view_context_menu(
         &self,
         path: &std::path::Path,
         font_size: u32,
     ) -> Element<'_, FileBrowserMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
-        let is_fav = self.is_favorite(path);
-        let toggle_label = if is_fav {
-            "☆ Remove from Favorites"
-        } else {
-            "★ Add to Favorites"
-        };
         let label = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or_else(|| path.to_str().unwrap_or(""));
-        let menu = row![
-            text(format!("→ {}", label))
-                .size(fs.tiny)
-                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
-            Space::new().width(Length::Fill),
-            button(text(toggle_label).size(fs.small))
-                .on_press(FileBrowserMessage::ToggleFavorite(path.to_path_buf()))
-                .padding([3, 8]),
+
+        let mut buttons: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+
+        if path.is_dir() {
+            let is_fav = self.is_favorite(path);
+            let toggle_label = if is_fav {
+                "☆ Remove from Favorites"
+            } else {
+                "★ Add to Favorites"
+            };
+            buttons.push(
+                button(text(toggle_label).size(fs.small))
+                    .on_press(FileBrowserMessage::ToggleFavorite(path.to_path_buf()))
+                    .padding([3, 8])
+                    .into(),
+            );
+        }
+
+        buttons.push(
+            button(text("📂 Reveal").size(fs.small))
+                .on_press(FileBrowserMessage::RevealInFileManager(path.to_path_buf()))
+                .padding([3, 8])
+                .into(),
+        );
+        buttons.push(
             button(text("✕ Cancel").size(fs.small))
                 .on_press(FileBrowserMessage::CloseContextMenu)
                 .padding([3, 8])
-                .style(iced::widget::button::text),
-        ]
-        .spacing(6)
-        .align_y(iced::Alignment::Center)
-        .padding([3, 10]);
+                .style(iced::widget::button::text)
+                .into(),
+        );
+
+        let mut menu_items: Vec<Element<'_, FileBrowserMessage>> = Vec::new();
+        menu_items.push(
+            text(format!("→ {}", label))
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6))
+                .into(),
+        );
+        menu_items.push(Space::new().width(Length::Fill).into());
+        menu_items.extend(buttons);
+
+        let menu = iced::widget::Row::with_children(menu_items)
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .padding([3, 10]);
         container(menu)
             .style(|_theme| container::Style {
                 background: Some(iced::Background::Color(iced::Color::from_rgba(
@@ -2644,6 +2670,51 @@ fn compress_home(p: &std::path::Path) -> String {
         }
     }
     p.display().to_string()
+}
+
+/// Open the OS file manager with `path` highlighted (when supported).
+///
+/// - **macOS**: `open -R <path>` selects the file in Finder.
+/// - **Windows**: `explorer /select,<path>` selects in Explorer.
+/// - **Linux**: most file managers don't expose a "select file" mode, so we
+///   fall back to opening the parent directory via `xdg-open`. The user
+///   sees the folder, just not the specific item highlighted.
+///
+/// Spawns the helper detached — we don't wait for the file manager to exit.
+/// Returns the spawn error if the launcher binary is missing.
+pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `/select,` argument requires no space and a comma — Explorer is
+        // picky about the exact form. The path goes in literally; quoting
+        // happens via process arg passing, not in the format string.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No standard "select file" path on Linux file managers, so open
+        // the parent directory. If `path` IS a directory, open it directly.
+        let target: &std::path::Path = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        std::process::Command::new("xdg-open")
+            .arg(target)
+            .spawn()
+            .map(|_| ())
+    }
 }
 
 pub fn migrate_csdb_to_assembly(base: &std::path::Path) -> MigrationOutcome {
