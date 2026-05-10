@@ -54,7 +54,18 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Mount disk images with drive (8/9) and mode (RO/RW) selection
   - Extract ZIPs and run/mount their contents
   - Open original CSDB release pages in the browser for scene comments
-  
+- **BASIC Editor** – Write, validate, and run C64 BASIC v2 programs from inside the app
+  - Syntax highlighting (line numbers · keywords · strings · REM · PETSCII codes)
+  - Validate before send — catches unbalanced quotes, descending line numbers, unknown control codes
+  - petcat-style PETSCII control codes (`{CLR}`, `{RVS ON}`, `{$93}`, …)
+  - Save tokenized .prg or load .bas text files
+  - One-click "Send & Run" with cancel button for in-flight transfers
+- **Drag & Drop** – Drop any file onto the app window for a quick action dialog
+  - PRG/CRT/SID → Run on device · D64/D71/… → Mount on Drive A · BAS/TXT → Open in BASIC editor · anything → Upload to remote
+- **Folder Favorites** – Star folders in the local and remote file browsers
+  - Toolbar dropdown jumps to a saved path; right-click for an inline context menu
+  - Right-click a file → "Reveal in Finder/Explorer" (macOS / Windows / Linux)
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |
@@ -122,3 +133,4 @@ MIT License
 - [Ultimate64](https://github.com/GideonZ/1541ultimate) team
 - [Ultimate64 Rust Library](https://github.com/mlund/ultimate64)
 - [Iced](https://github.com/iced-rs/iced) GUI framework
+- **Fredrik Åberg** for opening up the [Assembly64 API](https://hackerswithstyle.se/leet/swagger-ui/index.html)
