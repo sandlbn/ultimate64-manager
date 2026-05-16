@@ -68,10 +68,32 @@ https://github.com/sandlbn/ultimate64-manager/releases
 
 ## Keyboard Shortcuts
 
+### Global
+
 | Shortcut | Action |
 |----------|--------|
 | `Opt+F` / `Alt+F` | Toggle video fullscreen |
 | `ESC` | Exit fullscreen |
+| `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z` | Memory editor undo / redo |
+
+### File Browser (Total Commander-style)
+
+| Shortcut | Action |
+|----------|--------|
+| `F2` | Rename selected file |
+| `F3` | View file contents |
+| `F4` | Edit selected file in OS default editor (local pane) |
+| `F5` | Copy across panes |
+| `F7` | Make new folder |
+| `F8` | Delete selected |
+| `Cmd/Ctrl+R` | Refresh active pane |
+| `Tab` | Switch active pane |
+| `Backspace` / `Cmd/Ctrl+←` / `Cmd/Ctrl+↑` | Go to parent folder |
+| `↑` / `↓` | Move file cursor |
+| `Enter` | Open folder / select file |
+| `Space` | Calculate folder size + toggle selection (local pane) |
+| `a`–`z`, `0`–`9` | Quick search — type to jump to first matching file |
+| `Cmd/Ctrl+A` | Select all in active pane |
 
 ## Song Length Database
 
