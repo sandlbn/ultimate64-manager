@@ -222,6 +222,28 @@ pub enum Message {
     FnMkDir,
     FnNewDisk,
     FnDelete,
+    /// Refresh / re-read the active pane's directory listing. Bound to Ctrl+R
+    /// and the toolbar "↻ Refresh" button.
+    FnRefresh,
+    /// Open the selected local file with the OS's default editor (F4 in TC).
+    /// Remote files aren't supported in v1 — that needs a download-edit-upload
+    /// round-trip which we leave to the user (download via F5, edit locally).
+    FnEdit,
+    /// Calculate the recursive size of the currently-selected folder on the
+    /// active pane. Bound to Space, matching Total Commander. Local-only
+    /// for now (remote FTP recursive walk is too slow to be friendly).
+    FnSize,
+    /// Move the file-list cursor up/down in the active pane (arrow keys).
+    /// Wraps around. Scrolls the row into view.
+    PaneCursorUp,
+    PaneCursorDown,
+    /// Activate (Enter) the currently-selected file/folder in the active pane.
+    PaneActivate,
+    /// Type-to-jump quick search — a printable character was pressed while
+    /// the dual-pane browser was active. Routed to the active pane's buffer.
+    PaneQuickSearch(char),
+    /// Esc — clear the quick-search buffer on the active pane.
+    PaneQuickSearchClear,
     ToggleActivePane,
     NavigateUpActivePane,
     SelectAllActivePane,
@@ -902,6 +924,76 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::PaneCursorUp => {
+                self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionUp)
+            }
+            Message::PaneCursorDown => {
+                self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionDown)
+            }
+            Message::PaneActivate => {
+                self.dispatch_local_pane_message(FileBrowserMessage::ActivateSelection)
+            }
+            Message::PaneQuickSearch(ch) => {
+                self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchInput(ch))
+            }
+            Message::PaneQuickSearchClear => {
+                self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchClear)
+            }
+
+            Message::FnSize => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::CalculateSelectedSize,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => {
+                    self.user_message = Some(UserMessage::Info(
+                        "Folder size on Space is local-only — FTP walk is too slow".to_string(),
+                    ));
+                    Task::none()
+                }
+            },
+
+            Message::FnEdit => {
+                // F4 Edit — open the selected file in the OS default editor.
+                // Only meaningful on the local pane; remote files would need
+                // a download-edit-upload round-trip that's better done
+                // explicitly by the user.
+                match self.active_pane {
+                    Pane::Left => {
+                        if let Some(path) = self.left_browser.get_selected_file().cloned() {
+                            match open::that_detached(&path) {
+                                Ok(()) => {
+                                    self.user_message = Some(UserMessage::Info(format!(
+                                        "Opened in editor: {}",
+                                        path.display()
+                                    )));
+                                }
+                                Err(e) => {
+                                    self.user_message =
+                                        Some(UserMessage::Error(format!("Open failed: {}", e)));
+                                }
+                            }
+                        } else {
+                            self.user_message = Some(UserMessage::Info(
+                                "Click a file first, then press F4 to edit".to_string(),
+                            ));
+                        }
+                    }
+                    Pane::Right => {
+                        self.user_message = Some(UserMessage::Info(
+                            "F4 Edit works on local files only — download first with F5"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Task::none()
+            }
+
             Message::FnView => {
                 // Preview selected file in active pane
                 match self.active_pane {
@@ -943,6 +1035,22 @@ impl Ultimate64Browser {
                     Pane::Right => self.update(Message::CopyRemoteToLocal),
                 }
             }
+
+            Message::FnRefresh => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::RefreshFiles,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
 
             Message::FnMkDir => match self.active_pane {
                 Pane::Left => self
@@ -2939,8 +3047,13 @@ impl Ultimate64Browser {
         }
 
         // Keyboard shortcuts: ESC to exit fullscreen, Opt+F (macOS) or Alt+F (Windows/Linux) to toggle
-        let keyboard_sub = event::listen_with(|event, _status, _id| {
+        let keyboard_sub = event::listen_with(|event, status, _id| {
             if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event {
+                // `captured` is true when a focused widget (e.g. a text
+                // input) consumed the key. Pane-navigation bindings check
+                // this to avoid stealing keystrokes from text fields —
+                // typing in the filter box shouldn't move the file cursor.
+                let captured = matches!(status, event::Status::Captured);
                 match key {
                     Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.alt() => Some(
@@ -2964,6 +3077,13 @@ impl Ultimate64Browser {
                     // File browser shortcuts (TC-style)
                     Key::Named(keyboard::key::Named::F2) => Some(Message::FnRename),
                     Key::Named(keyboard::key::Named::F3) => Some(Message::FnView),
+                    Key::Named(keyboard::key::Named::F4) => Some(Message::FnEdit),
+                    // Space on a folder calculates its recursive size, just
+                    // like Total Commander. Plain Space only — modifiers
+                    // would interfere with text input shortcuts.
+                    Key::Named(keyboard::key::Named::Space) if modifiers.is_empty() => {
+                        Some(Message::FnSize)
+                    }
                     Key::Named(keyboard::key::Named::F5) => Some(Message::FnCopy),
                     Key::Named(keyboard::key::Named::F7) => Some(Message::FnMkDir),
                     Key::Named(keyboard::key::Named::F8) => Some(Message::FnDelete),
@@ -2973,8 +3093,48 @@ impl Ultimate64Browser {
                     Key::Named(keyboard::key::Named::Backspace) => {
                         Some(Message::NavigateUpActivePane)
                     }
+                    // Cmd/Ctrl+Left = go up one folder (back to parent).
+                    // Also Cmd/Ctrl+Up — Mac Finder muscle memory. Both
+                    // mirror the existing Backspace binding.
+                    Key::Named(keyboard::key::Named::ArrowLeft) if modifiers.command() => {
+                        Some(Message::NavigateUpActivePane)
+                    }
+                    Key::Named(keyboard::key::Named::ArrowUp) if modifiers.command() => {
+                        Some(Message::NavigateUpActivePane)
+                    }
                     Key::Character(ref c) if c.as_str() == "a" && modifiers.command() => {
                         Some(Message::SelectAllActivePane)
+                    }
+                    // Refresh active pane — Ctrl/Cmd+R, matches Total
+                    // Commander's "Re-read source" muscle memory.
+                    Key::Character(ref c) if c.as_str() == "r" && modifiers.command() => {
+                        Some(Message::FnRefresh)
+                    }
+                    // ── Pane navigation — gated by `!captured` so text
+                    // inputs (filter, path, dialog fields) still get their
+                    // keystrokes first.
+                    Key::Named(keyboard::key::Named::ArrowUp) if !captured => {
+                        Some(Message::PaneCursorUp)
+                    }
+                    Key::Named(keyboard::key::Named::ArrowDown) if !captured => {
+                        Some(Message::PaneCursorDown)
+                    }
+                    Key::Named(keyboard::key::Named::Enter) if !captured => {
+                        Some(Message::PaneActivate)
+                    }
+                    // Quick search: any single printable alphanumeric pressed
+                    // with no modifiers, when no widget grabbed it. Filters
+                    // out punctuation/whitespace so symbols don't poison the
+                    // search buffer.
+                    Key::Character(ref c)
+                        if !captured
+                            && modifiers.is_empty()
+                            && c.chars().count() == 1
+                            && c.chars()
+                                .next()
+                                .map_or(false, |ch| ch.is_ascii_alphanumeric()) =>
+                    {
+                        c.chars().next().map(Message::PaneQuickSearch)
                     }
                     _ => None,
                 }
@@ -3059,6 +3219,31 @@ impl Ultimate64Browser {
     /// Centered modal dialog shown when the OS dropped a file on our window.
     /// Renders a button per applicable action (Run / Mount / Open / Upload)
     /// with the always-available Cancel.
+    /// Route a per-pane file-browser message to the active pane. Used by
+    /// keyboard nav (arrows, Enter, quick-search) and folder-size hotkeys
+    /// — anything that only acts on the local pane. No-op when:
+    /// - the dual-pane browser isn't the active tab (so typing in BASIC /
+    ///   Memory / Assembly64 doesn't poison the local browser's state),
+    /// - the active pane is Right (remote-side keyboard nav not wired —
+    ///   different message enum, slower I/O on activate).
+    fn dispatch_local_pane_message(&mut self, msg: FileBrowserMessage) -> Task<Message> {
+        if self.active_tab != Tab::DualPaneBrowser {
+            return Task::none();
+        }
+        match self.active_pane {
+            Pane::Left => self
+                .left_browser
+                .update(
+                    msg,
+                    self.connection.clone(),
+                    Some(self.settings.connection.host.clone()),
+                    self.settings.connection.password.clone(),
+                )
+                .map(Message::LeftBrowser),
+            Pane::Right => Task::none(),
+        }
+    }
+
     fn view_drop_dialog(&self, path: &PathBuf) -> Element<'_, Message> {
         let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let basename = path
@@ -3306,6 +3491,10 @@ impl Ultimate64Browser {
                     .on_press(Message::FnView)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
+                button(text("F4 Edit").size(small))
+                    .on_press(Message::FnEdit)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
                 button(text(copy_label).size(small))
                     .on_press(Message::FnCopy)
                     .padding([4, 8])
@@ -3320,6 +3509,10 @@ impl Ultimate64Browser {
                     .style(crate::styles::nav_button),
                 button(text("F8 Del").size(small))
                     .on_press(Message::FnDelete)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("↻ Refresh").size(small))
+                    .on_press(Message::FnRefresh)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
                 text("|")

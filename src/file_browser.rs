@@ -97,6 +97,25 @@ pub enum FileBrowserMessage {
     /// Open the OS file manager with `path` selected — fired from the
     /// context menu. Auto-closes the menu on success.
     RevealInFileManager(PathBuf),
+    /// Calculate the recursive size of the currently-selected folder
+    /// (mirrors Total Commander's Space-on-folder). No-op when nothing or
+    /// a file is selected. Walks the tree asynchronously.
+    CalculateSelectedSize,
+    /// Result delivered back from the async walker.
+    CalculateSizeCompleted(Result<(PathBuf, u64, usize), String>),
+    /// Keyboard cursor: move the selection up/down within the visible
+    /// (filtered + sorted) list. Wraps at the edges.
+    MoveSelectionUp,
+    MoveSelectionDown,
+    /// Enter / double-click on the selected entry — open a directory or
+    /// run/open a file via the standard activation.
+    ActivateSelection,
+    /// Quick-search: a printable character was typed while the pane was
+    /// active. Appends to the search buffer (with a 1.5s timeout reset)
+    /// and selects the first file whose name starts with that prefix.
+    QuickSearchInput(char),
+    /// Esc — clear any in-progress quick-search buffer.
+    QuickSearchClear,
     // Local disk image creation
     ShowCreateDisk,
     CloseCreateDisk,
@@ -193,6 +212,11 @@ pub struct FileBrowser {
     /// star button toggles the current directory; right-click on any
     /// folder row opens a context menu over that folder.
     favorites: Vec<PathBuf>,
+    /// Type-to-jump quick search buffer — appended to on each printable
+    /// keystroke while the pane is active. Cleared by Esc or after 1.5s
+    /// of inactivity (compared against `quick_search_at`).
+    quick_search_buffer: String,
+    quick_search_at: Option<std::time::Instant>,
     /// When set, the file list renders a small inline action bar (★ toggle
     /// + Cancel) directly under the row whose path matches. Right-click on
     /// a folder row sets this; clicking either action clears it.
@@ -240,6 +264,8 @@ impl FileBrowser {
             create_disk_type: crate::ftp_ops::DiskCreateType::D64,
             favorites: crate::folder_favorites::load(FAVORITES_FILE),
             context_menu_for: None,
+            quick_search_buffer: String::new(),
+            quick_search_at: None,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -265,6 +291,72 @@ impl FileBrowser {
             self.persist_favorites();
             true
         }
+    }
+
+    /// Build the same (filter + sort) list the view renders, then advance
+    /// `selected_file` by `delta` (positive = down, negative = up) with
+    /// wrap-around. If nothing was selected, pick the first or last entry
+    /// depending on direction.
+    fn move_selection(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let filter = self.filter.to_lowercase();
+        let filtered: Vec<&FileEntry> = self
+            .files
+            .iter()
+            .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+        let n = filtered.len() as isize;
+        let current_index = self
+            .selected_file
+            .as_ref()
+            .and_then(|p| filtered.iter().position(|f| &f.path == p))
+            .map(|i| i as isize);
+        let new_index = match current_index {
+            Some(i) => ((i + delta).rem_euclid(n)) as usize,
+            None => {
+                if delta > 0 {
+                    0
+                } else {
+                    (n - 1) as usize
+                }
+            }
+        };
+        self.selected_file = Some(filtered[new_index].path.clone());
+    }
+
+    /// Best-effort scroll-to-view: estimates the selected row's vertical
+    /// position assuming a roughly uniform row height (~28px including
+    /// padding) and snaps the scrollable there. Not pixel-perfect — variable
+    /// row heights make precise scroll-to hard in iced — but reliably keeps
+    /// the cursor on-screen during keyboard navigation.
+    fn scroll_to_selected(&self) -> Task<FileBrowserMessage> {
+        const ROW_HEIGHT_PX: f32 = 28.0;
+        const VIEWPORT_GUESS_PX: f32 = 400.0; // pad scroll so row sits a bit above the bottom
+        let Some(ref selected) = self.selected_file else {
+            return Task::none();
+        };
+        let filter = self.filter.to_lowercase();
+        let idx = self
+            .files
+            .iter()
+            .filter(|f| filter.is_empty() || f.name.to_lowercase().contains(&filter))
+            .position(|f| &f.path == selected);
+        let Some(idx) = idx else {
+            return Task::none();
+        };
+        let target_y = (idx as f32 * ROW_HEIGHT_PX).max(0.0);
+        // Bias upward by ~1/3 viewport so the selection isn't pinned to the
+        // bottom edge after a Down press.
+        let y = (target_y - VIEWPORT_GUESS_PX / 3.0).max(0.0);
+        iced::widget::operation::scroll_to(
+            WidgetId::new(FILE_LIST_SCROLLABLE_ID),
+            AbsoluteOffset { x: 0.0, y },
+        )
     }
 
     pub fn update(
@@ -952,6 +1044,159 @@ impl FileBrowser {
                 self.context_menu_for = None;
                 Task::none()
             }
+            FileBrowserMessage::CalculateSelectedSize => {
+                // Only meaningful when a folder is highlighted. If nothing
+                // is selected OR the selection is a file, no-op so Space
+                // doesn't fire spurious "select something" status spam.
+                let path = match self.selected_file.clone() {
+                    Some(p) if p.is_dir() => p,
+                    _ => return Task::none(),
+                };
+                // Total Commander's Space toggles the checkbox in addition
+                // to running the size calc — same single keystroke builds
+                // up a multi-folder selection for batch copy / delete.
+                if self.checked_files.contains(&path) {
+                    self.checked_files.remove(&path);
+                } else {
+                    self.checked_files.insert(path.clone());
+                }
+                self.is_loading = true;
+                self.status_message = Some(format!(
+                    "Calculating size of {}…",
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("folder")
+                ));
+                Task::perform(
+                    async move {
+                        let path_for_walk = path.clone();
+                        // Walk synchronously in a blocking task so the iced
+                        // runtime stays responsive on big trees. walkdir is
+                        // already a dependency.
+                        tokio::task::spawn_blocking(move || {
+                            let mut total: u64 = 0;
+                            let mut count: usize = 0;
+                            for entry in walkdir::WalkDir::new(&path_for_walk)
+                                .into_iter()
+                                .filter_map(|e| e.ok())
+                            {
+                                if entry.file_type().is_file() {
+                                    if let Ok(meta) = entry.metadata() {
+                                        total = total.saturating_add(meta.len());
+                                        count += 1;
+                                    }
+                                }
+                            }
+                            Ok((path_for_walk, total, count))
+                        })
+                        .await
+                        .map_err(|e| format!("Task error: {}", e))?
+                    },
+                    FileBrowserMessage::CalculateSizeCompleted,
+                )
+            }
+            FileBrowserMessage::CalculateSizeCompleted(result) => {
+                self.is_loading = false;
+                self.status_message = Some(match result {
+                    Ok((path, total, count)) => format!(
+                        "📊 {}: {} ({} files)",
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("folder"),
+                        crate::file_types::format_file_size(total),
+                        count
+                    ),
+                    Err(e) => format!("Size calc failed: {}", e),
+                });
+                Task::none()
+            }
+            // ── Keyboard navigation: arrows / Enter / quick-search ──────
+            FileBrowserMessage::MoveSelectionUp => {
+                self.move_selection(-1);
+                self.scroll_to_selected()
+            }
+            FileBrowserMessage::MoveSelectionDown => {
+                self.move_selection(1);
+                self.scroll_to_selected()
+            }
+            FileBrowserMessage::ActivateSelection => {
+                // Enter on a directory navigates into it; on a runnable
+                // file it triggers the same action as the row's "Run" /
+                // "Play" button. Falls back to FileSelected (highlight)
+                // for unknown types.
+                let Some(path) = self.selected_file.clone() else {
+                    return Task::none();
+                };
+                if path.is_dir() {
+                    return self.update(
+                        FileBrowserMessage::FileSelected(path),
+                        connection,
+                        host,
+                        password,
+                    );
+                }
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_lowercase());
+                let action = match ext.as_deref() {
+                    Some("prg") | Some("crt") => Some(FileBrowserMessage::LoadAndRun(path.clone())),
+                    Some("sid") => Some(FileBrowserMessage::PlaySid(path.clone())),
+                    Some(e) if crate::file_types::is_disk_image(e) => {
+                        Some(FileBrowserMessage::RunDisk(
+                            path.clone(),
+                            self.selected_drive.to_drive_string(),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(msg) = action {
+                    return self.update(msg, connection, host, password);
+                }
+                // Unrecognised type — just keep the row highlighted.
+                self.update(
+                    FileBrowserMessage::FileSelected(path),
+                    connection,
+                    host,
+                    password,
+                )
+            }
+            FileBrowserMessage::QuickSearchInput(ch) => {
+                // Reset buffer after 1.5s of inactivity so a fresh search
+                // doesn't pick up where the last one left off.
+                let now = std::time::Instant::now();
+                if let Some(prev) = self.quick_search_at {
+                    if now.duration_since(prev) > std::time::Duration::from_millis(1500) {
+                        self.quick_search_buffer.clear();
+                    }
+                }
+                self.quick_search_buffer.push(ch.to_ascii_lowercase());
+                self.quick_search_at = Some(now);
+
+                // First entry in current sort whose name starts with the buffer.
+                let needle = self.quick_search_buffer.as_str();
+                if let Some(entry) = self
+                    .files
+                    .iter()
+                    .find(|f| f.name.to_lowercase().starts_with(needle))
+                {
+                    self.selected_file = Some(entry.path.clone());
+                    self.status_message = Some(format!("Quick search: {}", needle));
+                    return self.scroll_to_selected();
+                } else {
+                    self.status_message = Some(format!("Quick search: {} (no match)", needle));
+                }
+                Task::none()
+            }
+            FileBrowserMessage::QuickSearchClear => {
+                if !self.quick_search_buffer.is_empty() {
+                    self.quick_search_buffer.clear();
+                    self.quick_search_at = None;
+                    self.status_message = Some("Quick search cleared".to_string());
+                }
+                Task::none()
+            }
+
             FileBrowserMessage::RevealInFileManager(path) => {
                 self.context_menu_for = None;
                 match reveal_in_file_manager(&path) {
@@ -2202,17 +2447,20 @@ impl FileBrowser {
         .align_y(iced::Alignment::Center)
         .padding([2, 4]);
 
-        // Highlight the previously-visited child directory or currently selected file
-        // using a subtle coloured background (reverse video feel)
+        // Highlight the previously-visited child directory or currently
+        // selected file. Bumped the background alpha to 0.55 (was 0.25 —
+        // too faint to see at a glance when keyboard-navigating with
+        // arrow keys) and brightened the border so the row reads as
+        // "the cursor is here".
         let row_element: Element<'_, FileBrowserMessage> = if is_last_visited || is_selected {
             container(file_row)
                 .width(Length::Fill)
                 .style(|_theme| container::Style {
                     background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.45, 0.52, 0.85, 0.25,
+                        0.45, 0.52, 0.85, 0.55,
                     ))),
                     border: iced::Border {
-                        color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.6),
+                        color: iced::Color::from_rgba(0.55, 0.65, 1.00, 0.9),
                         width: 1.0,
                         radius: 3.0.into(),
                     },
