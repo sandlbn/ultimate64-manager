@@ -1120,10 +1120,14 @@ impl FileBrowser {
                 self.scroll_to_selected()
             }
             FileBrowserMessage::ActivateSelection => {
-                // Reuses FileSelected — dispatches into directories and
-                // marks files as selected for the action buttons. Mirrors
-                // what a normal click on the row would do.
-                if let Some(path) = self.selected_file.clone() {
+                // Enter on a directory navigates into it; on a runnable
+                // file it triggers the same action as the row's "Run" /
+                // "Play" button. Falls back to FileSelected (highlight)
+                // for unknown types.
+                let Some(path) = self.selected_file.clone() else {
+                    return Task::none();
+                };
+                if path.is_dir() {
                     return self.update(
                         FileBrowserMessage::FileSelected(path),
                         connection,
@@ -1131,7 +1135,31 @@ impl FileBrowser {
                         password,
                     );
                 }
-                Task::none()
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_lowercase());
+                let action = match ext.as_deref() {
+                    Some("prg") | Some("crt") => Some(FileBrowserMessage::LoadAndRun(path.clone())),
+                    Some("sid") => Some(FileBrowserMessage::PlaySid(path.clone())),
+                    Some(e) if crate::file_types::is_disk_image(e) => {
+                        Some(FileBrowserMessage::RunDisk(
+                            path.clone(),
+                            self.selected_drive.to_drive_string(),
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(msg) = action {
+                    return self.update(msg, connection, host, password);
+                }
+                // Unrecognised type — just keep the row highlighted.
+                self.update(
+                    FileBrowserMessage::FileSelected(path),
+                    connection,
+                    host,
+                    password,
+                )
             }
             FileBrowserMessage::QuickSearchInput(ch) => {
                 // Reset buffer after 1.5s of inactivity so a fresh search
@@ -2419,17 +2447,20 @@ impl FileBrowser {
         .align_y(iced::Alignment::Center)
         .padding([2, 4]);
 
-        // Highlight the previously-visited child directory or currently selected file
-        // using a subtle coloured background (reverse video feel)
+        // Highlight the previously-visited child directory or currently
+        // selected file. Bumped the background alpha to 0.55 (was 0.25 —
+        // too faint to see at a glance when keyboard-navigating with
+        // arrow keys) and brightened the border so the row reads as
+        // "the cursor is here".
         let row_element: Element<'_, FileBrowserMessage> = if is_last_visited || is_selected {
             container(file_row)
                 .width(Length::Fill)
                 .style(|_theme| container::Style {
                     background: Some(iced::Background::Color(iced::Color::from_rgba(
-                        0.45, 0.52, 0.85, 0.25,
+                        0.45, 0.52, 0.85, 0.55,
                     ))),
                     border: iced::Border {
-                        color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.6),
+                        color: iced::Color::from_rgba(0.55, 0.65, 1.00, 0.9),
                         width: 1.0,
                         radius: 3.0.into(),
                     },
