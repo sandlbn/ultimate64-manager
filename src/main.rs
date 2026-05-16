@@ -222,6 +222,13 @@ pub enum Message {
     FnMkDir,
     FnNewDisk,
     FnDelete,
+    /// Refresh / re-read the active pane's directory listing. Bound to Ctrl+R
+    /// and the toolbar "↻ Refresh" button.
+    FnRefresh,
+    /// Open the selected local file with the OS's default editor (F4 in TC).
+    /// Remote files aren't supported in v1 — that needs a download-edit-upload
+    /// round-trip which we leave to the user (download via F5, edit locally).
+    FnEdit,
     ToggleActivePane,
     NavigateUpActivePane,
     SelectAllActivePane,
@@ -902,6 +909,42 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::FnEdit => {
+                // F4 Edit — open the selected file in the OS default editor.
+                // Only meaningful on the local pane; remote files would need
+                // a download-edit-upload round-trip that's better done
+                // explicitly by the user.
+                match self.active_pane {
+                    Pane::Left => {
+                        if let Some(path) = self.left_browser.get_selected_file().cloned() {
+                            match open::that_detached(&path) {
+                                Ok(()) => {
+                                    self.user_message = Some(UserMessage::Info(format!(
+                                        "Opened in editor: {}",
+                                        path.display()
+                                    )));
+                                }
+                                Err(e) => {
+                                    self.user_message =
+                                        Some(UserMessage::Error(format!("Open failed: {}", e)));
+                                }
+                            }
+                        } else {
+                            self.user_message = Some(UserMessage::Info(
+                                "Click a file first, then press F4 to edit".to_string(),
+                            ));
+                        }
+                    }
+                    Pane::Right => {
+                        self.user_message = Some(UserMessage::Info(
+                            "F4 Edit works on local files only — download first with F5"
+                                .to_string(),
+                        ));
+                    }
+                }
+                Task::none()
+            }
+
             Message::FnView => {
                 // Preview selected file in active pane
                 match self.active_pane {
@@ -943,6 +986,22 @@ impl Ultimate64Browser {
                     Pane::Right => self.update(Message::CopyRemoteToLocal),
                 }
             }
+
+            Message::FnRefresh => match self.active_pane {
+                Pane::Left => self
+                    .left_browser
+                    .update(
+                        FileBrowserMessage::RefreshFiles,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser),
+                Pane::Right => self
+                    .remote_browser
+                    .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
+                    .map(Message::RemoteBrowser),
+            },
 
             Message::FnMkDir => match self.active_pane {
                 Pane::Left => self
@@ -2964,6 +3023,7 @@ impl Ultimate64Browser {
                     // File browser shortcuts (TC-style)
                     Key::Named(keyboard::key::Named::F2) => Some(Message::FnRename),
                     Key::Named(keyboard::key::Named::F3) => Some(Message::FnView),
+                    Key::Named(keyboard::key::Named::F4) => Some(Message::FnEdit),
                     Key::Named(keyboard::key::Named::F5) => Some(Message::FnCopy),
                     Key::Named(keyboard::key::Named::F7) => Some(Message::FnMkDir),
                     Key::Named(keyboard::key::Named::F8) => Some(Message::FnDelete),
@@ -2975,6 +3035,11 @@ impl Ultimate64Browser {
                     }
                     Key::Character(ref c) if c.as_str() == "a" && modifiers.command() => {
                         Some(Message::SelectAllActivePane)
+                    }
+                    // Refresh active pane — Ctrl/Cmd+R, matches Total
+                    // Commander's "Re-read source" muscle memory.
+                    Key::Character(ref c) if c.as_str() == "r" && modifiers.command() => {
+                        Some(Message::FnRefresh)
                     }
                     _ => None,
                 }
@@ -3320,6 +3385,10 @@ impl Ultimate64Browser {
                     .style(crate::styles::nav_button),
                 button(text("F8 Del").size(small))
                     .on_press(Message::FnDelete)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                button(text("↻ Refresh").size(small))
+                    .on_press(Message::FnRefresh)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
                 text("|")
