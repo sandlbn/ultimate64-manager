@@ -72,8 +72,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
 
 | Shortcut | Action |
 |----------|--------|
+| `?` | Show keyboard shortcut overlay |
 | `Opt+F` / `Alt+F` | Toggle video fullscreen |
-| `ESC` | Exit fullscreen |
+| `ESC` | Close overlays / exit fullscreen / clear quick search |
 | `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z` | Memory editor undo / redo |
 
 ### File Browser (Total Commander-style)
