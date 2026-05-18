@@ -3199,9 +3199,15 @@ impl Ultimate64Browser {
                 match key {
                     Key::Named(keyboard::key::Named::Escape) => Some(Message::EscPressed),
                     // `?` opens the Help overlay (cheat-sheet of all keybinds).
-                    // On US layout that's Shift+/; iced normalises the char to
-                    // '?' when shift is held, so we match by character.
-                    Key::Character(ref c) if c.as_str() == "?" && !captured => {
+                    // Match both forms iced may report on Shift+/ : the
+                    // already-normalised `"?"` AND the raw `"/"` with the
+                    // shift modifier — platforms differ on which one fires.
+                    // No `!captured` gate here: matches the pattern of every
+                    // other shortcut in this list, otherwise the binding
+                    // silently dies whenever any widget has focus.
+                    Key::Character(ref c)
+                        if c.as_str() == "?" || (c.as_str() == "/" && modifiers.shift()) =>
+                    {
                         Some(Message::ShowHelp)
                     }
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.alt() => Some(
