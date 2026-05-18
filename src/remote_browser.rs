@@ -118,6 +118,10 @@ pub enum RemoteBrowserMessage {
     OpenContextMenu(String),
     /// Click on the context menu's Cancel button.
     CloseContextMenu,
+    /// User typed in the editable path field — buffer update only.
+    PathInputChanged(String),
+    /// User pressed Enter in the editable path field — navigate to it.
+    PathInputSubmit,
 
     // ── Sort ─────────────────────────────────────────────────────────────
     /// Change sort column (or toggle order if same column)
@@ -203,9 +207,16 @@ pub struct RemoteBrowser {
     /// resulting `FilesLoaded` is an Err, that favorite is auto-removed —
     /// keeps the dropdown from filling up with broken entries.
     pending_favorite_check: Option<String>,
+    /// Editable path field shown at the top of the pane. Synced to
+    /// `current_path` after each navigation; user can type a path and
+    /// press Enter to jump there.
+    path_input: String,
 }
 
 const FAVORITES_FILE: &str = "remote_favorites.json";
+/// Stable widget id for the editable remote path field — used by the
+/// app-level Ctrl+L keybind in main.rs to focus this input from anywhere.
+pub const PATH_INPUT_ID: &str = "remote_path_input";
 
 impl Default for RemoteBrowser {
     fn default() -> Self {
@@ -244,6 +255,7 @@ impl Default for RemoteBrowser {
             favorites: crate::folder_favorites::load(FAVORITES_FILE),
             context_menu_for: None,
             pending_favorite_check: None,
+            path_input: "/".to_string(),
         }
     }
 }
@@ -309,6 +321,9 @@ impl RemoteBrowser {
                         self.status_message = Some(format!("{} items", self.files.len()));
                         // Successful navigation means the favorite is fine.
                         self.pending_favorite_check = None;
+                        // Keep the editable path field in sync with the
+                        // newly-loaded directory.
+                        self.path_input = self.current_path.clone();
                     }
                     Err(e) => {
                         // If the failed listing was a favorite the user just
@@ -745,11 +760,28 @@ impl RemoteBrowser {
                     let password = self.password.clone();
                     Task::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || {
-                                create_and_upload_disk(host, name, id, disk_type, dest, password)
-                            })
+                            // 60s hard cap — the inner work is "build a few KB
+                            // disk image then FTP-upload it". On a healthy
+                            // device this finishes in well under a second;
+                            // the cap protects against a hung FTP layer
+                            // pinning the worker thread.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                tokio::task::spawn_blocking(move || {
+                                    create_and_upload_disk(
+                                        host, name, id, disk_type, dest, password,
+                                    )
+                                }),
+                            )
                             .await
-                            .unwrap_or_else(|e| Err(e.to_string()))
+                            {
+                                Ok(Ok(inner)) => inner,
+                                Ok(Err(e)) => Err(e.to_string()),
+                                Err(_) => {
+                                    Err("Disk creation timed out after 60s — device may be offline"
+                                        .to_string())
+                                }
+                            }
                         },
                         RemoteBrowserMessage::CreateDiskComplete,
                     )
@@ -1141,6 +1173,24 @@ impl RemoteBrowser {
                 self.context_menu_for = None;
                 Task::none()
             }
+            RemoteBrowserMessage::PathInputChanged(value) => {
+                self.path_input = value;
+                Task::none()
+            }
+            RemoteBrowserMessage::PathInputSubmit => {
+                let mut trimmed = self.path_input.trim().to_string();
+                if trimmed.is_empty() {
+                    return Task::none();
+                }
+                if !trimmed.starts_with('/') {
+                    // Device paths are always absolute; missing leading
+                    // slash is the most common typo — fix it silently.
+                    trimmed = format!("/{}", trimmed);
+                }
+                self.current_path = trimmed;
+                self.checked_files.clear();
+                self.update(RemoteBrowserMessage::RefreshFiles, _connection)
+            }
             RemoteBrowserMessage::NavigateToFavorite(path) => {
                 // Mark this favorite as "under test" — if the listing fails
                 // we'll know it's the one to drop, and the result handler
@@ -1208,11 +1258,6 @@ impl RemoteBrowser {
     fn build_nav_row(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
         let small = fs.small;
-        let display_path = if self.current_path.len() > 35 {
-            format!("...{}", &self.current_path[self.current_path.len() - 32..])
-        } else {
-            self.current_path.clone()
-        };
 
         let mut items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
         items.push(
@@ -1227,7 +1272,18 @@ impl RemoteBrowser {
             .style(crate::styles::subtle_tooltip)
             .into(),
         );
-        items.push(text(display_path).size(small).width(Length::Fill).into());
+        // Editable path field — Ctrl+L (in main.rs) focuses this. Enter
+        // submits and re-runs the FTP listing for the typed path.
+        items.push(
+            iced::widget::text_input("/SD/path", &self.path_input)
+                .id(iced::widget::Id::new(PATH_INPUT_ID))
+                .on_input(RemoteBrowserMessage::PathInputChanged)
+                .on_submit(RemoteBrowserMessage::PathInputSubmit)
+                .size(small)
+                .padding(4)
+                .width(Length::Fill)
+                .into(),
+        );
 
         // ── Favorites: ★ for current path + dropdown when non-empty ──
         let is_fav = self.is_favorite(&self.current_path);

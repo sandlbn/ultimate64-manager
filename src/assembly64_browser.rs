@@ -1181,11 +1181,19 @@ impl Assembly64Browser {
                         .await
                         .map_err(|_| "Download timed out".to_string())?
                         .map_err(|e| e.to_string())?;
-                        tokio::task::spawn_blocking(move || {
-                            extract_zip_to_dir(&bytes, &safe_name, &target)
-                                .map_err(|e| e.to_string())
-                        })
+                        // 60s hard cap on the actual extraction. The PRG
+                        // bytes are already bounded by upstream download
+                        // size; this timeout protects against slow storage
+                        // / tens-of-thousands-of-entries pathological ZIPs.
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            tokio::task::spawn_blocking(move || {
+                                extract_zip_to_dir(&bytes, &safe_name, &target)
+                                    .map_err(|e| e.to_string())
+                            }),
+                        )
                         .await
+                        .map_err(|_| "ZIP extraction timed out after 60s".to_string())?
                         .map_err(|e| format!("Task error: {}", e))?
                     },
                     M::ZipExtracted,

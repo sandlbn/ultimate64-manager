@@ -17,6 +17,9 @@ use ultimate64::{drives::MountMode, Rest};
 
 /// Stable ID for the main file-list scrollable widget
 const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
+/// Stable widget id for the editable path field so the app-level Ctrl+L
+/// keybind can call `text_input::focus(...)` on it from main.rs.
+pub const PATH_INPUT_ID: &str = "local_path_input";
 
 use crate::archive::{extract_zip_to_dir, MAX_ZIP_EXTRACT_BYTES};
 use crate::dir_preview::{self, ContentPreview};
@@ -116,6 +119,12 @@ pub enum FileBrowserMessage {
     QuickSearchInput(char),
     /// Esc — clear any in-progress quick-search buffer.
     QuickSearchClear,
+    /// User typed in the editable path field. Just updates the buffer —
+    /// no navigation until Submit.
+    PathInputChanged(String),
+    /// User pressed Enter in the editable path field. Validates the path
+    /// exists and navigates to it; otherwise shows an inline status.
+    PathInputSubmit,
     // Local disk image creation
     ShowCreateDisk,
     CloseCreateDisk,
@@ -217,6 +226,10 @@ pub struct FileBrowser {
     /// of inactivity (compared against `quick_search_at`).
     quick_search_buffer: String,
     quick_search_at: Option<std::time::Instant>,
+    /// Editable path field shown at the top of the pane. Synced to
+    /// `current_directory` on every directory change; the user can also
+    /// type in it and press Enter to navigate.
+    path_input: String,
     /// When set, the file list renders a small inline action bar (★ toggle
     /// + Cancel) directly under the row whose path matches. Right-click on
     /// a folder row sets this; clicking either action clears it.
@@ -266,6 +279,7 @@ impl FileBrowser {
             context_menu_for: None,
             quick_search_buffer: String::new(),
             quick_search_at: None,
+            path_input: initial_dir.to_string_lossy().to_string(),
         };
         browser.load_directory(&initial_dir);
         browser
@@ -1072,24 +1086,32 @@ impl FileBrowser {
                         let path_for_walk = path.clone();
                         // Walk synchronously in a blocking task so the iced
                         // runtime stays responsive on big trees. walkdir is
-                        // already a dependency.
-                        tokio::task::spawn_blocking(move || {
-                            let mut total: u64 = 0;
-                            let mut count: usize = 0;
-                            for entry in walkdir::WalkDir::new(&path_for_walk)
-                                .into_iter()
-                                .filter_map(|e| e.ok())
-                            {
-                                if entry.file_type().is_file() {
-                                    if let Ok(meta) = entry.metadata() {
-                                        total = total.saturating_add(meta.len());
-                                        count += 1;
+                        // already a dependency. Hard 120s cap so pressing
+                        // Space on a network mount, a symlink loop, or `/`
+                        // can't pin the worker thread forever.
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(120),
+                            tokio::task::spawn_blocking(move || {
+                                let mut total: u64 = 0;
+                                let mut count: usize = 0;
+                                for entry in walkdir::WalkDir::new(&path_for_walk)
+                                    .into_iter()
+                                    .filter_map(|e| e.ok())
+                                {
+                                    if entry.file_type().is_file() {
+                                        if let Ok(meta) = entry.metadata() {
+                                            total = total.saturating_add(meta.len());
+                                            count += 1;
+                                        }
                                     }
                                 }
-                            }
-                            Ok((path_for_walk, total, count))
-                        })
+                                Ok::<_, String>((path_for_walk, total, count))
+                            }),
+                        )
                         .await
+                        .map_err(|_| {
+                            "Calculation timed out — folder too large or unreachable".to_string()
+                        })?
                         .map_err(|e| format!("Task error: {}", e))?
                     },
                     FileBrowserMessage::CalculateSizeCompleted,
@@ -1194,6 +1216,49 @@ impl FileBrowser {
                     self.quick_search_at = None;
                     self.status_message = Some("Quick search cleared".to_string());
                 }
+                Task::none()
+            }
+            FileBrowserMessage::PathInputChanged(value) => {
+                self.path_input = value;
+                Task::none()
+            }
+            FileBrowserMessage::PathInputSubmit => {
+                let trimmed = self.path_input.trim();
+                if trimmed.is_empty() {
+                    return Task::none();
+                }
+                // Expand `~` to home for ergonomics — most users expect it.
+                let expanded: PathBuf = if let Some(stripped) = trimmed.strip_prefix("~") {
+                    if let Some(home) = dirs::home_dir() {
+                        let rest = stripped.trim_start_matches('/');
+                        if rest.is_empty() {
+                            home
+                        } else {
+                            home.join(rest)
+                        }
+                    } else {
+                        PathBuf::from(trimmed)
+                    }
+                } else {
+                    PathBuf::from(trimmed)
+                };
+                if !expanded.exists() {
+                    self.status_message =
+                        Some(format!("Path doesn't exist: {}", expanded.display()));
+                    // Revert the input to the current directory so the
+                    // user can see what's actually open.
+                    self.path_input = self.current_directory.to_string_lossy().to_string();
+                    return Task::none();
+                }
+                if !expanded.is_dir() {
+                    self.status_message = Some(format!("Not a directory: {}", expanded.display()));
+                    self.path_input = self.current_directory.to_string_lossy().to_string();
+                    return Task::none();
+                }
+                self.load_directory(&expanded);
+                self.current_directory = expanded;
+                self.checked_files.clear();
+                self.last_entered_child = None;
                 Task::none()
             }
 
@@ -1313,13 +1378,6 @@ impl FileBrowser {
     fn build_nav_row(&self, font_size: u32) -> Element<'_, FileBrowserMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
 
-        let path_str = self.current_directory.to_string_lossy();
-        let display_path = if path_str.len() > 45 {
-            format!("...{}", &path_str[path_str.len() - 43..])
-        } else {
-            path_str.to_string()
-        };
-
         row![
             tooltip(
                 button(text("⬆").size(fs.normal))
@@ -1330,7 +1388,17 @@ impl FileBrowser {
                 tooltip::Position::Bottom,
             )
             .style(crate::styles::subtle_tooltip),
-            text(display_path).size(fs.small).width(Length::Fill),
+            // Editable path field — Ctrl+L (in main.rs) focuses this and
+            // pressing Enter navigates. The buffer stays synced to
+            // `current_directory` via `load_directory(...)` so what you
+            // see is always the open folder unless you're mid-edit.
+            iced::widget::text_input("Path", &self.path_input)
+                .id(WidgetId::new(PATH_INPUT_ID))
+                .on_input(FileBrowserMessage::PathInputChanged)
+                .on_submit(FileBrowserMessage::PathInputSubmit)
+                .size(fs.small)
+                .padding(4)
+                .width(Length::Fill),
         ]
         .spacing(5)
         .align_y(iced::Alignment::Center)
@@ -2627,6 +2695,10 @@ impl FileBrowser {
     fn load_directory(&mut self, path: &Path) {
         self.files.clear();
         self.filter.clear();
+        // Keep the editable path field in sync with whatever directory
+        // we're loading — the user typing in the field commits via Enter,
+        // which routes through here, so the input visibly updates.
+        self.path_input = path.to_string_lossy().to_string();
 
         if let Ok(entries) = std::fs::read_dir(path) {
             let files: Vec<FileEntry> = entries
@@ -2694,13 +2766,20 @@ async fn extract_zip_file_async(zip_path: PathBuf, target_dir: PathBuf) -> Resul
         .to_string();
 
     let target_dir_clone = target_dir.clone();
-    // Run the CPU-bound extraction off the async thread pool
-    tokio::task::spawn_blocking(move || {
-        extract_zip_to_dir(&data, &filename, &target_dir_clone)
-            .map(|_| target_dir_clone)
-            .map_err(|e| e.to_string())
-    })
+    // Run the CPU-bound extraction off the async thread pool. 60s hard cap
+    // — `MAX_ZIP_EXTRACT_BYTES` already bounds the actual data size, but a
+    // ZIP with tens of thousands of tiny entries on slow storage could
+    // still grind for minutes. The cap surfaces a clear error instead.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::task::spawn_blocking(move || {
+            extract_zip_to_dir(&data, &filename, &target_dir_clone)
+                .map(|_| target_dir_clone)
+                .map_err(|e| e.to_string())
+        }),
+    )
     .await
+    .map_err(|_| "ZIP extraction timed out after 60s".to_string())?
     .map_err(|e| format!("Task error: {}", e))?
 }
 

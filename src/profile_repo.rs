@@ -549,13 +549,36 @@ impl ProfileRepo {
 
 /// Async wrappers for profile repo operations.
 
+/// Hard cap for any git operation on the profile repo. Git itself can hang
+/// indefinitely on a network-mounted FS, a corrupt index, or a huge history
+/// — wrapping every entry point in this guard means the worst-case "click
+/// Save and nothing happens" is bounded to 30 seconds instead of forever.
+const PROFILE_REPO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Run a blocking git operation under both `spawn_blocking` (so it doesn't
+/// pin the iced runtime) and a hard outer timeout (so a hung op surfaces
+/// as a clear error instead of a frozen UI).
+async fn run_with_timeout<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::time::timeout(PROFILE_REPO_TIMEOUT, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err(format!(
+            "Git operation timed out after {}s — repo may be on slow/unreachable storage",
+            PROFILE_REPO_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 pub async fn list_profiles_async(root: PathBuf) -> Result<Vec<ProfileEntry>, String> {
-    tokio::task::spawn_blocking(move || {
+    run_with_timeout(move || {
         let repo = ProfileRepo::new(root);
         repo.list_profiles()
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))?
 }
 
 pub async fn save_profile_async(
@@ -565,7 +588,7 @@ pub async fn save_profile_async(
     original_cfg: Option<String>,
     commit_message: Option<String>,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
+    run_with_timeout(move || {
         let mut repo = ProfileRepo::new(root);
         repo.save_profile(&profile, &category, original_cfg.as_deref())?;
 
@@ -590,16 +613,14 @@ pub async fn save_profile_async(
         ))
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))?
 }
 
 pub async fn load_profile_async(path: PathBuf) -> Result<DeviceProfile, String> {
-    tokio::task::spawn_blocking(move || {
+    run_with_timeout(move || {
         let repo = ProfileRepo::new(path.parent().unwrap_or(Path::new(".")).to_path_buf());
         repo.load_profile(&path)
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))?
 }
 
 pub async fn delete_profile_async(
@@ -607,22 +628,20 @@ pub async fn delete_profile_async(
     profile_path: PathBuf,
     profile_name: String,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
+    run_with_timeout(move || {
         let mut repo = ProfileRepo::new(root);
         repo.delete_profile(&profile_path)?;
         repo.commit(&format!("Delete profile: {}", profile_name))?;
         Ok(format!("Deleted profile: {}", profile_name))
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))?
 }
 
 pub async fn init_repo_async(root: PathBuf) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
+    run_with_timeout(move || {
         let mut repo = ProfileRepo::new(root);
         repo.init()?;
         Ok("Profile repository initialized".to_string())
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))?
 }

@@ -65,6 +65,8 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Folder Favorites** – Star folders in the local and remote file browsers
   - Toolbar dropdown jumps to a saved path; right-click for an inline context menu
   - Right-click a file → "Reveal in Finder/Explorer" (macOS / Windows / Linux)
+- **Editable path field** – `Cmd/Ctrl+L` focuses the path; type a path and press Enter to jump there. `~` expands to home on the local pane.
+- **In-app Help overlay** – Press `?` from any tab to see every keybind in one place.
 
 ## Keyboard Shortcuts
 
@@ -72,8 +74,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
 
 | Shortcut | Action |
 |----------|--------|
+| `?` | Show keyboard shortcut overlay |
 | `Opt+F` / `Alt+F` | Toggle video fullscreen |
-| `ESC` | Exit fullscreen |
+| `ESC` | Close overlays / exit fullscreen / clear quick search |
 | `Cmd/Ctrl+Z` / `Cmd/Ctrl+Shift+Z` | Memory editor undo / redo |
 
 ### File Browser (Total Commander-style)
@@ -90,8 +93,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
 | `Tab` | Switch active pane |
 | `Backspace` / `Cmd/Ctrl+←` / `Cmd/Ctrl+↑` | Go to parent folder |
 | `↑` / `↓` | Move file cursor |
-| `Enter` | Open folder / select file |
+| `Enter` | Open folder · Run PRG/CRT/SID · Mount disk image |
 | `Space` | Calculate folder size + toggle selection (local pane) |
+| `Cmd/Ctrl+L` | Focus the path field (type a path, press Enter to navigate) |
 | `a`–`z`, `0`–`9` | Quick search — type to jump to first matching file |
 | `Cmd/Ctrl+A` | Select all in active pane |
 

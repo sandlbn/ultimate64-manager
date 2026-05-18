@@ -21,6 +21,61 @@ const STATUS_POLL_RETRY_SECS: u64 = 2;
 /// "Not connected". With [`STATUS_POLL_RETRY_SECS`] = 2s, this gives ~6s of
 /// grace before disconnect — comfortably covers a normal reboot.
 const MAX_TRANSIENT_STATUS_FAILURES: u8 = 3;
+
+/// Keyboard shortcuts rendered by the `?` Help overlay. Tuples are
+/// `(section, key, description)` — grouping is by adjacent equal section
+/// names so order matters. New keybinds should be added here too so the
+/// help stays in sync with reality.
+const HELP_BINDS: &[(&str, &str, &str)] = &[
+    ("Navigation", "Tab", "Switch between local and remote pane"),
+    ("Navigation", "↑ / ↓", "Move cursor up / down in file list"),
+    (
+        "Navigation",
+        "Enter",
+        "Open folder · Run PRG/CRT/SID · Mount disk image",
+    ),
+    ("Navigation", "Backspace", "Go to parent folder"),
+    ("Navigation", "Cmd/Ctrl + ←", "Go to parent folder"),
+    ("Navigation", "Cmd/Ctrl + ↑", "Go to parent folder"),
+    ("File operations", "F2", "Rename selected file"),
+    ("File operations", "F3", "View / preview selected file"),
+    (
+        "File operations",
+        "F4",
+        "Edit selected local file (OS default editor)",
+    ),
+    ("File operations", "F5", "Copy selected to other pane"),
+    ("File operations", "F7", "Create new folder"),
+    ("File operations", "F8", "Delete selected"),
+    (
+        "File operations",
+        "Space",
+        "Calculate folder size + toggle selection",
+    ),
+    (
+        "Search & filter",
+        "Type letters",
+        "Quick-jump to first matching file",
+    ),
+    (
+        "Search & filter",
+        "Esc",
+        "Clear quick-search / close dialogs",
+    ),
+    (
+        "Search & filter",
+        "Cmd/Ctrl + L",
+        "Focus path field (type a path, Enter to navigate)",
+    ),
+    ("General", "Cmd/Ctrl + R", "Refresh active pane"),
+    ("General", "Cmd/Ctrl + A", "Select all in active pane"),
+    ("General", "?", "Show this help"),
+    ("Memory editor", "Cmd/Ctrl + Z", "Undo last write"),
+    ("Memory editor", "Cmd/Ctrl + Shift + Z", "Redo"),
+    ("Video / streaming", "Alt/Opt + F", "Toggle fullscreen"),
+    ("Video / streaming", "Esc", "Exit fullscreen"),
+];
+
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 use ultimate64::Rest;
@@ -318,6 +373,19 @@ pub enum Message {
     DropCancel,
     /// Async drop action finished — surface the result message.
     DropCompleted(Result<String, String>),
+    /// User clicked the Cancel button while a drop action was in flight.
+    /// Aborts the running Task without waiting for the network timeout.
+    DropAbort,
+    /// Toggle the Help overlay (cheatsheet of every keybind).
+    ShowHelp,
+    HideHelp,
+    /// Single Esc key — context-aware in the update handler: closes the
+    /// help overlay first, then exits fullscreen if active, then propagates
+    /// to per-pane quick-search clear.
+    EscPressed,
+    /// Ctrl/Cmd+L — focus the active pane's editable path field so the user
+    /// can type a path and press Enter to jump there.
+    FocusPathField,
 }
 
 /// Action chosen from the drag-and-drop dialog.
@@ -474,6 +542,11 @@ pub struct Ultimate64Browser {
     /// True while a drop action is sending data to the device — disables
     /// the dialog buttons so a slow upload can't be triggered twice.
     drop_in_flight: bool,
+    /// Handle for the in-flight drop task so the Cancel button can abort.
+    drop_handle: Option<iced::task::Handle>,
+    /// When true, the Help overlay (cheatsheet of every keybind) is rendered
+    /// on top of whatever tab is active. Toggled by `?`.
+    show_help: bool,
     // Separate streaming window
     streaming_window_id: Option<window::Id>,
     main_window_id: Option<window::Id>,
@@ -568,6 +641,8 @@ impl Ultimate64Browser {
             basic_editor: BasicEditor::new(),
             pending_drop: None,
             drop_in_flight: false,
+            drop_handle: None,
+            show_help: false,
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
             profile_manager,
@@ -924,6 +999,16 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::FocusPathField => {
+                // Ctrl+L focuses whichever pane is active. The matching
+                // `text_input` is registered with the same `Id` in each
+                // browser's `build_nav_row`.
+                let id = match self.active_pane {
+                    Pane::Left => iced::widget::Id::new(file_browser::PATH_INPUT_ID),
+                    Pane::Right => iced::widget::Id::new(remote_browser::PATH_INPUT_ID),
+                };
+                iced::widget::operation::focus(id)
+            }
             Message::PaneCursorUp => {
                 self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionUp)
             }
@@ -2388,6 +2473,24 @@ impl Ultimate64Browser {
                     .map(Message::Streaming)
             }
 
+            Message::EscPressed => {
+                // Priority order: dismiss the most-modal thing first.
+                // Help overlay → drop dialog → fullscreen → pane quick-search.
+                if self.show_help {
+                    self.show_help = false;
+                    return Task::none();
+                }
+                if self.pending_drop.is_some() {
+                    self.pending_drop = None;
+                    return Task::none();
+                }
+                if self.video_streaming.is_fullscreen {
+                    return self.update(Message::ExitFullscreen);
+                }
+                // Final fallback: clear the active pane's quick-search buffer.
+                self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchClear)
+            }
+
             Message::ExitFullscreen => {
                 // Only exit fullscreen if currently in fullscreen mode
                 if self.video_streaming.is_fullscreen {
@@ -2491,12 +2594,16 @@ impl Ultimate64Browser {
             }
             Message::DropAction(action) => {
                 self.pending_drop = None;
-                self.drop_in_flight = true;
                 self.user_message = Some(UserMessage::Info(format!("{}…", action.status_label())));
                 let host_url = format!("http://{}", self.settings.connection.host);
                 let password = self.settings.connection.password.clone();
                 let remote_path = self.remote_browser.current_path.clone();
-                match action {
+                // Only network actions need the cancel handle + in-flight
+                // flag — OpenInBasicEditor is local fs reads that finish
+                // in milliseconds and don't deserve a Cancel button.
+                let is_network = !matches!(action, DropAction::OpenInBasicEditor { .. });
+                self.drop_in_flight = is_network;
+                let task = match action {
                     DropAction::RunOnDevice { path, runner } => Task::perform(
                         async move {
                             let bytes = tokio::fs::read(&path)
@@ -2608,14 +2715,42 @@ impl Ultimate64Browser {
                             Message::DropCompleted,
                         )
                     }
+                };
+                // Wrap the network task in `abortable()` so the Cancel
+                // button can drop the future without waiting for the
+                // timeout. Local-only tasks (OpenInBasicEditor) skip this
+                // — they have nothing to cancel.
+                if is_network {
+                    let (task, handle) = task.abortable();
+                    self.drop_handle = Some(handle);
+                    task
+                } else {
+                    task
                 }
             }
             Message::DropCompleted(result) => {
                 self.drop_in_flight = false;
+                self.drop_handle = None;
                 self.user_message = Some(match result {
                     Ok(msg) => UserMessage::Info(msg),
                     Err(e) => UserMessage::Error(e),
                 });
+                Task::none()
+            }
+            Message::DropAbort => {
+                if let Some(h) = self.drop_handle.take() {
+                    h.abort();
+                }
+                self.drop_in_flight = false;
+                self.user_message = Some(UserMessage::Info("Drop cancelled".into()));
+                Task::none()
+            }
+            Message::ShowHelp => {
+                self.show_help = true;
+                Task::none()
+            }
+            Message::HideHelp => {
+                self.show_help = false;
                 Task::none()
             }
 
@@ -2934,6 +3069,13 @@ impl Ultimate64Browser {
             return self.view_drop_dialog(dropped);
         }
 
+        // Help overlay (`?` keypress) — global cheatsheet, takes
+        // precedence over the normal tab view so the user can pop it
+        // open from anywhere.
+        if self.show_help {
+            return self.view_help_overlay();
+        }
+
         // Tab bar with retro style
         let tabs = container(
             row![
@@ -3055,7 +3197,19 @@ impl Ultimate64Browser {
                 // typing in the filter box shouldn't move the file cursor.
                 let captured = matches!(status, event::Status::Captured);
                 match key {
-                    Key::Named(keyboard::key::Named::Escape) => Some(Message::ExitFullscreen),
+                    Key::Named(keyboard::key::Named::Escape) => Some(Message::EscPressed),
+                    // `?` opens the Help overlay (cheat-sheet of all keybinds).
+                    // Match both forms iced may report on Shift+/ : the
+                    // already-normalised `"?"` AND the raw `"/"` with the
+                    // shift modifier — platforms differ on which one fires.
+                    // No `!captured` gate here: matches the pattern of every
+                    // other shortcut in this list, otherwise the binding
+                    // silently dies whenever any widget has focus.
+                    Key::Character(ref c)
+                        if c.as_str() == "?" || (c.as_str() == "/" && modifiers.shift()) =>
+                    {
+                        Some(Message::ShowHelp)
+                    }
                     Key::Character(ref c) if c.as_str() == "f" && modifiers.alt() => Some(
                         Message::Streaming(streaming::StreamingMessage::ToggleFullscreen),
                     ),
@@ -3109,6 +3263,12 @@ impl Ultimate64Browser {
                     // Commander's "Re-read source" muscle memory.
                     Key::Character(ref c) if c.as_str() == "r" && modifiers.command() => {
                         Some(Message::FnRefresh)
+                    }
+                    // Ctrl/Cmd+L — focus the active pane's path field.
+                    // Universal "focus address bar" convention from web
+                    // browsers and modern file managers.
+                    Key::Character(ref c) if c.as_str() == "l" && modifiers.command() => {
+                        Some(Message::FocusPathField)
                     }
                     // ── Pane navigation — gated by `!captured` so text
                     // inputs (filter, path, dialog fields) still get their
@@ -3242,6 +3402,85 @@ impl Ultimate64Browser {
                 .map(Message::LeftBrowser),
             Pane::Right => Task::none(),
         }
+    }
+
+    /// Centered modal cheatsheet of every app-level keybind. Triggered by
+    /// `?`; dismissed by Esc or the Close button. Edit `HELP_BINDS` to add
+    /// new entries — keeping them in one table avoids documentation rot.
+    fn view_help_overlay(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+
+        let header = text("Keyboard Shortcuts").size(fs.large);
+        let mut body = column![header, Space::new().height(10)].spacing(0);
+
+        let mut current_section: Option<&'static str> = None;
+        for (section, key, desc) in HELP_BINDS {
+            if Some(*section) != current_section {
+                if current_section.is_some() {
+                    body = body.push(Space::new().height(8));
+                }
+                body = body.push(
+                    text(*section)
+                        .size(fs.normal)
+                        .color(iced::Color::from_rgb(0.45, 0.65, 1.00)),
+                );
+                body = body.push(Space::new().height(4));
+                current_section = Some(section);
+            }
+            body = body.push(
+                row![
+                    container(
+                        text(*key)
+                            .size(fs.small)
+                            .color(iced::Color::from_rgb(0.85, 0.75, 0.45))
+                    )
+                    .width(Length::Fixed(180.0)),
+                    text(*desc)
+                        .size(fs.small)
+                        .color(iced::Color::from_rgb(0.85, 0.85, 0.9)),
+                ]
+                .spacing(8),
+            );
+        }
+
+        body = body.push(Space::new().height(14));
+        body = body.push(
+            row![
+                Space::new().width(Length::Fill),
+                button(text("Close").size(fs.small))
+                    .on_press(Message::HideHelp)
+                    .padding([6, 14]),
+                Space::new().width(Length::Fill),
+            ]
+            .align_y(iced::Alignment::Center),
+        );
+        body = body.push(
+            text("Press Esc to close")
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+        );
+
+        let dialog = container(body.padding(20))
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.18, 0.20, 0.28, 0.98,
+                ))),
+                border: iced::Border {
+                    color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.7),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .width(Length::Fixed(520.0));
+
+        container(dialog)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(20)
+            .into()
     }
 
     fn view_drop_dialog(&self, path: &PathBuf) -> Element<'_, Message> {
@@ -4033,10 +4272,29 @@ impl Ultimate64Browser {
                 .align_y(iced::Alignment::Center)
                 .into()
             } else {
-                row![
-                    text(format!("{}{}", prefix, message))
+                let mut row_items: Vec<Element<'_, Message>> =
+                    vec![text(format!("{}{}", prefix, message))
                         .size(fs.normal)
-                        .color(color),
+                        .color(color)
+                        .into()];
+                // While a drag-and-drop upload is in flight, expose a
+                // Cancel button right next to the status text so the user
+                // doesn't have to wait for the timeout if the device is
+                // silent. Cancels via `Task::abort()` on the stashed handle.
+                if self.drop_in_flight {
+                    row_items.push(
+                        tooltip(
+                            button(text("✕ Cancel").size(fs.tiny))
+                                .on_press(Message::DropAbort)
+                                .padding([2, 8]),
+                            "Cancel the in-flight drop action",
+                            tooltip::Position::Top,
+                        )
+                        .style(container::bordered_box)
+                        .into(),
+                    );
+                }
+                row_items.push(
                     tooltip(
                         button(text("X").size(fs.tiny))
                             .on_press(Message::DismissMessage)
@@ -4044,11 +4302,13 @@ impl Ultimate64Browser {
                         "Dismiss message",
                         tooltip::Position::Top,
                     )
-                    .style(container::bordered_box),
-                ]
-                .spacing(10)
-                .align_y(iced::Alignment::Center)
-                .into()
+                    .style(container::bordered_box)
+                    .into(),
+                );
+                iced::widget::Row::with_children(row_items)
+                    .spacing(10)
+                    .align_y(iced::Alignment::Center)
+                    .into()
             }
         } else {
             text(video_status).size(fs.normal).into()
