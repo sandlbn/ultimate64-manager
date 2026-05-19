@@ -1685,12 +1685,7 @@ impl FileBrowser {
             let dialog = container(
                 column![
                     text(format!("Delete {} item(s)?", paths.len())).size(fs.normal),
-                    text(if summary.len() > 80 {
-                        format!("{}...", &summary[..77])
-                    } else {
-                        summary
-                    })
-                    .size(fs.small),
+                    text(crate::string_utils::truncate_string(&summary, 80)).size(fs.small),
                     row![
                         button(text("Delete").size(fs.small))
                             .on_press(FileBrowserMessage::DeleteConfirmed)
@@ -2096,12 +2091,9 @@ impl FileBrowser {
                 content,
                 line_count,
             } => {
-                // Truncate long filenames
-                let display_name = if filename.len() > 40 {
-                    format!("{}...", &filename[..37])
-                } else {
-                    filename.clone()
-                };
+                // Char-aware truncation — byte-index slicing panics on
+                // multi-byte UTF-8 filenames (umlauts, accents, emoji, …).
+                let display_name = crate::string_utils::truncate_string(filename, 40);
 
                 // Header with filename and close button
                 let header = row![
@@ -2162,12 +2154,9 @@ impl FileBrowser {
                 width,
                 height,
             } => {
-                // Truncate long filenames
-                let display_name = if filename.len() > 40 {
-                    format!("{}...", &filename[..37])
-                } else {
-                    filename.clone()
-                };
+                // Char-aware truncation — byte-index slicing panics on
+                // multi-byte UTF-8 filenames.
+                let display_name = crate::string_utils::truncate_string(filename, 40);
 
                 // Header with filename and close button
                 let header = row![
@@ -2261,13 +2250,13 @@ impl FileBrowser {
             }
         };
 
-        // Truncate long filenames
+        // Truncate long filenames — must be char-aware (not byte-aware)
+        // or filenames with multi-byte UTF-8 (umlauts, accents, emoji,
+        // CJK) panic the entire app with "byte index N is not a char
+        // boundary" when the cut lands mid-codepoint. truncate_string is
+        // already in string_utils for exactly this.
         let max_name_len = 45;
-        let display_name = if entry.name.len() > max_name_len {
-            format!("{}...", &entry.name[..max_name_len - 3])
-        } else {
-            entry.name.clone()
-        };
+        let display_name = crate::string_utils::truncate_string(&entry.name, max_name_len);
 
         // Check if this is a disk image that can show info
         let is_disk_image = entry

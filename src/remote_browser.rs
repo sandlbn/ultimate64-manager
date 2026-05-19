@@ -1739,12 +1739,11 @@ impl RemoteBrowser {
                     get_file_icon(&entry.name)
                 };
 
+                // Char-aware truncation — byte-index slicing panics on
+                // multi-byte UTF-8 filenames (umlauts, accents, emoji,
+                // CJK, …) when the cut lands mid-codepoint.
                 let max_name_len = 45;
-                let display_name = if entry.name.len() > max_name_len {
-                    format!("{}...", &entry.name[..max_name_len - 3])
-                } else {
-                    entry.name.clone()
-                };
+                let display_name = crate::string_utils::truncate_string(&entry.name, max_name_len);
 
                 let can_show_disk_info = {
                     let lower = entry.name.to_lowercase();
@@ -2467,11 +2466,9 @@ impl RemoteBrowser {
                 content,
                 line_count,
             } => {
-                let display_name = if filename.len() > 40 {
-                    format!("{}...", &filename[..37])
-                } else {
-                    filename.clone()
-                };
+                // Char-aware truncation — byte-index slicing panics on
+                // multi-byte UTF-8 filenames.
+                let display_name = crate::string_utils::truncate_string(filename, 40);
 
                 let header = row![
                     text("TEXT - ").size(small),
@@ -2528,11 +2525,9 @@ impl RemoteBrowser {
                 width,
                 height,
             } => {
-                let display_name = if filename.len() > 40 {
-                    format!("{}...", &filename[..37])
-                } else {
-                    filename.clone()
-                };
+                // Char-aware truncation — byte-index slicing panics on
+                // multi-byte UTF-8 filenames.
+                let display_name = crate::string_utils::truncate_string(filename, 40);
 
                 let header = row![
                     text("IMAGE - ").size(small),
