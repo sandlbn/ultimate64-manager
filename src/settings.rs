@@ -74,6 +74,11 @@ pub struct Preferences {
     pub default_song_duration: u32, // Default duration for songs without known length (in seconds)
     #[serde(default = "default_font_size")]
     pub font_size: u32, // Base font size for UI elements
+    /// Tab the user was on when they last closed the app. Restored at
+    /// startup. `#[serde(default)]` keeps older settings.json files (which
+    /// don't have this field) loading cleanly.
+    #[serde(default)]
+    pub last_active_tab: Option<crate::Tab>,
 }
 
 fn default_font_size() -> u32 {
@@ -105,6 +110,7 @@ impl Default for AppSettings {
                 show_hidden_files: false,
                 default_song_duration: 180, // 3 minutes
                 font_size: 12,
+                last_active_tab: None,
             },
         }
     }
@@ -132,5 +138,17 @@ impl AppSettings {
             log::info!("No settings file found, using defaults");
             Ok(Self::default())
         }
+    }
+
+    /// Persist the current settings to `settings.json`. Used after the user
+    /// changes a remembered preference (e.g. tab selection) — callers
+    /// generally ignore the result since a failed write is not worth
+    /// interrupting the UI for.
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let config_file = Self::config_path()?;
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(&config_file, json)?;
+        log::debug!("Settings saved to: {:?}", config_file);
+        Ok(())
     }
 }

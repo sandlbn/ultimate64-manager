@@ -526,6 +526,34 @@ pub async fn upload_mount_disk_async(
 }
 
 /// Upload bytes to a runner endpoint (run_crt, run_prg, sidplay).
+/// Remove the disk image currently mounted on the specified drive.
+///
+/// `drive` is `"a"` or `"b"`. Maps to the device's
+/// `PUT /v1/drives/<drive>:remove` endpoint. The call is idempotent — an
+/// empty drive returns 200 OK without error, so callers can always-fire it
+/// to "ensure empty" without checking first.
+pub async fn unmount_disk_async(
+    host: &str,
+    drive: &str,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let url = format!("{}/v1/drives/{}:remove", host, drive);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req = crate::net_utils::with_password(client.put(&url), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("unmount Drive {}: {}", drive.to_uppercase(), e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "unmount Drive {}: HTTP {}",
+            drive.to_uppercase(),
+            resp.status()
+        ));
+    }
+    Ok(())
+}
+
 pub async fn upload_runner_async(
     host: &str,
     runner: &str,
