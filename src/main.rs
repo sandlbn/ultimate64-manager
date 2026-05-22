@@ -326,6 +326,12 @@ pub enum Message {
     PoweroffMachine,
     MenuButton,
     MachineCommandCompleted(Result<String, String>),
+    /// Eject the disk image from both Drive A and Drive B.
+    EjectAllDrives,
+    EjectCompleted(Result<String, String>),
+    /// Re-fire whatever PRG/CRT/SID/disk the local file browser most
+    /// recently ran. No-op if no run has happened in this session.
+    RunLast,
 
     // Settings
     DefaultSongDurationChanged(String),
@@ -449,7 +455,9 @@ impl DropAction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Serialize/Deserialize so the active tab can be persisted in settings.json
+// and restored on next launch — see `Preferences::last_active_tab`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     DualPaneBrowser,
     MusicPlayer,
@@ -612,7 +620,12 @@ impl Ultimate64Browser {
         });
 
         let mut app = Self {
-            active_tab: Tab::DualPaneBrowser,
+            // Restore the tab the user closed in last session, or fall back
+            // to the file browser for first-time launches.
+            active_tab: settings
+                .preferences
+                .last_active_tab
+                .unwrap_or(Tab::DualPaneBrowser),
             left_browser,
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
@@ -692,13 +705,16 @@ impl Ultimate64Browser {
             return "Ultimate64 Video Stream".to_string();
         }
         if Some(window_id) == self.main_window_id {
-            // Main window title
-            let connection_status = if self.status.connected {
-                format!(" - Connected to {}", self.settings.connection.host)
+            // Format: "Ultimate64 Manager — <host> · <tab>"  when connected,
+            //         "Ultimate64 Manager · Disconnected · <tab>"  otherwise.
+            // The tab name on the tail means people running multiple instances
+            // (one per device) can tell at a glance which window is which.
+            let location = if self.status.connected {
+                self.settings.connection.host.as_str()
             } else {
-                " - Disconnected".to_string()
+                "Disconnected"
             };
-            return format!("Ultimate64 Manager v{}{}", APP_VERSION, connection_status);
+            return format!("Ultimate64 Manager — {} · {}", location, self.active_tab);
         }
         // Fallback
         "Ultimate64 Manager".to_string()
@@ -795,6 +811,13 @@ impl Ultimate64Browser {
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
+                // Remember the choice so the next launch opens on the same
+                // tab. A failed disk write is logged but never blocks the
+                // UI — losing a single tab preference is not worth a popup.
+                self.settings.preferences.last_active_tab = Some(tab);
+                if let Err(e) = self.settings.save() {
+                    log::warn!("Could not save settings after tab switch: {}", e);
+                }
                 // Auto-load latest entries when Assembly64 tab is first opened.
                 // Also kick off a background refresh of the dropdown
                 // presets and category map (one-shot per session).
@@ -2754,6 +2777,66 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::EjectAllDrives => {
+                let host_url = format!("http://{}", self.settings.connection.host);
+                let password = self.settings.connection.password.clone();
+                // Fire both unmount calls in parallel; the device handles
+                // them independently. Each has its own 5s REST timeout
+                // baked into the client, so the whole op is bounded.
+                let host_a = host_url.clone();
+                let pwd_a = password.clone();
+                let host_b = host_url;
+                let pwd_b = password;
+                Task::perform(
+                    async move {
+                        let (res_a, res_b) = tokio::join!(
+                            api::unmount_disk_async(&host_a, "a", pwd_a.as_deref()),
+                            api::unmount_disk_async(&host_b, "b", pwd_b.as_deref()),
+                        );
+                        match (res_a, res_b) {
+                            (Ok(()), Ok(())) => Ok("Ejected Drives A and B".to_string()),
+                            (Ok(()), Err(e)) => Err(format!("Drive A OK, Drive B failed: {}", e)),
+                            (Err(e), Ok(())) => Err(format!("Drive B OK, Drive A failed: {}", e)),
+                            (Err(a), Err(b)) => Err(format!("Both drives failed: {}; {}", a, b)),
+                        }
+                    },
+                    Message::EjectCompleted,
+                )
+            }
+            Message::EjectCompleted(result) => {
+                self.user_message = Some(match result {
+                    Ok(msg) => UserMessage::Info(msg),
+                    Err(e) => UserMessage::Error(e),
+                });
+                Task::none()
+            }
+            Message::RunLast => {
+                // Re-fire the most recent successful run/mount via the
+                // file_browser's own message bus. Cloning the LastRun is
+                // cheap (PathBuf + small String).
+                let Some(last) = self.left_browser.last_run().cloned() else {
+                    self.user_message = Some(UserMessage::Info("Nothing to re-run yet".into()));
+                    return Task::none();
+                };
+                let msg = match last {
+                    file_browser::LastRun::Prg(p) | file_browser::LastRun::Crt(p) => {
+                        FileBrowserMessage::LoadAndRun(p)
+                    }
+                    file_browser::LastRun::Sid(p) => FileBrowserMessage::PlaySid(p),
+                    file_browser::LastRun::Disk { path, drive } => {
+                        FileBrowserMessage::RunDisk(path, drive)
+                    }
+                };
+                self.left_browser
+                    .update(
+                        msg,
+                        self.connection.clone(),
+                        Some(self.settings.connection.host.clone()),
+                        self.settings.connection.password.clone(),
+                    )
+                    .map(Message::LeftBrowser)
+            }
+
             Message::ResetMachine => {
                 if let Some(conn) = &self.connection {
                     let conn = conn.clone();
@@ -3754,6 +3837,37 @@ impl Ultimate64Browser {
                     .on_press(Message::FnRefresh)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
+                // Device-control quick actions — gated on connection so an
+                // offline click can't fire a hopeless REST request.
+                button(text("⏏ Eject A+B").size(small))
+                    .on_press_maybe(self.status.connected.then_some(Message::EjectAllDrives),)
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                // Run last — re-fires the most recent PRG/CRT/SID/disk
+                // the local browser sent. Greys out when nothing's been
+                // run yet OR when the device is offline.
+                tooltip(
+                    button(
+                        text(match self.left_browser.last_run() {
+                            Some(last) => format!("↪ Run last ({})", last.basename()),
+                            None => "↪ Run last".to_string(),
+                        })
+                        .size(small),
+                    )
+                    .on_press_maybe(
+                        (self.status.connected && self.left_browser.last_run().is_some())
+                            .then_some(Message::RunLast),
+                    )
+                    .padding([4, 8])
+                    .style(crate::styles::nav_button),
+                    text(match self.left_browser.last_run() {
+                        Some(last) => format!("Re-run {}", last.path().display()),
+                        None => "Nothing has been run yet".to_string(),
+                    })
+                    .size(tiny),
+                    tooltip::Position::Top,
+                )
+                .style(crate::styles::subtle_tooltip),
                 text("|")
                     .size(tiny)
                     .color(iced::Color::from_rgb(0.4, 0.4, 0.45)),

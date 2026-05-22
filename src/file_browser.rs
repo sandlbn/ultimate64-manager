@@ -178,6 +178,34 @@ impl DriveOption {
     }
 }
 
+/// Snapshot of the last successful "run / mount / play" so the `↪ Run last`
+/// toolbar button can re-fire the same action. Updated by the file-browser's
+/// run/mount handlers and read by main.rs through [`FileBrowser::last_run`].
+#[derive(Debug, Clone)]
+pub enum LastRun {
+    Prg(PathBuf),
+    Crt(PathBuf),
+    Sid(PathBuf),
+    Disk { path: PathBuf, drive: String },
+}
+
+impl LastRun {
+    pub fn path(&self) -> &PathBuf {
+        match self {
+            LastRun::Prg(p) | LastRun::Crt(p) | LastRun::Sid(p) => p,
+            LastRun::Disk { path, .. } => path,
+        }
+    }
+
+    pub fn basename(&self) -> String {
+        self.path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string()
+    }
+}
+
 pub struct FileBrowser {
     current_directory: PathBuf,
     files: Vec<FileEntry>,
@@ -234,6 +262,9 @@ pub struct FileBrowser {
     /// + Cancel) directly under the row whose path matches. Right-click on
     /// a folder row sets this; clicking either action clears it.
     context_menu_for: Option<PathBuf>,
+    /// Most recent successful run / mount — populated by the run/mount
+    /// handlers below. Drives the `↪ Run last` toolbar button in main.rs.
+    last_run: Option<LastRun>,
 }
 
 const FAVORITES_FILE: &str = "local_favorites.json";
@@ -280,6 +311,7 @@ impl FileBrowser {
             quick_search_buffer: String::new(),
             quick_search_at: None,
             path_input: initial_dir.to_string_lossy().to_string(),
+            last_run: None,
         };
         browser.load_directory(&initial_dir);
         browser
@@ -460,6 +492,14 @@ impl FileBrowser {
             }
             FileBrowserMessage::RunDisk(path, drive) => {
                 if connection.is_some() {
+                    // Record as "last run" before the drive-check round-trip
+                    // — the user clicked Run, so this is what they meant
+                    // regardless of whether the device side ultimately
+                    // succeeds.
+                    self.last_run = Some(LastRun::Disk {
+                        path: path.clone(),
+                        drive: drive.clone(),
+                    });
                     let action = PendingDriveAction::Run(path, drive);
                     return Task::done(FileBrowserMessage::CheckDriveBeforeAction(action));
                 } else {
@@ -482,6 +522,18 @@ impl FileBrowser {
             }
             FileBrowserMessage::LoadAndRun(path) => {
                 if let Some(conn) = connection {
+                    // Record as "last run" — extension drives which variant
+                    // we'll re-fire when the user later hits "↪ Run last".
+                    self.last_run = match path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_lowercase())
+                        .as_deref()
+                    {
+                        Some("prg") => Some(LastRun::Prg(path.clone())),
+                        Some("crt") => Some(LastRun::Crt(path.clone())),
+                        _ => self.last_run.take(), // unknown ext → keep previous
+                    };
                     self.status_message = Some(format!(
                         "Loading {}...",
                         path.file_name().unwrap_or_default().to_string_lossy()
@@ -861,6 +913,7 @@ impl FileBrowser {
 
             FileBrowserMessage::PlaySid(path) => {
                 if let (Some(_host), Some(conn)) = (host.clone(), connection.clone()) {
+                    self.last_run = Some(LastRun::Sid(path.clone()));
                     Task::perform(
                         async move {
                             let data = tokio::fs::read(&path)
@@ -1356,6 +1409,12 @@ impl FileBrowser {
     #[allow(dead_code)]
     pub fn get_selected_file(&self) -> Option<&PathBuf> {
         self.selected_file.as_ref()
+    }
+
+    /// Most-recent successful run / mount, used by main.rs to drive the
+    /// `↪ Run last` toolbar button label + dispatch.
+    pub fn last_run(&self) -> Option<&LastRun> {
+        self.last_run.as_ref()
     }
 
     pub fn filter(&self) -> &str {
