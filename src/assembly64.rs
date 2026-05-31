@@ -539,8 +539,8 @@ impl SearchForm {
     /// Compose this form into a single AQL query string.
     ///
     /// Free text containing `:` is treated as raw AQL and passed through
-    /// verbatim; otherwise it's wrapped as `name:*…*` so a typed word
-    /// becomes a substring search.
+    /// verbatim; otherwise it's wrapped as `name:"…"` (quoted phrase) so
+    /// a typed term becomes a substring search.
     ///
     /// If the form would produce no constraints at all, falls back to
     /// `sort:updated order:desc` (the API rejects empty queries).
@@ -552,15 +552,15 @@ impl SearchForm {
             if trimmed.contains(':') {
                 parts.push(trimmed.to_string());
             } else {
-                // Multi-word terms must use `*` as the separator inside the
-                // `name:*…*` wildcard — the server's AQL parser rejects a
-                // literal space between two words (HTTP 463), even though
-                // entries with spaces in their names are common ("Bubble
-                // Bobble" etc.). Collapsing runs of whitespace to a single
-                // `*` matches space, underscore, hyphen, or any other
-                // separator the title might use.
-                let glued = trimmed.split_whitespace().collect::<Vec<_>>().join("*");
-                parts.push(format!("name:*{}*", glued));
+                // The Assembly64 server dropped support for `name:*term*`
+                // glob wildcards (2026-05 API change) — they now return
+                // empty results. The replacement is the **quoted phrase**
+                // form `name:"term term"`, which does a case-insensitive
+                // substring match and naturally handles spaces inside
+                // the quotes. We escape embedded quotes defensively even
+                // though they're vanishingly rare in C64 filenames.
+                let phrase = trimmed.replace('"', "");
+                parts.push(format!("name:\"{}\"", phrase));
             }
         }
         // The `aqlKey` from /search/aql/presets is the *value* half of a
@@ -1109,31 +1109,46 @@ mod tests {
             free_text: "elite".to_string(),
             ..Default::default()
         };
-        assert_eq!(form.compose_aql(), "name:*elite* sort:updated order:desc");
+        assert_eq!(form.compose_aql(), "name:\"elite\" sort:updated order:desc");
     }
 
     #[test]
-    fn compose_aql_glues_multi_word_with_wildcard() {
-        // The server returns HTTP 463 for a literal space inside the name
-        // wildcard (`name:*bubble bobble*`), so multi-word input must be
-        // glued with `*` to match the title regardless of separator.
+    fn compose_aql_quotes_multi_word_phrase() {
+        // The 2026-05 API change requires `name:"…"` quoted phrases —
+        // the old `name:*term*` glob wildcards now silently return empty.
         let form = SearchForm {
             free_text: "bubble bobble".to_string(),
             ..Default::default()
         };
         assert_eq!(
             form.compose_aql(),
-            "name:*bubble*bobble* sort:updated order:desc"
+            "name:\"bubble bobble\" sort:updated order:desc"
         );
 
-        // Whitespace runs collapse cleanly.
+        // Whitespace IS preserved inside the quotes — the server tolerates
+        // multiple spaces between words, so we don't need to normalise.
         let form = SearchForm {
-            free_text: "  space   invaders  64 ".to_string(),
+            free_text: "space invaders 64".to_string(),
             ..Default::default()
         };
         assert_eq!(
             form.compose_aql(),
-            "name:*space*invaders*64* sort:updated order:desc"
+            "name:\"space invaders 64\" sort:updated order:desc"
+        );
+    }
+
+    #[test]
+    fn compose_aql_strips_embedded_quotes() {
+        // Defensive — quotes inside the phrase would break the AQL
+        // tokeniser. C64 filenames almost never contain them, but if a
+        // user pastes one we silently drop it rather than fail.
+        let form = SearchForm {
+            free_text: "fred's \"demo\"".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            form.compose_aql(),
+            "name:\"fred's demo\" sort:updated order:desc"
         );
     }
 
@@ -1162,7 +1177,7 @@ mod tests {
         };
         assert_eq!(
             form.compose_aql(),
-            "name:*elite* category:demos repo:csdb rating:>=8 latest:1month sort:rating order:desc"
+            "name:\"elite\" category:demos repo:csdb rating:>=8 latest:1month sort:rating order:desc"
         );
     }
 
