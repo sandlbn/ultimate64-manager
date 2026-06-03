@@ -55,6 +55,7 @@ linux: dist
 			--executable=target/release/ultimate64-manager \
 			--desktop-file=ultimate64-manager.desktop \
 			--icon-file=assets/icon.png \
+			--icon-filename=ultimate64-manager \
 			--output=appimage; \
 		mv Ultimate64_Manager*.AppImage "$(LINUX_OUT)"; \
 	else \
