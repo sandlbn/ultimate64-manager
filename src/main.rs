@@ -14,6 +14,11 @@ use std::path::PathBuf;
 
 /// Background status poll cadence when the device is reachable.
 const STATUS_POLL_NORMAL_SECS: u64 = 60;
+/// Background reconnect cadence when the app has officially disconnected
+/// (consecutive failures exceeded [`MAX_TRANSIENT_STATUS_FAILURES`]) but the
+/// user still has a host configured. A successful poll flips back to
+/// "Connected" automatically — no user intervention needed.
+const STATUS_POLL_RECONNECT_SECS: u64 = 10;
 /// Faster poll cadence used during a transient outage window so a 2-3s
 /// reboot is recovered well before the user sees "Not connected".
 const STATUS_POLL_RETRY_SECS: u64 = 2;
@@ -326,8 +331,18 @@ pub enum Message {
     PoweroffMachine,
     MenuButton,
     MachineCommandCompleted(Result<String, String>),
-    /// Eject the disk image from both Drive A and Drive B.
+    /// Sink for events we explicitly want to absorb without doing anything
+    /// (e.g. clicks on a modal dialog's body so they don't bubble to the
+    /// backdrop's dismiss handler).
+    Nop,
+    /// Eject the disk image from both Drive A and Drive B. Shows a
+    /// confirmation dialog first — accidentally clearing a hand-set
+    /// mount has no undo, so we make the user confirm explicitly.
     EjectAllDrives,
+    /// User confirmed the Eject A+B prompt; actually fire the unmounts.
+    EjectAllDrivesConfirmed,
+    /// User dismissed the Eject A+B confirmation without confirming.
+    EjectCancel,
     EjectCompleted(Result<String, String>),
     /// Re-fire whatever PRG/CRT/SID/disk the local file browser most
     /// recently ran. No-op if no run has happened in this session.
@@ -552,6 +567,10 @@ pub struct Ultimate64Browser {
     drop_in_flight: bool,
     /// Handle for the in-flight drop task so the Cancel button can abort.
     drop_handle: Option<iced::task::Handle>,
+    /// True while the Eject A+B confirmation modal is showing. The actual
+    /// eject only fires after the user explicitly confirms — accidentally
+    /// clearing a mount has no undo.
+    pending_eject_confirm: bool,
     /// When true, the Help overlay (cheatsheet of every keybind) is rendered
     /// on top of whatever tab is active. Toggled by `?`.
     show_help: bool,
@@ -655,6 +674,7 @@ impl Ultimate64Browser {
             pending_drop: None,
             drop_in_flight: false,
             drop_handle: None,
+            pending_eject_confirm: false,
             show_help: false,
             main_window_id: Some(main_window_id),
             streaming_window_id: None,
@@ -2498,9 +2518,13 @@ impl Ultimate64Browser {
 
             Message::EscPressed => {
                 // Priority order: dismiss the most-modal thing first.
-                // Help overlay → drop dialog → fullscreen → pane quick-search.
+                // Help overlay → eject confirm → drop dialog → fullscreen → pane quick-search.
                 if self.show_help {
                     self.show_help = false;
+                    return Task::none();
+                }
+                if self.pending_eject_confirm {
+                    self.pending_eject_confirm = false;
                     return Task::none();
                 }
                 if self.pending_drop.is_some() {
@@ -2777,7 +2801,21 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::Nop => Task::none(),
+
             Message::EjectAllDrives => {
+                // Click on the toolbar button arms the confirmation modal —
+                // the actual ejection is gated on EjectAllDrivesConfirmed
+                // so an accidental click can't clear a hand-set mount.
+                self.pending_eject_confirm = true;
+                Task::none()
+            }
+            Message::EjectCancel => {
+                self.pending_eject_confirm = false;
+                Task::none()
+            }
+            Message::EjectAllDrivesConfirmed => {
+                self.pending_eject_confirm = false;
                 let host_url = format!("http://{}", self.settings.connection.host);
                 let password = self.settings.connection.password.clone();
                 // Fire both unmount calls in parallel; the device handles
@@ -3152,6 +3190,12 @@ impl Ultimate64Browser {
             return self.view_drop_dialog(dropped);
         }
 
+        // Eject A+B confirmation — guards against accidental clicks since
+        // there's no undo for clearing a mounted disk.
+        if self.pending_eject_confirm {
+            return self.view_eject_confirm_dialog();
+        }
+
         // Help overlay (`?` keypress) — global cheatsheet, takes
         // precedence over the normal tab view so the user can pop it
         // open from anywhere.
@@ -3398,19 +3442,28 @@ impl Ultimate64Browser {
         // Periodic connection check every 60 seconds
         // Suppressed while transferring or applying profiles to avoid
         // overwhelming the device's HTTP server
-        let status_check = if self.status.connected
-            && !self.remote_browser.is_transferring()
-            && !self.device_profile_manager.is_loading
+        let status_check = if self.remote_browser.is_transferring()
+            || self.device_profile_manager.is_loading
         {
-            // During an outage window (1..MAX failures) poll fast so a 2-3s
-            // reboot recovers before the user notices; otherwise idle at the
-            // normal background cadence.
+            // Suppress all polling while transferring or applying profiles
+            // to avoid overwhelming the device's HTTP server.
+            Subscription::none()
+        } else if self.status.connected {
+            // Connected — poll at the slow background cadence, but switch
+            // to a fast retry during a transient outage window so a 2-3s
+            // reboot recovers before the user notices.
             let interval_secs = if self.consecutive_status_failures > 0 {
                 STATUS_POLL_RETRY_SECS
             } else {
                 STATUS_POLL_NORMAL_SECS
             };
             iced::time::every(Duration::from_secs(interval_secs)).map(|_| Message::RefreshStatus)
+        } else if self.connection.is_some() {
+            // Officially disconnected but the user is still authenticated —
+            // keep tapping at the device so we silently reconnect when it
+            // comes back online (e.g. after a longer reboot).
+            iced::time::every(Duration::from_secs(STATUS_POLL_RECONNECT_SECS))
+                .map(|_| Message::RefreshStatus)
         } else {
             Subscription::none()
         };
@@ -3637,13 +3690,80 @@ impl Ultimate64Browser {
         })
         .width(Length::Fixed(420.0));
 
-        container(dialog)
+        // Click-outside-to-dismiss: the outer mouse_area covers the full
+        // backdrop and fires DropCancel; the inner mouse_area around the
+        // dialog absorbs clicks (with a Nop) so clicks ON the dialog itself
+        // — between buttons, on the border, etc. — don't bubble through.
+        // Button widgets capture their own clicks already, so this only
+        // affects "dead" space inside the dialog.
+        iced::widget::mouse_area(
+            container(
+                iced::widget::mouse_area(dialog).on_press(Message::Nop),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
-            .padding(20)
-            .into()
+            .padding(20),
+        )
+        .on_press(Message::DropCancel)
+        .into()
+    }
+
+    /// Confirmation modal for the Eject A+B toolbar button. Mirrors the
+    /// drop-dialog overlay pattern so click-outside / Esc dismiss for free.
+    fn view_eject_confirm_dialog(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+
+        let dialog = container(
+            column![
+                text("Eject both drives?").size(fs.large),
+                text("Drive A and Drive B will be cleared on the device. Any in-progress writes finish first; this cannot be undone.")
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
+                Space::new().height(12),
+                column![
+                    button(text("⏏ Yes, eject A+B").size(fs.normal))
+                        .on_press(Message::EjectAllDrivesConfirmed)
+                        .padding([6, 14])
+                        .width(Length::Fill)
+                        .style(iced::widget::button::danger),
+                    button(text("Cancel").size(fs.normal))
+                        .on_press(Message::EjectCancel)
+                        .padding([6, 14])
+                        .width(Length::Fill)
+                        .style(iced::widget::button::text),
+                ]
+                .spacing(8),
+            ]
+            .spacing(6)
+            .padding(20),
+        )
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.18, 0.20, 0.28, 0.98,
+            ))),
+            border: iced::Border {
+                color: iced::Color::from_rgba(0.85, 0.4, 0.4, 0.7),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .width(Length::Fixed(380.0));
+
+        iced::widget::mouse_area(
+            container(
+                iced::widget::mouse_area(dialog).on_press(Message::Nop),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .padding(20),
+        )
+        .on_press(Message::EjectCancel)
+        .into()
     }
 
     fn view_overwrite_dialog(&self, pending: &PendingCopy) -> Element<'_, Message> {

@@ -569,9 +569,20 @@ impl MusicPlayer {
                 let root = self.browser_directory.clone();
                 Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || search_files_recursive(&root, &query))
-                            .await
-                            .unwrap_or_default()
+                        // 60s cap — recursive music-library walks can be
+                        // huge on a properly-organised HVSC mirror but a
+                        // network mount shouldn't pin the runtime forever.
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(60),
+                            tokio::task::spawn_blocking(move || {
+                                search_files_recursive(&root, &query)
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(results)) => results,
+                            _ => Vec::new(),
+                        }
                     },
                     MusicPlayerMessage::BrowserSearchComplete,
                 )

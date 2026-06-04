@@ -97,28 +97,47 @@ pub fn load_preset_from_file(path: &Path) -> Result<ConfigPreset, String> {
     Ok(preset)
 }
 
+/// 15s cap on preset file I/O — presets are tiny JSON; anything longer is
+/// a slow / unreachable storage mount and should fail loudly rather than
+/// pin the worker thread.
+const PRESET_IO_TIMEOUT_SECS: u64 = 15;
+
 /// Async wrapper for saving preset (for use with file dialog)
 pub async fn save_preset_async(
     preset: ConfigPreset,
     path: std::path::PathBuf,
 ) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || {
-        save_preset_to_file(&preset, &path)?;
-        Ok(format!(
-            "Saved {} settings to {}",
-            preset.setting_count(),
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
-        ))
-    })
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PRESET_IO_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            save_preset_to_file(&preset, &path)?;
+            Ok(format!(
+                "Saved {} settings to {}",
+                preset.setting_count(),
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+            ))
+        }),
+    )
     .await
-    .map_err(|e| format!("Task error: {}", e))?
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Preset save timed out — storage may be unreachable".into()),
+    }
 }
 
 /// Async wrapper for loading preset (for use with file dialog)
 pub async fn load_preset_async(path: std::path::PathBuf) -> Result<ConfigPreset, String> {
-    tokio::task::spawn_blocking(move || load_preset_from_file(&path))
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PRESET_IO_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || load_preset_from_file(&path)),
+    )
+    .await
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Preset load timed out — storage may be unreachable".into()),
+    }
 }
 
 /// Create a preset from current category items
