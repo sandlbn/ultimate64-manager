@@ -278,11 +278,27 @@ fn extract_pdf_text(data: &[u8], filename: String) -> Result<ContentPreview, Str
     })
 }
 
+/// Hard cap for PDF rendering — `pdf-extract` + `lopdf` are well-behaved on
+/// normal files but a corrupt or pathological PDF can spin for minutes. 30s
+/// covers any reasonable real document on slow disks; anything longer is
+/// almost certainly a bad file and we'd rather surface the failure.
+const PDF_TIMEOUT_SECS: u64 = 30;
+
 /// Async wrapper for loading PDF preview from path
 pub async fn load_pdf_preview_async(path: std::path::PathBuf) -> Result<ContentPreview, String> {
-    tokio::task::spawn_blocking(move || load_pdf_preview(&path))
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PDF_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || load_pdf_preview(&path)),
+    )
+    .await
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err(format!(
+            "PDF preview timed out after {}s — file may be corrupt",
+            PDF_TIMEOUT_SECS
+        )),
+    }
 }
 
 /// Async wrapper for loading PDF preview from bytes
@@ -290,7 +306,17 @@ pub async fn load_pdf_preview_from_bytes_async(
     data: Vec<u8>,
     filename: String,
 ) -> Result<ContentPreview, String> {
-    tokio::task::spawn_blocking(move || load_pdf_preview_from_bytes(&data, filename))
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(PDF_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || load_pdf_preview_from_bytes(&data, filename)),
+    )
+    .await
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err(format!(
+            "PDF preview timed out after {}s — file may be corrupt",
+            PDF_TIMEOUT_SECS
+        )),
+    }
 }

@@ -330,11 +330,19 @@ pub fn render_disk_listing_image(disk_info: &DiskInfo) -> Vec<u8> {
     png_bytes
 }
 
-/// Async wrapper: render disk listing image on a blocking thread
+/// Async wrapper: render disk listing image on a blocking thread.
+/// 15s cap — rendering is a small in-memory PNG encode; anything longer
+/// means we're either OOMing or the encoder is wedged.
 pub async fn render_disk_listing_image_async(disk_info: DiskInfo) -> Vec<u8> {
-    tokio::task::spawn_blocking(move || render_disk_listing_image(&disk_info))
-        .await
-        .unwrap_or_default()
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || render_disk_listing_image(&disk_info)),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        _ => Vec::new(),
+    }
 }
 
 /// Render a C64-style directory listing into a PNG image.
@@ -416,16 +424,32 @@ pub fn load_image_file(path: &Path) -> Result<ContentPreview, String> {
     })
 }
 
-/// Async wrapper for loading text file
+/// Async wrapper for loading text file. 15s cap — text reads are local
+/// disk I/O; a slow network mount or huge file shouldn't pin the worker.
 pub async fn load_text_file_async(path: PathBuf) -> Result<ContentPreview, String> {
-    tokio::task::spawn_blocking(move || load_text_file(&path))
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || load_text_file(&path)),
+    )
+    .await
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Text preview timed out — file too large or slow storage".into()),
+    }
 }
 
-/// Async wrapper for loading image file
+/// Async wrapper for loading image file. 15s cap as above (image decoding
+/// can spin on corrupt PNGs / weird JPEGs).
 pub async fn load_image_file_async(path: PathBuf) -> Result<ContentPreview, String> {
-    tokio::task::spawn_blocking(move || load_image_file(&path))
-        .await
-        .map_err(|e| format!("Task error: {}", e))?
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || load_image_file(&path)),
+    )
+    .await
+    {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("Image preview timed out — file may be corrupt".into()),
+    }
 }
