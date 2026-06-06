@@ -544,6 +544,10 @@ impl Assembly64Browser {
         !self.results.is_empty()
     }
 
+    pub fn is_busy(&self) -> bool {
+        self.is_loading
+    }
+
     fn persist(&self) {
         let state = PersistedState {
             favorites: self.favorites.clone(),

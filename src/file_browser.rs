@@ -1417,6 +1417,10 @@ impl FileBrowser {
         self.last_run.as_ref()
     }
 
+    pub fn clear_last_run(&mut self) {
+        self.last_run = None;
+    }
+
     pub fn filter(&self) -> &str {
         &self.filter
     }
