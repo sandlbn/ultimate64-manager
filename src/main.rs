@@ -407,6 +407,17 @@ pub enum Message {
     /// Ctrl/Cmd+L — focus the active pane's editable path field so the user
     /// can type a path and press Enter to jump there.
     FocusPathField,
+    /// Periodic tick fired while a toast is visible — clears it once the
+    /// 4s display window has elapsed.
+    ToastTick,
+    /// OS asked us to close the given window. We swallow the request and
+    /// either close immediately or pop a confirmation modal when a transfer
+    /// is in flight.
+    WindowCloseRequested(iced::window::Id),
+    /// User confirmed they want to close despite an in-flight transfer.
+    ConfirmCloseWindow,
+    /// User dismissed the close-confirmation modal.
+    CancelCloseWindow,
 }
 
 /// Action chosen from the drag-and-drop dialog.
@@ -594,7 +605,19 @@ pub struct Ultimate64Browser {
     /// If set, a local→remote copy is waiting for the user to confirm
     /// overwriting existing files on the device.
     pending_copy: Option<PendingCopy>,
+
+    /// Transient success banner for completed long ops (FTP copy, drag-drop
+    /// upload, eject A+B, etc). Auto-fades after [`TOAST_DURATION_SECS`].
+    toast: Option<(String, std::time::Instant)>,
+
+    /// Set when the user tried to close the window while a transfer was in
+    /// flight. Shows a confirm dialog; clearing it aborts the close, the
+    /// `ConfirmClose` button on the dialog finishes it.
+    pending_close: Option<window::Id>,
 }
+
+/// How long a toast stays on screen before [`Message::ToastTick`] clears it.
+const TOAST_DURATION_SECS: u64 = 4;
 
 /// Staged local→remote copy, held while we ask the user whether to overwrite.
 #[derive(Debug, Clone)]
@@ -635,6 +658,9 @@ impl Ultimate64Browser {
             size: iced::Size::new(1200.0, 800.0),
             min_size: Some(iced::Size::new(800.0, 600.0)),
             icon: icon,
+            // Intercept close so we can warn when a transfer is in flight.
+            // See [`Message::WindowCloseRequested`].
+            exit_on_close_request: false,
             ..Default::default()
         });
 
@@ -686,6 +712,8 @@ impl Ultimate64Browser {
             discovered_devices: Vec::new(),
             copy_progress: Arc::new(std::sync::Mutex::new(None)),
             pending_copy: None,
+            toast: None,
+            pending_close: None,
         };
         app.video_streaming
             .set_stream_control_method(settings.connection.stream_control_method);
@@ -1932,6 +1960,7 @@ impl Ultimate64Browser {
                 }
                 match result {
                     Ok(msg) => {
+                        self.show_toast(msg.clone());
                         self.user_message = Some(UserMessage::Info(msg));
                         // Clear checked files after successful copy
                         self.left_browser.clear_checked();
@@ -2523,6 +2552,10 @@ impl Ultimate64Browser {
                     self.show_help = false;
                     return Task::none();
                 }
+                if self.pending_close.is_some() {
+                    self.pending_close = None;
+                    return Task::none();
+                }
                 if self.pending_eject_confirm {
                     self.pending_eject_confirm = false;
                     return Task::none();
@@ -2578,6 +2611,31 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            Message::WindowCloseRequested(id) => {
+                // Streaming window — close it without prompting; only the
+                // main window holds in-flight transfers that we'd hate to
+                // lose.
+                if self.streaming_window_id == Some(id) {
+                    return iced::window::close(id);
+                }
+                if self.main_window_id == Some(id) && self.is_transfer_in_flight() {
+                    self.pending_close = Some(id);
+                    Task::none()
+                } else {
+                    iced::window::close(id)
+                }
+            }
+            Message::ConfirmCloseWindow => {
+                if let Some(id) = self.pending_close.take() {
+                    iced::window::close(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CancelCloseWindow => {
+                self.pending_close = None;
+                Task::none()
+            }
             Message::WindowClosed(id) => {
                 if self.streaming_window_id == Some(id) {
                     // Streaming window was closed
@@ -2778,6 +2836,10 @@ impl Ultimate64Browser {
             Message::DropCompleted(result) => {
                 self.drop_in_flight = false;
                 self.drop_handle = None;
+                match &result {
+                    Ok(msg) => self.show_toast(msg.clone()),
+                    Err(_) => {}
+                }
                 self.user_message = Some(match result {
                     Ok(msg) => UserMessage::Info(msg),
                     Err(e) => UserMessage::Error(e),
@@ -2802,6 +2864,15 @@ impl Ultimate64Browser {
             }
 
             Message::Nop => Task::none(),
+
+            Message::ToastTick => {
+                if let Some((_, shown_at)) = &self.toast {
+                    if shown_at.elapsed() >= std::time::Duration::from_secs(TOAST_DURATION_SECS) {
+                        self.toast = None;
+                    }
+                }
+                Task::none()
+            }
 
             Message::EjectAllDrives => {
                 // Click on the toolbar button arms the confirmation modal —
@@ -2842,6 +2913,9 @@ impl Ultimate64Browser {
                 )
             }
             Message::EjectCompleted(result) => {
+                if let Ok(msg) = &result {
+                    self.show_toast(msg.clone());
+                }
                 self.user_message = Some(match result {
                     Ok(msg) => UserMessage::Info(msg),
                     Err(e) => UserMessage::Error(e),
@@ -2856,6 +2930,14 @@ impl Ultimate64Browser {
                     self.user_message = Some(UserMessage::Info("Nothing to re-run yet".into()));
                     return Task::none();
                 };
+                if !last.path().exists() {
+                    self.user_message = Some(UserMessage::Error(format!(
+                        "Run-last target no longer exists: {}",
+                        last.path().display()
+                    )));
+                    self.left_browser.clear_last_run();
+                    return Task::none();
+                }
                 let msg = match last {
                     file_browser::LastRun::Prg(p) | file_browser::LastRun::Crt(p) => {
                         FileBrowserMessage::LoadAndRun(p)
@@ -3196,6 +3278,12 @@ impl Ultimate64Browser {
             return self.view_eject_confirm_dialog();
         }
 
+        // Close-window confirmation — only shows when the user tried to
+        // close mid-transfer.
+        if self.pending_close.is_some() {
+            return self.view_close_confirm_dialog();
+        }
+
         // Help overlay (`?` keypress) — global cheatsheet, takes
         // precedence over the normal tab view so the user can pop it
         // open from anywhere.
@@ -3300,9 +3388,43 @@ impl Ultimate64Browser {
         ]
         .spacing(0);
 
-        container(main_content)
+        let body: Element<'_, Message> = container(main_content)
             .width(Length::Fill)
             .height(Length::Fill)
+            .into();
+
+        // Layer a transient toast on top when one is active.
+        if let Some((msg, _)) = &self.toast {
+            iced::widget::stack![body, self.view_toast(msg)].into()
+        } else {
+            body
+        }
+    }
+
+    /// Bottom-centered banner used by [`show_toast`]. Pointer-transparent
+    /// (no `on_press`), so clicks still reach the underlying UI.
+    fn view_toast<'a>(&self, message: &'a str) -> Element<'a, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let banner = container(text(message).size(fs.normal))
+            .padding([10, 20])
+            .style(|theme: &Theme| {
+                let palette = theme.extended_palette();
+                container::Style {
+                    background: Some(palette.success.base.color.into()),
+                    text_color: Some(palette.success.base.text),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            });
+        container(banner)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(iced::Padding::ZERO.bottom(40))
+            .center_x(Length::Fill)
+            .align_y(iced::alignment::Vertical::Bottom)
             .into()
     }
     fn subscription(&self) -> Subscription<Message> {
@@ -3433,6 +3555,9 @@ impl Ultimate64Browser {
         // Window-level event listener: streaming-window close + OS file drops.
         let window_events = iced::event::listen_with(|event, _status, id| match event {
             iced::Event::Window(iced::window::Event::Closed) => Some(Message::WindowClosed(id)),
+            iced::Event::Window(iced::window::Event::CloseRequested) => {
+                Some(Message::WindowCloseRequested(id))
+            }
             iced::Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
             }
@@ -3483,6 +3608,12 @@ impl Ultimate64Browser {
             }
         };
 
+        let toast_tick = if self.toast.is_some() {
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::ToastTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
@@ -3495,6 +3626,7 @@ impl Ultimate64Browser {
             window_events,
             status_check,
             copy_progress_tick,
+            toast_tick,
         ])
     }
 
@@ -3522,6 +3654,28 @@ impl Ultimate64Browser {
     ///   Memory / Assembly64 doesn't poison the local browser's state),
     /// - the active pane is Right (remote-side keyboard nav not wired —
     ///   different message enum, slower I/O on activate).
+    /// Show a transient banner at the bottom of the window. Subscription
+    /// ticks every 500ms while one is active and clears it after 4s.
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some((message.into(), std::time::Instant::now()));
+    }
+
+    /// True when any long-running transfer is in flight — used to gate the
+    /// window-close confirmation. BASIC send isn't included: it's fast and
+    /// already has its own Cancel button.
+    fn is_transfer_in_flight(&self) -> bool {
+        let copy_in_progress = self
+            .copy_progress
+            .lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        self.drop_in_flight
+            || self.remote_browser.is_transferring()
+            || self.assembly64_browser.is_busy()
+            || copy_in_progress
+    }
+
     fn dispatch_local_pane_message(&mut self, msg: FileBrowserMessage) -> Task<Message> {
         if self.active_tab != Tab::DualPaneBrowser {
             return Task::none();
@@ -3697,14 +3851,12 @@ impl Ultimate64Browser {
         // Button widgets capture their own clicks already, so this only
         // affects "dead" space inside the dialog.
         iced::widget::mouse_area(
-            container(
-                iced::widget::mouse_area(dialog).on_press(Message::Nop),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .padding(20),
+            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .padding(20),
         )
         .on_press(Message::DropCancel)
         .into()
@@ -3753,16 +3905,69 @@ impl Ultimate64Browser {
         .width(Length::Fixed(380.0));
 
         iced::widget::mouse_area(
-            container(
-                iced::widget::mouse_area(dialog).on_press(Message::Nop),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .padding(20),
+            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .padding(20),
         )
         .on_press(Message::EjectCancel)
+        .into()
+    }
+
+    /// "Really close?" prompt shown when the user tried to quit while a
+    /// transfer was in flight. Same overlay pattern as the other modals so
+    /// click-outside cancels.
+    fn view_close_confirm_dialog(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+
+        let dialog = container(
+            column![
+                text("Quit while transfer is in progress?").size(fs.large),
+                text("A file transfer or download hasn't finished yet. Closing now will abort it; partial files may be left behind.")
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
+                Space::new().height(12),
+                column![
+                    button(text("Quit anyway").size(fs.normal))
+                        .on_press(Message::ConfirmCloseWindow)
+                        .padding([6, 14])
+                        .width(Length::Fill)
+                        .style(iced::widget::button::danger),
+                    button(text("Keep working").size(fs.normal))
+                        .on_press(Message::CancelCloseWindow)
+                        .padding([6, 14])
+                        .width(Length::Fill)
+                        .style(iced::widget::button::text),
+                ]
+                .spacing(8),
+            ]
+            .spacing(6)
+            .padding(20),
+        )
+        .style(|_theme| container::Style {
+            background: Some(iced::Background::Color(iced::Color::from_rgba(
+                0.18, 0.20, 0.28, 0.98,
+            ))),
+            border: iced::Border {
+                color: iced::Color::from_rgba(0.85, 0.4, 0.4, 0.7),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .width(Length::Fixed(420.0));
+
+        iced::widget::mouse_area(
+            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .padding(20),
+        )
+        .on_press(Message::CancelCloseWindow)
         .into()
     }
 
