@@ -19,19 +19,25 @@ WINDOWS_OUT  := $(DIST_DIR)/$(APP_NAME)-Win.exe
 # --- Targets ---
 WINDOWS_TARGET := x86_64-pc-windows-msvc
 
-.PHONY: all linux macos macos_dist windows dist clean version help
+.PHONY: all linux linux_docker linux_docker_image macos macos_dist windows dist clean version help
+
+# Docker image tag for the reproducible Linux build environment.
+LINUX_BUILD_IMAGE := u64m-linux-build
 
 all: help
 
 help:
 	@echo "Ultimate64 Manager v$(VERSION) - Build targets:"
 	@echo ""
-	@echo "  make linux      - Build Linux AppImage"
-	@echo "  make macos      - Build macOS app bundle (unsigned)"
-	@echo "  make macos_dist - Build, codesign & notarize macOS app"
-	@echo "  make windows    - Build Windows executable"
-	@echo "  make clean      - Remove build artifacts"
-	@echo "  make version    - Show version"
+	@echo "  make linux              - Build Linux AppImage on the host"
+	@echo "  make linux_docker       - Build Linux AppImage in Ubuntu 20.04 container"
+	@echo "                            (glibc 2.31, runs on Ubuntu 20.04+/Debian 11+)"
+	@echo "  make linux_docker_image - (Re)build the Linux build container image"
+	@echo "  make macos              - Build macOS app bundle (unsigned)"
+	@echo "  make macos_dist         - Build, codesign & notarize macOS app"
+	@echo "  make windows            - Build Windows executable"
+	@echo "  make clean              - Remove build artifacts"
+	@echo "  make version            - Show version"
 	@echo ""
 	@echo "Output files:"
 	@echo "  $(LINUX_OUT)"
@@ -63,6 +69,34 @@ linux: dist
 		cp target/release/ultimate64-manager "$(LINUX_OUT)"; \
 	fi
 	@echo "Created: $(LINUX_OUT)"
+
+# --- Linux AppImage (Docker, glibc 2.31 / Ubuntu 20.04 base) ---
+# Produces an AppImage that runs on Ubuntu 20.04+, Debian 11+, Fedora 33+,
+# etc. Building on a newer host links against newer glibc (e.g. 2.38) which
+# breaks compatibility — Docker pins the build to the oldest supported glibc.
+#
+# The container's target dir is kept separate (`target-linux`) so it
+# coexists peacefully with native macOS/Linux builds in `target/`.
+linux_docker_image:
+	@echo "Building Linux build container image: $(LINUX_BUILD_IMAGE)"
+	docker build --platform=linux/amd64 \
+		-f Dockerfile.linux-build \
+		-t $(LINUX_BUILD_IMAGE) .
+
+linux_docker: dist
+	@if ! command -v docker >/dev/null 2>&1; then \
+		echo "ERROR: docker not found in PATH"; exit 1; \
+	fi
+	@if ! docker image inspect $(LINUX_BUILD_IMAGE) >/dev/null 2>&1; then \
+		echo "Image $(LINUX_BUILD_IMAGE) not found — building it now..."; \
+		$(MAKE) linux_docker_image; \
+	fi
+	@echo "Building Linux AppImage in container (glibc 2.31)..."
+	docker run --rm --platform=linux/amd64 \
+		-v "$(CURDIR)":/src \
+		-e CARGO_TARGET_DIR=/src/target-linux \
+		$(LINUX_BUILD_IMAGE) \
+		bash tools/build-appimage.sh $(LINUX_OUT)
 
 # --- macOS App Bundle (unsigned) ---
 macos: dist
