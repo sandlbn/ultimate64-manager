@@ -40,6 +40,37 @@ mkdir -p AppDir/usr/bin \
 cp "$BIN" AppDir/usr/bin/ultimate64-manager
 strip AppDir/usr/bin/ultimate64-manager || true
 
+echo "==> bundling shared libraries (ldd)"
+mkdir -p AppDir/usr/lib
+
+# Libraries that MUST come from the host system, not bundled. Bundling these
+# either breaks ABI compat with the host's kernel/glibc (the glibc family,
+# gcc runtime) or breaks rendering (the GL/X11 base — bundled copies
+# wouldn't match the user's installed Mesa/Nvidia driver).
+EXCLUDE_LIBS="
+    ld-linux.so.2 ld-linux-x86-64.so.2
+    libc.so.6 libdl.so.2 libm.so.6 libpthread.so.0 librt.so.1
+    libutil.so.1 libnsl.so.1 libresolv.so.2 libcrypt.so.1
+    libgcc_s.so.1 libstdc++.so.6
+    libGL.so.1 libEGL.so.1 libGLX.so.0 libGLdispatch.so.0 libOpenGL.so.0
+    libdrm.so.2 libgbm.so.1
+    libX11.so.6 libxcb.so.1 libXext.so.6
+"
+
+bundled_count=0
+while IFS= read -r line; do
+    libname=$(awk '{print $1}' <<<"$line")
+    libpath=$(awk '{print $3}' <<<"$line")
+    [[ -z "$libpath" || ! -f "$libpath" ]] && continue
+    case " $EXCLUDE_LIBS " in
+        *" $libname "*) continue ;;
+    esac
+    cp -L "$libpath" AppDir/usr/lib/
+    bundled_count=$((bundled_count + 1))
+done < <(ldd AppDir/usr/bin/ultimate64-manager | grep '=>')
+
+echo "  bundled $bundled_count libraries"
+
 cp ultimate64-manager.desktop AppDir/
 cp ultimate64-manager.desktop AppDir/usr/share/applications/
 cp assets/icon.png AppDir/ultimate64-manager.png
@@ -50,6 +81,7 @@ cat > AppDir/AppRun <<'APPRUN'
 #!/bin/sh
 HERE="$(dirname "$(readlink -f "${0}")")"
 export PATH="${HERE}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
 exec "${HERE}/usr/bin/ultimate64-manager" "$@"
 APPRUN
 chmod +x AppDir/AppRun
@@ -57,8 +89,12 @@ chmod +x AppDir/AppRun
 echo "==> mksquashfs payload"
 PAYLOAD=$(mktemp --suffix=.squashfs)
 trap 'rm -f "$PAYLOAD"' EXIT
+# NOTE: -comp must be zstd or gzip — the AppImage type-2 runtime
+# bundles only those two decompressors. xz produces a smaller payload
+# but the runtime errors out with "this version supports only zlib,
+# zstd" when users try to launch it.
 mksquashfs AppDir "$PAYLOAD" \
-    -root-owned -noappend -comp xz -no-progress >/dev/null
+    -root-owned -noappend -comp zstd -Xcompression-level 19 -no-progress >/dev/null
 
 echo "==> writing $OUT"
 mkdir -p "$(dirname "$OUT")"
