@@ -578,3 +578,203 @@ pub async fn upload_runner_async(
     }
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────
+//  Drive control (mode / power / reset). `host` includes the scheme,
+//  e.g. "http://10.0.0.139"; `drive` is "a" or "b".
+// ─────────────────────────────────────────────────────────────────
+
+/// Switch a drive's emulated hardware type live.
+/// `mode` is one of "1541", "1571", "1581".
+/// PUT /v1/drives/<drive>:set_mode?mode=<mode>
+pub async fn set_drive_mode_async(
+    host: &str,
+    drive: &str,
+    mode: &str,
+    password: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}/v1/drives/{}:set_mode", host, drive);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req = crate::net_utils::with_password(client.put(&url).query(&[("mode", mode)]), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Drive {} set mode: {}", drive.to_uppercase(), e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Drive {} set mode: HTTP {}",
+            drive.to_uppercase(),
+            resp.status()
+        ));
+    }
+    Ok(format!("Drive {} → {}", drive.to_uppercase(), mode))
+}
+
+/// Power a drive on or off.
+/// PUT /v1/drives/<drive>:on | :off
+pub async fn drive_power_async(
+    host: &str,
+    drive: &str,
+    on: bool,
+    password: Option<&str>,
+) -> Result<String, String> {
+    let action = if on { "on" } else { "off" };
+    let url = format!("{}/v1/drives/{}:{}", host, drive, action);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req = crate::net_utils::with_password(client.put(&url), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Drive {} power {}: {}", drive.to_uppercase(), action, e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Drive {} power {}: HTTP {}",
+            drive.to_uppercase(),
+            action,
+            resp.status()
+        ));
+    }
+    Ok(format!("Drive {} powered {}", drive.to_uppercase(), action))
+}
+
+/// Reset a drive.
+/// PUT /v1/drives/<drive>:reset
+pub async fn drive_reset_async(
+    host: &str,
+    drive: &str,
+    password: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}/v1/drives/{}:reset", host, drive);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req = crate::net_utils::with_password(client.put(&url), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("Drive {} reset: {}", drive.to_uppercase(), e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Drive {} reset: HTTP {}",
+            drive.to_uppercase(),
+            resp.status()
+        ));
+    }
+    Ok(format!("Drive {} reset", drive.to_uppercase()))
+}
+
+/// Load a PRG into C64 memory *without* running it.
+/// PUT /v1/runners:load_prg?file=<path>
+pub async fn load_prg_async(
+    host: &str,
+    file_path: &str,
+    password: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}/v1/runners:load_prg", host);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req =
+        crate::net_utils::with_password(client.put(&url).query(&[("file", file_path)]), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("load_prg failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("load_prg HTTP {}", resp.status()));
+    }
+    let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+    Ok(format!("Loaded: {}", filename))
+}
+
+/// Read the debug register ($D7FF, U64 only).
+/// GET /v1/machine:debugreg  → body is the value (hex or decimal text).
+pub async fn read_debugreg_async(host: &str, password: Option<&str>) -> Result<u8, String> {
+    let url = format!("{}/v1/machine:debugreg", host);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let req = crate::net_utils::with_password(client.get(&url), password);
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("debugreg read: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("debugreg read HTTP {}", resp.status()));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("debugreg read body: {}", e))?;
+    parse_debugreg_value(&body)
+        .ok_or_else(|| format!("debugreg: could not parse value from '{}'", body.trim()))
+}
+
+/// Write the debug register ($D7FF, U64 only).
+/// PUT /v1/machine:debugreg?value=<hex>
+pub async fn write_debugreg_async(
+    host: &str,
+    value: u8,
+    password: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("{}/v1/machine:debugreg", host);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let value_str = format!("{:02x}", value);
+    let req = crate::net_utils::with_password(
+        client.put(&url).query(&[("value", value_str.as_str())]),
+        password,
+    );
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("debugreg write: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("debugreg write HTTP {}", resp.status()));
+    }
+    Ok(format!("Debug register = ${:02X}", value))
+}
+
+/// Parse a debug-register value returned by the device. Accepts a bare
+/// number, an optional `0x`/`$` hex prefix, or a JSON-ish `{"value": N}`
+/// fragment — returns the low byte.
+fn parse_debugreg_value(body: &str) -> Option<u8> {
+    let mut s = body.trim();
+    // Pull a value out of a trivial `"value": 123` shape if present.
+    if let Some(pos) = s.find(':') {
+        if s.contains('{') || s.contains("value") {
+            s = s[pos + 1..]
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != 'x' && c != '$');
+        }
+    }
+    let s = s.trim();
+    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("$")) {
+        u32::from_str_radix(hex.trim(), 16).ok()
+    } else {
+        // Try decimal first, then fall back to hex for bare hex like "ff".
+        s.parse::<u32>()
+            .ok()
+            .or_else(|| u32::from_str_radix(s, 16).ok())
+    };
+    parsed.map(|v| (v & 0xff) as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_debugreg_decimal() {
+        assert_eq!(parse_debugreg_value("255"), Some(255));
+        assert_eq!(parse_debugreg_value(" 16 "), Some(16));
+    }
+
+    #[test]
+    fn parse_debugreg_hex_prefixes() {
+        assert_eq!(parse_debugreg_value("0xff"), Some(0xff));
+        assert_eq!(parse_debugreg_value("$1A"), Some(0x1a));
+    }
+
+    #[test]
+    fn parse_debugreg_json_fragment() {
+        assert_eq!(parse_debugreg_value("{\"value\": 42}"), Some(42));
+    }
+
+    #[test]
+    fn parse_debugreg_rejects_garbage() {
+        assert_eq!(parse_debugreg_value("hello"), None);
+    }
+}

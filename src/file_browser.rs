@@ -84,6 +84,15 @@ pub enum FileBrowserMessage {
     CreateDirNameChanged(String),
     CreateDirConfirm,
     CreateDirCancel,
+    // Local rename (F2 on the local pane)
+    /// Open the rename dialog for a local path (name pre-filled)
+    RenameFile(PathBuf),
+    /// User is typing the new name
+    RenameInputChanged(String),
+    /// Execute the rename via std::fs::rename
+    RenameConfirm,
+    /// Dismiss the rename dialog
+    RenameCancel,
     // Favorites
     /// Toggle the *current* directory in/out of favorites (toolbar star).
     ToggleCurrentFavorite,
@@ -206,6 +215,14 @@ impl LastRun {
     }
 }
 
+/// State for the local file-rename dialog (F2 on the local pane).
+struct LocalRenamePending {
+    /// Full path of the file/folder being renamed
+    original_path: PathBuf,
+    /// Current value of the name text input
+    new_name: String,
+}
+
 pub struct FileBrowser {
     current_directory: PathBuf,
     files: Vec<FileEntry>,
@@ -240,6 +257,8 @@ pub struct FileBrowser {
     // Create directory dialog
     show_create_dir: bool,
     create_dir_name: String,
+    // Local rename dialog: Some(...) while the user is renaming a local file
+    rename_pending: Option<LocalRenamePending>,
     // Create disk image dialog
     show_create_disk: bool,
     create_disk_name: String,
@@ -302,6 +321,7 @@ impl FileBrowser {
             delete_pending: None,
             show_create_dir: false,
             create_dir_name: String::new(),
+            rename_pending: None,
             show_create_disk: false,
             create_disk_name: "NEWDISK".to_string(),
             create_disk_id: "01 2A".to_string(),
@@ -1074,6 +1094,77 @@ impl FileBrowser {
                 Task::none()
             }
 
+            // ── Local rename (F2) ────────────────────────────────────────
+            FileBrowserMessage::RenameFile(path) => {
+                let current_name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.rename_pending = Some(LocalRenamePending {
+                    original_path: path,
+                    new_name: current_name,
+                });
+                Task::none()
+            }
+            FileBrowserMessage::RenameInputChanged(value) => {
+                if let Some(ref mut rp) = self.rename_pending {
+                    rp.new_name = value;
+                }
+                Task::none()
+            }
+            FileBrowserMessage::RenameConfirm => {
+                let Some(rp) = self.rename_pending.take() else {
+                    return Task::none();
+                };
+                let new_name = rp.new_name.trim();
+                // Validate: non-empty, changed, and a bare filename (no separators)
+                if new_name.is_empty() {
+                    self.status_message = Some("Rename: name cannot be empty".to_string());
+                    return Task::none();
+                }
+                if new_name.contains('/') || new_name.contains('\\') {
+                    self.status_message =
+                        Some("Rename: name cannot contain path separators".to_string());
+                    return Task::none();
+                }
+                let old_name = rp
+                    .original_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                if new_name == old_name {
+                    // No change — silently close.
+                    return Task::none();
+                }
+                let parent = rp
+                    .original_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.current_directory.clone());
+                let new_path = parent.join(new_name);
+                if new_path.exists() {
+                    self.status_message = Some(format!("Rename: \"{}\" already exists", new_name));
+                    return Task::none();
+                }
+                match std::fs::rename(&rp.original_path, &new_path) {
+                    Ok(_) => {
+                        self.status_message = Some(format!("Renamed to: {}", new_name));
+                        // Keep the renamed entry selected after refresh.
+                        self.selected_file = Some(new_path);
+                        self.load_directory(&self.current_directory.clone());
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Rename error: {}", e));
+                    }
+                }
+                Task::none()
+            }
+            FileBrowserMessage::RenameCancel => {
+                self.rename_pending = None;
+                Task::none()
+            }
+
             // ── Favorites ────────────────────────────────────────────────
             FileBrowserMessage::ToggleCurrentFavorite => {
                 let current = self.current_directory.clone();
@@ -1756,6 +1847,60 @@ impl FileBrowser {
                             .style(button::secondary),
                         button(text("Cancel").size(fs.small))
                             .on_press(FileBrowserMessage::DeleteCancelled)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                    ]
+                    .spacing(10),
+                ]
+                .spacing(10)
+                .padding(15),
+            )
+            .style(crate::styles::subtle_tooltip)
+            .width(Length::Fill);
+
+            column![
+                self.build_nav_row(font_size),
+                self.build_quick_nav_row(font_size),
+                dialog,
+                self.build_status_bar(font_size),
+            ]
+            .spacing(2)
+            .padding(5)
+            .into()
+        } else if let Some(ref rp) = self.rename_pending {
+            // Local rename dialog
+            let original_name = rp
+                .original_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let dialog = container(
+                column![
+                    text("Rename").size(fs.normal),
+                    row![
+                        text("From:").size(fs.small),
+                        text(original_name).size(fs.small),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        text("To:").size(fs.small),
+                        iced::widget::text_input("new name...", &rp.new_name)
+                            .on_input(FileBrowserMessage::RenameInputChanged)
+                            .on_submit(FileBrowserMessage::RenameConfirm)
+                            .size(fs.small as f32)
+                            .padding(4)
+                            .width(Length::Fixed(240.0)),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center),
+                    row![
+                        button(text("Rename").size(fs.small))
+                            .on_press(FileBrowserMessage::RenameConfirm)
+                            .padding([5, 15])
+                            .style(button::secondary),
+                        button(text("Cancel").size(fs.small))
+                            .on_press(FileBrowserMessage::RenameCancel)
                             .padding([5, 15])
                             .style(button::secondary),
                     ]

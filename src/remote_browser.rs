@@ -33,6 +33,7 @@ pub enum RemoteBrowserMessage {
     UploadDirectoryComplete(Result<String, String>),
     // Runners - execute files on Ultimate64
     RunPrg(String),
+    LoadPrg(String),
     RunCrt(String),
     PlaySid(String),
     PlayMod(String),
@@ -518,6 +519,21 @@ impl RemoteBrowser {
                     let password = self.password.clone();
                     Task::perform(
                         async move { api::run_prg(&host, &path, password).await },
+                        RemoteBrowserMessage::RunnerComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Task::none()
+                }
+            }
+
+            RemoteBrowserMessage::LoadPrg(path) => {
+                if let Some(host) = &self.host_address {
+                    self.status_message = Some("Loading PRG...".to_string());
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    Task::perform(
+                        async move { api::load_prg_async(&host, &path, password.as_deref()).await },
                         RemoteBrowserMessage::RunnerComplete,
                     )
                 } else {
@@ -1759,15 +1775,27 @@ impl RemoteBrowser {
                 let action_button: Element<'_, RemoteBrowserMessage> = if entry.is_dir {
                     Space::new().width(0).into()
                 } else if ext.ends_with(".prg") {
-                    tooltip(
-                        button(text("Run").size(small))
-                            .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
-                            .padding([2, 8])
-                            .style(crate::styles::action_button),
-                        "Load and run PRG file",
-                        tooltip::Position::Top,
-                    )
-                    .style(crate::styles::subtle_tooltip)
+                    row![
+                        tooltip(
+                            button(text("Run").size(small))
+                                .on_press(RemoteBrowserMessage::RunPrg(entry.path.clone()))
+                                .padding([2, 8])
+                                .style(crate::styles::action_button),
+                            "Load and run PRG file",
+                            tooltip::Position::Top,
+                        )
+                        .style(crate::styles::subtle_tooltip),
+                        tooltip(
+                            button(text("Load").size(small))
+                                .on_press(RemoteBrowserMessage::LoadPrg(entry.path.clone()))
+                                .padding([2, 8])
+                                .style(crate::styles::nav_button),
+                            "Load PRG into memory without running",
+                            tooltip::Position::Top,
+                        )
+                        .style(crate::styles::subtle_tooltip),
+                    ]
+                    .spacing(4)
                     .into()
                 } else if ext.ends_with(".crt") {
                     tooltip(

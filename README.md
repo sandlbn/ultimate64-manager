@@ -22,7 +22,7 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Remote Directory Browser** – Browse the Ultimate filesystem without mounting disks
 - **Disk Image Viewer** – Display **D64/D71 directory contents** (C64-style listing)
 - **Disk Management** – Mount D64, D71, D81, G64, G71, G81 images to Drive A/B
-- **Run Programs** – Direct load and run for PRG, CRT, and SID files
+- **Run Programs** – Direct load and run for PRG, CRT, and SID files (PRG files also offer **Load** without running)
 - **Supported File Types** – D64, D71, D81, G64, G71, G81, PRG, P00, CRT, SID, MOD, XM, S3M, TAP, T64, REU, ROM, BIN, CFG, ZIP, and firmware updates (U2L, U2P, U2R, U64, UE2)
 - **Music Player** – Play SID and MOD files with playlist support
   - Shuffle and repeat modes
@@ -30,6 +30,8 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Song length database support (HVSC Songlengths.md5)
   - True pause/resume (freezes C64)
   - Configurable default song duration
+  - "Up Next" queue strip showing the next tracks in play order (honors shuffle)
+  - Import/export **M3U/PLS** playlists (relative paths resolved, duplicates skipped)
 - **Video Streaming** – Real-time VIC video with audio
   - Fullscreen mode (double-click or Opt+F / Alt+F)
   - Screenshot capture to Pictures folder
@@ -46,6 +48,11 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
 - **Remote Keyboard Input** – For BASIC only
+- **Device tab** – Low-level device capabilities in one place
+  - Live drive-type switching (1541 / 1571 / 1581), drive power on/off, and drive reset for Drive A/B
+  - Keyboard/text injection – feeds text into the KERNAL keyboard buffer (`$0277`) and presses RETURN. Works at the BASIC prompt and programs that read via the KERNAL (GETIN/CHRIN); **not** games that scan the keyboard matrix (`$DC00`) directly
+  - Debug register `$D7FF` read/write (U64 only)
+  - Debug bus-trace stream capture (U64 only) – records the cycle-accurate 6510/VIC/1541 stream to a raw `.bin` for the documented GtkWave/VCD converter
 - **Assembly64 Browser** – Search the Assembly64 API (aggregates CSDB, HVSC, c64.org, OneLoad64, Gamebase64 and more)
   - Filter by type, source, rating, recency, and sort order — no AQL knowledge required
   - Save named searches and star favorites for one-click recall
