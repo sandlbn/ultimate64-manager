@@ -1,0 +1,11 @@
+# Build the Windows (MSVC) target with a static C runtime so the resulting
+# ultimate64-manager.exe does not depend on the Visual C++ redistributable
+# (VCRUNTIME140.dll / MSVCP140.dll). This lets the Inno Setup installer ship a
+# single self-contained executable with nothing to install alongside it.
+#
+# Target-scoped on purpose: Linux and macOS builds are unaffected.
+# If `dumpbin /dependents target\release\ultimate64-manager.exe` still reports a
+# runtime DLL (a C++ `-sys` crate can force it), either bundle vc_redist.x64.exe
+# in the installer or investigate the offending crate.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

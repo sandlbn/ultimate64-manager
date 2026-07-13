@@ -1,0 +1,177 @@
+# Build, sign (via SignPath.io), and publish the Windows installer.
+#
+# Signing uses SignPath's cloud service — there is no local .pfx. For the free
+# SignPath Foundation (OSS) certificate, ALL build steps must run on
+# GitHub-hosted runners (no self-hosted / local builds), which is why release
+# signing lives here rather than in windows/build_installer.ps1. That script is
+# still used for local UNSIGNED / self-signed dev testing.
+#
+# ── One-time setup after you are approved by SignPath ───────────────────────
+#   Repo secret:    SIGNPATH_API_TOKEN          (SignPath REST API user token)
+#   Repo variable:  SIGNPATH_ORGANIZATION_ID    (your SignPath organization id)
+# In the SignPath portal, create a project + signing policy + two artifact
+# configurations, then match the slugs below:
+#   project-slug:                 ultimate64-manager
+#   signing-policy-slug:          release-signing
+#   artifact-configuration-slug:  windows-exe  /  windows-installer
+# Adjust the literals below if you pick different slugs.
+#
+# Triggers:
+#   - Every push to `main` (i.e. every PR merge). Builds + uploads the
+#     installer as a downloadable workflow artifact. No GitHub Release is
+#     published — only tag pushes do that (see the last step's `if:`).
+#   - Push of a version tag (e.g. `git tag v0.4.6 && git push --tags`) —
+#     builds, signs (if configured), and attaches the installer to the
+#     auto-created GitHub Release.
+#   - Manual run from the Actions tab.
+#   - PRs that touch packaging files — same build + artifact, no release.
+#
+# The installer filename ends in "-Win.exe" so the in-app updater
+# (src/version_check.rs, which matches an asset name ending in "Win.exe")
+# finds it — no other changes needed.
+
+name: Windows Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-release.yml'
+      - 'windows/**'
+      - '.cargo/config.toml'
+      - 'build.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: write   # create the GitHub Release + upload the installer asset
+  actions: read     # let the SignPath action read this run's job/artifact metadata
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    # 'true' only when both the token and org id are present. Referenced as
+    # env.DO_SIGN in step `if:` guards so the signing steps skip cleanly
+    # (green) when SignPath isn't configured yet.
+    env:
+      DO_SIGN: ${{ secrets.SIGNPATH_API_TOKEN != '' && vars.SIGNPATH_ORGANIZATION_ID != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Read version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $v = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $v) { throw "Could not read version from Cargo.toml" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "Ultimate64 Manager version $v"
+
+      # Static-CRT build (see .cargo/config.toml) -> self-contained exe
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Signing status
+        if: env.DO_SIGN != 'true'
+        run: echo "::warning::SignPath not configured (SIGNPATH_API_TOKEN / SIGNPATH_ORGANIZATION_ID missing) — building an UNSIGNED installer. Signing is skipped; tag pushes still publish the (unsigned) installer to the Release."
+
+      # ── Sign ultimate64-manager.exe via SignPath (sign the app binary first,
+      #    so the exe that ends up inside the installer is itself signed) ──────
+      - name: Upload unsigned exe
+        id: upload_exe
+        if: env.DO_SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultimate64-manager-exe-unsigned
+          path: target/release/ultimate64-manager.exe
+          if-no-files-found: error
+
+      - name: Sign exe (SignPath)
+        if: env.DO_SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ultimate64-manager
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-exe
+          github-artifact-id: ${{ steps.upload_exe.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          output-artifact-directory: signed/exe
+
+      - name: Swap in the signed exe
+        if: env.DO_SIGN == 'true'
+        shell: pwsh
+        run: Copy-Item signed/exe/ultimate64-manager.exe target/release/ultimate64-manager.exe -Force
+
+      # ── Build the installer around the (signed, if enabled) exe ──────────
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=${{ steps.version.outputs.version }}" `
+            windows\ultimate64-manager.iss
+
+      # ── Sign the installer via SignPath, then overwrite dist\ in place so
+      #    dist\...-Win.exe is always the final artifact (signed or not) ──────
+      - name: Upload unsigned installer
+        id: upload_installer
+        if: env.DO_SIGN == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultimate64-manager-installer-unsigned
+          path: dist/Ultimate64Manager-${{ steps.version.outputs.version }}-Win.exe
+          if-no-files-found: error
+
+      - name: Sign installer (SignPath)
+        if: env.DO_SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ultimate64-manager
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.upload_installer.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          output-artifact-directory: signed/installer
+
+      - name: Promote signed installer into dist
+        if: env.DO_SIGN == 'true'
+        shell: pwsh
+        run: Copy-Item "signed/installer/Ultimate64Manager-${{ steps.version.outputs.version }}-Win.exe" "dist/Ultimate64Manager-${{ steps.version.outputs.version }}-Win.exe" -Force
+
+      # Always publish the installer as a downloadable workflow artifact — this
+      # is what you grab to test the installer on a branch/PR run. It is signed
+      # when DO_SIGN is true, unsigned otherwise.
+      - name: Upload installer (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ultimate64-manager-windows-installer
+          path: dist/Ultimate64Manager-${{ steps.version.outputs.version }}-Win.exe
+          if-no-files-found: error
+
+      # ── Publish to a GitHub Release on tag pushes. The asset name ends in
+      #    "Win.exe", which the in-app updater (src/version_check.rs) matches.
+      #    Published whether or not signing is configured, so releases work
+      #    even before SignPath is set up. ──────────────────────────────────
+      - name: Attach installer to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Ultimate64Manager-${{ steps.version.outputs.version }}-Win.exe
+          fail_on_unmatched_files: true
