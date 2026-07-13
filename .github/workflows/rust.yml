@@ -22,3 +22,21 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
+  windows:
+    # Build + test on Windows for every push/PR so breakage on the MSVC
+    # target (static CRT, winres icon embedding, path handling) is caught
+    # before release time. Audio uses WASAPI on Windows, so no extra system
+    # deps are needed.
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v7
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache cargo build
+      uses: Swatinem/rust-cache@v2
+    - name: Build
+      run: cargo build --verbose
+    - name: Run tests
+      run: cargo test --verbose
