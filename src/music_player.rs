@@ -92,6 +92,12 @@ pub enum MusicPlayerMessage {
     PlaylistSaved(Result<String, String>),
     PlaylistLoaded(Result<Vec<PlaylistEntry>, String>),
     PlaylistNameChanged(String),
+    // Playlist import/export (M3U/PLS)
+    ImportM3U,
+    ImportPLS,
+    ExportM3U,
+    /// Resolved music-file paths from an M3U/PLS import — appended (deduped)
+    PlaylistImported(Result<Vec<PathBuf>, String>),
 
     // Song length database
     DownloadSongLengths,
@@ -854,6 +860,48 @@ impl MusicPlayer {
                 Task::none()
             }
 
+            MusicPlayerMessage::ImportM3U => Task::perform(
+                music_ops::import_m3u_async(),
+                MusicPlayerMessage::PlaylistImported,
+            ),
+
+            MusicPlayerMessage::ImportPLS => Task::perform(
+                music_ops::import_pls_async(),
+                MusicPlayerMessage::PlaylistImported,
+            ),
+
+            MusicPlayerMessage::ExportM3U => {
+                let playlist = SavedPlaylist {
+                    name: self.playlist_name.clone(),
+                    entries: self.playlist.clone(),
+                };
+                let default_duration = self.default_song_duration;
+                Task::perform(
+                    music_ops::export_m3u_async(playlist, default_duration),
+                    MusicPlayerMessage::PlaylistSaved,
+                )
+            }
+
+            MusicPlayerMessage::PlaylistImported(result) => {
+                match result {
+                    Ok(paths) => {
+                        let (added, skipped) = self.append_music_paths(paths);
+                        self.status_message = if skipped > 0 {
+                            format!(
+                                "Imported {} track(s), {} duplicate(s) skipped",
+                                added, skipped
+                            )
+                        } else {
+                            format!("Imported {} track(s)", added)
+                        };
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Import failed: {}", e);
+                    }
+                }
+                Task::none()
+            }
+
             // === Song Length Database ===
             MusicPlayerMessage::DownloadSongLengths => {
                 self.song_lengths_status = "Downloading song lengths database...".to_string();
@@ -1365,6 +1413,26 @@ impl MusicPlayer {
             );
         }
 
+        // "Up Next" strip — shows the next few tracks in true play order
+        // (honors shuffle + repeat). Each is clickable to jump straight to it.
+        let upcoming = self.upcoming_indices(3);
+        if !upcoming.is_empty() {
+            let mut up_next = row![text("Up Next:")
+                .size(fs.small)
+                .color(iced::Color::from_rgb(0.6, 0.7, 0.8))]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+            for idx in upcoming {
+                up_next = up_next.push(
+                    button(text(self.short_track_label(idx)).size(fs.small))
+                        .on_press(MusicPlayerMessage::PlaylistItemDoubleClick(idx))
+                        .padding([2, 6])
+                        .style(crate::styles::nav_button),
+                );
+            }
+            top_bar_items.push(up_next.into());
+        }
+
         top_bar_items.push(
             row![transport, Space::new().width(20), modes]
                 .align_y(iced::Alignment::Center)
@@ -1693,6 +1761,36 @@ impl MusicPlayer {
                     .style(crate::styles::subtle_tooltip),
                 ]
                 .spacing(5),
+                row![
+                    tooltip(
+                        button(text("+M3U").size(fs.small))
+                            .on_press(MusicPlayerMessage::ImportM3U)
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
+                        "Import an M3U/M3U8 playlist (appended, duplicates skipped)",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(crate::styles::subtle_tooltip),
+                    tooltip(
+                        button(text("+PLS").size(fs.small))
+                            .on_press(MusicPlayerMessage::ImportPLS)
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
+                        "Import a PLS playlist (appended, duplicates skipped)",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(crate::styles::subtle_tooltip),
+                    tooltip(
+                        button(text("→M3U").size(fs.small))
+                            .on_press(MusicPlayerMessage::ExportM3U)
+                            .padding([3, 6])
+                            .style(crate::styles::nav_button),
+                        "Export the playlist as an extended M3U file",
+                        tooltip::Position::Bottom,
+                    )
+                    .style(crate::styles::subtle_tooltip),
+                ]
+                .spacing(5),
                 text(format!(
                     "{} tracks | Total: {}",
                     self.playlist.len(),
@@ -1961,6 +2059,39 @@ impl MusicPlayer {
 
     // Helper methods
 
+    /// Append imported music-file paths to the playlist, building full
+    /// entries via `create_playlist_entry` and skipping duplicates (same
+    /// path already present). Returns (added, skipped_as_duplicate).
+    fn append_music_paths(&mut self, paths: Vec<PathBuf>) -> (usize, usize) {
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for path in paths {
+            if self.playlist.iter().any(|e| e.path == path) {
+                skipped += 1;
+                continue;
+            }
+            let Some(file_type) = music_type_from_path(&path) else {
+                skipped += 1;
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let browser_entry = BrowserEntry {
+                path,
+                name,
+                entry_type: BrowserEntryType::MusicFile(file_type.clone()),
+                subsongs: 1,
+                sid_tooltip: None,
+            };
+            let entry = self.create_playlist_entry(&browser_entry, file_type);
+            self.playlist.push(entry);
+            added += 1;
+        }
+        (added, skipped)
+    }
+
     fn create_playlist_entry(
         &self,
         browser_entry: &BrowserEntry,
@@ -2143,6 +2274,66 @@ impl MusicPlayer {
         );
     }
 
+    /// Return up to `n` playlist indices that will play *after* the current
+    /// track, in true play order — honoring shuffle order and repeat
+    /// wrap-around. Drives the "Up Next" strip in the view.
+    fn upcoming_indices(&self, n: usize) -> Vec<usize> {
+        if self.playlist.is_empty() || n == 0 {
+            return Vec::new();
+        }
+        // Traversal order matches next_track(): shuffle_order when shuffling,
+        // otherwise sequential 0..len.
+        let order: Vec<usize> = if self.shuffle_enabled && !self.shuffle_order.is_empty() {
+            self.shuffle_order.clone()
+        } else {
+            (0..self.playlist.len()).collect()
+        };
+        let len = order.len();
+        // Position just after the current track within `order`.
+        let start_pos = match self.current_playing {
+            Some(cur) => order
+                .iter()
+                .position(|&x| x == cur)
+                .map(|p| p + 1)
+                .unwrap_or(0),
+            None => 0,
+        };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while out.len() < n && i < len {
+            let pos = start_pos + i;
+            if !self.repeat_enabled && pos >= len {
+                break; // no wrap when repeat is off
+            }
+            let entry = order[pos % len];
+            // Skip the current track itself (can recur when wrapping under repeat).
+            if Some(entry) != self.current_playing {
+                out.push(entry);
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Compact display label for a playlist entry (name or filename,
+    /// truncated) — used by the "Up Next" strip.
+    fn short_track_label(&self, idx: usize) -> String {
+        match self.playlist.get(idx) {
+            Some(e) => {
+                let n = if e.name.is_empty() {
+                    e.path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                } else {
+                    e.name.clone()
+                };
+                truncate_string(&n, 18)
+            }
+            None => String::new(),
+        }
+    }
+
     fn next_track(&mut self) {
         if self.playlist.is_empty() {
             self.current_playing = None;
@@ -2284,6 +2475,21 @@ fn search_files_recursive(root: &Path, query: &str) -> Vec<BrowserEntry> {
 }
 
 // === Helper Functions ===
+
+/// Map a file path's extension to a playable `MusicFileType`, if any.
+fn music_type_from_path(path: &Path) -> Option<MusicFileType> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
+        Some("sid") => Some(MusicFileType::Sid),
+        Some("mod") => Some(MusicFileType::Mod),
+        Some("prg") => Some(MusicFileType::Prg),
+        _ => None,
+    }
+}
 
 fn truncate_string(s: &str, max_len: usize) -> String {
     crate::string_utils::truncate_string(s, max_len)

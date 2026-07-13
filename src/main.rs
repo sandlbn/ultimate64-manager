@@ -98,6 +98,7 @@ mod config_api;
 mod config_editor;
 mod config_presets;
 mod csdb_screenshots;
+mod debug_stream;
 mod device_profile;
 mod dir_preview;
 mod discovery;
@@ -331,6 +332,36 @@ pub enum Message {
     PoweroffMachine,
     MenuButton,
     MachineCommandCompleted(Result<String, String>),
+    // ── DEVICE tab: drive control / keyboard / debug register ────────
+    /// Switch a drive's emulated type. (drive "a"|"b", mode "1541"|"1571"|"1581")
+    DeviceSetDriveMode(String, String),
+    /// Power a drive on (true) or off (false). (drive, on)
+    DeviceDrivePower(String, bool),
+    /// Reset a drive. (drive)
+    DeviceDriveReset(String),
+    /// Text field for keyboard injection.
+    DeviceKeyboardInputChanged(String),
+    /// Send the buffered text into the running C64 keyboard buffer.
+    DeviceSendKeys,
+    /// Debug-register write-value text field (hex).
+    DeviceDebugRegInputChanged(String),
+    /// Read the debug register ($D7FF).
+    DeviceReadDebugReg,
+    /// Result of a debug-register read.
+    DeviceDebugRegRead(Result<u8, String>),
+    /// Write the debug register with the buffered value.
+    DeviceWriteDebugReg,
+    // ── DEVICE tab: debug bus-trace stream capture ───────────────────
+    /// Start capturing the debug bus-trace stream.
+    DeviceDebugStreamStart,
+    /// Stop the debug-stream capture.
+    DeviceDebugStreamStop,
+    /// Timer tick to refresh capture counters while active.
+    DeviceDebugStreamTick,
+    /// Save the captured debug stream to a file.
+    DeviceDebugStreamSave,
+    /// Result of a debug-stream save.
+    DeviceDebugStreamSaved(Result<String, String>),
     /// Sink for events we explicitly want to absorb without doing anything
     /// (e.g. clicks on a modal dialog's body so they don't bubble to the
     /// backdrop's dismiss handler).
@@ -494,6 +525,7 @@ pub enum Tab {
     Profiles,
     Assembly64,
     BasicEditor,
+    Device,
     Settings,
 }
 
@@ -509,6 +541,7 @@ impl std::fmt::Display for Tab {
             Tab::Profiles => write!(f, "Profiles"),
             Tab::Assembly64 => write!(f, "Assembly64"),
             Tab::BasicEditor => write!(f, "BASIC"),
+            Tab::Device => write!(f, "Device"),
             Tab::Settings => write!(f, "Settings"),
         }
     }
@@ -551,6 +584,14 @@ pub struct Ultimate64Browser {
     connection: Option<Arc<TokioMutex<Rest>>>,
     host_url: Option<String>, // Store host URL for direct HTTP requests
     status: StatusInfo,
+    /// DEVICE tab: buffered text to inject into the running C64 keyboard.
+    device_keyboard_input: String,
+    /// DEVICE tab: input for the debug-register write value (hex).
+    device_debugreg_input: String,
+    /// DEVICE tab: last value read from the debug register ($D7FF).
+    device_debugreg_value: Option<u8>,
+    /// DEVICE tab: raw debug bus-trace stream capture engine.
+    debug_stream: debug_stream::DebugStreamCapture,
     /// Count of back-to-back failed status polls. We only flip the UI to
     /// "Not connected" once it crosses [`MAX_TRANSIENT_STATUS_FAILURES`],
     /// so a 2-3 second reboot blip doesn't show as a disconnect.
@@ -683,6 +724,10 @@ impl Ultimate64Browser {
             font_size_input: settings.preferences.font_size.to_string(),
             settings: settings.clone(),
             host_url: None,
+            device_keyboard_input: String::new(),
+            device_debugreg_input: String::new(),
+            device_debugreg_value: None,
+            debug_stream: debug_stream::DebugStreamCapture::new(),
             template_manager: TemplateManager::new(),
             selected_template: None,
             connection: None,
@@ -1355,9 +1400,19 @@ impl Ultimate64Browser {
             Message::FnRename => {
                 match self.active_pane {
                     Pane::Left => {
-                        // Local rename not supported via function bar yet
+                        if let Some(path) = self.left_browser.get_selected_file().cloned() {
+                            return self
+                                .left_browser
+                                .update(
+                                    FileBrowserMessage::RenameFile(path),
+                                    self.connection.clone(),
+                                    Some(self.settings.connection.host.clone()),
+                                    self.settings.connection.password.clone(),
+                                )
+                                .map(Message::LeftBrowser);
+                        }
                         self.user_message = Some(UserMessage::Info(
-                            "Select a file and use your OS to rename local files".to_string(),
+                            "Click a file first, then press F2 to rename".to_string(),
                         ));
                         Task::none()
                     }
@@ -3125,6 +3180,171 @@ impl Ultimate64Browser {
                 }
                 Task::none()
             }
+
+            // ── DEVICE tab handlers ──────────────────────────────────────
+            Message::DeviceSetDriveMode(drive, mode) => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                let password = self.settings.connection.password.clone();
+                Task::perform(
+                    async move {
+                        api::set_drive_mode_async(&host, &drive, &mode, password.as_deref()).await
+                    },
+                    Message::MachineCommandCompleted,
+                )
+            }
+            Message::DeviceDrivePower(drive, on) => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                let password = self.settings.connection.password.clone();
+                Task::perform(
+                    async move { api::drive_power_async(&host, &drive, on, password.as_deref()).await },
+                    Message::MachineCommandCompleted,
+                )
+            }
+            Message::DeviceDriveReset(drive) => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                let password = self.settings.connection.password.clone();
+                Task::perform(
+                    async move { api::drive_reset_async(&host, &drive, password.as_deref()).await },
+                    Message::MachineCommandCompleted,
+                )
+            }
+            Message::DeviceKeyboardInputChanged(value) => {
+                self.device_keyboard_input = value;
+                Task::none()
+            }
+            Message::DeviceSendKeys => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                if self.device_keyboard_input.is_empty() {
+                    return Task::none();
+                }
+                let password = self.settings.connection.password.clone();
+                // Append RETURN so a typed command actually executes. This writes
+                // PETSCII into the KERNAL keyboard buffer ($0277) — only code that
+                // reads via the KERNAL (BASIC prompt, GETIN) sees it; programs
+                // scanning the CIA keyboard matrix directly do not.
+                let text = format!("{}\n", self.device_keyboard_input);
+                Task::perform(
+                    async move {
+                        api::type_text_async(&host, &text, password.as_deref())
+                            .await
+                            .map(|_| "Sent keystrokes".to_string())
+                    },
+                    Message::MachineCommandCompleted,
+                )
+            }
+            Message::DeviceDebugRegInputChanged(value) => {
+                self.device_debugreg_input = value;
+                Task::none()
+            }
+            Message::DeviceReadDebugReg => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                let password = self.settings.connection.password.clone();
+                Task::perform(
+                    async move { api::read_debugreg_async(&host, password.as_deref()).await },
+                    Message::DeviceDebugRegRead,
+                )
+            }
+            Message::DeviceDebugRegRead(result) => {
+                match result {
+                    Ok(v) => {
+                        self.device_debugreg_value = Some(v);
+                        self.user_message =
+                            Some(UserMessage::Info(format!("Debug register = ${:02X}", v)));
+                    }
+                    Err(e) => {
+                        self.user_message = Some(UserMessage::Error(e));
+                    }
+                }
+                Task::none()
+            }
+            Message::DeviceWriteDebugReg => {
+                let Some(host) = self.host_url.clone() else {
+                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
+                    return Task::none();
+                };
+                // Accept hex with optional 0x/$ prefix.
+                let raw = self.device_debugreg_input.trim();
+                let raw = raw
+                    .strip_prefix("0x")
+                    .or_else(|| raw.strip_prefix('$'))
+                    .unwrap_or(raw);
+                let Ok(value) = u8::from_str_radix(raw, 16) else {
+                    self.user_message = Some(UserMessage::Error(
+                        "Debug register: enter a hex byte (00–FF)".to_string(),
+                    ));
+                    return Task::none();
+                };
+                let password = self.settings.connection.password.clone();
+                Task::perform(
+                    async move { api::write_debugreg_async(&host, value, password.as_deref()).await },
+                    Message::MachineCommandCompleted,
+                )
+            }
+            Message::DeviceDebugStreamStart => {
+                self.debug_stream.set_host(
+                    self.host_url.clone(),
+                    self.settings.connection.password.clone(),
+                    self.settings.connection.stream_control_method,
+                );
+                match self.debug_stream.start() {
+                    Ok(()) => {
+                        self.user_message = Some(UserMessage::Info(
+                            "Debug stream capture started".to_string(),
+                        ));
+                    }
+                    Err(e) => {
+                        self.user_message =
+                            Some(UserMessage::Error(format!("Debug stream: {}", e)));
+                    }
+                }
+                Task::none()
+            }
+            Message::DeviceDebugStreamStop => {
+                self.debug_stream.stop();
+                self.user_message = Some(UserMessage::Info(format!(
+                    "Debug stream stopped — {} packets captured",
+                    self.debug_stream.packets()
+                )));
+                Task::none()
+            }
+            Message::DeviceDebugStreamTick => {
+                // Counters live in shared atomics; a redraw is enough.
+                Task::none()
+            }
+            Message::DeviceDebugStreamSave => {
+                let data = self.debug_stream.snapshot();
+                Task::perform(
+                    debug_stream::save_capture_async(data),
+                    Message::DeviceDebugStreamSaved,
+                )
+            }
+            Message::DeviceDebugStreamSaved(result) => {
+                match result {
+                    Ok(path) => {
+                        self.user_message =
+                            Some(UserMessage::Info(format!("Capture saved: {}", path)));
+                    }
+                    Err(e) => {
+                        self.user_message = Some(UserMessage::Error(e));
+                    }
+                }
+                Task::none()
+            }
             Message::DefaultSongDurationChanged(value) => {
                 if let Ok(duration) = value.parse::<u32>() {
                     if duration > 0 && duration <= 3600 {
@@ -3304,6 +3524,7 @@ impl Ultimate64Browser {
                 // self.tab_button("PROFILES", Tab::Profiles),
                 self.tab_button("ASSEMBLY64", Tab::Assembly64),
                 self.tab_button("BASIC", Tab::BasicEditor),
+                self.tab_button("DEVICE", Tab::Device),
                 self.tab_button("SETTINGS", Tab::Settings),
             ]
             .spacing(2),
@@ -3368,6 +3589,7 @@ impl Ultimate64Browser {
                 .basic_editor
                 .view(self.settings.preferences.font_size, self.status.connected)
                 .map(Message::BasicEditor),
+            Tab::Device => self.view_device(),
             Tab::Settings => self.view_settings(),
         })
         .padding(10)
@@ -3614,6 +3836,13 @@ impl Ultimate64Browser {
             Subscription::none()
         };
 
+        // Refresh the debug-stream capture counters while active.
+        let debug_stream_tick = if self.debug_stream.active {
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::DeviceDebugStreamTick)
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
@@ -3627,6 +3856,7 @@ impl Ultimate64Browser {
             status_check,
             copy_progress_tick,
             toast_tick,
+            debug_stream_tick,
         ])
     }
 
@@ -4659,6 +4889,206 @@ impl Ultimate64Browser {
         )
         .height(Length::Fill)
         .into()
+    }
+
+    /// Debug bus-trace stream capture controls (part of the DEVICE tab).
+    fn view_debug_stream_section(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let connected = self.status.connected;
+        let active = self.debug_stream.active;
+
+        let captured_kib = self.debug_stream.captured_len() as f64 / 1024.0;
+        let stats = text(format!(
+            "{} · {} packets · {:.1} KiB captured",
+            if active { "CAPTURING" } else { "idle" },
+            self.debug_stream.packets(),
+            captured_kib,
+        ))
+        .size(fs.small)
+        .color(iced::Color::from_rgb(0.6, 0.7, 0.8));
+
+        let start_stop = if active {
+            button(text("Stop").size(fs.small))
+                .on_press(Message::DeviceDebugStreamStop)
+                .padding([4, 10])
+                .style(crate::styles::action_button)
+        } else {
+            button(text("Start Capture").size(fs.small))
+                .on_press_maybe(connected.then_some(Message::DeviceDebugStreamStart))
+                .padding([4, 10])
+                .style(crate::styles::action_button)
+        };
+
+        let save_btn = button(text("Save Capture…").size(fs.small))
+            .on_press_maybe(
+                (!active && self.debug_stream.captured_len() > 0)
+                    .then_some(Message::DeviceDebugStreamSave),
+            )
+            .padding([4, 10])
+            .style(crate::styles::nav_button);
+
+        column![
+            text("DEBUG BUS-TRACE STREAM (U64 only)")
+                .size(fs.normal)
+                .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
+            row![start_stop, save_btn, Space::new().width(12), stats]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            text(
+                "Cycle-accurate 6510/VIC/1541 bus trace. Mutually exclusive with the \
+                 VIC video stream. Saved as a raw capture (.bin) for the documented \
+                 GtkWave/VCD converter — the sample layout is FPGA-defined and not \
+                 decoded here."
+            )
+            .size(fs.tiny)
+            .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// DEVICE tab — drive control, keyboard injection, and the debug
+    /// register. Groups low-level device capabilities the REST API exposes
+    /// but that don't fit the file/music/config tabs.
+    fn view_device(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let connected = self.status.connected;
+
+        // One drive's control cluster: mode switch + power + reset.
+        let drive_row = |label: &'static str, drive: &'static str| -> Element<'_, Message> {
+            let mode_btn =
+                |mode: &'static str| {
+                    button(text(mode).size(fs.small))
+                        .on_press_maybe(connected.then(|| {
+                            Message::DeviceSetDriveMode(drive.to_string(), mode.to_string())
+                        }))
+                        .padding([3, 8])
+                        .style(crate::styles::nav_button)
+                };
+            row![
+                text(label).size(fs.normal).width(Length::Fixed(70.0)),
+                text("Mode:").size(fs.small),
+                mode_btn("1541"),
+                mode_btn("1571"),
+                mode_btn("1581"),
+                Space::new().width(12),
+                button(text("Power On").size(fs.small))
+                    .on_press_maybe(
+                        connected.then(|| Message::DeviceDrivePower(drive.to_string(), true)),
+                    )
+                    .padding([3, 8])
+                    .style(crate::styles::nav_button),
+                button(text("Power Off").size(fs.small))
+                    .on_press_maybe(
+                        connected.then(|| Message::DeviceDrivePower(drive.to_string(), false)),
+                    )
+                    .padding([3, 8])
+                    .style(crate::styles::nav_button),
+                button(text("Reset").size(fs.small))
+                    .on_press_maybe(connected.then(|| Message::DeviceDriveReset(drive.to_string())))
+                    .padding([3, 8])
+                    .style(crate::styles::nav_button),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        let drive_section = column![
+            text("DRIVE CONTROL")
+                .size(fs.normal)
+                .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
+            drive_row("Drive A", "a"),
+            drive_row("Drive B", "b"),
+        ]
+        .spacing(8);
+
+        // Keyboard injection — type into the running C64 (BASIC or any prompt).
+        let keyboard_section = column![
+            text("KEYBOARD INPUT (KERNAL buffer)")
+                .size(fs.normal)
+                .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
+            row![
+                text_input("text to type into the C64…", &self.device_keyboard_input)
+                    .on_input(Message::DeviceKeyboardInputChanged)
+                    .on_submit(Message::DeviceSendKeys)
+                    .size(fs.small)
+                    .padding(4)
+                    .width(Length::Fixed(360.0)),
+                button(text("Send Keys").size(fs.small))
+                    .on_press_maybe(connected.then_some(Message::DeviceSendKeys))
+                    .padding([4, 10])
+                    .style(crate::styles::action_button),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+            text(
+                "Feeds text into the KERNAL keyboard buffer ($0277) and presses RETURN — \
+                  works at the BASIC prompt and programs that read via the KERNAL (GETIN). \
+                  Games that scan the keyboard matrix ($DC00) directly won't see it."
+            )
+            .size(fs.tiny)
+            .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
+        ]
+        .spacing(8);
+
+        // Debug register ($D7FF) — U64 only.
+        let debugreg_current = match self.device_debugreg_value {
+            Some(v) => format!("${:02X} ({})", v, v),
+            None => "—".to_string(),
+        };
+        let debugreg_section = column![
+            text("DEBUG REGISTER ($D7FF · U64 only)")
+                .size(fs.normal)
+                .color(iced::Color::from_rgb(0.7, 0.72, 0.8)),
+            row![
+                button(text("Read").size(fs.small))
+                    .on_press_maybe(connected.then_some(Message::DeviceReadDebugReg))
+                    .padding([4, 10])
+                    .style(crate::styles::nav_button),
+                text(format!("Current: {}", debugreg_current)).size(fs.small),
+                Space::new().width(16),
+                text("Write hex:").size(fs.small),
+                text_input("00", &self.device_debugreg_input)
+                    .on_input(Message::DeviceDebugRegInputChanged)
+                    .on_submit(Message::DeviceWriteDebugReg)
+                    .size(fs.small)
+                    .padding(4)
+                    .width(Length::Fixed(70.0)),
+                button(text("Write").size(fs.small))
+                    .on_press_maybe(connected.then_some(Message::DeviceWriteDebugReg))
+                    .padding([4, 10])
+                    .style(crate::styles::action_button),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(8);
+
+        let gate = if connected {
+            text("")
+        } else {
+            text("Not connected — device controls are disabled.")
+                .size(fs.small)
+                .color(iced::Color::from_rgb(0.8, 0.4, 0.0))
+        };
+
+        let content = column![
+            text("DEVICE CONTROLS").size(fs.large),
+            gate,
+            rule::horizontal(1),
+            drive_section,
+            rule::horizontal(1),
+            keyboard_section,
+            rule::horizontal(1),
+            debugreg_section,
+            rule::horizontal(1),
+            self.view_debug_stream_section(),
+        ]
+        .spacing(16)
+        .padding(10);
+
+        scrollable(content).height(Length::Fill).into()
     }
 
     fn view_status_bar(&self) -> Element<'_, Message> {

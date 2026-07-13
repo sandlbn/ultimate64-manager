@@ -186,6 +186,174 @@ pub async fn load_playlist_async() -> Result<Vec<PlaylistEntry>, String> {
     Ok(playlist.entries)
 }
 
+/// True if `path` has a music extension we can play (SID, MOD, PRG).
+fn is_music_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .as_deref(),
+        Some("sid") | Some("mod") | Some("prg")
+    )
+}
+
+/// Resolve a playlist line to an absolute path. Absolute paths are kept
+/// as-is; relative paths are joined against `base_dir` (the directory the
+/// playlist file lives in). `http(s)://` URLs return None (unsupported).
+fn resolve_playlist_path(raw: &str, base_dir: &Path) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let lower = raw.to_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        log::warn!("Skipping unsupported URL in playlist: {}", raw);
+        return None;
+    }
+    let p = PathBuf::from(raw);
+    Some(if p.is_absolute() { p } else { base_dir.join(p) })
+}
+
+/// Turn a list of resolved candidate paths into the subset that exists and
+/// is a playable music file, logging (and counting) anything skipped.
+fn keep_existing_music(candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    for c in candidates {
+        if is_music_path(&c) && c.is_file() {
+            out.push(c);
+        } else {
+            skipped += 1;
+            log::warn!(
+                "Playlist import: skipping missing/unsupported entry: {}",
+                c.display()
+            );
+        }
+    }
+    if skipped > 0 {
+        log::info!("Playlist import: skipped {} entr(y/ies)", skipped);
+    }
+    out
+}
+
+/// Import an M3U/M3U8 playlist. Returns resolved, existing music-file paths.
+/// `#`-comment lines (including `#EXTINF`) are ignored — entries are rebuilt
+/// with authoritative metadata on the app side.
+pub async fn import_m3u_async() -> Result<Vec<PathBuf>, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("M3U Playlist", &["m3u", "m3u8"])
+        .pick_file()
+        .await
+        .ok_or("Import cancelled")?;
+
+    let path = handle.path().to_path_buf();
+    let base_dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    let candidates: Vec<PathBuf> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| resolve_playlist_path(l, &base_dir))
+        .collect();
+
+    let paths = keep_existing_music(candidates);
+    if paths.is_empty() {
+        return Err("No playable files found in M3U".to_string());
+    }
+    Ok(paths)
+}
+
+/// Import a PLS playlist (INI-style `FileN=path`). Returns resolved, existing
+/// music-file paths in entry order.
+pub async fn import_pls_async() -> Result<Vec<PathBuf>, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("PLS Playlist", &["pls"])
+        .pick_file()
+        .await
+        .ok_or("Import cancelled")?;
+
+    let path = handle.path().to_path_buf();
+    let base_dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("Read error: {}", e))?;
+
+    // Collect (index, path) from `FileN=...` lines, then order by N.
+    let mut indexed: Vec<(u32, PathBuf)> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        let lower = line.to_lowercase();
+        if !lower.starts_with("file") {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // key looks like "File1", "File12" — parse the trailing number.
+        let n: u32 = key[4..].trim().parse().unwrap_or(u32::MAX);
+        if let Some(p) = resolve_playlist_path(value, &base_dir) {
+            indexed.push((n, p));
+        }
+    }
+    indexed.sort_by_key(|(n, _)| *n);
+
+    let paths = keep_existing_music(indexed.into_iter().map(|(_, p)| p).collect());
+    if paths.is_empty() {
+        return Err("No playable files found in PLS".to_string());
+    }
+    Ok(paths)
+}
+
+/// Export the current playlist as an extended M3U file (`#EXTM3U` +
+/// `#EXTINF:<secs>,<name>` per track, followed by the absolute path).
+pub async fn export_m3u_async(
+    playlist: SavedPlaylist,
+    default_duration: u32,
+) -> Result<String, String> {
+    let handle = rfd::AsyncFileDialog::new()
+        .add_filter("M3U Playlist", &["m3u"])
+        .set_file_name(&format!("{}.m3u", playlist.name))
+        .save_file()
+        .await
+        .ok_or("Export cancelled")?;
+
+    let path = handle.path().to_path_buf();
+
+    let mut out = String::from("#EXTM3U\n");
+    for entry in &playlist.entries {
+        let secs = entry.duration.unwrap_or(default_duration);
+        let name = if entry.name.is_empty() {
+            entry
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Unknown".to_string())
+        } else {
+            entry.name.clone()
+        };
+        out.push_str(&format!("#EXTINF:{},{}\n", secs, name));
+        out.push_str(&entry.path.to_string_lossy());
+        out.push('\n');
+    }
+
+    tokio::fs::write(&path, out)
+        .await
+        .map_err(|e| format!("Write error: {}", e))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
 /// Search for music files (SID, MOD, PRG) recursively under `root`, matching
 /// filenames or directory names against `query` (case-insensitive).
 /// Returns BrowserEntry items with names showing relative paths from root.
@@ -318,5 +486,46 @@ pub fn format_total_duration(entries: &[PlaylistEntry], default_duration: u32) -
         format!("{}h {}m {}s", hours, minutes, seconds)
     } else {
         format!("{}m {}s", minutes, seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_absolute_path_kept_as_is() {
+        let base = Path::new("/music/lists");
+        let abs = if cfg!(windows) {
+            "C:\\games\\a.sid"
+        } else {
+            "/games/a.sid"
+        };
+        let got = resolve_playlist_path(abs, base).unwrap();
+        assert_eq!(got, PathBuf::from(abs));
+    }
+
+    #[test]
+    fn resolve_relative_path_joined_against_base() {
+        let base = Path::new("/music/lists");
+        let got = resolve_playlist_path("sub/tune.sid", base).unwrap();
+        assert_eq!(got, PathBuf::from("/music/lists/sub/tune.sid"));
+    }
+
+    #[test]
+    fn resolve_url_is_skipped() {
+        let base = Path::new("/music");
+        assert!(resolve_playlist_path("http://example.com/x.sid", base).is_none());
+        assert!(resolve_playlist_path("HTTPS://example.com/x.sid", base).is_none());
+        assert!(resolve_playlist_path("   ", base).is_none());
+    }
+
+    #[test]
+    fn is_music_path_matches_known_extensions() {
+        assert!(is_music_path(Path::new("a.sid")));
+        assert!(is_music_path(Path::new("a.MOD")));
+        assert!(is_music_path(Path::new("a.Prg")));
+        assert!(!is_music_path(Path::new("a.txt")));
+        assert!(!is_music_path(Path::new("a")));
     }
 }
