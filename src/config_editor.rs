@@ -10,7 +10,7 @@ use iced::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 /// A single configuration item with full details (from /v1/configs/<category>/<item>)
@@ -144,7 +144,7 @@ impl ConfigEditor {
         }
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: ConfigEditorMessage,
         _connection: Option<Arc<Mutex<Rest>>>,
@@ -419,7 +419,7 @@ impl ConfigEditor {
                     }
                 }
                 if let Some(category) = self.selected_category.clone() {
-                    return self.update(
+                    return self.update_impl(
                         ConfigEditorMessage::SelectCategory(category),
                         _connection,
                         host_url,
@@ -445,7 +445,7 @@ impl ConfigEditor {
                 if let Some(category) = self.selected_category.clone() {
                     self.pending_changes.clear();
                     self.has_unsaved_changes = false;
-                    return self.update(
+                    return self.update_impl(
                         ConfigEditorMessage::SelectCategory(category),
                         _connection,
                         host_url,
@@ -730,7 +730,7 @@ impl ConfigEditor {
                         self.error_message = None;
                         // Refresh current category view if one is selected
                         if let Some(category) = self.selected_category.clone() {
-                            return self.update(
+                            return self.update_impl(
                                 ConfigEditorMessage::SelectCategory(category),
                                 _connection,
                                 host_url,
@@ -1303,4 +1303,15 @@ async fn apply_all_config(
     password: Option<String>,
 ) -> Result<String, String> {
     config_api::apply_all_config(host, settings, password).await
+}
+
+impl crate::tab::TabController for ConfigEditor {
+    type Message = ConfigEditorMessage;
+    fn update(
+        &mut self,
+        message: ConfigEditorMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<ConfigEditorMessage> {
+        self.update_impl(message, ctx.connection, ctx.host_url, ctx.password)
+    }
 }

@@ -8,8 +8,8 @@ use iced::{
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::api;
@@ -280,7 +280,7 @@ impl RemoteBrowser {
         }
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: RemoteBrowserMessage,
         _connection: Option<Arc<Mutex<Rest>>>,
@@ -357,7 +357,7 @@ impl RemoteBrowser {
                         self.current_path = path;
                         self.selected_file = None;
                         self.checked_files.clear();
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     } else {
                         self.selected_file = Some(path);
                     }
@@ -374,7 +374,7 @@ impl RemoteBrowser {
                             self.current_path = "/".to_string();
                         }
                     }
-                    return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                    return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                 }
                 Task::none()
             }
@@ -382,7 +382,7 @@ impl RemoteBrowser {
             RemoteBrowserMessage::NavigateToPath(path) => {
                 self.current_path = path;
                 self.checked_files.clear();
-                self.update(RemoteBrowserMessage::RefreshFiles, _connection)
+                self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection)
             }
 
             RemoteBrowserMessage::DownloadFile(remote_path) => {
@@ -471,7 +471,7 @@ impl RemoteBrowser {
                 match result {
                     Ok(name) => {
                         self.status_message = Some(format!("Uploaded: {}", name));
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Upload failed: {}", e));
@@ -503,7 +503,7 @@ impl RemoteBrowser {
                 match result {
                     Ok(msg) => {
                         self.status_message = Some(msg);
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Directory upload failed: {}", e));
@@ -1012,7 +1012,7 @@ impl RemoteBrowser {
                 match result {
                     Ok(msg) => {
                         self.status_message = Some(msg);
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Delete failed: {}", e));
@@ -1087,7 +1087,7 @@ impl RemoteBrowser {
                 match result {
                     Ok(msg) => {
                         self.status_message = Some(msg);
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Rename failed: {}", e));
@@ -1147,7 +1147,7 @@ impl RemoteBrowser {
                     Ok(msg) => {
                         self.status_message = Some(msg);
                         // Refresh files to show new directory
-                        return self.update(RemoteBrowserMessage::RefreshFiles, _connection);
+                        return self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection);
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Error: {}", e));
@@ -1205,7 +1205,7 @@ impl RemoteBrowser {
                 }
                 self.current_path = trimmed;
                 self.checked_files.clear();
-                self.update(RemoteBrowserMessage::RefreshFiles, _connection)
+                self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection)
             }
             RemoteBrowserMessage::NavigateToFavorite(path) => {
                 // Mark this favorite as "under test" — if the listing fails
@@ -1214,7 +1214,7 @@ impl RemoteBrowser {
                 self.pending_favorite_check = Some(path.clone());
                 self.current_path = path;
                 self.checked_files.clear();
-                self.update(RemoteBrowserMessage::RefreshFiles, _connection)
+                self.update_impl(RemoteBrowserMessage::RefreshFiles, _connection)
             }
         }
     }
@@ -2740,4 +2740,15 @@ fn is_remote_image_file(name: &str) -> bool {
 
 fn is_remote_pdf_file(name: &str) -> bool {
     crate::file_types::is_pdf_file(name)
+}
+
+impl crate::tab::TabController for RemoteBrowser {
+    type Message = RemoteBrowserMessage;
+    fn update(
+        &mut self,
+        message: RemoteBrowserMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<RemoteBrowserMessage> {
+        self.update_impl(message, ctx.connection)
+    }
 }

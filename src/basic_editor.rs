@@ -81,7 +81,7 @@ impl BasicEditor {
         self.content.text()
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: BasicEditorMessage,
         host: Option<String>,
@@ -786,5 +786,16 @@ mod tests {
         let editor = BasicEditor::new();
         let result = basic_tokenizer::validate(&editor.source());
         assert!(result.is_ok(), "starter must validate: {:?}", result);
+    }
+}
+
+impl crate::tab::TabController for BasicEditor {
+    type Message = BasicEditorMessage;
+    fn update(
+        &mut self,
+        message: BasicEditorMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<BasicEditorMessage> {
+        self.update_impl(message, ctx.host, ctx.password)
     }
 }

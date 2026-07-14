@@ -4,7 +4,7 @@ use crate::net_utils::REST_TIMEOUT_SECS;
 use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 /// Run a PRG file from the Ultimate64 filesystem
@@ -163,7 +163,7 @@ pub async fn run_disk(
         let device = device_num.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let c = conn.blocking_lock();
+            let c = conn.lock().unwrap();
 
             // Reset the machine
             c.reset().map_err(|e| format!("Reset failed: {}", e))?;
@@ -249,7 +249,7 @@ async fn read_chunk(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             conn.read_mem(address, length)
                 .map_err(|e| format!("Read failed: {}", e))
         }),
@@ -270,7 +270,7 @@ pub async fn write_byte_async(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             conn.write_mem(address, &[value])
                 .map_err(|e| format!("Write failed: {}", e))
         }),
@@ -292,7 +292,7 @@ pub async fn fill_memory_async(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS * 2),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             let fill_data: Vec<u8> = vec![value; RAW_CHUNK];
             // Walk in u32 to support length == 65536 (full address space).
             // The device address itself stays u16; `wrapping_add` matches
@@ -325,7 +325,7 @@ pub async fn write_memory_async(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS * 4),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             let mut offset = 0usize;
             while offset < data.len() {
                 let write_size = (data.len() - offset).min(RAW_CHUNK);

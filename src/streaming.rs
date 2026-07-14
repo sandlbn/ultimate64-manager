@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tokio::sync::Mutex as TokioMutex;
 use ultimate64::petscii::Petscii;
 use ultimate64::Rest;
 
@@ -296,10 +295,10 @@ impl VideoStreaming {
     pub fn set_stream_control_method(&mut self, method: StreamControlMethod) {
         self.stream_control_method = method;
     }
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: StreamingMessage,
-        connection: Option<Arc<TokioMutex<Rest>>>,
+        connection: Option<Arc<Mutex<Rest>>>,
     ) -> Task<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {
@@ -579,7 +578,7 @@ impl VideoStreaming {
                                 let result = tokio::time::timeout(
                                     std::time::Duration::from_millis(500),
                                     tokio::task::spawn_blocking(move || {
-                                        let c = conn.blocking_lock();
+                                        let c = conn.lock().unwrap();
 
                                         // Match type_text behavior from ultimate64 library:
                                         // 1. Clear LSTX ($C5) and NDX ($C6) - last key and buffer count
@@ -2316,4 +2315,15 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
         .map_err(|e| format!("Failed to save PNG: {}", e))?;
 
     Ok(path.to_string_lossy().to_string())
+}
+
+impl crate::tab::TabController for VideoStreaming {
+    type Message = StreamingMessage;
+    fn update(
+        &mut self,
+        message: StreamingMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<StreamingMessage> {
+        self.update_impl(message, ctx.connection)
+    }
 }

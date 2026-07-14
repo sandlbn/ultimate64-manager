@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::music_ops;
@@ -299,7 +299,7 @@ impl MusicPlayer {
         player
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: MusicPlayerMessage,
         connection: Option<Arc<Mutex<Rest>>>,
@@ -364,7 +364,7 @@ impl MusicPlayer {
                     self.current_playing = Some(0);
                     self.current_subsong = 1;
                     self.elapsed_seconds = 0;
-                    return self.update(MusicPlayerMessage::Play, connection);
+                    return self.update_impl(MusicPlayerMessage::Play, connection);
                 }
                 Task::none()
             }
@@ -389,7 +389,7 @@ impl MusicPlayer {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                                 tokio::task::spawn_blocking(move || {
-                                    let conn = conn.blocking_lock();
+                                    let conn = conn.lock().unwrap();
                                     conn.reset().map_err(|e| e.to_string())
                                 }),
                             )
@@ -437,7 +437,7 @@ impl MusicPlayer {
                     }
 
                     if self.playback_state == PlaybackState::Playing {
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -466,7 +466,7 @@ impl MusicPlayer {
                     }
 
                     if self.playback_state == PlaybackState::Playing {
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -478,7 +478,7 @@ impl MusicPlayer {
                     self.elapsed_seconds = 0;
                     self.current_subsong = 1;
                     if self.playback_state == PlaybackState::Playing {
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -490,7 +490,7 @@ impl MusicPlayer {
                     self.elapsed_seconds = 0;
                     self.current_subsong = 1;
                     if self.playback_state == PlaybackState::Playing {
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -621,15 +621,19 @@ impl MusicPlayer {
                         BrowserEntryType::Directory => {
                             // Navigate into directory
                             let path = browser_entry.path.clone();
-                            return self
-                                .update(MusicPlayerMessage::NavigateToDirectory(path), connection);
+                            return self.update_impl(
+                                MusicPlayerMessage::NavigateToDirectory(path),
+                                connection,
+                            );
                         }
                         BrowserEntryType::MusicFile(_) => {
                             // Check if this is a double-click (same item selected)
                             if self.browser_selected == Some(index) {
                                 // Double-click - add and play
-                                return self
-                                    .update(MusicPlayerMessage::AddAndPlay(index), connection);
+                                return self.update_impl(
+                                    MusicPlayerMessage::AddAndPlay(index),
+                                    connection,
+                                );
                             } else {
                                 // First click - just select
                                 self.browser_selected = Some(index);
@@ -668,7 +672,7 @@ impl MusicPlayer {
                         self.playback_state = PlaybackState::Playing;
                         self.status_message = format!("Playing: {}", name);
 
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -740,7 +744,7 @@ impl MusicPlayer {
                 self.elapsed_seconds = 0;
                 self.current_subsong = 1;
                 self.playback_state = PlaybackState::Playing;
-                self.update(MusicPlayerMessage::Play, connection)
+                self.update_impl(MusicPlayerMessage::Play, connection)
             }
 
             MusicPlayerMessage::MovePlaylistItemUp(index) => {
@@ -1034,7 +1038,7 @@ impl MusicPlayer {
                     }
 
                     if self.playback_state == PlaybackState::Playing {
-                        return self.update(MusicPlayerMessage::Play, connection);
+                        return self.update_impl(MusicPlayerMessage::Play, connection);
                     }
                 }
                 Task::none()
@@ -1047,7 +1051,7 @@ impl MusicPlayer {
 
                     // Check if song should end
                     if self.elapsed_seconds >= self.current_song_duration {
-                        return self.update(MusicPlayerMessage::SongEnded, connection);
+                        return self.update_impl(MusicPlayerMessage::SongEnded, connection);
                     }
                 }
                 Task::none()
@@ -1074,7 +1078,7 @@ impl MusicPlayer {
                         }
                     }
 
-                    return self.update(MusicPlayerMessage::Play, connection);
+                    return self.update_impl(MusicPlayerMessage::Play, connection);
                 }
 
                 // Check if current song is a MOD (needs reset to stop looping)
@@ -1100,7 +1104,7 @@ impl MusicPlayer {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(2),
                                         tokio::task::spawn_blocking(move || {
-                                            let c = conn_clone.blocking_lock();
+                                            let c = conn_clone.lock().unwrap();
                                             c.reset().map_err(|e| e.to_string())
                                         }),
                                     )
@@ -1123,7 +1127,7 @@ impl MusicPlayer {
                         }
                     }
 
-                    self.update(MusicPlayerMessage::Play, connection)
+                    self.update_impl(MusicPlayerMessage::Play, connection)
                 } else {
                     // End of playlist
                     if self.repeat_enabled && !self.playlist.is_empty() {
@@ -1140,7 +1144,7 @@ impl MusicPlayer {
                                         let result = tokio::time::timeout(
                                             tokio::time::Duration::from_secs(2),
                                             tokio::task::spawn_blocking(move || {
-                                                let c = conn_clone.blocking_lock();
+                                                let c = conn_clone.lock().unwrap();
                                                 c.reset().map_err(|e| e.to_string())
                                             }),
                                         )
@@ -1162,7 +1166,7 @@ impl MusicPlayer {
                             }
                         }
 
-                        self.update(MusicPlayerMessage::Play, connection)
+                        self.update_impl(MusicPlayerMessage::Play, connection)
                     } else {
                         // Playlist ended - stop playback on hardware
                         self.playback_state = PlaybackState::Stopped;
@@ -1175,7 +1179,7 @@ impl MusicPlayer {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(2),
                                         tokio::task::spawn_blocking(move || {
-                                            let conn = conn.blocking_lock();
+                                            let conn = conn.lock().unwrap();
                                             conn.reboot().map_err(|e| e.to_string())
                                         }),
                                     )
@@ -2501,4 +2505,15 @@ fn truncate_path(path: &Path, max_len: usize) -> String {
 
 fn format_total_duration(entries: &[PlaylistEntry], default_duration: u32) -> String {
     music_ops::format_total_duration(entries, default_duration)
+}
+
+impl crate::tab::TabController for MusicPlayer {
+    type Message = MusicPlayerMessage;
+    fn update(
+        &mut self,
+        message: MusicPlayerMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<MusicPlayerMessage> {
+        self.update_impl(message, ctx.connection)
+    }
 }

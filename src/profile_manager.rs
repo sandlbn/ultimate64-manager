@@ -346,12 +346,12 @@ impl ProfileManager {
         self.streaming_frame = Some(frame);
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: ProfileManagerMessage,
         host_url: Option<String>,
         password: Option<String>,
-        connection: Option<Arc<tokio::sync::Mutex<ultimate64::Rest>>>,
+        connection: Option<Arc<std::sync::Mutex<ultimate64::Rest>>>,
     ) -> Task<ProfileManagerMessage> {
         match message {
             // ── Repository ──
@@ -372,14 +372,14 @@ impl ProfileManager {
                         self.status_message = Some(msg);
                         self.error_message = None;
                         // Refresh profiles list, then auto-snapshot baseline if connected
-                        let refresh = self.update(
+                        let refresh = self.update_impl(
                             ProfileManagerMessage::RefreshProfiles,
                             host_url.clone(),
                             password.clone(),
                             connection.clone(),
                         );
                         if host_url.is_some() && self.baseline_config.is_none() {
-                            let snapshot = self.update(
+                            let snapshot = self.update_impl(
                                 ProfileManagerMessage::SnapshotBaseline,
                                 host_url,
                                 password,
@@ -836,7 +836,7 @@ impl ProfileManager {
                     None => return Task::none(),
                 };
                 // Route through RemotePickerNavigate so the state is updated consistently
-                return self.update(
+                return self.update_impl(
                     ProfileManagerMessage::RemotePickerNavigate(path),
                     host_url,
                     password,
@@ -961,7 +961,7 @@ impl ProfileManager {
             ProfileManagerMessage::BrowseDriveASelected(path) => {
                 if let Some(path) = path {
                     let path_str = path.to_string_lossy().to_string();
-                    return self.update(
+                    return self.update_impl(
                         ProfileManagerMessage::DriveAPathChanged(path_str),
                         host_url,
                         password,
@@ -1010,7 +1010,7 @@ impl ProfileManager {
             ProfileManagerMessage::BrowseDriveBSelected(path) => {
                 if let Some(path) = path {
                     let path_str = path.to_string_lossy().to_string();
-                    return self.update(
+                    return self.update_impl(
                         ProfileManagerMessage::DriveBPathChanged(path_str),
                         host_url,
                         password,
@@ -1053,7 +1053,7 @@ impl ProfileManager {
             ProfileManagerMessage::BrowseCartridgeSelected(path) => {
                 if let Some(path) = path {
                     let path_str = path.to_string_lossy().to_string();
-                    return self.update(
+                    return self.update_impl(
                         ProfileManagerMessage::CartridgePathChanged(path_str),
                         host_url,
                         password,
@@ -1226,7 +1226,7 @@ impl ProfileManager {
                             self.original_profile_dir =
                                 Some(self.repo_root.join("profiles").join(&cat).join(&profile.id));
                         }
-                        return self.update(
+                        return self.update_impl(
                             ProfileManagerMessage::RefreshProfiles,
                             host_url,
                             password,
@@ -1286,7 +1286,7 @@ impl ProfileManager {
                         self.current_profile = None;
                         self.view_mode = ViewMode::ProfileList;
                         self.error_message = None;
-                        return self.update(
+                        return self.update_impl(
                             ProfileManagerMessage::RefreshProfiles,
                             host_url,
                             password,
@@ -3738,5 +3738,16 @@ impl ProfileManager {
 
         let diff = device_profile::diff_configs(baseline, &profile.config);
         diff.get(category).cloned()
+    }
+}
+
+impl crate::tab::TabController for ProfileManager {
+    type Message = ProfileManagerMessage;
+    fn update(
+        &mut self,
+        message: ProfileManagerMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<ProfileManagerMessage> {
+        self.update_impl(message, ctx.host_url, ctx.password, ctx.connection)
     }
 }

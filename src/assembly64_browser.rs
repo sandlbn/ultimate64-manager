@@ -23,7 +23,7 @@ use iced::{
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::archive::{extract_zip_to_dir, runnable_extracted_files, ExtractedFile, ExtractedZip};
@@ -564,7 +564,7 @@ impl Assembly64Browser {
     // update
     // -------------------------------------------------------------------------
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: Assembly64BrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
@@ -1436,7 +1436,7 @@ impl Assembly64Browser {
                 tokio::time::timeout(
                     tokio::time::Duration::from_secs(60),
                     tokio::task::spawn_blocking(move || -> Result<String, String> {
-                        let conn = conn.blocking_lock();
+                        let conn = conn.lock().unwrap();
                         match (mount, ext.as_str()) {
                             (Some(mode), "d64" | "d71" | "d81" | "g64") => {
                                 let temp = std::env::temp_dir().join(&safe_name);
@@ -1538,7 +1538,7 @@ impl Assembly64Browser {
                 tokio::time::timeout(
                     tokio::time::Duration::from_secs(60),
                     tokio::task::spawn_blocking(move || -> Result<String, String> {
-                        let conn = conn.blocking_lock();
+                        let conn = conn.lock().unwrap();
                         let data = std::fs::read(&path).map_err(|e| format!("read: {}", e))?;
                         match (mount, ext.as_str()) {
                             (Some(mode), "d64" | "d71" | "d81" | "g64") => {
@@ -2864,5 +2864,16 @@ mod tests {
     #[test]
     fn sanitize_filename_strips_path_separators() {
         assert_eq!(sanitize_filename("a/b/c.d64"), "a_b_c.d64");
+    }
+}
+
+impl crate::tab::TabController for Assembly64Browser {
+    type Message = Assembly64BrowserMessage;
+    fn update(
+        &mut self,
+        message: Assembly64BrowserMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<Assembly64BrowserMessage> {
+        self.update_impl(message, ctx.connection, ctx.host, ctx.password)
     }
 }

@@ -13,7 +13,7 @@ use iced::{
     Element, Length, Subscription, Task,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 // ─────────────────────────────────────────────────────────────────
@@ -534,10 +534,10 @@ impl SidMonitor {
         }
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: SidMonitorMessage,
-        connection: Option<Arc<TokioMutex<Rest>>>,
+        connection: Option<Arc<Mutex<Rest>>>,
     ) -> Task<SidMonitorMessage> {
         match message {
             SidMonitorMessage::PanelChanged(p) => {
@@ -565,7 +565,7 @@ impl SidMonitor {
                 };
                 // Trigger an immediate read when starting
                 if self.watch_active {
-                    return self.update(SidMonitorMessage::Tick, connection);
+                    return self.update_impl(SidMonitorMessage::Tick, connection);
                 }
                 Task::none()
             }
@@ -1390,14 +1390,14 @@ fn section_style(theme: &iced::Theme) -> container::Style {
 // ─────────────────────────────────────────────────────────────────
 
 async fn read_bytes(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     address: u16,
     length: u16,
 ) -> Result<Vec<u8>, String> {
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             conn.read_mem(address, length)
                 .map_err(|e| format!("read_mem failed: {}", e))
         }),
@@ -1407,5 +1407,16 @@ async fn read_bytes(
         Ok(Ok(data)) => data,
         Ok(Err(e)) => Err(format!("Task error: {}", e)),
         Err(_) => Err("Read timed out — device may be offline".to_string()),
+    }
+}
+
+impl crate::tab::TabController for SidMonitor {
+    type Message = SidMonitorMessage;
+    fn update(
+        &mut self,
+        message: SidMonitorMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<SidMonitorMessage> {
+        self.update_impl(message, ctx.connection)
     }
 }
