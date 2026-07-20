@@ -6,7 +6,7 @@ use iced::{
     Element, Length, Subscription, Task,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::port64;
@@ -536,10 +536,10 @@ impl MemoryEditor {
     /// `host` and `password` are needed by the raw-socket helpers.
     /// Pass `self.settings.connection.host.clone()` and
     /// `self.settings.connection.password.clone()` from the parent update.
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: MemoryEditorMessage,
-        connection: Option<Arc<TokioMutex<Rest>>>,
+        connection: Option<Arc<Mutex<Rest>>>,
         host: Option<String>,
         password: Option<String>,
     ) -> Task<MemoryEditorMessage> {
@@ -609,7 +609,7 @@ impl MemoryEditor {
                 self.address_space = AddressSpace::C64Ram;
                 self.status_message = Some(format!("Selected: {}", location.description));
                 if connection.is_some() {
-                    return self.update(
+                    return self.update_impl(
                         MemoryEditorMessage::ReadMemory,
                         connection,
                         host,
@@ -866,7 +866,7 @@ impl MemoryEditor {
                 match result {
                     Ok(()) => {
                         self.status_message = Some("Fill complete".to_string());
-                        return self.update(
+                        return self.update_impl(
                             MemoryEditorMessage::ReadMemory,
                             connection,
                             host,
@@ -922,7 +922,7 @@ impl MemoryEditor {
 
             MemoryEditorMessage::RefreshMemory => {
                 if self.memory_data.is_some() {
-                    return self.update(
+                    return self.update_impl(
                         MemoryEditorMessage::ReadMemory,
                         connection,
                         host,
@@ -1044,7 +1044,7 @@ impl MemoryEditor {
                 match result {
                     Ok(()) => {
                         self.status_message = Some("Memory written successfully!".to_string());
-                        return self.update(
+                        return self.update_impl(
                             MemoryEditorMessage::ReadMemory,
                             connection,
                             host,
@@ -1100,7 +1100,7 @@ impl MemoryEditor {
                 self.length_input = bm.length.to_string();
                 self.status_message = Some(format!("Jumped to bookmark: {}", bm.label));
                 if connection.is_some() && self.address_space == AddressSpace::C64Ram {
-                    return self.update(
+                    return self.update_impl(
                         MemoryEditorMessage::ReadMemory,
                         connection,
                         host,
@@ -2155,7 +2155,7 @@ fn parse_length_input(input: &str) -> Option<u32> {
 // ─────────────────────────────────────────────────────────────────
 
 async fn read_memory_async(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     address: u16,
     length: u32,
 ) -> Result<Vec<u8>, String> {
@@ -2163,7 +2163,7 @@ async fn read_memory_async(
 }
 
 async fn write_byte_async(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     address: u16,
     value: u8,
 ) -> Result<(), String> {
@@ -2171,7 +2171,7 @@ async fn write_byte_async(
 }
 
 async fn fill_memory_async(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     address: u16,
     length: u32,
     value: u8,
@@ -2180,7 +2180,7 @@ async fn fill_memory_async(
 }
 
 async fn write_memory_async(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     address: u16,
     data: Vec<u8>,
 ) -> Result<(), String> {
@@ -2238,5 +2238,16 @@ mod tests {
         assert_eq!(parse_length_input("65536"), Some(65536));
         assert_eq!(parse_length_input("$10000"), Some(0x10000));
         assert_eq!(parse_length_input("10000h"), Some(0x10000));
+    }
+}
+
+impl crate::tab::TabController for MemoryEditor {
+    type Message = MemoryEditorMessage;
+    fn update(
+        &mut self,
+        message: MemoryEditorMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<MemoryEditorMessage> {
+        self.update_impl(message, ctx.connection, ctx.host, ctx.password)
     }
 }

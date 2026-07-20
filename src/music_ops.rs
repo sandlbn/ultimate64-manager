@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 use crate::music_player::{
@@ -29,7 +29,7 @@ pub async fn play_music_file(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             match file_type {
                 MusicFileType::Sid => conn.sid_play(&data, song_number).map_err(|e| e.to_string()),
                 MusicFileType::Mod => conn.mod_play(&data).map_err(|e| e.to_string()),

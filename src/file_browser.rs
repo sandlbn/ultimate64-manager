@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::{drives::MountMode, Rest};
 
 /// Stable ID for the main file-list scrollable widget
@@ -425,7 +425,7 @@ impl FileBrowser {
         )
     }
 
-    pub fn update(
+    pub fn update_impl(
         &mut self,
         message: FileBrowserMessage,
         connection: Option<Arc<Mutex<Rest>>>,
@@ -942,7 +942,7 @@ impl FileBrowser {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                                 tokio::task::spawn_blocking(move || {
-                                    let c = conn.blocking_lock();
+                                    let c = conn.lock().unwrap();
                                     c.sid_play(&data, None).map_err(|e| e.to_string())
                                 }),
                             )
@@ -973,7 +973,7 @@ impl FileBrowser {
                             let result = tokio::time::timeout(
                                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                                 tokio::task::spawn_blocking(move || {
-                                    let c = conn.blocking_lock();
+                                    let c = conn.lock().unwrap();
                                     c.mod_play(&data).map_err(|e| e.to_string())
                                 }),
                             )
@@ -1294,7 +1294,7 @@ impl FileBrowser {
                     return Task::none();
                 };
                 if path.is_dir() {
-                    return self.update(
+                    return self.update_impl(
                         FileBrowserMessage::FileSelected(path),
                         connection,
                         host,
@@ -1317,10 +1317,10 @@ impl FileBrowser {
                     _ => None,
                 };
                 if let Some(msg) = action {
-                    return self.update(msg, connection, host, password);
+                    return self.update_impl(msg, connection, host, password);
                 }
                 // Unrecognised type — just keep the row highlighted.
-                self.update(
+                self.update_impl(
                     FileBrowserMessage::FileSelected(path),
                     connection,
                     host,
@@ -3016,7 +3016,7 @@ async fn mount_disk_async(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             conn.mount_disk_image(&path, drive.clone(), mode, false)
                 .map_err(|e| {
                     log::error!("Mount error: {}", e);
@@ -3052,7 +3052,7 @@ async fn run_disk_async(
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(RUN_DISK_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
 
             // 1. Mount the disk image (read-only is fine for running)
             conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
@@ -3109,7 +3109,7 @@ async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Resu
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
             match ext.as_deref() {
                 Some("crt") => {
                     log::info!("Running as CRT cartridge");
@@ -3349,5 +3349,16 @@ pub async fn enable_drive_async(
         Ok(())
     } else {
         Err(format!("Config API returned HTTP {}", resp.status()))
+    }
+}
+
+impl crate::tab::TabController for FileBrowser {
+    type Message = FileBrowserMessage;
+    fn update(
+        &mut self,
+        message: FileBrowserMessage,
+        ctx: crate::tab::TabContext,
+    ) -> iced::Task<FileBrowserMessage> {
+        self.update_impl(message, ctx.connection, ctx.host, ctx.password)
     }
 }

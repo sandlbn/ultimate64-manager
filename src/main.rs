@@ -3,10 +3,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
-    widget::{
-        button, column, container, pick_list, progress_bar, row, rule, scrollable, text,
-        text_input, tooltip, Space,
-    },
+    widget::{button, column, container, row, rule, scrollable, text, text_input, Space},
     window, Element, Length, Subscription, Task, Theme,
 };
 use net_utils::REST_TIMEOUT_SECS;
@@ -82,12 +79,13 @@ const HELP_BINDS: &[(&str, &str, &str)] = &[
 ];
 
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
+mod app;
 mod archive;
 mod assembly64;
 mod assembly64_browser;
@@ -128,6 +126,7 @@ mod stream_control;
 mod streaming;
 mod string_utils;
 mod styles;
+mod tab;
 mod templates;
 mod version_check;
 mod video_scaling;
@@ -142,9 +141,10 @@ use music_player::{MusicPlayer, MusicPlayerMessage, PlaybackState};
 use profile_manager::{ProfileManager as DeviceProfileManager, ProfileManagerMessage};
 use profiles::ProfileManager;
 use remote_browser::{RemoteBrowser, RemoteBrowserMessage};
-use settings::{AppSettings, ConnectionSettings, StreamControlMethod};
+use settings::{AppSettings, StreamControlMethod};
 use sid_monitor::{SidMonitor, SidMonitorMessage};
 use streaming::{StreamingMessage, VideoStreaming};
+use tab::{TabContext, TabController};
 use templates::{DiskTemplate, TemplateManager};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -581,7 +581,7 @@ pub struct Ultimate64Browser {
     settings: AppSettings,
     template_manager: TemplateManager,
     selected_template: Option<DiskTemplate>,
-    connection: Option<Arc<TokioMutex<Rest>>>,
+    connection: Option<Arc<Mutex<Rest>>>,
     host_url: Option<String>, // Store host URL for direct HTTP requests
     status: StatusInfo,
     /// DEVICE tab: buffered text to inject into the running C64 keyboard.
@@ -827,80 +827,28 @@ impl Ultimate64Browser {
         )
     }
 
+    /// Gather the device context handed to every tab via `TabController::update`.
+    fn tab_context(&self) -> TabContext {
+        TabContext {
+            connection: self.connection.clone(),
+            host: Some(self.settings.connection.host.clone()),
+            host_url: self.host_url.clone(),
+            password: self.settings.connection.password.clone(),
+        }
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Uniform device context handed to every tab's `TabController::update`.
+        // Built once (owned) so it can be cloned into tab calls without holding
+        // a borrow on `self` across the mutable per-tab borrows below.
+        let ctx = self.tab_context();
         match message {
-            Message::SaveProfile => {
-                // Sync current input fields to the active profile before saving
-                let conn_settings = ConnectionSettings {
-                    host: self.host_input.clone(),
-                    password: if self.password_input.is_empty() {
-                        None
-                    } else {
-                        Some(self.password_input.clone())
-                    },
-                    stream_control_method: self.settings.connection.stream_control_method,
-                };
-                self.profile_manager.active_settings_mut().connection = conn_settings;
+            Message::SaveProfile => self.handle_save_profile(),
+            Message::StartDiscovery => self.handle_start_discovery(),
 
-                if let Ok(size) = self.font_size_input.parse::<u32>() {
-                    if size >= 8 && size <= 24 {
-                        self.profile_manager
-                            .active_settings_mut()
-                            .preferences
-                            .font_size = size;
-                    }
-                }
+            Message::DiscoveryComplete(devices) => self.handle_discovery_complete(devices),
 
-                self.settings = self.profile_manager.active_settings().clone();
-
-                match self.profile_manager.save() {
-                    Ok(()) => {
-                        self.user_message =
-                            Some(UserMessage::Info("Profile saved successfully".to_string()));
-                    }
-                    Err(e) => {
-                        self.user_message =
-                            Some(UserMessage::Error(format!("Failed to save profile: {}", e)));
-                    }
-                }
-                Task::none()
-            }
-            Message::StartDiscovery => {
-                if self.is_discovering {
-                    return Task::none();
-                }
-                self.is_discovering = true;
-                self.discovered_devices.clear();
-                self.user_message = Some(UserMessage::Info("Scanning network...".to_string()));
-
-                Task::perform(discovery::discover_devices(), Message::DiscoveryComplete)
-            }
-
-            Message::DiscoveryComplete(devices) => {
-                self.is_discovering = false;
-                self.discovered_devices = devices.clone();
-
-                if devices.is_empty() {
-                    self.user_message = Some(UserMessage::Info(
-                        "No Ultimate devices found on network".to_string(),
-                    ));
-                } else {
-                    self.user_message = Some(UserMessage::Info(format!(
-                        "Found {} device(s)",
-                        devices.len()
-                    )));
-                }
-                Task::none()
-            }
-
-            Message::SelectDiscoveredDevice(device) => {
-                self.host_input = device.ip.clone();
-                self.user_message = Some(UserMessage::Info(format!(
-                    "Selected: {} ({})",
-                    device.product, device.ip
-                )));
-                Task::none()
-            }
+            Message::SelectDiscoveredDevice(device) => self.handle_select_discovered_device(device),
             Message::TabSelected(tab) => {
                 log::debug!("Tab selected: {:?}", tab);
                 self.active_tab = tab;
@@ -915,49 +863,26 @@ impl Ultimate64Browser {
                 // Also kick off a background refresh of the dropdown
                 // presets and category map (one-shot per session).
                 if tab == Tab::Assembly64 && !self.assembly64_browser.has_content() {
-                    let host = Some(self.settings.connection.host.clone());
-                    let pwd = self.settings.connection.password.clone();
                     let refresh = self
                         .assembly64_browser
-                        .update(
-                            Assembly64BrowserMessage::RefreshPresets,
-                            self.connection.clone(),
-                            host.clone(),
-                            pwd.clone(),
-                        )
+                        .update(Assembly64BrowserMessage::RefreshPresets, ctx.clone())
                         .map(Message::Assembly64Browser);
                     let search = self
                         .assembly64_browser
-                        .update(
-                            Assembly64BrowserMessage::SearchSubmit,
-                            self.connection.clone(),
-                            host,
-                            pwd,
-                        )
+                        .update(Assembly64BrowserMessage::SearchSubmit, ctx.clone())
                         .map(Message::Assembly64Browser);
                     return Task::batch([refresh, search]);
                 }
                 Task::none()
             }
-            Message::CloseStreamingWindow => {
-                if let Some(id) = self.streaming_window_id {
-                    self.streaming_window_id = None;
-                    return iced::window::close(id);
-                }
-                Task::none()
-            }
+            Message::CloseStreamingWindow => self.handle_close_streaming_window(),
             Message::MemoryEditor(msg) => self
                 .memory_editor
-                .update(
-                    msg,
-                    self.connection.clone(),
-                    Some(self.settings.connection.host.clone()),
-                    self.settings.connection.password.clone(),
-                )
+                .update(msg, ctx.clone())
                 .map(Message::MemoryEditor),
             Message::Monitor(msg) => self
                 .sid_monitor
-                .update(msg, self.connection.clone())
+                .update(msg, ctx.clone())
                 .map(Message::Monitor),
             Message::LeftBrowser(msg) => {
                 // User interaction with left pane makes it active
@@ -989,12 +914,7 @@ impl Ultimate64Browser {
 
                 let cmd = self
                     .left_browser
-                    .update(
-                        msg,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(msg, ctx.clone())
                     .map(Message::LeftBrowser);
 
                 let mut commands = vec![cmd];
@@ -1004,7 +924,7 @@ impl Ultimate64Browser {
                     log::info!("Stopping music player - running cartridge/disk");
                     commands.push(
                         self.music_player
-                            .update(MusicPlayerMessage::Stop, self.connection.clone())
+                            .update(MusicPlayerMessage::Stop, ctx.clone())
                             .map(Message::MusicPlayer),
                     );
                 }
@@ -1067,16 +987,11 @@ impl Ultimate64Browser {
                     }
                     let cmd = self
                         .remote_browser
-                        .update(msg, self.connection.clone())
+                        .update(msg, ctx.clone())
                         .map(Message::RemoteBrowser);
                     let refresh = self
                         .left_browser
-                        .update(
-                            FileBrowserMessage::RefreshFiles,
-                            self.connection.clone(),
-                            Some(self.settings.connection.host.clone()),
-                            self.settings.connection.password.clone(),
-                        )
+                        .update(FileBrowserMessage::RefreshFiles, ctx.clone())
                         .map(Message::LeftBrowser);
                     return Task::batch(vec![cmd, refresh]);
                 }
@@ -1095,7 +1010,7 @@ impl Ultimate64Browser {
 
                 let cmd = self
                     .remote_browser
-                    .update(msg, self.connection.clone())
+                    .update(msg, ctx.clone())
                     .map(Message::RemoteBrowser);
 
                 if should_stop_music {
@@ -1103,7 +1018,7 @@ impl Ultimate64Browser {
                     Task::batch(vec![
                         cmd,
                         self.music_player
-                            .update(MusicPlayerMessage::Stop, self.connection.clone())
+                            .update(MusicPlayerMessage::Stop, ctx.clone())
                             .map(Message::MusicPlayer),
                     ])
                 } else {
@@ -1144,12 +1059,7 @@ impl Ultimate64Browser {
             Message::FnSize => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::CalculateSelectedSize,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::CalculateSelectedSize, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => {
                     self.user_message = Some(UserMessage::Info(
@@ -1202,12 +1112,7 @@ impl Ultimate64Browser {
                         if let Some(path) = self.left_browser.get_selected_file().cloned() {
                             return self
                                 .left_browser
-                                .update(
-                                    FileBrowserMessage::ShowContentPreview(path),
-                                    self.connection.clone(),
-                                    Some(self.settings.connection.host.clone()),
-                                    self.settings.connection.password.clone(),
-                                )
+                                .update(FileBrowserMessage::ShowContentPreview(path), ctx.clone())
                                 .map(Message::LeftBrowser);
                         }
                         Task::none()
@@ -1218,10 +1123,7 @@ impl Ultimate64Browser {
                         {
                             return self
                                 .remote_browser
-                                .update(
-                                    RemoteBrowserMessage::ShowContentPreview(path),
-                                    self.connection.clone(),
-                                )
+                                .update(RemoteBrowserMessage::ShowContentPreview(path), ctx.clone())
                                 .map(Message::RemoteBrowser);
                         }
                         Task::none()
@@ -1240,51 +1142,33 @@ impl Ultimate64Browser {
             Message::FnRefresh => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::RefreshFiles,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::RefreshFiles, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
+                    .update(RemoteBrowserMessage::RefreshFiles, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
             Message::FnMkDir => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::ShowCreateDir,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::ShowCreateDir, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(RemoteBrowserMessage::ShowCreateDir, self.connection.clone())
+                    .update(RemoteBrowserMessage::ShowCreateDir, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
             Message::FnNewDisk => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::ShowCreateDisk,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::ShowCreateDisk, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(
-                        RemoteBrowserMessage::ShowCreateDisk,
-                        self.connection.clone(),
-                    )
+                    .update(RemoteBrowserMessage::ShowCreateDisk, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
@@ -1296,12 +1180,7 @@ impl Ultimate64Browser {
                         if checked_count > 0 {
                             return self
                                 .left_browser
-                                .update(
-                                    FileBrowserMessage::DeleteChecked,
-                                    self.connection.clone(),
-                                    Some(self.settings.connection.host.clone()),
-                                    self.settings.connection.password.clone(),
-                                )
+                                .update(FileBrowserMessage::DeleteChecked, ctx.clone())
                                 .map(Message::LeftBrowser);
                         }
                         Task::none()
@@ -1311,10 +1190,7 @@ impl Ultimate64Browser {
                         if checked_count > 0 {
                             return self
                                 .remote_browser
-                                .update(
-                                    RemoteBrowserMessage::DeleteChecked,
-                                    self.connection.clone(),
-                                )
+                                .update(RemoteBrowserMessage::DeleteChecked, ctx.clone())
                                 .map(Message::RemoteBrowser);
                         }
                         Task::none()
@@ -1325,19 +1201,11 @@ impl Ultimate64Browser {
             Message::FilterChanged(text) => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::FilterChanged(text),
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::FilterChanged(text), ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(
-                        RemoteBrowserMessage::FilterChanged(text),
-                        self.connection.clone(),
-                    )
+                    .update(RemoteBrowserMessage::FilterChanged(text), ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
@@ -1352,48 +1220,33 @@ impl Ultimate64Browser {
             Message::NavigateUpActivePane => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::NavigateUp,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::NavigateUp, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(RemoteBrowserMessage::NavigateUp, self.connection.clone())
+                    .update(RemoteBrowserMessage::NavigateUp, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
             Message::SelectAllActivePane => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::SelectAll,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::SelectAll, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(RemoteBrowserMessage::SelectAll, self.connection.clone())
+                    .update(RemoteBrowserMessage::SelectAll, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
             Message::SelectNoneActivePane => match self.active_pane {
                 Pane::Left => self
                     .left_browser
-                    .update(
-                        FileBrowserMessage::SelectNone,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(FileBrowserMessage::SelectNone, ctx.clone())
                     .map(Message::LeftBrowser),
                 Pane::Right => self
                     .remote_browser
-                    .update(RemoteBrowserMessage::SelectNone, self.connection.clone())
+                    .update(RemoteBrowserMessage::SelectNone, ctx.clone())
                     .map(Message::RemoteBrowser),
             },
 
@@ -1403,12 +1256,7 @@ impl Ultimate64Browser {
                         if let Some(path) = self.left_browser.get_selected_file().cloned() {
                             return self
                                 .left_browser
-                                .update(
-                                    FileBrowserMessage::RenameFile(path),
-                                    self.connection.clone(),
-                                    Some(self.settings.connection.host.clone()),
-                                    self.settings.connection.password.clone(),
-                                )
+                                .update(FileBrowserMessage::RenameFile(path), ctx.clone())
                                 .map(Message::LeftBrowser);
                         }
                         self.user_message = Some(UserMessage::Info(
@@ -1422,10 +1270,7 @@ impl Ultimate64Browser {
                             let path = selected.clone();
                             return self
                                 .remote_browser
-                                .update(
-                                    RemoteBrowserMessage::RenameFile(path),
-                                    self.connection.clone(),
-                                )
+                                .update(RemoteBrowserMessage::RenameFile(path), ctx.clone())
                                 .map(Message::RemoteBrowser);
                         }
                         self.user_message = Some(UserMessage::Info(
@@ -1436,610 +1281,14 @@ impl Ultimate64Browser {
                 }
             }
 
-            Message::CopyLocalToRemote => {
-                // Copy checked local files and directories to Ultimate64.
-                // Before kicking off the FTP upload, check which top-level
-                // destination names already exist on the device — if any do,
-                // stash the operation in `pending_copy` and let the overwrite
-                // dialog gate the actual transfer.
-                let items_to_copy = self.left_browser.get_checked_files();
+            Message::CopyLocalToRemote => self.handle_copy_local_to_remote(),
+            Message::CopyOverwriteCancel => self.handle_copy_overwrite_cancel(),
+            Message::CopyOverwriteConfirm => self.handle_copy_overwrite_confirm(),
+            Message::CopyRemoteToLocal => self.handle_copy_remote_to_local(),
 
-                if items_to_copy.is_empty() {
-                    self.user_message = Some(UserMessage::Error(
-                        "No files selected. Use checkboxes to select files.".to_string(),
-                    ));
-                    return Task::none();
-                }
-
-                if self.host_url.is_none() {
-                    self.user_message = Some(UserMessage::Error(
-                        "Not connected to Ultimate64".to_string(),
-                    ));
-                    return Task::none();
-                }
-
-                let remote_dest = self.remote_browser.get_current_path().to_string();
-                let existing: std::collections::HashSet<&str> = self
-                    .remote_browser
-                    .files
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect();
-                let conflicts: Vec<String> = items_to_copy
-                    .iter()
-                    .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
-                    .filter(|n| existing.contains(n))
-                    .map(String::from)
-                    .collect();
-
-                self.pending_copy = Some(PendingCopy {
-                    items: items_to_copy,
-                    remote_dest,
-                    conflicts: conflicts.clone(),
-                });
-                if conflicts.is_empty() {
-                    return Task::done(Message::CopyOverwriteConfirm);
-                }
-                Task::none()
-            }
-            Message::CopyOverwriteCancel => {
-                self.pending_copy = None;
-                Task::none()
-            }
-            Message::CopyOverwriteConfirm => {
-                let pending = match self.pending_copy.take() {
-                    Some(p) => p,
-                    None => return Task::none(),
-                };
-                let items_to_copy = pending.items;
-                let remote_dest = pending.remote_dest;
-
-                let host = match &self.host_url {
-                    Some(h) => h
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
-                        .to_string(),
-                    None => {
-                        self.user_message = Some(UserMessage::Error(
-                            "Not connected to Ultimate64".to_string(),
-                        ));
-                        return Task::none();
-                    }
-                };
-
-                let password = self.settings.connection.password.clone();
-                let progress = self.copy_progress.clone();
-
-                // Count total files and bytes (recursively walking directories)
-                let mut total_files: usize = 0;
-                let mut total_bytes: u64 = 0;
-                for p in &items_to_copy {
-                    if p.is_dir() {
-                        for e in walkdir::WalkDir::new(p)
-                            .min_depth(1)
-                            .into_iter()
-                            .filter_map(|e| e.ok())
-                        {
-                            if e.file_type().is_file() {
-                                total_files += 1;
-                                total_bytes = total_bytes
-                                    .saturating_add(e.metadata().map(|m| m.len()).unwrap_or(0));
-                            }
-                        }
-                    } else {
-                        total_files += 1;
-                        total_bytes = total_bytes
-                            .saturating_add(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0));
-                    }
-                }
-
-                if let Ok(mut g) = progress.lock() {
-                    *g = Some(crate::ftp_ops::TransferProgress {
-                        current: 0,
-                        total: total_files,
-                        current_file: String::new(),
-                        operation: "Uploading".to_string(),
-                        done: false,
-                        cancelled: false,
-                        started_at: std::time::Instant::now(),
-                        bytes_transferred: 0,
-                        bytes_total: total_bytes,
-                    });
-                }
-
-                self.user_message = Some(UserMessage::Info(format!(
-                    "Uploading {} file(s) via FTP...",
-                    total_files
-                )));
-
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            use std::io::Cursor;
-                            use std::time::Duration;
-                            use suppaftp::FtpStream;
-
-                            let addr = format!("{}:21", host);
-                            let mut ftp = FtpStream::connect(&addr)
-                                .map_err(|e| format!("FTP connect failed: {}", e))?;
-
-                            ftp.get_ref()
-                                .set_write_timeout(Some(Duration::from_secs(120)))
-                                .ok();
-
-                            if let Some(ref pwd) = password {
-                                if !pwd.is_empty() {
-                                    ftp.login("admin", pwd)
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
-                                } else {
-                                    ftp.login("anonymous", "anonymous")
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
-                                }
-                            } else {
-                                ftp.login("anonymous", "anonymous")
-                                    .map_err(|e| format!("FTP login failed: {}", e))?;
-                            }
-
-                            ftp.transfer_type(suppaftp::types::FileType::Binary)
-                                .map_err(|e| format!("Set binary mode failed: {}", e))?;
-
-                            let mut uploaded = 0usize;
-                            let mut errors: Vec<String> = Vec::new();
-
-                            for item_path in &items_to_copy {
-                                // Check for cancellation
-                                let is_cancelled = progress
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                    .unwrap_or(false);
-                                if is_cancelled {
-                                    break;
-                                }
-
-                                if item_path.is_dir() {
-                                    // Upload directory recursively
-                                    let dir_name = item_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("dir");
-                                    let base_remote = format!(
-                                        "{}/{}",
-                                        remote_dest.trim_end_matches('/'),
-                                        dir_name
-                                    );
-
-                                    for entry in walkdir::WalkDir::new(item_path).min_depth(0) {
-                                        // Check for cancellation inside dir walk
-                                        let is_cancelled = progress
-                                            .lock()
-                                            .ok()
-                                            .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                            .unwrap_or(false);
-                                        if is_cancelled {
-                                            break;
-                                        }
-                                        let entry = match entry {
-                                            Ok(e) => e,
-                                            Err(e) => {
-                                                errors.push(format!("Walk error: {}", e));
-                                                continue;
-                                            }
-                                        };
-                                        let relative = match entry.path().strip_prefix(item_path) {
-                                            Ok(r) => r,
-                                            Err(_) => continue,
-                                        };
-                                        let remote_path = if relative.as_os_str().is_empty() {
-                                            base_remote.clone()
-                                        } else {
-                                            let rel_str =
-                                                relative.to_string_lossy().replace('\\', "/");
-                                            format!("{}/{}", base_remote, rel_str)
-                                        };
-
-                                        if entry.file_type().is_dir() {
-                                            let _ = ftp.mkdir(&remote_path);
-                                        } else if entry.file_type().is_file() {
-                                            let filename = entry
-                                                .path()
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .to_string();
-
-                                            if let Ok(mut g) = progress.lock() {
-                                                if let Some(ref mut p) = *g {
-                                                    p.current_file = filename.clone();
-                                                }
-                                            }
-
-                                            match std::fs::read(entry.path()) {
-                                                Ok(data) => {
-                                                    let (parent_dir, fname) =
-                                                        if let Some(pos) = remote_path.rfind('/') {
-                                                            (
-                                                                &remote_path[..pos],
-                                                                &remote_path[pos + 1..],
-                                                            )
-                                                        } else {
-                                                            ("/", remote_path.as_str())
-                                                        };
-                                                    if ftp.cwd(parent_dir).is_err() {
-                                                        errors.push(format!(
-                                                            "CWD {}: failed",
-                                                            parent_dir
-                                                        ));
-                                                        continue;
-                                                    }
-                                                    let cursor = Cursor::new(data);
-                                                    let mut reader =
-                                                        crate::ftp_ops::ProgressReader {
-                                                            inner: cursor,
-                                                            progress: progress.clone(),
-                                                        };
-                                                    match ftp.put_file(fname, &mut reader) {
-                                                        Ok(_) => {
-                                                            uploaded += 1;
-                                                            if let Ok(mut g) = progress.lock() {
-                                                                if let Some(ref mut p) = *g {
-                                                                    p.current = uploaded;
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => errors.push(format!(
-                                                            "Upload {}: {}",
-                                                            fname, e
-                                                        )),
-                                                    }
-                                                }
-                                                Err(e) => errors.push(format!(
-                                                    "Read {}: {}",
-                                                    entry.path().display(),
-                                                    e
-                                                )),
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Upload single file
-                                    let filename = item_path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("file")
-                                        .to_string();
-
-                                    if let Ok(mut g) = progress.lock() {
-                                        if let Some(ref mut p) = *g {
-                                            p.current_file = filename.clone();
-                                        }
-                                    }
-
-                                    // CWD to remote dest for loose files
-                                    ftp.cwd(&remote_dest).map_err(|e| {
-                                        format!("Cannot access {}: {}", remote_dest, e)
-                                    })?;
-
-                                    let data = std::fs::read(item_path).map_err(|e| {
-                                        format!("Cannot read {}: {}", item_path.display(), e)
-                                    })?;
-                                    let cursor = Cursor::new(data);
-                                    let mut reader = crate::ftp_ops::ProgressReader {
-                                        inner: cursor,
-                                        progress: progress.clone(),
-                                    };
-                                    ftp.put_file(&filename, &mut reader).map_err(|e| {
-                                        format!("FTP upload {} failed: {}", filename, e)
-                                    })?;
-
-                                    uploaded += 1;
-                                    if let Ok(mut g) = progress.lock() {
-                                        if let Some(ref mut p) = *g {
-                                            p.current = uploaded;
-                                        }
-                                    }
-                                }
-                            }
-
-                            let was_cancelled = progress
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                .unwrap_or(false);
-
-                            if let Ok(mut g) = progress.lock() {
-                                if let Some(ref mut p) = *g {
-                                    p.done = true;
-                                }
-                            }
-
-                            let _ = ftp.quit();
-
-                            let mut msg = if was_cancelled {
-                                format!("Cancelled after {} file(s)", uploaded)
-                            } else {
-                                format!("Uploaded {} file(s)", uploaded)
-                            };
-                            if !errors.is_empty() {
-                                msg.push_str(&format!(" ({} errors)", errors.len()));
-                                for e in errors.iter().take(3) {
-                                    log::warn!("Upload error: {}", e);
-                                }
-                            }
-                            Ok(msg)
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?
-                    },
-                    Message::CopyComplete,
-                );
-            }
-            Message::CopyRemoteToLocal => {
-                let (file_paths, dir_paths) = self.remote_browser.get_checked_files_and_dirs();
-
-                // Fall back to single selected file if nothing checked
-                let (file_paths, dir_paths) = if file_paths.is_empty() && dir_paths.is_empty() {
-                    if let Some(path) = self.remote_browser.get_selected_file() {
-                        (vec![path.to_string()], vec![])
-                    } else {
-                        self.user_message = Some(UserMessage::Error(
-                            "No files selected. Use checkboxes to select files.".to_string(),
-                        ));
-                        return Task::none();
-                    }
-                } else {
-                    (file_paths, dir_paths)
-                };
-
-                let host = match &self.host_url {
-                    Some(h) => h
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
-                        .to_string(),
-                    None => {
-                        self.user_message = Some(UserMessage::Error(
-                            "Not connected to Ultimate64".to_string(),
-                        ));
-                        return Task::none();
-                    }
-                };
-
-                let local_dest = self.left_browser.get_current_directory().clone();
-                let password = self.settings.connection.password.clone();
-                let progress = self.copy_progress.clone();
-
-                // Initial total is just file count; directories will be counted via FTP LIST
-                if let Ok(mut g) = progress.lock() {
-                    *g = Some(crate::ftp_ops::TransferProgress {
-                        current: 0,
-                        total: file_paths.len(),
-                        current_file: "counting files...".to_string(),
-                        operation: "Downloading".to_string(),
-                        done: false,
-                        cancelled: false,
-                        started_at: std::time::Instant::now(),
-                        bytes_transferred: 0,
-                        bytes_total: 0,
-                    });
-                }
-
-                self.user_message = Some(UserMessage::Info("Downloading via FTP...".to_string()));
-
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            use std::io::Read;
-                            use std::time::Duration;
-                            use suppaftp::FtpStream;
-
-                            let addr = format!("{}:21", host);
-                            let mut ftp = FtpStream::connect(&addr)
-                                .map_err(|e| format!("FTP connect failed: {}", e))?;
-
-                            ftp.get_ref()
-                                .set_read_timeout(Some(Duration::from_secs(60)))
-                                .ok();
-
-                            if let Some(ref pwd) = password {
-                                if !pwd.is_empty() {
-                                    ftp.login("admin", pwd)
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
-                                } else {
-                                    ftp.login("anonymous", "anonymous")
-                                        .map_err(|e| format!("FTP login failed: {}", e))?;
-                                }
-                            } else {
-                                ftp.login("anonymous", "anonymous")
-                                    .map_err(|e| format!("FTP login failed: {}", e))?;
-                            }
-
-                            ftp.transfer_type(suppaftp::types::FileType::Binary)
-                                .map_err(|e| format!("Set binary mode failed: {}", e))?;
-
-                            let mut downloaded = 0usize;
-                            let mut errors: Vec<String> = Vec::new();
-
-                            // Count total files in directories via FTP LIST
-                            let mut dir_file_count = 0usize;
-                            for remote_dir in &dir_paths {
-                                dir_file_count +=
-                                    count_remote_files_recursive(&mut ftp, remote_dir);
-                            }
-                            // Update total with actual file count
-                            if let Ok(mut g) = progress.lock() {
-                                if let Some(ref mut p) = *g {
-                                    p.total = file_paths.len() + dir_file_count;
-                                    p.current_file = String::new();
-                                }
-                            }
-
-                            // Download individual files
-                            for remote_path in &file_paths {
-                                let is_cancelled = progress
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                    .unwrap_or(false);
-                                if is_cancelled {
-                                    break;
-                                }
-
-                                let filename = remote_path.rsplit('/').next().unwrap_or("file");
-
-                                // Get file size for progress
-                                let file_size = ftp.size(remote_path).unwrap_or(0);
-
-                                if let Ok(mut g) = progress.lock() {
-                                    if let Some(ref mut p) = *g {
-                                        p.current_file = filename.to_string();
-                                        p.bytes_total += file_size as u64;
-                                    }
-                                }
-
-                                match ftp.retr_as_stream(remote_path) {
-                                    Ok(mut reader) => {
-                                        let mut data = Vec::new();
-                                        if let Err(e) = reader.read_to_end(&mut data) {
-                                            errors.push(format!("{}: {}", filename, e));
-                                            continue;
-                                        }
-                                        if let Err(e) = ftp.finalize_retr_stream(reader) {
-                                            errors.push(format!("{}: {}", filename, e));
-                                            continue;
-                                        }
-                                        let local_path = local_dest.join(filename);
-                                        if let Err(e) = std::fs::write(&local_path, &data) {
-                                            errors.push(format!("{}: {}", filename, e));
-                                            continue;
-                                        }
-                                        downloaded += 1;
-                                        if let Ok(mut g) = progress.lock() {
-                                            if let Some(ref mut p) = *g {
-                                                p.current = downloaded;
-                                                p.bytes_transferred += data.len() as u64;
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        errors.push(format!("{}: {}", filename, e));
-                                    }
-                                }
-                            }
-
-                            // Download directories recursively
-                            for remote_dir in &dir_paths {
-                                let is_cancelled = progress
-                                    .lock()
-                                    .ok()
-                                    .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                    .unwrap_or(false);
-                                if is_cancelled {
-                                    break;
-                                }
-
-                                let dir_name = remote_dir.rsplit('/').next().unwrap_or("dir");
-                                let local_dir = local_dest.join(dir_name);
-
-                                if let Ok(mut g) = progress.lock() {
-                                    if let Some(ref mut p) = *g {
-                                        p.current_file = format!("{}/", dir_name);
-                                    }
-                                }
-
-                                match download_directory_with_progress(
-                                    &mut ftp,
-                                    remote_dir,
-                                    &local_dir,
-                                    &progress,
-                                    &mut downloaded,
-                                ) {
-                                    Ok(files) => {
-                                        log::info!("Downloaded dir {}: {} files", dir_name, files);
-                                    }
-                                    Err(e) => {
-                                        errors.push(format!("{}: {}", dir_name, e));
-                                    }
-                                }
-                            }
-
-                            let was_cancelled = progress
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.as_ref().map(|p| p.cancelled))
-                                .unwrap_or(false);
-
-                            if let Ok(mut g) = progress.lock() {
-                                if let Some(ref mut p) = *g {
-                                    p.done = true;
-                                }
-                            }
-
-                            let _ = ftp.quit();
-
-                            let mut msg = if was_cancelled {
-                                format!("Cancelled after {} item(s)", downloaded)
-                            } else {
-                                format!("Downloaded {} item(s)", downloaded)
-                            };
-                            if !errors.is_empty() {
-                                msg.push_str(&format!(" ({} errors)", errors.len()));
-                                for e in errors.iter().take(3) {
-                                    log::warn!("Download error: {}", e);
-                                }
-                            }
-                            Ok(msg)
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?
-                    },
-                    Message::CopyComplete,
-                );
-            }
-
-            Message::CopyCancel => {
-                if let Ok(mut g) = self.copy_progress.lock() {
-                    if let Some(ref mut p) = *g {
-                        p.cancelled = true;
-                    }
-                }
-                Task::none()
-            }
-            Message::CopyProgressTick => {
-                // Just triggers a re-render so the progress bar updates
-                Task::none()
-            }
-            Message::CopyComplete(result) => {
-                // Clear copy progress
-                if let Ok(mut g) = self.copy_progress.lock() {
-                    *g = None;
-                }
-                match result {
-                    Ok(msg) => {
-                        self.show_toast(msg.clone());
-                        self.user_message = Some(UserMessage::Info(msg));
-                        // Clear checked files after successful copy
-                        self.left_browser.clear_checked();
-                        // Refresh both browsers
-                        return Task::batch(vec![
-                            self.left_browser
-                                .update(
-                                    FileBrowserMessage::RefreshFiles,
-                                    self.connection.clone(),
-                                    Some(self.settings.connection.host.clone()),
-                                    self.settings.connection.password.clone(),
-                                )
-                                .map(Message::LeftBrowser),
-                            self.remote_browser
-                                .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
-                                .map(Message::RemoteBrowser),
-                        ]);
-                    }
-                    Err(e) => {
-                        self.user_message = Some(UserMessage::Error(e));
-                    }
-                }
-                Task::none()
-            }
+            Message::CopyCancel => self.handle_copy_cancel(),
+            Message::CopyProgressTick => self.handle_copy_progress_tick(),
+            Message::CopyComplete(result) => self.handle_copy_complete(result, ctx.clone()),
             Message::VersionCheck(msg) => {
                 match msg {
                     VersionCheckMessage::CheckComplete(result) => match result {
@@ -2072,7 +1321,7 @@ impl Ultimate64Browser {
                 if let MusicPlayerMessage::Pause = &msg {
                     let cmd = self
                         .music_player
-                        .update(msg, self.connection.clone())
+                        .update(msg, ctx.clone())
                         .map(Message::MusicPlayer);
 
                     // Also send PauseMachine command
@@ -2101,7 +1350,7 @@ impl Ultimate64Browser {
                     if was_paused {
                         let cmd = self
                             .music_player
-                            .update(msg, self.connection.clone())
+                            .update(msg, ctx.clone())
                             .map(Message::MusicPlayer);
 
                         // Also send ResumeMachine command
@@ -2127,18 +1376,13 @@ impl Ultimate64Browser {
                 }
 
                 self.music_player
-                    .update(msg, self.connection.clone())
+                    .update(msg, ctx.clone())
                     .map(Message::MusicPlayer)
             }
 
             Message::ConfigEditor(msg) => self
                 .config_editor
-                .update(
-                    msg,
-                    self.connection.clone(),
-                    self.host_url.clone(),
-                    self.settings.connection.password.clone(),
-                )
+                .update(msg, ctx.clone())
                 .map(Message::ConfigEditor),
 
             Message::DeviceProfileManager(msg) => {
@@ -2146,330 +1390,51 @@ impl Ultimate64Browser {
                 self.device_profile_manager
                     .set_streaming_frame(self.video_streaming.frame_buffer.clone());
                 self.device_profile_manager
-                    .update(
-                        msg,
-                        self.host_url.clone(),
-                        self.settings.connection.password.clone(),
-                        self.connection.clone(),
-                    )
+                    .update(msg, ctx.clone())
                     .map(Message::DeviceProfileManager)
             }
 
-            Message::HostInputChanged(value) => {
-                self.host_input = value;
-                Task::none()
-            }
+            Message::HostInputChanged(value) => self.handle_host_input_changed(value),
 
-            Message::PasswordInputChanged(value) => {
-                self.password_input = value;
-                Task::none()
-            }
+            Message::PasswordInputChanged(value) => self.handle_password_input_changed(value),
 
-            Message::ConnectPressed => {
-                log::info!("Connect button pressed");
-                let conn_settings = ConnectionSettings {
-                    host: self.host_input.clone(),
-                    password: if self.password_input.is_empty() {
-                        None
-                    } else {
-                        Some(self.password_input.clone())
-                    },
-                    stream_control_method: self.settings.connection.stream_control_method,
-                };
-                self.profile_manager.active_settings_mut().connection = conn_settings;
-                self.settings = self.profile_manager.active_settings().clone();
+            Message::ConnectPressed => self.handle_connect_pressed(),
 
-                self.establish_connection();
-                // Trigger status refresh and remote browser refresh after a short delay
-                Task::perform(
-                    async {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    },
-                    |_| Message::RefreshAfterConnect,
-                )
-            }
-
-            Message::DisconnectPressed => {
-                log::info!("Disconnecting...");
-
-                // Stop video streaming if active to prevent hangs
-                if self.video_streaming.is_streaming {
-                    let _ = self
-                        .video_streaming
-                        .update(StreamingMessage::StopStream, None);
-                }
-
-                self.connection = None;
-                self.host_url = None;
-                self.status.connected = false;
-                self.status.device_info = None;
-                self.status.mounted_disks.clear();
-                self.consecutive_status_failures = 0;
-                self.remote_browser.set_host(None, None);
-                // Clear telnet host for video streaming control
-                self.video_streaming.set_ultimate_host(None);
-                self.user_message = Some(UserMessage::Info(
-                    "Disconnected from Ultimate64".to_string(),
-                ));
-                Task::none()
-            }
+            Message::DisconnectPressed => self.handle_disconnect_pressed(ctx.clone()),
             Message::StreamControlMethodChanged(method) => {
-                self.profile_manager
-                    .active_settings_mut()
-                    .connection
-                    .stream_control_method = method;
-                self.settings = self.profile_manager.active_settings().clone();
-                self.video_streaming.set_stream_control_method(method);
-                if let Err(e) = self.profile_manager.save() {
-                    log::error!("Failed to save profiles: {}", e);
-                }
-                Task::none()
+                self.handle_stream_control_method_changed(method)
             }
-            Message::RefreshStatus => {
-                if let Some(conn) = &self.connection {
-                    let conn = conn.clone();
-                    Task::perform(
-                        async move { fetch_status(conn).await },
-                        Message::StatusUpdated,
-                    )
-                } else {
-                    Task::none()
-                }
-            }
-            Message::ProfileSelected(name) => {
-                if self.profile_manager.switch_profile(&name) {
-                    self.settings = self.profile_manager.active_settings().clone();
-                    self.host_input = self.settings.connection.host.clone();
-                    self.password_input = self
-                        .settings
-                        .connection
-                        .password
-                        .clone()
-                        .unwrap_or_default();
-                    self.font_size_input = self.settings.preferences.font_size.to_string();
-                    self.video_streaming
-                        .set_stream_control_method(self.settings.connection.stream_control_method);
+            Message::RefreshStatus => self.handle_refresh_status(),
+            Message::ProfileSelected(name) => self.handle_profile_selected(name),
 
-                    self.user_message =
-                        Some(UserMessage::Info(format!("Switched to profile: {}", name)));
-                    // Disconnect when switching profiles
-                    return Task::done(Message::DisconnectPressed);
-                }
-                Task::none()
-            }
+            Message::NewProfileNameChanged(name) => self.handle_new_profile_name_changed(name),
 
-            Message::NewProfileNameChanged(name) => {
-                self.new_profile_name = name;
-                Task::none()
-            }
+            Message::CreateProfile => self.handle_create_profile(),
 
-            Message::CreateProfile => {
-                let name = self.new_profile_name.trim().to_string();
-                if name.is_empty() {
-                    self.user_message = Some(UserMessage::Error(
-                        "Profile name cannot be empty".to_string(),
-                    ));
-                } else if self.profile_manager.add_profile(name.clone()) {
-                    self.new_profile_name.clear();
+            Message::DuplicateProfile => self.handle_duplicate_profile(),
 
-                    self.user_message =
-                        Some(UserMessage::Info(format!("Created profile: {}", name)));
-                } else {
-                    self.user_message = Some(UserMessage::Error(
-                        "Profile name already exists".to_string(),
-                    ));
-                }
-                Task::none()
-            }
-
-            Message::DuplicateProfile => {
-                let new_name = format!("{} (copy)", self.profile_manager.active_profile);
-                if self.profile_manager.duplicate_profile(
-                    &self.profile_manager.active_profile.clone(),
-                    new_name.clone(),
-                ) {
-                    self.user_message =
-                        Some(UserMessage::Info(format!("Duplicated to: {}", new_name)));
-                }
-                Task::none()
-            }
-
-            Message::DeleteProfile => {
-                let name = self.profile_manager.active_profile.clone();
-                if self.profile_manager.delete_profile(&name) {
-                    self.settings = self.profile_manager.active_settings().clone();
-
-                    self.user_message =
-                        Some(UserMessage::Info(format!("Deleted profile: {}", name)));
-                } else {
-                    self.user_message = Some(UserMessage::Error(
-                        "Cannot delete active or last profile".to_string(),
-                    ));
-                }
-                Task::none()
-            }
+            Message::DeleteProfile => self.handle_delete_profile(),
 
             Message::RenameProfileNameChanged(name) => {
-                self.rename_profile_name = name;
-                Task::none()
+                self.handle_rename_profile_name_changed(name)
             }
 
-            Message::RenameProfile => {
-                let new_name = self.rename_profile_name.trim().to_string();
-                let old_name = self.profile_manager.active_profile.clone();
-                if new_name.is_empty() {
-                    self.user_message = Some(UserMessage::Error(
-                        "Profile name cannot be empty".to_string(),
-                    ));
-                } else if self
-                    .profile_manager
-                    .rename_profile(&old_name, new_name.clone())
-                {
-                    self.rename_profile_name.clear();
-
-                    self.user_message =
-                        Some(UserMessage::Info(format!("Renamed to: {}", new_name)));
-                } else {
-                    self.user_message = Some(UserMessage::Error(
-                        "Profile name already exists".to_string(),
-                    ));
-                }
-                Task::none()
-            }
+            Message::RenameProfile => self.handle_rename_profile(),
             Message::Assembly64Browser(msg) => self
                 .assembly64_browser
-                .update(
-                    msg,
-                    self.connection.clone(),
-                    Some(self.settings.connection.host.clone()),
-                    self.settings.connection.password.clone(),
-                )
+                .update(msg, ctx.clone())
                 .map(Message::Assembly64Browser),
             Message::BasicEditor(msg) => self
                 .basic_editor
-                .update(
-                    msg,
-                    Some(self.settings.connection.host.clone()),
-                    self.settings.connection.password.clone(),
-                )
+                .update(msg, ctx.clone())
                 .map(Message::BasicEditor),
-            Message::RefreshAfterConnect => {
-                // Refresh both status and remote browser after connection
-                let status_cmd = if let Some(conn) = &self.connection {
-                    let conn = conn.clone();
-                    Task::perform(
-                        async move { fetch_status(conn).await },
-                        Message::StatusUpdated,
-                    )
-                } else {
-                    Task::none()
-                };
+            Message::RefreshAfterConnect => self.handle_refresh_after_connect(ctx.clone()),
 
-                let browser_cmd = self
-                    .remote_browser
-                    .update(RemoteBrowserMessage::RefreshFiles, self.connection.clone())
-                    .map(Message::RemoteBrowser);
+            Message::StatusUpdated(result) => self.handle_status_updated(result, ctx.clone()),
 
-                Task::batch(vec![status_cmd, browser_cmd])
-            }
+            Message::TemplateSelected(template) => self.handle_template_selected(template),
 
-            Message::StatusUpdated(result) => {
-                match result {
-                    Ok(status) => {
-                        log::debug!(
-                            "Status: Connected={}, Device={:?}, Disks={}",
-                            status.connected,
-                            status.device_info,
-                            status.mounted_disks.len()
-                        );
-                        // Recovered from a transient outage — log it so the
-                        // user can correlate with reboot events.
-                        if self.consecutive_status_failures > 0 {
-                            log::info!(
-                                "Status recovered after {} failed poll(s)",
-                                self.consecutive_status_failures
-                            );
-                        }
-                        self.consecutive_status_failures = 0;
-                        // Show connected message when first connecting
-                        if !self.status.connected && status.connected {
-                            self.user_message = Some(UserMessage::Info(format!(
-                                "Connected to {}",
-                                self.settings.connection.host
-                            )));
-                        }
-                        self.status = status;
-                    }
-                    Err(e) => {
-                        if self.remote_browser.is_transferring() {
-                            log::debug!("Ignoring status failure during active transfer");
-                            return Task::none();
-                        }
-                        // Ignore status failures during profile operations — the
-                        // device may be rebooting or applying config, which
-                        // legitimately takes it offline for 15-30 seconds.
-                        if self.device_profile_manager.is_loading {
-                            log::debug!("Ignoring status failure during profile operation");
-                            return Task::none();
-                        }
-
-                        self.consecutive_status_failures =
-                            self.consecutive_status_failures.saturating_add(1);
-
-                        // Tolerate brief outages (reboots typically settle in
-                        // 2-3 seconds) — keep the UI showing "Connected" and
-                        // let the subscription poll back at the faster cadence.
-                        if self.consecutive_status_failures < MAX_TRANSIENT_STATUS_FAILURES {
-                            log::debug!(
-                                "Status poll failed ({} of {}): {}",
-                                self.consecutive_status_failures,
-                                MAX_TRANSIENT_STATUS_FAILURES,
-                                e
-                            );
-                            return Task::none();
-                        }
-
-                        log::warn!(
-                            "Status update failed {} times — marking disconnected: {}",
-                            self.consecutive_status_failures,
-                            e
-                        );
-                        self.status.connected = false;
-                        self.status.device_info = None;
-                        // Stop streaming only if it was running
-                        if self.video_streaming.is_streaming {
-                            let _ = self
-                                .video_streaming
-                                .update(StreamingMessage::StopStream, None);
-                        }
-                    }
-                }
-                Task::none()
-            }
-
-            Message::TemplateSelected(template) => {
-                self.selected_template = Some(template);
-                Task::none()
-            }
-
-            Message::ExecuteTemplate => {
-                if let Some(template) = &self.selected_template {
-                    if let Some(conn) = &self.connection {
-                        let conn = conn.clone();
-                        let commands = template.commands.clone();
-                        return Task::perform(
-                            async move { execute_template_commands(conn, commands).await },
-                            |result| match result {
-                                Ok(_) => Message::RefreshStatus,
-                                Err(e) => Message::ShowError(e),
-                            },
-                        );
-                    } else {
-                        self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    }
-                }
-                Task::none()
-            }
+            Message::ExecuteTemplate => self.handle_execute_template(),
 
             Message::ShowError(error) => {
                 log::error!("Error: {}", error);
@@ -2483,10 +1448,7 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
-            Message::DismissMessage => {
-                self.user_message = None;
-                Task::none()
-            }
+            Message::DismissMessage => self.handle_dismiss_message(),
 
             Message::Streaming(msg) => {
                 self.video_streaming
@@ -2555,7 +1517,7 @@ impl Ultimate64Browser {
                                     let result = tokio::time::timeout(
                                         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                                         tokio::task::spawn_blocking(move || {
-                                            let conn = conn.blocking_lock();
+                                            let conn = conn.lock().unwrap();
                                             // Add newline to execute the command
                                             conn.type_text(&format!("{}\n", cmd))
                                                 .map(|_| format!("Sent: {}", cmd))
@@ -2596,387 +1558,39 @@ impl Ultimate64Browser {
                 }
 
                 self.video_streaming
-                    .update(msg, self.connection.clone())
+                    .update(msg, ctx.clone())
                     .map(Message::Streaming)
             }
 
-            Message::EscPressed => {
-                // Priority order: dismiss the most-modal thing first.
-                // Help overlay → eject confirm → drop dialog → fullscreen → pane quick-search.
-                if self.show_help {
-                    self.show_help = false;
-                    return Task::none();
-                }
-                if self.pending_close.is_some() {
-                    self.pending_close = None;
-                    return Task::none();
-                }
-                if self.pending_eject_confirm {
-                    self.pending_eject_confirm = false;
-                    return Task::none();
-                }
-                if self.pending_drop.is_some() {
-                    self.pending_drop = None;
-                    return Task::none();
-                }
-                if self.video_streaming.is_fullscreen {
-                    return self.update(Message::ExitFullscreen);
-                }
-                // Final fallback: clear the active pane's quick-search buffer.
-                self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchClear)
-            }
+            Message::EscPressed => self.handle_esc_pressed(),
 
-            Message::ExitFullscreen => {
-                // Only exit fullscreen if currently in fullscreen mode
-                if self.video_streaming.is_fullscreen {
-                    self.video_streaming.is_fullscreen = false;
-                    // Exit fullscreen on the appropriate window
-                    if let Some(streaming_id) = self.streaming_window_id {
-                        return window::set_mode(streaming_id, iced::window::Mode::Windowed)
-                            .map(|_: ()| Message::RefreshStatus);
-                    } else {
-                        return iced::window::oldest()
-                            .and_then(|id| iced::window::set_mode(id, iced::window::Mode::Windowed))
-                            .map(|_: ()| Message::RefreshStatus);
-                    }
-                }
-                Task::none()
-            }
+            Message::ExitFullscreen => self.handle_exit_fullscreen(),
 
-            Message::OpenStreamingWindow => {
-                if self.streaming_window_id.is_some() {
-                    // Window already open
-                    return Task::none();
-                }
-                let settings = iced::window::Settings {
-                    size: iced::Size::new(800.0, 600.0),
-                    min_size: Some(iced::Size::new(400.0, 300.0)),
-                    decorations: true,
-                    ..Default::default()
-                };
-                // Destructure the tuple - open() returns (Id, Task<Id>)
-                let (id, open_task) = iced::window::open(settings);
-                self.streaming_window_id = Some(id);
-                open_task.map(move |_| Message::StreamingWindowOpened(id))
-            }
+            Message::OpenStreamingWindow => self.handle_open_streaming_window(),
 
-            Message::StreamingWindowOpened(id) => {
-                log::info!("Streaming window opened: {:?}", id);
-                // ID already stored in OpenStreamingWindow handler
-                Task::none()
-            }
+            Message::StreamingWindowOpened(id) => self.handle_streaming_window_opened(id),
 
-            Message::WindowCloseRequested(id) => {
-                // Streaming window — close it without prompting; only the
-                // main window holds in-flight transfers that we'd hate to
-                // lose.
-                if self.streaming_window_id == Some(id) {
-                    return iced::window::close(id);
-                }
-                if self.main_window_id == Some(id) && self.is_transfer_in_flight() {
-                    self.pending_close = Some(id);
-                    Task::none()
-                } else {
-                    iced::window::close(id)
-                }
-            }
-            Message::ConfirmCloseWindow => {
-                if let Some(id) = self.pending_close.take() {
-                    iced::window::close(id)
-                } else {
-                    Task::none()
-                }
-            }
-            Message::CancelCloseWindow => {
-                self.pending_close = None;
-                Task::none()
-            }
-            Message::WindowClosed(id) => {
-                if self.streaming_window_id == Some(id) {
-                    // Streaming window was closed
-                    log::info!("Streaming window closed: {:?}", id);
-                    self.streaming_window_id = None;
-                    Task::none()
-                } else if self.main_window_id == Some(id) {
-                    // Main window was closed - clean up immediately and exit
-                    log::info!("Main window closed: {:?}", id);
-
-                    // Cancel any in-progress copy transfer and clear it
-                    if let Ok(mut g) = self.copy_progress.lock() {
-                        if let Some(ref mut p) = *g {
-                            p.cancelled = true;
-                            p.done = true;
-                        }
-                    }
-
-                    // Cancel any remote browser transfer
-                    self.remote_browser.cancel_transfer();
-
-                    // Stop streaming if active
-                    if self.video_streaming.is_streaming {
-                        self.video_streaming
-                            .stop_signal
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-
-                    // Disconnect immediately to prevent further status checks
-                    self.connection = None;
-                    self.host_url = None;
-                    self.status.connected = false;
-
-                    // Mark main window as gone so subscriptions stop
-                    self.main_window_id = None;
-
-                    // Close any remaining windows and exit
-                    if let Some(streaming_id) = self.streaming_window_id {
-                        self.streaming_window_id = None;
-                        return Task::batch(vec![iced::window::close(streaming_id), iced::exit()]);
-                    }
-                    iced::exit()
-                } else {
-                    Task::none()
-                }
-            }
+            Message::WindowCloseRequested(id) => self.handle_window_close_requested(id),
+            Message::ConfirmCloseWindow => self.handle_confirm_close_window(),
+            Message::CancelCloseWindow => self.handle_cancel_close_window(),
+            Message::WindowClosed(id) => self.handle_window_closed(id),
             // ── Drag-and-drop from the OS ───────────────────────────────
-            Message::FileDropped(path) => {
-                // If a drop is already pending or one is in flight, ignore
-                // the new one — the user can re-drop after dismissing the
-                // dialog. Avoids the dialog stacking on accidental drops.
-                if self.pending_drop.is_none() && !self.drop_in_flight {
-                    log::info!("File dropped: {}", path.display());
-                    self.pending_drop = Some(path);
-                }
-                Task::none()
-            }
-            Message::DropCancel => {
-                self.pending_drop = None;
-                Task::none()
-            }
-            Message::DropAction(action) => {
-                self.pending_drop = None;
-                self.user_message = Some(UserMessage::Info(format!("{}…", action.status_label())));
-                let host_url = format!("http://{}", self.settings.connection.host);
-                let password = self.settings.connection.password.clone();
-                let remote_path = self.remote_browser.current_path.clone();
-                // Only network actions need the cancel handle + in-flight
-                // flag — OpenInBasicEditor is local fs reads that finish
-                // in milliseconds and don't deserve a Cancel button.
-                let is_network = !matches!(action, DropAction::OpenInBasicEditor { .. });
-                self.drop_in_flight = is_network;
-                let task = match action {
-                    DropAction::RunOnDevice { path, runner } => Task::perform(
-                        async move {
-                            let bytes = tokio::fs::read(&path)
-                                .await
-                                .map_err(|e| format!("Read failed: {}", e))?;
-                            tokio::time::timeout(
-                                std::time::Duration::from_secs(30),
-                                api::upload_runner_async(
-                                    &host_url,
-                                    runner,
-                                    bytes,
-                                    password.as_deref(),
-                                ),
-                            )
-                            .await
-                            .map_err(|_| "Send timed out — device offline?".to_string())?
-                            .map(|_| {
-                                format!(
-                                    "Sent {} via {}",
-                                    path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-                                    runner
-                                )
-                            })
-                        },
-                        Message::DropCompleted,
-                    ),
-                    DropAction::MountDisk { path } => {
-                        let drive = "a"; // dropped images mount on the active drive A
-                        Task::perform(
-                            async move {
-                                tokio::time::timeout(
-                                    std::time::Duration::from_secs(30),
-                                    api::upload_mount_disk_async(
-                                        &host_url,
-                                        &path,
-                                        drive,
-                                        "readonly",
-                                        password.as_deref(),
-                                    ),
-                                )
-                                .await
-                                .map_err(|_| "Mount timed out — device offline?".to_string())?
-                                .map(|_| {
-                                    format!(
-                                        "Mounted {} on Drive A (RO)",
-                                        path.file_name().and_then(|s| s.to_str()).unwrap_or("disk")
-                                    )
-                                })
-                            },
-                            Message::DropCompleted,
-                        )
-                    }
-                    DropAction::OpenInBasicEditor { path } => {
-                        // Local file load — no network. Switch to the BASIC
-                        // tab and reuse the editor's existing OpenCompleted
-                        // message so it gets the same treatment as Open .bas.
-                        self.active_tab = Tab::BasicEditor;
-                        Task::perform(
-                            async move {
-                                let text = tokio::fs::read_to_string(&path)
-                                    .await
-                                    .map_err(|e| format!("Read failed: {}", e))?;
-                                Ok::<_, String>((path, text))
-                            },
-                            |result| {
-                                Message::BasicEditor(BasicEditorMessage::OpenCompleted(result))
-                            },
-                        )
-                    }
-                    DropAction::UploadToRemote { path } => {
-                        let progress = self.remote_browser.transfer_progress_handle();
-                        // FTP connect needs a bare host, no scheme — the
-                        // user-configured host might include `http://`.
-                        let host = self
-                            .settings
-                            .connection
-                            .host
-                            .trim_start_matches("http://")
-                            .trim_start_matches("https://")
-                            .trim_end_matches('/')
-                            .to_string();
-                        // `upload_file_ftp` only treats `remote_dest` as a
-                        // directory when it ends with `/`. The remote
-                        // browser's `current_path` is `/SD` (no trailing
-                        // slash) once the user navigates anywhere, so we
-                        // append one explicitly to avoid an empty CWD.
-                        let dest = if remote_path.ends_with('/') {
-                            remote_path
-                        } else {
-                            format!("{}/", remote_path)
-                        };
-                        Task::perform(
-                            async move {
-                                ftp_ops::upload_file_ftp(
-                                    host,
-                                    path.clone(),
-                                    dest,
-                                    password,
-                                    progress,
-                                )
-                                .await
-                                .map(|_| {
-                                    format!(
-                                        "Uploaded {}",
-                                        path.file_name().and_then(|s| s.to_str()).unwrap_or("file")
-                                    )
-                                })
-                            },
-                            Message::DropCompleted,
-                        )
-                    }
-                };
-                // Wrap the network task in `abortable()` so the Cancel
-                // button can drop the future without waiting for the
-                // timeout. Local-only tasks (OpenInBasicEditor) skip this
-                // — they have nothing to cancel.
-                if is_network {
-                    let (task, handle) = task.abortable();
-                    self.drop_handle = Some(handle);
-                    task
-                } else {
-                    task
-                }
-            }
-            Message::DropCompleted(result) => {
-                self.drop_in_flight = false;
-                self.drop_handle = None;
-                match &result {
-                    Ok(msg) => self.show_toast(msg.clone()),
-                    Err(_) => {}
-                }
-                self.user_message = Some(match result {
-                    Ok(msg) => UserMessage::Info(msg),
-                    Err(e) => UserMessage::Error(e),
-                });
-                Task::none()
-            }
-            Message::DropAbort => {
-                if let Some(h) = self.drop_handle.take() {
-                    h.abort();
-                }
-                self.drop_in_flight = false;
-                self.user_message = Some(UserMessage::Info("Drop cancelled".into()));
-                Task::none()
-            }
-            Message::ShowHelp => {
-                self.show_help = true;
-                Task::none()
-            }
-            Message::HideHelp => {
-                self.show_help = false;
-                Task::none()
-            }
+            Message::FileDropped(path) => self.handle_file_dropped(path),
+            Message::DropCancel => self.handle_drop_cancel(),
+            Message::DropAction(action) => self.handle_drop_action(action),
+            Message::DropCompleted(result) => self.handle_drop_completed(result),
+            Message::DropAbort => self.handle_drop_abort(),
+            Message::ShowHelp => self.handle_show_help(),
+            Message::HideHelp => self.handle_hide_help(),
 
             Message::Nop => Task::none(),
 
-            Message::ToastTick => {
-                if let Some((_, shown_at)) = &self.toast {
-                    if shown_at.elapsed() >= std::time::Duration::from_secs(TOAST_DURATION_SECS) {
-                        self.toast = None;
-                    }
-                }
-                Task::none()
-            }
+            Message::ToastTick => self.handle_toast_tick(),
 
-            Message::EjectAllDrives => {
-                // Click on the toolbar button arms the confirmation modal —
-                // the actual ejection is gated on EjectAllDrivesConfirmed
-                // so an accidental click can't clear a hand-set mount.
-                self.pending_eject_confirm = true;
-                Task::none()
-            }
-            Message::EjectCancel => {
-                self.pending_eject_confirm = false;
-                Task::none()
-            }
-            Message::EjectAllDrivesConfirmed => {
-                self.pending_eject_confirm = false;
-                let host_url = format!("http://{}", self.settings.connection.host);
-                let password = self.settings.connection.password.clone();
-                // Fire both unmount calls in parallel; the device handles
-                // them independently. Each has its own 5s REST timeout
-                // baked into the client, so the whole op is bounded.
-                let host_a = host_url.clone();
-                let pwd_a = password.clone();
-                let host_b = host_url;
-                let pwd_b = password;
-                Task::perform(
-                    async move {
-                        let (res_a, res_b) = tokio::join!(
-                            api::unmount_disk_async(&host_a, "a", pwd_a.as_deref()),
-                            api::unmount_disk_async(&host_b, "b", pwd_b.as_deref()),
-                        );
-                        match (res_a, res_b) {
-                            (Ok(()), Ok(())) => Ok("Ejected Drives A and B".to_string()),
-                            (Ok(()), Err(e)) => Err(format!("Drive A OK, Drive B failed: {}", e)),
-                            (Err(e), Ok(())) => Err(format!("Drive B OK, Drive A failed: {}", e)),
-                            (Err(a), Err(b)) => Err(format!("Both drives failed: {}; {}", a, b)),
-                        }
-                    },
-                    Message::EjectCompleted,
-                )
-            }
-            Message::EjectCompleted(result) => {
-                if let Ok(msg) = &result {
-                    self.show_toast(msg.clone());
-                }
-                self.user_message = Some(match result {
-                    Ok(msg) => UserMessage::Info(msg),
-                    Err(e) => UserMessage::Error(e),
-                });
-                Task::none()
-            }
+            Message::EjectAllDrives => self.handle_eject_all_drives(),
+            Message::EjectCancel => self.handle_eject_cancel(),
+            Message::EjectAllDrivesConfirmed => self.handle_eject_all_drives_confirmed(),
+            Message::EjectCompleted(result) => self.handle_eject_completed(result),
             Message::RunLast => {
                 // Re-fire the most recent successful run/mount via the
                 // file_browser's own message bus. Cloning the LastRun is
@@ -3003,381 +1617,53 @@ impl Ultimate64Browser {
                     }
                 };
                 self.left_browser
-                    .update(
-                        msg,
-                        self.connection.clone(),
-                        Some(self.settings.connection.host.clone()),
-                        self.settings.connection.password.clone(),
-                    )
+                    .update(msg, ctx.clone())
                     .map(Message::LeftBrowser)
             }
 
-            Message::ResetMachine => {
-                if let Some(conn) = &self.connection {
-                    let conn = conn.clone();
-                    Task::perform(
-                        async move {
-                            let result = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-                                tokio::task::spawn_blocking(move || {
-                                    let conn = conn.blocking_lock();
-                                    conn.reset()
-                                        .map(|_| "Machine reset successfully".to_string())
-                                        .map_err(|e| format!("Reset failed: {}", e))
-                                }),
-                            )
-                            .await;
-
-                            match result {
-                                Ok(Ok(r)) => r,
-                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
-                                Err(_) => {
-                                    Err("Reset timed out - device may be offline".to_string())
-                                }
-                            }
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
-            Message::RebootMachine => {
-                if let Some(host) = &self.host_url {
-                    let url = format!("{}/v1/machine:reboot", host);
-                    Task::perform(
-                        async move {
-                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
-                            client
-                                .put(&url)
-                                .send()
-                                .await
-                                .map_err(|e| format!("Reboot failed: {}", e))?;
-                            Ok("Machine rebooting...".to_string())
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
-            Message::PauseMachine => {
-                if let Some(host) = &self.host_url {
-                    let url = format!("{}/v1/machine:pause", host);
-                    Task::perform(
-                        async move {
-                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
-                            client
-                                .put(&url)
-                                .send()
-                                .await
-                                .map_err(|e| format!("Pause failed: {}", e))?;
-                            Ok("Machine paused".to_string())
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
-            Message::ResumeMachine => {
-                if let Some(host) = &self.host_url {
-                    let url = format!("{}/v1/machine:resume", host);
-                    Task::perform(
-                        async move {
-                            let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
-                            client
-                                .put(&url)
-                                .send()
-                                .await
-                                .map_err(|e| format!("Resume failed: {}", e))?;
-                            Ok("Machine resumed".to_string())
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
-            Message::PoweroffMachine => {
-                if let Some(conn) = &self.connection {
-                    let conn = conn.clone();
-                    Task::perform(
-                        async move {
-                            let result = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-                                tokio::task::spawn_blocking(move || {
-                                    let conn = conn.blocking_lock();
-                                    conn.poweroff()
-                                        .map(|_| "Machine powered off".to_string())
-                                        .map_err(|e| format!("Poweroff failed: {}", e))
-                                }),
-                            )
-                            .await;
-
-                            match result {
-                                Ok(Ok(r)) => r,
-                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
-                                Err(_) => {
-                                    Err("Poweroff timed out - device may be offline".to_string())
-                                }
-                            }
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
-            Message::MenuButton => {
-                if let Some(conn) = &self.connection {
-                    let conn = conn.clone();
-                    Task::perform(
-                        async move {
-                            let result = tokio::time::timeout(
-                                tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-                                tokio::task::spawn_blocking(move || {
-                                    let conn = conn.blocking_lock();
-                                    conn.menu()
-                                        .map(|_| "Menu button pressed".to_string())
-                                        .map_err(|e| format!("Menu failed: {}", e))
-                                }),
-                            )
-                            .await;
-
-                            match result {
-                                Ok(Ok(r)) => r,
-                                Ok(Err(e)) => Err(format!("Task error: {}", e)),
-                                Err(_) => Err("Menu timed out - device may be offline".to_string()),
-                            }
-                        },
-                        Message::MachineCommandCompleted,
-                    )
-                } else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    Task::none()
-                }
-            }
-
+            Message::ResetMachine => self.handle_reset_machine(),
+            Message::RebootMachine => self.handle_reboot_machine(),
+            Message::PauseMachine => self.handle_pause_machine(),
+            Message::ResumeMachine => self.handle_resume_machine(),
+            Message::PoweroffMachine => self.handle_poweroff_machine(),
+            Message::MenuButton => self.handle_menu_button(),
             Message::MachineCommandCompleted(result) => {
-                match result {
-                    Ok(msg) => {
-                        self.user_message = Some(UserMessage::Info(msg));
-                    }
-                    Err(e) => {
-                        self.user_message = Some(UserMessage::Error(e));
-                    }
-                }
-                Task::none()
+                self.handle_machine_command_completed(result)
             }
 
             // ── DEVICE tab handlers ──────────────────────────────────────
             Message::DeviceSetDriveMode(drive, mode) => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                let password = self.settings.connection.password.clone();
-                Task::perform(
-                    async move {
-                        api::set_drive_mode_async(&host, &drive, &mode, password.as_deref()).await
-                    },
-                    Message::MachineCommandCompleted,
-                )
+                self.handle_device_set_drive_mode(drive, mode)
             }
-            Message::DeviceDrivePower(drive, on) => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                let password = self.settings.connection.password.clone();
-                Task::perform(
-                    async move { api::drive_power_async(&host, &drive, on, password.as_deref()).await },
-                    Message::MachineCommandCompleted,
-                )
-            }
-            Message::DeviceDriveReset(drive) => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                let password = self.settings.connection.password.clone();
-                Task::perform(
-                    async move { api::drive_reset_async(&host, &drive, password.as_deref()).await },
-                    Message::MachineCommandCompleted,
-                )
-            }
+            Message::DeviceDrivePower(drive, on) => self.handle_device_drive_power(drive, on),
+            Message::DeviceDriveReset(drive) => self.handle_device_drive_reset(drive),
             Message::DeviceKeyboardInputChanged(value) => {
                 self.device_keyboard_input = value;
                 Task::none()
             }
-            Message::DeviceSendKeys => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                if self.device_keyboard_input.is_empty() {
-                    return Task::none();
-                }
-                let password = self.settings.connection.password.clone();
-                // Append RETURN so a typed command actually executes. This writes
-                // PETSCII into the KERNAL keyboard buffer ($0277) — only code that
-                // reads via the KERNAL (BASIC prompt, GETIN) sees it; programs
-                // scanning the CIA keyboard matrix directly do not.
-                let text = format!("{}\n", self.device_keyboard_input);
-                Task::perform(
-                    async move {
-                        api::type_text_async(&host, &text, password.as_deref())
-                            .await
-                            .map(|_| "Sent keystrokes".to_string())
-                    },
-                    Message::MachineCommandCompleted,
-                )
-            }
+            Message::DeviceSendKeys => self.handle_device_send_keys(),
             Message::DeviceDebugRegInputChanged(value) => {
                 self.device_debugreg_input = value;
                 Task::none()
             }
-            Message::DeviceReadDebugReg => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                let password = self.settings.connection.password.clone();
-                Task::perform(
-                    async move { api::read_debugreg_async(&host, password.as_deref()).await },
-                    Message::DeviceDebugRegRead,
-                )
-            }
-            Message::DeviceDebugRegRead(result) => {
-                match result {
-                    Ok(v) => {
-                        self.device_debugreg_value = Some(v);
-                        self.user_message =
-                            Some(UserMessage::Info(format!("Debug register = ${:02X}", v)));
-                    }
-                    Err(e) => {
-                        self.user_message = Some(UserMessage::Error(e));
-                    }
-                }
-                Task::none()
-            }
-            Message::DeviceWriteDebugReg => {
-                let Some(host) = self.host_url.clone() else {
-                    self.user_message = Some(UserMessage::Error("Not connected".to_string()));
-                    return Task::none();
-                };
-                // Accept hex with optional 0x/$ prefix.
-                let raw = self.device_debugreg_input.trim();
-                let raw = raw
-                    .strip_prefix("0x")
-                    .or_else(|| raw.strip_prefix('$'))
-                    .unwrap_or(raw);
-                let Ok(value) = u8::from_str_radix(raw, 16) else {
-                    self.user_message = Some(UserMessage::Error(
-                        "Debug register: enter a hex byte (00–FF)".to_string(),
-                    ));
-                    return Task::none();
-                };
-                let password = self.settings.connection.password.clone();
-                Task::perform(
-                    async move { api::write_debugreg_async(&host, value, password.as_deref()).await },
-                    Message::MachineCommandCompleted,
-                )
-            }
-            Message::DeviceDebugStreamStart => {
-                self.debug_stream.set_host(
-                    self.host_url.clone(),
-                    self.settings.connection.password.clone(),
-                    self.settings.connection.stream_control_method,
-                );
-                match self.debug_stream.start() {
-                    Ok(()) => {
-                        self.user_message = Some(UserMessage::Info(
-                            "Debug stream capture started".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        self.user_message =
-                            Some(UserMessage::Error(format!("Debug stream: {}", e)));
-                    }
-                }
-                Task::none()
-            }
-            Message::DeviceDebugStreamStop => {
-                self.debug_stream.stop();
-                self.user_message = Some(UserMessage::Info(format!(
-                    "Debug stream stopped — {} packets captured",
-                    self.debug_stream.packets()
-                )));
-                Task::none()
-            }
+            Message::DeviceReadDebugReg => self.handle_device_read_debugreg(),
+            Message::DeviceDebugRegRead(result) => self.handle_device_debugreg_read(result),
+            Message::DeviceWriteDebugReg => self.handle_device_write_debugreg(),
+            Message::DeviceDebugStreamStart => self.handle_device_debug_stream_start(),
+            Message::DeviceDebugStreamStop => self.handle_device_debug_stream_stop(),
             Message::DeviceDebugStreamTick => {
                 // Counters live in shared atomics; a redraw is enough.
                 Task::none()
             }
-            Message::DeviceDebugStreamSave => {
-                let data = self.debug_stream.snapshot();
-                Task::perform(
-                    debug_stream::save_capture_async(data),
-                    Message::DeviceDebugStreamSaved,
-                )
-            }
+            Message::DeviceDebugStreamSave => self.handle_device_debug_stream_save(),
             Message::DeviceDebugStreamSaved(result) => {
-                match result {
-                    Ok(path) => {
-                        self.user_message =
-                            Some(UserMessage::Info(format!("Capture saved: {}", path)));
-                    }
-                    Err(e) => {
-                        self.user_message = Some(UserMessage::Error(e));
-                    }
-                }
-                Task::none()
+                self.handle_device_debug_stream_saved(result)
             }
             Message::DefaultSongDurationChanged(value) => {
-                if let Ok(duration) = value.parse::<u32>() {
-                    if duration > 0 && duration <= 3600 {
-                        self.profile_manager
-                            .active_settings_mut()
-                            .preferences
-                            .default_song_duration = duration;
-                        self.settings = self.profile_manager.active_settings().clone();
-                        self.music_player.set_default_song_duration(duration);
-                        if let Err(e) = self.profile_manager.save() {
-                            log::error!("Failed to save profiles: {}", e);
-                        }
-                    }
-                }
-                Task::none()
+                self.handle_default_song_duration_changed(value)
             }
 
-            Message::FontSizeChanged(value) => {
-                self.font_size_input = value.clone();
-                if let Ok(size) = value.parse::<u32>() {
-                    if size >= 8 && size <= 24 {
-                        self.profile_manager
-                            .active_settings_mut()
-                            .preferences
-                            .font_size = size;
-                        self.settings = self.profile_manager.active_settings().clone();
-                        if let Err(e) = self.profile_manager.save() {
-                            log::error!("Failed to save profiles: {}", e);
-                        }
-                    }
-                }
-                Task::none()
-            }
+            Message::FontSizeChanged(value) => self.handle_font_size_changed(value),
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -3390,34 +1676,10 @@ impl Ultimate64Browser {
             ),
 
             Message::FileBrowserStartDirSelected(path) => {
-                if let Some(p) = path {
-                    self.profile_manager
-                        .active_settings_mut()
-                        .default_paths
-                        .file_browser_start_dir = Some(p);
-                    self.settings = self.profile_manager.active_settings().clone();
-
-                    self.user_message = Some(UserMessage::Info(
-                        "File Browser start directory set (restart app to apply)".to_string(),
-                    ));
-                }
-                Task::none()
+                self.handle_file_browser_start_dir_selected(path)
             }
 
-            Message::ClearFileBrowserStartDir => {
-                self.profile_manager
-                    .active_settings_mut()
-                    .default_paths
-                    .file_browser_start_dir = None;
-                self.settings = self.profile_manager.active_settings().clone();
-                if let Err(e) = self.profile_manager.save() {
-                    log::error!("Failed to save profiles: {}", e);
-                }
-                self.user_message = Some(UserMessage::Info(
-                    "File Browser start directory cleared".to_string(),
-                ));
-                Task::none()
-            }
+            Message::ClearFileBrowserStartDir => self.handle_clear_file_browser_start_dir(),
 
             Message::BrowseMusicPlayerStartDir => Task::perform(
                 async {
@@ -3430,34 +1692,10 @@ impl Ultimate64Browser {
             ),
 
             Message::MusicPlayerStartDirSelected(path) => {
-                if let Some(p) = path {
-                    self.profile_manager
-                        .active_settings_mut()
-                        .default_paths
-                        .music_player_start_dir = Some(p);
-                    self.settings = self.profile_manager.active_settings().clone();
-
-                    self.user_message = Some(UserMessage::Info(
-                        "Music Player start directory set (restart app to apply)".to_string(),
-                    ));
-                }
-                Task::none()
+                self.handle_music_player_start_dir_selected(path)
             }
 
-            Message::ClearMusicPlayerStartDir => {
-                self.profile_manager
-                    .active_settings_mut()
-                    .default_paths
-                    .music_player_start_dir = None;
-                self.settings = self.profile_manager.active_settings().clone();
-                if let Err(e) = self.profile_manager.save() {
-                    log::error!("Failed to save profiles: {}", e);
-                }
-                self.user_message = Some(UserMessage::Info(
-                    "Music Player start directory cleared".to_string(),
-                ));
-                Task::none()
-            }
+            Message::ClearMusicPlayerStartDir => self.handle_clear_music_player_start_dir(),
         }
     }
 
@@ -3910,16 +2148,9 @@ impl Ultimate64Browser {
         if self.active_tab != Tab::DualPaneBrowser {
             return Task::none();
         }
+        let ctx = self.tab_context();
         match self.active_pane {
-            Pane::Left => self
-                .left_browser
-                .update(
-                    msg,
-                    self.connection.clone(),
-                    Some(self.settings.connection.host.clone()),
-                    self.settings.connection.password.clone(),
-                )
-                .map(Message::LeftBrowser),
+            Pane::Left => self.left_browser.update(msg, ctx).map(Message::LeftBrowser),
             Pane::Right => Task::none(),
         }
     }
@@ -3927,968 +2158,18 @@ impl Ultimate64Browser {
     /// Centered modal cheatsheet of every app-level keybind. Triggered by
     /// `?`; dismissed by Esc or the Close button. Edit `HELP_BINDS` to add
     /// new entries — keeping them in one table avoids documentation rot.
-    fn view_help_overlay(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-
-        let header = text("Keyboard Shortcuts").size(fs.large);
-        let mut body = column![header, Space::new().height(10)].spacing(0);
-
-        let mut current_section: Option<&'static str> = None;
-        for (section, key, desc) in HELP_BINDS {
-            if Some(*section) != current_section {
-                if current_section.is_some() {
-                    body = body.push(Space::new().height(8));
-                }
-                body = body.push(
-                    text(*section)
-                        .size(fs.normal)
-                        .color(iced::Color::from_rgb(0.45, 0.65, 1.00)),
-                );
-                body = body.push(Space::new().height(4));
-                current_section = Some(section);
-            }
-            body = body.push(
-                row![
-                    container(
-                        text(*key)
-                            .size(fs.small)
-                            .color(iced::Color::from_rgb(0.85, 0.75, 0.45))
-                    )
-                    .width(Length::Fixed(180.0)),
-                    text(*desc)
-                        .size(fs.small)
-                        .color(iced::Color::from_rgb(0.85, 0.85, 0.9)),
-                ]
-                .spacing(8),
-            );
-        }
-
-        body = body.push(Space::new().height(14));
-        body = body.push(
-            row![
-                Space::new().width(Length::Fill),
-                button(text("Close").size(fs.small))
-                    .on_press(Message::HideHelp)
-                    .padding([6, 14]),
-                Space::new().width(Length::Fill),
-            ]
-            .align_y(iced::Alignment::Center),
-        );
-        body = body.push(
-            text("Press Esc to close")
-                .size(fs.tiny)
-                .color(iced::Color::from_rgb(0.55, 0.55, 0.6)),
-        );
-
-        let dialog = container(body.padding(20))
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(iced::Color::from_rgba(
-                    0.18, 0.20, 0.28, 0.98,
-                ))),
-                border: iced::Border {
-                    color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.7),
-                    width: 1.0,
-                    radius: 6.0.into(),
-                },
-                ..Default::default()
-            })
-            .width(Length::Fixed(520.0));
-
-        container(dialog)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .padding(20)
-            .into()
-    }
-
-    fn view_drop_dialog(&self, path: &PathBuf) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let basename = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let size_label = std::fs::metadata(path)
-            .ok()
-            .map(|m| crate::file_types::format_file_size(m.len()))
-            .unwrap_or_else(|| "?".to_string());
-        let ext = path
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-
-        let header = text(format!("Dropped: {}  ({})", basename, size_label)).size(fs.normal);
-        let path_line = text(path.display().to_string())
-            .size(fs.tiny)
-            .color(iced::Color::from_rgb(0.55, 0.55, 0.6));
-
-        // Per-extension actions (may be empty for unknown types).
-        let mut button_col = column![].spacing(8);
-        for action in DropAction::available_for(&ext, path) {
-            let label = action.button_label();
-            button_col = button_col.push(
-                button(text(label).size(fs.normal))
-                    .on_press(Message::DropAction(action))
-                    .padding([6, 14])
-                    .width(Length::Fill),
-            );
-        }
-        // Upload to remote — always available.
-        button_col = button_col.push(
-            button(
-                text(DropAction::UploadToRemote { path: path.clone() }.button_label())
-                    .size(fs.normal),
-            )
-            .on_press(Message::DropAction(DropAction::UploadToRemote {
-                path: path.clone(),
-            }))
-            .padding([6, 14])
-            .width(Length::Fill),
-        );
-        button_col = button_col.push(
-            button(text("✕ Cancel").size(fs.normal))
-                .on_press(Message::DropCancel)
-                .padding([6, 14])
-                .width(Length::Fill)
-                .style(iced::widget::button::text),
-        );
-
-        let dialog = container(
-            column![header, path_line, Space::new().height(8), button_col]
-                .spacing(6)
-                .padding(20),
-        )
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                0.18, 0.20, 0.28, 0.98,
-            ))),
-            border: iced::Border {
-                color: iced::Color::from_rgba(0.45, 0.52, 0.85, 0.7),
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fixed(420.0));
-
-        // Click-outside-to-dismiss: the outer mouse_area covers the full
-        // backdrop and fires DropCancel; the inner mouse_area around the
-        // dialog absorbs clicks (with a Nop) so clicks ON the dialog itself
-        // — between buttons, on the border, etc. — don't bubble through.
-        // Button widgets capture their own clicks already, so this only
-        // affects "dead" space inside the dialog.
-        iced::widget::mouse_area(
-            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .padding(20),
-        )
-        .on_press(Message::DropCancel)
-        .into()
-    }
 
     /// Confirmation modal for the Eject A+B toolbar button. Mirrors the
     /// drop-dialog overlay pattern so click-outside / Esc dismiss for free.
-    fn view_eject_confirm_dialog(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-
-        let dialog = container(
-            column![
-                text("Eject both drives?").size(fs.large),
-                text("Drive A and Drive B will be cleared on the device. Any in-progress writes finish first; this cannot be undone.")
-                    .size(fs.small)
-                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
-                Space::new().height(12),
-                column![
-                    button(text("⏏ Yes, eject A+B").size(fs.normal))
-                        .on_press(Message::EjectAllDrivesConfirmed)
-                        .padding([6, 14])
-                        .width(Length::Fill)
-                        .style(iced::widget::button::danger),
-                    button(text("Cancel").size(fs.normal))
-                        .on_press(Message::EjectCancel)
-                        .padding([6, 14])
-                        .width(Length::Fill)
-                        .style(iced::widget::button::text),
-                ]
-                .spacing(8),
-            ]
-            .spacing(6)
-            .padding(20),
-        )
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                0.18, 0.20, 0.28, 0.98,
-            ))),
-            border: iced::Border {
-                color: iced::Color::from_rgba(0.85, 0.4, 0.4, 0.7),
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fixed(380.0));
-
-        iced::widget::mouse_area(
-            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .padding(20),
-        )
-        .on_press(Message::EjectCancel)
-        .into()
-    }
 
     /// "Really close?" prompt shown when the user tried to quit while a
     /// transfer was in flight. Same overlay pattern as the other modals so
     /// click-outside cancels.
-    fn view_close_confirm_dialog(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-
-        let dialog = container(
-            column![
-                text("Quit while transfer is in progress?").size(fs.large),
-                text("A file transfer or download hasn't finished yet. Closing now will abort it; partial files may be left behind.")
-                    .size(fs.small)
-                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
-                Space::new().height(12),
-                column![
-                    button(text("Quit anyway").size(fs.normal))
-                        .on_press(Message::ConfirmCloseWindow)
-                        .padding([6, 14])
-                        .width(Length::Fill)
-                        .style(iced::widget::button::danger),
-                    button(text("Keep working").size(fs.normal))
-                        .on_press(Message::CancelCloseWindow)
-                        .padding([6, 14])
-                        .width(Length::Fill)
-                        .style(iced::widget::button::text),
-                ]
-                .spacing(8),
-            ]
-            .spacing(6)
-            .padding(20),
-        )
-        .style(|_theme| container::Style {
-            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                0.18, 0.20, 0.28, 0.98,
-            ))),
-            border: iced::Border {
-                color: iced::Color::from_rgba(0.85, 0.4, 0.4, 0.7),
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            ..Default::default()
-        })
-        .width(Length::Fixed(420.0));
-
-        iced::widget::mouse_area(
-            container(iced::widget::mouse_area(dialog).on_press(Message::Nop))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .padding(20),
-        )
-        .on_press(Message::CancelCloseWindow)
-        .into()
-    }
-
-    fn view_overwrite_dialog(&self, pending: &PendingCopy) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let n = pending.conflicts.len();
-        let header = if n == 1 {
-            format!("Overwrite 1 file in {}?", pending.remote_dest)
-        } else {
-            format!("Overwrite {} files in {}?", n, pending.remote_dest)
-        };
-
-        let mut list_col = column![].spacing(2);
-        for name in pending.conflicts.iter().take(8) {
-            list_col = list_col.push(
-                text(format!("  • {}", name))
-                    .size(fs.small)
-                    .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
-            );
-        }
-        if n > 8 {
-            list_col = list_col.push(
-                text(format!("  … and {} more", n - 8))
-                    .size(fs.small)
-                    .color(iced::Color::from_rgb(0.6, 0.6, 0.6)),
-            );
-        }
-
-        container(
-            column![
-                text("⚠ Overwrite existing files")
-                    .size(fs.large)
-                    .color(iced::Color::from_rgb(1.0, 0.6, 0.3)),
-                Space::new().height(8),
-                text(header).size(fs.normal),
-                Space::new().height(6),
-                list_col,
-                Space::new().height(12),
-                text("Existing files with the same name will be replaced.")
-                    .size(fs.small)
-                    .color(iced::Color::from_rgb(0.9, 0.5, 0.5)),
-                Space::new().height(16),
-                row![
-                    button(text("Cancel").size(fs.normal))
-                        .on_press(Message::CopyOverwriteCancel)
-                        .padding([6, 20])
-                        .style(button::secondary),
-                    Space::new().width(12),
-                    button(text("Overwrite").size(fs.normal))
-                        .on_press(Message::CopyOverwriteConfirm)
-                        .padding([6, 20])
-                        .style(button::danger),
-                ]
-                .align_y(iced::Alignment::Center),
-            ]
-            .align_x(iced::Alignment::Center)
-            .spacing(2),
-        )
-        .padding(40)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-    }
-
-    fn view_connection_bar(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let status_indicator = if self.status.connected {
-            text("● CONNECTED").color(iced::Color::from_rgb(0.2, 0.8, 0.2))
-        } else {
-            text("○ DISCONNECTED").color(iced::Color::from_rgb(0.8, 0.2, 0.2))
-        };
-
-        let device_text =
-            text(self.status.device_info.as_deref().unwrap_or("No device")).size(fs.normal);
-
-        // Update notification on the right side
-        let update_notification: Element<'_, Message> = if let Some(info) = &self.new_version {
-            row![
-                text(format!("🎉 {} available!", info.version))
-                    .size(fs.normal)
-                    .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
-                button(text("Download").size(fs.small))
-                    .on_press(Message::OpenReleasePage)
-                    .padding([2, 8])
-                    .style(button::primary),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-            .into()
-        } else {
-            Space::new().into()
-        };
-
-        container(
-            row![
-                status_indicator,
-                text(" | ").size(fs.normal),
-                device_text,
-                Space::new().width(Length::Fill),
-                update_notification,
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding([8, 15])
-        .into()
-    }
-
-    fn view_dual_pane_browser(&self) -> Element<'_, Message> {
-        // Left pane - Local files
-        let left_content = container(
-            self.left_browser
-                .view(self.settings.preferences.font_size)
-                .map(Message::LeftBrowser),
-        )
-        .width(Length::FillPortion(1))
-        .height(Length::Fill)
-        .padding(2)
-        .style(if self.active_pane == Pane::Left {
-            crate::styles::active_pane_style
-        } else {
-            crate::styles::inactive_pane_style
-        });
-
-        let left_pane =
-            iced::widget::mouse_area(left_content).on_press(Message::ActivePaneChanged(Pane::Left));
-
-        // Right pane - Ultimate64 files
-        let right_content = container(
-            self.remote_browser
-                .view(self.settings.preferences.font_size)
-                .map(Message::RemoteBrowser),
-        )
-        .width(Length::FillPortion(1))
-        .height(Length::Fill)
-        .padding(2)
-        .style(if self.active_pane == Pane::Right {
-            crate::styles::active_pane_style
-        } else {
-            crate::styles::inactive_pane_style
-        });
-
-        let right_pane = iced::widget::mouse_area(right_content)
-            .on_press(Message::ActivePaneChanged(Pane::Right));
-
-        // Function bar at bottom
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let small = fs.small as f32;
-        let tiny = fs.tiny as f32;
-
-        let active_filter = match self.active_pane {
-            Pane::Left => self.left_browser.filter(),
-            Pane::Right => self.remote_browser.filter(),
-        };
-
-        let copy_label = match self.active_pane {
-            Pane::Left => "F5 Copy \u{2192}",
-            Pane::Right => "F5 Copy \u{2190}",
-        };
-
-        let function_bar = container(
-            row![
-                button(text("F2 Ren").size(small))
-                    .on_press(Message::FnRename)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("F3 View").size(small))
-                    .on_press(Message::FnView)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("F4 Edit").size(small))
-                    .on_press(Message::FnEdit)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text(copy_label).size(small))
-                    .on_press(Message::FnCopy)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("F7 MkDir").size(small))
-                    .on_press(Message::FnMkDir)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("New Disk").size(small))
-                    .on_press(Message::FnNewDisk)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("F8 Del").size(small))
-                    .on_press(Message::FnDelete)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("↻ Refresh").size(small))
-                    .on_press(Message::FnRefresh)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                // Device-control quick actions — gated on connection so an
-                // offline click can't fire a hopeless REST request.
-                button(text("⏏ Eject A+B").size(small))
-                    .on_press_maybe(self.status.connected.then_some(Message::EjectAllDrives),)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                // Run last — re-fires the most recent PRG/CRT/SID/disk
-                // the local browser sent. Greys out when nothing's been
-                // run yet OR when the device is offline.
-                tooltip(
-                    button(
-                        text(match self.left_browser.last_run() {
-                            Some(last) => format!("↪ Run last ({})", last.basename()),
-                            None => "↪ Run last".to_string(),
-                        })
-                        .size(small),
-                    )
-                    .on_press_maybe(
-                        (self.status.connected && self.left_browser.last_run().is_some())
-                            .then_some(Message::RunLast),
-                    )
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                    text(match self.left_browser.last_run() {
-                        Some(last) => format!("Re-run {}", last.path().display()),
-                        None => "Nothing has been run yet".to_string(),
-                    })
-                    .size(tiny),
-                    tooltip::Position::Top,
-                )
-                .style(crate::styles::subtle_tooltip),
-                text("|")
-                    .size(tiny)
-                    .color(iced::Color::from_rgb(0.4, 0.4, 0.45)),
-                button(text("Sel All").size(small))
-                    .on_press(Message::SelectAllActivePane)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                button(text("Sel None").size(small))
-                    .on_press(Message::SelectNoneActivePane)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-                Space::new().width(Length::Fill),
-                text("Filter:")
-                    .size(tiny)
-                    .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
-                text_input("filter...", active_filter)
-                    .on_input(Message::FilterChanged)
-                    .size(small)
-                    .padding(4)
-                    .width(Length::Fixed(120.0)),
-                Space::new().width(8),
-                pick_list(
-                    self.template_manager.get_templates(),
-                    self.selected_template.clone(),
-                    Message::TemplateSelected,
-                )
-                .placeholder("Template...")
-                .text_size(tiny)
-                .width(Length::Fixed(150.0)),
-                button(text("Exec").size(tiny))
-                    .on_press(Message::ExecuteTemplate)
-                    .padding([4, 8])
-                    .style(crate::styles::nav_button),
-            ]
-            .spacing(3)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding([5, 8])
-        .width(Length::Fill);
-
-        let copy_progress_bar: Element<'_, Message> = {
-            let progress_data = self.copy_progress.lock().ok().and_then(|g| g.clone());
-            match progress_data {
-                Some(p) if !p.done => {
-                    let pct = if p.bytes_total > 0 {
-                        (p.bytes_transferred as f32 / p.bytes_total as f32).min(1.0)
-                    } else if p.total > 0 {
-                        p.current as f32 / p.total as f32
-                    } else {
-                        0.0
-                    };
-                    // Build label with byte info if available
-                    let label = if p.bytes_total > 0 {
-                        format!(
-                            "{} {}/{} ({})",
-                            p.operation,
-                            p.current,
-                            p.total,
-                            crate::file_types::format_file_size(p.bytes_transferred),
-                        )
-                    } else {
-                        format!("{} {}/{}", p.operation, p.current, p.total)
-                    };
-
-                    // Calculate ETA based on bytes if available, else items
-                    let elapsed = p.started_at.elapsed();
-                    let eta_text = if p.bytes_transferred > 0 && p.bytes_total > 0 {
-                        let bytes_per_sec = p.bytes_transferred as f64 / elapsed.as_secs_f64();
-                        let remaining_bytes =
-                            p.bytes_total.saturating_sub(p.bytes_transferred) as f64;
-                        let remaining_secs = remaining_bytes / bytes_per_sec;
-                        if remaining_secs < 60.0 {
-                            format!(
-                                "{}/s ~{}s",
-                                crate::file_types::format_file_size(bytes_per_sec as u64),
-                                remaining_secs as u64
-                            )
-                        } else {
-                            format!(
-                                "{}/s ~{}m{}s",
-                                crate::file_types::format_file_size(bytes_per_sec as u64),
-                                remaining_secs as u64 / 60,
-                                remaining_secs as u64 % 60
-                            )
-                        }
-                    } else if p.current > 0 {
-                        let secs_per_item = elapsed.as_secs_f64() / p.current as f64;
-                        let remaining = p.total.saturating_sub(p.current) as f64 * secs_per_item;
-                        if remaining < 60.0 {
-                            format!("~{}s left", remaining as u64)
-                        } else {
-                            format!(
-                                "~{}m {}s left",
-                                remaining as u64 / 60,
-                                remaining as u64 % 60
-                            )
-                        }
-                    } else {
-                        "estimating...".to_string()
-                    };
-
-                    let file_display = if p.current_file.len() > 25 {
-                        format!(
-                            "...{}",
-                            &p.current_file[p.current_file.len().saturating_sub(22)..]
-                        )
-                    } else {
-                        p.current_file.clone()
-                    };
-
-                    container(
-                        row![
-                            text(label)
-                                .size(tiny)
-                                .color(iced::Color::from_rgb(0.4, 0.8, 0.4)),
-                            text(file_display)
-                                .size(tiny)
-                                .width(Length::Fixed(150.0))
-                                .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
-                            progress_bar(0.0..=1.0, pct).girth(6.0).length(Length::Fill),
-                            text(eta_text)
-                                .size(tiny)
-                                .color(iced::Color::from_rgb(0.6, 0.6, 0.65)),
-                            button(text("Cancel").size(tiny))
-                                .on_press(Message::CopyCancel)
-                                .padding([2, 8])
-                                .style(crate::styles::nav_button),
-                        ]
-                        .spacing(8)
-                        .align_y(iced::Alignment::Center),
-                    )
-                    .padding([3, 10])
-                    .into()
-                }
-                _ => Space::new().height(0).into(),
-            }
-        };
-
-        column![
-            row![left_pane, rule::vertical(1), right_pane].height(Length::Fill),
-            rule::horizontal(1),
-            copy_progress_bar,
-            function_bar,
-        ]
-        .into()
-    }
 
     fn view_music_player(&self) -> Element<'_, Message> {
         self.music_player
             .view(self.settings.preferences.font_size)
             .map(Message::MusicPlayer)
-    }
-
-    fn view_settings(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let dim = iced::Color::from_rgb(0.55, 0.55, 0.6);
-        let header_color = iced::Color::from_rgb(0.7, 0.72, 0.8);
-
-        macro_rules! section {
-            ($title:expr, $content:expr) => {
-                container(
-                    column![
-                        text($title).size(fs.large).color(header_color),
-                        rule::horizontal(1),
-                        Space::new().height(8),
-                        $content,
-                    ]
-                    .spacing(4),
-                )
-                .padding(15)
-                .width(Length::Fill)
-                .style(crate::styles::section_style)
-            };
-        }
-
-        // ── Profiles ─────────────────────────────────────────────────────
-        let profile_names = self.profile_manager.profile_names();
-        let profile_section = section!(
-            "Profiles",
-            column![
-                row![
-                    text("Active:").size(fs.normal).color(dim),
-                    pick_list(
-                        profile_names,
-                        Some(self.profile_manager.active_profile.clone()),
-                        Message::ProfileSelected,
-                    )
-                    .text_size(fs.small as f32)
-                    .width(Length::Fixed(180.0)),
-                    button(text("Save").size(fs.small))
-                        .on_press(Message::SaveProfile)
-                        .padding([4, 10])
-                        .style(crate::styles::action_button),
-                    button(text("Duplicate").size(fs.small))
-                        .on_press(Message::DuplicateProfile)
-                        .padding([4, 10])
-                        .style(crate::styles::nav_button),
-                    button(text("Delete").size(fs.small))
-                        .on_press(Message::DeleteProfile)
-                        .padding([4, 10])
-                        .style(crate::styles::nav_button),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                row![
-                    text("New:").size(fs.normal).color(dim),
-                    text_input("Profile name...", &self.new_profile_name)
-                        .on_input(Message::NewProfileNameChanged)
-                        .on_submit(Message::CreateProfile)
-                        .padding(6)
-                        .size(fs.small as f32)
-                        .width(Length::Fixed(180.0)),
-                    button(text("Create").size(fs.small))
-                        .on_press(Message::CreateProfile)
-                        .padding([4, 10])
-                        .style(crate::styles::nav_button),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-            ]
-            .spacing(8)
-        );
-
-        // ── Connection ───────────────────────────────────────────────────
-        let discovery_button: Element<'_, Message> = if self.is_discovering {
-            button(text("Scanning...").size(fs.small))
-                .padding([4, 10])
-                .style(crate::styles::nav_button)
-                .into()
-        } else {
-            button(text("Find Devices").size(fs.small))
-                .on_press(Message::StartDiscovery)
-                .padding([4, 10])
-                .style(crate::styles::nav_button)
-                .into()
-        };
-
-        let discovered_list: Element<'_, Message> = if self.discovered_devices.is_empty() {
-            if self.is_discovering {
-                text("Scanning network...").size(fs.small).color(dim).into()
-            } else {
-                Space::new().height(0).into()
-            }
-        } else {
-            column(
-                self.discovered_devices
-                    .iter()
-                    .map(|d| {
-                        let device = d.clone();
-                        let label = format!("{} - {} ({})", d.ip, d.product, d.firmware);
-                        button(text(label).size(fs.small))
-                            .on_press(Message::SelectDiscoveredDevice(device))
-                            .padding([4, 8])
-                            .width(Length::Fill)
-                            .style(crate::styles::nav_button)
-                            .into()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .spacing(2)
-            .width(Length::Fixed(400.0))
-            .into()
-        };
-
-        let status_indicator: Element<'_, Message> = if self.status.connected {
-            let info_text = self.status.device_info.as_deref().unwrap_or("");
-            row![
-                text(format!("Connected to {}", self.settings.connection.host))
-                    .size(fs.normal)
-                    .color(iced::Color::from_rgb(0.3, 0.8, 0.3)),
-                text(info_text).size(fs.small).color(dim),
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center)
-            .into()
-        } else {
-            text("Not connected")
-                .size(fs.normal)
-                .color(iced::Color::from_rgb(0.7, 0.3, 0.3))
-                .into()
-        };
-
-        let connection_section = section!(
-            "Connection",
-            column![
-                row![
-                    text("IP Address:").size(fs.normal).color(dim),
-                    text_input("eg. 192.168.1.64", &self.host_input)
-                        .on_input(Message::HostInputChanged)
-                        .padding(6)
-                        .size(fs.small as f32)
-                        .width(Length::Fixed(200.0)),
-                    discovery_button,
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                discovered_list,
-                row![
-                    text("Password:").size(fs.normal).color(dim),
-                    text_input("optional", &self.password_input)
-                        .on_input(Message::PasswordInputChanged)
-                        .padding(6)
-                        .size(fs.small as f32)
-                        .width(Length::Fixed(200.0)),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                row![
-                    text("Stream Control:").size(fs.normal).color(dim),
-                    pick_list(
-                        &StreamControlMethod::ALL[..],
-                        Some(self.settings.connection.stream_control_method),
-                        Message::StreamControlMethodChanged,
-                    )
-                    .text_size(fs.small as f32)
-                    .width(Length::Fixed(220.0)),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                Space::new().height(4),
-                row![
-                    button(text("Connect").size(fs.small))
-                        .on_press(Message::ConnectPressed)
-                        .padding([6, 16])
-                        .style(crate::styles::action_button),
-                    button(text("Disconnect").size(fs.small))
-                        .on_press(Message::DisconnectPressed)
-                        .padding([6, 16])
-                        .style(crate::styles::nav_button),
-                    button(text("Test").size(fs.small))
-                        .on_press(Message::RefreshStatus)
-                        .padding([6, 16])
-                        .style(crate::styles::nav_button),
-                    Space::new().width(20),
-                    status_indicator,
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-            ]
-            .spacing(8)
-        );
-
-        // ── Starting Directories ─────────────────────────────────────────
-        let fb_dir = self
-            .settings
-            .default_paths
-            .file_browser_start_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(home directory)".to_string());
-        let mp_dir = self
-            .settings
-            .default_paths
-            .music_player_start_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(home directory)".to_string());
-
-        let dirs_section = section!(
-            "Starting Directories",
-            column![
-                row![
-                    text("File Browser:")
-                        .size(fs.normal)
-                        .color(dim)
-                        .width(Length::Fixed(120.0)),
-                    text(fb_dir.clone()).size(fs.small).width(Length::Fill),
-                    button(text("Browse").size(fs.small))
-                        .on_press(Message::BrowseFileBrowserStartDir)
-                        .padding([3, 8])
-                        .style(crate::styles::nav_button),
-                    button(text("Clear").size(fs.small))
-                        .on_press(Message::ClearFileBrowserStartDir)
-                        .padding([3, 8])
-                        .style(crate::styles::nav_button),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                row![
-                    text("Music Player:")
-                        .size(fs.normal)
-                        .color(dim)
-                        .width(Length::Fixed(120.0)),
-                    text(mp_dir.clone()).size(fs.small).width(Length::Fill),
-                    button(text("Browse").size(fs.small))
-                        .on_press(Message::BrowseMusicPlayerStartDir)
-                        .padding([3, 8])
-                        .style(crate::styles::nav_button),
-                    button(text("Clear").size(fs.small))
-                        .on_press(Message::ClearMusicPlayerStartDir)
-                        .padding([3, 8])
-                        .style(crate::styles::nav_button),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                text("Changes take effect on next restart")
-                    .size(fs.tiny)
-                    .color(dim),
-            ]
-            .spacing(6)
-        );
-
-        // ── Preferences ──────────────────────────────────────────────────
-        let prefs_section = section!(
-            "Preferences",
-            column![
-                row![
-                    text("Default song duration:").size(fs.normal).color(dim),
-                    text_input(
-                        "180",
-                        &self.settings.preferences.default_song_duration.to_string()
-                    )
-                    .on_input(Message::DefaultSongDurationChanged)
-                    .padding(6)
-                    .size(fs.small as f32)
-                    .width(Length::Fixed(60.0)),
-                    text("seconds").size(fs.small).color(dim),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-                row![
-                    text("Font size:").size(fs.normal).color(dim),
-                    text_input("12", &self.font_size_input)
-                        .on_input(Message::FontSizeChanged)
-                        .padding(6)
-                        .size(fs.small as f32)
-                        .width(Length::Fixed(50.0)),
-                    text("(8\u{2013}24)").size(fs.small).color(dim),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-            ]
-            .spacing(8)
-        );
-
-        // ── Debug ────────────────────────────────────────────────────────
-        let debug_section = section!(
-            "Debug",
-            column![text(format!(
-                "Platform: {} | Config: {} | Profile: {} ({} total)",
-                std::env::consts::OS,
-                dirs::config_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default(),
-                self.profile_manager.active_profile,
-                self.profile_manager.profiles.len(),
-            ))
-            .size(fs.small)
-            .color(dim),]
-            .spacing(4)
-        );
-
-        scrollable(
-            column![
-                profile_section,
-                connection_section,
-                dirs_section,
-                prefs_section,
-                debug_section,
-            ]
-            .spacing(10)
-            .padding(15)
-            .width(Length::Fill),
-        )
-        .height(Length::Fill)
-        .into()
     }
 
     /// Debug bus-trace stream capture controls (part of the DEVICE tab).
@@ -5091,162 +2372,6 @@ impl Ultimate64Browser {
         scrollable(content).height(Length::Fill).into()
     }
 
-    fn view_status_bar(&self) -> Element<'_, Message> {
-        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
-        let video_status = if self.video_streaming.is_streaming {
-            "STREAMING"
-        } else {
-            "IDLE"
-        };
-
-        // Show user message if present, otherwise show video status
-        let status_text: Element<'_, Message> = if let Some(msg) = &self.user_message {
-            let (prefix, message, is_error) = match msg {
-                UserMessage::Error(e) => ("ERROR: ", e.as_str(), true),
-                UserMessage::Info(i) => ("", i.as_str(), false),
-            };
-            let color = if is_error {
-                iced::Color::from_rgb(0.8, 0.0, 0.0)
-            } else {
-                iced::Color::from_rgb(0.0, 0.5, 0.0)
-            };
-
-            // Check if this is a screenshot message - make path clickable
-            if message.starts_with("Screenshot saved: ") {
-                let path = message
-                    .strip_prefix("Screenshot saved: ")
-                    .unwrap_or(message);
-                row![
-                    text("Screenshot saved: ").size(fs.normal).color(color),
-                    button(
-                        text(path)
-                            .size(fs.normal)
-                            .color(iced::Color::from_rgb(0.3, 0.6, 1.0))
-                    )
-                    .style(button::text)
-                    .on_press(Message::Streaming(StreamingMessage::OpenScreenshot(
-                        path.to_string()
-                    )))
-                    .padding(0),
-                    tooltip(
-                        button(text("X").size(fs.tiny))
-                            .on_press(Message::DismissMessage)
-                            .padding([2, 6]),
-                        "Dismiss message",
-                        tooltip::Position::Top,
-                    )
-                    .style(container::bordered_box),
-                ]
-                .spacing(10)
-                .align_y(iced::Alignment::Center)
-                .into()
-            } else {
-                let mut row_items: Vec<Element<'_, Message>> =
-                    vec![text(format!("{}{}", prefix, message))
-                        .size(fs.normal)
-                        .color(color)
-                        .into()];
-                // While a drag-and-drop upload is in flight, expose a
-                // Cancel button right next to the status text so the user
-                // doesn't have to wait for the timeout if the device is
-                // silent. Cancels via `Task::abort()` on the stashed handle.
-                if self.drop_in_flight {
-                    row_items.push(
-                        tooltip(
-                            button(text("✕ Cancel").size(fs.tiny))
-                                .on_press(Message::DropAbort)
-                                .padding([2, 8]),
-                            "Cancel the in-flight drop action",
-                            tooltip::Position::Top,
-                        )
-                        .style(container::bordered_box)
-                        .into(),
-                    );
-                }
-                row_items.push(
-                    tooltip(
-                        button(text("X").size(fs.tiny))
-                            .on_press(Message::DismissMessage)
-                            .padding([2, 6]),
-                        "Dismiss message",
-                        tooltip::Position::Top,
-                    )
-                    .style(container::bordered_box)
-                    .into(),
-                );
-                iced::widget::Row::with_children(row_items)
-                    .spacing(10)
-                    .align_y(iced::Alignment::Center)
-                    .into()
-            }
-        } else {
-            text(video_status).size(fs.normal).into()
-        };
-
-        let connected = self.status.connected;
-
-        container(
-            row![
-                status_text,
-                Space::new().width(Length::Fill),
-                tooltip(
-                    button(text("MENU").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::MenuButton))
-                        .padding([4, 8]),
-                    "Press Ultimate64 menu button",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-                text("|").size(fs.normal),
-                tooltip(
-                    button(text("PAUSE").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::PauseMachine))
-                        .padding([4, 8]),
-                    "Pause the C64 CPU",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("RESUME").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::ResumeMachine))
-                        .padding([4, 8]),
-                    "Resume the C64 CPU",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-                text("|").size(fs.normal),
-                tooltip(
-                    button(text("RESET").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::ResetMachine))
-                        .padding([4, 8]),
-                    "Reset the C64 (soft reset)",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("REBOOT").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::RebootMachine))
-                        .padding([4, 8]),
-                    "Reboot the Ultimate64 device",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("POWER OFF").size(fs.small))
-                        .on_press_maybe(connected.then_some(Message::PoweroffMachine))
-                        .padding([4, 8]),
-                    "Power off the Ultimate64",
-                    tooltip::Position::Top,
-                )
-                .style(container::bordered_box),
-            ]
-            .spacing(6)
-            .align_y(iced::Alignment::Center),
-        )
-        .padding([8, 15])
-        .into()
-    }
-
     fn establish_connection(&mut self) {
         self.connection = None;
         self.host_url = None;
@@ -5295,7 +2420,7 @@ impl Ultimate64Browser {
         match Rest::new(&host, self.settings.connection.password.clone()) {
             Ok(rest) => {
                 log::info!("REST client created, verifying connection...");
-                self.connection = Some(Arc::new(TokioMutex::new(rest)));
+                self.connection = Some(Arc::new(Mutex::new(rest)));
                 // Build proper HTTP URL
                 let http_url = format!("http://{}", self.settings.connection.host);
                 self.host_url = Some(http_url.clone());
@@ -5319,7 +2444,7 @@ impl Ultimate64Browser {
 }
 
 async fn execute_template_commands(
-    connection: Arc<TokioMutex<Rest>>,
+    connection: Arc<Mutex<Rest>>,
     commands: Vec<String>,
 ) -> Result<(), String> {
     for command in commands {
@@ -5330,7 +2455,7 @@ async fn execute_template_commands(
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                 tokio::task::spawn_blocking(move || {
-                    let conn = conn.blocking_lock();
+                    let conn = conn.lock().unwrap();
                     conn.reset().map_err(|e| format!("Reset failed: {}", e))
                 }),
             )
@@ -5347,7 +2472,7 @@ async fn execute_template_commands(
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                 tokio::task::spawn_blocking(move || {
-                    let conn = conn.blocking_lock();
+                    let conn = conn.lock().unwrap();
                     conn.type_text(&text)
                         .map_err(|e| format!("Type failed: {}", e))
                 }),
@@ -5364,7 +2489,7 @@ async fn execute_template_commands(
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                 tokio::task::spawn_blocking(move || {
-                    let conn = conn.blocking_lock();
+                    let conn = conn.lock().unwrap();
                     conn.type_text("load\"*\",8,1\n")
                         .map_err(|e| format!("Load failed: {}", e))
                 }),
@@ -5381,7 +2506,7 @@ async fn execute_template_commands(
             let result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
                 tokio::task::spawn_blocking(move || {
-                    let conn = conn.blocking_lock();
+                    let conn = conn.lock().unwrap();
                     conn.type_text("run\n")
                         .map_err(|e| format!("Run failed: {}", e))
                 }),
@@ -5399,13 +2524,13 @@ async fn execute_template_commands(
     Ok(())
 }
 
-async fn fetch_status(connection: Arc<TokioMutex<Rest>>) -> Result<StatusInfo, String> {
+async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, String> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
     // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
-            let conn = connection.blocking_lock();
+            let conn = connection.lock().unwrap();
 
             let device_info = match conn.info() {
                 Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),

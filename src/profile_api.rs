@@ -13,7 +13,7 @@ use crate::device_profile::{ConfigTree, DeviceProfile};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use ultimate64::Rest;
 
 /// Apply a pre-computed config diff plus mounts to the device.
