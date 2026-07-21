@@ -40,22 +40,29 @@ pub fn check_for_updates(current_version: &str) -> Task<VersionCheckMessage> {
     )
 }
 
-/// Find the download URL for the current platform from release assets
+/// Find the download URL for the current platform from release assets.
+///
+/// Each platform lists its accepted asset suffixes in priority order — the
+/// first match wins. macOS prefers the drag-install `.dmg` (notarization
+/// stapled, nicer download) and falls back to the `.zip` for older releases
+/// that only shipped a zip.
 fn find_platform_asset(assets: &[GitHubAsset]) -> Option<&str> {
-    let target = if cfg!(target_os = "windows") {
-        "Win.exe"
+    let targets: &[&str] = if cfg!(target_os = "windows") {
+        &["Win.exe"]
     } else if cfg!(target_os = "macos") {
-        "MacOS.zip"
+        &["MacOS.dmg", "MacOS.zip"]
     } else if cfg!(target_os = "linux") {
-        "Linux.AppImage"
+        &["Linux.AppImage"]
     } else {
         return None;
     };
 
-    assets
-        .iter()
-        .find(|a| a.name.ends_with(target))
-        .map(|a| a.browser_download_url.as_str())
+    targets.iter().find_map(|target| {
+        assets
+            .iter()
+            .find(|a| a.name.ends_with(target))
+            .map(|a| a.browser_download_url.as_str())
+    })
 }
 
 async fn check_github_release(current_version: &str) -> Result<Option<NewVersionInfo>, String> {
@@ -154,5 +161,29 @@ mod tests {
     fn test_find_platform_asset_empty() {
         let assets: Vec<GitHubAsset> = vec![];
         assert!(find_platform_asset(&assets).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_macos_prefers_dmg_over_zip() {
+        let mk = |name: &str| GitHubAsset {
+            name: name.to_string(),
+            browser_download_url: format!("https://example.com/{}", name),
+        };
+        // Both present → DMG wins.
+        let both = vec![
+            mk("Ultimate64Manager-MacOS.zip"),
+            mk("Ultimate64Manager-0.4.6-MacOS.dmg"),
+        ];
+        assert_eq!(
+            find_platform_asset(&both),
+            Some("https://example.com/Ultimate64Manager-0.4.6-MacOS.dmg")
+        );
+        // Only zip (older release) → falls back to zip.
+        let zip_only = vec![mk("Ultimate64Manager-MacOS.zip")];
+        assert_eq!(
+            find_platform_asset(&zip_only),
+            Some("https://example.com/Ultimate64Manager-MacOS.zip")
+        );
     }
 }

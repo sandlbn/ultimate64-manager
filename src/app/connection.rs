@@ -120,7 +120,7 @@ impl Ultimate64Browser {
 
     pub(crate) fn handle_status_updated(
         &mut self,
-        result: Result<StatusInfo, String>,
+        result: Result<StatusInfo, crate::device_error::DeviceError>,
         ctx: TabContext,
     ) -> Task<Message> {
         match result {
@@ -159,6 +159,26 @@ impl Ultimate64Browser {
                 // legitimately takes it offline for 15-30 seconds.
                 if self.device_profile_manager.is_loading {
                     log::debug!("Ignoring status failure during profile operation");
+                    return Task::none();
+                }
+
+                // A wrong/missing network password won't fix itself by retrying,
+                // so skip the transient-outage grace period and surface it
+                // immediately with an actionable message.
+                if e == crate::device_error::DeviceError::Unauthorized {
+                    log::warn!("Status poll unauthorized — bad network password");
+                    self.consecutive_status_failures =
+                        self.consecutive_status_failures.saturating_add(1);
+                    self.status.connected = false;
+                    self.status.device_info = None;
+                    self.user_message = Some(UserMessage::Error(
+                        "Unauthorized — check the device network password (Settings).".to_string(),
+                    ));
+                    if self.video_streaming.is_streaming {
+                        let _ = self
+                            .video_streaming
+                            .update(StreamingMessage::StopStream, ctx.clone());
+                    }
                     return Task::none();
                 }
 
