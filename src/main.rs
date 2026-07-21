@@ -97,6 +97,7 @@ mod config_editor;
 mod config_presets;
 mod csdb_screenshots;
 mod debug_stream;
+mod device_error;
 mod device_profile;
 mod dir_preview;
 mod discovery;
@@ -134,6 +135,7 @@ mod video_scaling;
 use assembly64_browser::{Assembly64Browser, Assembly64BrowserMessage};
 use basic_editor::{BasicEditor, BasicEditorMessage};
 use config_editor::{ConfigEditor, ConfigEditorMessage};
+use device_error::DeviceError;
 use discovery::DiscoveredDevice;
 use file_browser::{FileBrowser, FileBrowserMessage};
 use memory_editor::{MemoryEditor, MemoryEditorMessage};
@@ -269,7 +271,7 @@ pub enum Message {
     DisconnectPressed,
     RefreshStatus,
     RefreshAfterConnect,
-    StatusUpdated(Result<StatusInfo, String>),
+    StatusUpdated(Result<StatusInfo, crate::device_error::DeviceError>),
     StreamControlMethodChanged(StreamControlMethod),
 
     // Templates
@@ -2524,7 +2526,7 @@ async fn execute_template_commands(
     Ok(())
 }
 
-async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, String> {
+async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, DeviceError> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
     // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
@@ -2534,7 +2536,9 @@ async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, String
 
             let device_info = match conn.info() {
                 Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),
-                Err(e) => return Err(format!("Failed to get device info: {}", e)),
+                // The ultimate64 crate surfaces HTTP failures as strings; classify
+                // a 403 so the UI can say "wrong password" instead of "offline".
+                Err(e) => return Err(classify_crate_error(&e.to_string())),
             };
 
             let mounted_disks = match conn.drive_list() {
@@ -2556,8 +2560,25 @@ async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, String
 
     match result {
         Ok(Ok(status)) => status,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Connection timed out - device may be offline".to_string()),
+        Ok(Err(e)) => Err(DeviceError::Network(format!("task join error: {}", e))),
+        Err(_) => Err(DeviceError::Timeout),
+    }
+}
+
+/// Best-effort classification of an `ultimate64` crate error string into a
+/// [`DeviceError`] — the crate doesn't expose the HTTP status, so we sniff the
+/// message. Only the auth case needs to be exact (it changes UX); everything
+/// else falls through to `Network`.
+fn classify_crate_error(msg: &str) -> DeviceError {
+    let s = msg.to_lowercase();
+    if s.contains("403")
+        || s.contains("forbidden")
+        || s.contains("unauthorized")
+        || s.contains("password")
+    {
+        DeviceError::Unauthorized
+    } else {
+        DeviceError::Network(msg.to_string())
     }
 }
 

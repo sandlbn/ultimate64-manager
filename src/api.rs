@@ -1,7 +1,7 @@
 // Ultimate64 REST API client
 
+use crate::device_error::DeviceError;
 use crate::net_utils::REST_TIMEOUT_SECS;
-use reqwest::Client;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -57,29 +57,15 @@ async fn run_file(
     let url = format!("http://{}:80/v1/runners:{}", host, runner);
     log::info!("API: {} -> {}", runner, file_path);
 
-    let client = Client::new();
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let request = crate::net_utils::with_password(
+        client.put(&url).query(&[("file", file_path)]),
+        password.as_deref(),
+    );
+    crate::net_utils::device_send(request).await?;
 
-    // Build request with file query parameter
-    let mut request = client.put(&url).query(&[("file", file_path)]);
-
-    // Add X-password header if password is configured
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            request = request.header("X-password", pwd.as_str());
-        }
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if response.status().is_success() {
-        let filename = file_path.rsplit('/').next().unwrap_or(file_path);
-        Ok(format!("{}: {}", runner_description(runner), filename))
-    } else {
-        Err(format!("Runner failed: HTTP {}", response.status()))
-    }
+    let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+    Ok(format!("{}: {}", runner_description(runner), filename))
 }
 
 fn runner_description(runner: &str) -> &'static str {
@@ -104,29 +90,17 @@ pub async fn mount_disk(
     let url = format!("http://{}:80/v1/drives/{}:mount", host, drive);
     log::info!("API: mount {} to drive {} ({})", file_path, drive, mode);
 
-    let client = Client::new();
-    let mut request = client
-        .put(&url)
-        .query(&[("image", file_path), ("mode", mode)]);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    let request = crate::net_utils::with_password(
+        client
+            .put(&url)
+            .query(&[("image", file_path), ("mode", mode)]),
+        password.as_deref(),
+    );
+    crate::net_utils::device_send(request).await?;
 
-    // Add X-password header if password is configured
-    if let Some(ref pwd) = password {
-        if !pwd.is_empty() {
-            request = request.header("X-password", pwd.as_str());
-        }
-    }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    if response.status().is_success() {
-        let filename = file_path.rsplit('/').next().unwrap_or(file_path);
-        Ok(format!("Mounted: {}", filename))
-    } else {
-        Err(format!("Mount failed: HTTP {}", response.status()))
-    }
+    let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+    Ok(format!("Mounted: {}", filename))
 }
 
 /// Run a disk image with full sequence: mount, reset, LOAD"*",8,1, RUN
@@ -362,9 +336,7 @@ pub async fn reset_machine_async(host: &str, password: Option<&str>) -> Result<(
     let url = format!("{}/v1/machine:reset", host);
     let client = crate::net_utils::build_device_client(5)?;
     let req = crate::net_utils::with_password(client.put(&url), password);
-    req.send()
-        .await
-        .map_err(|e| format!("Reset failed: {}", e))?;
+    crate::net_utils::device_send(req).await?;
     Ok(())
 }
 
@@ -396,9 +368,9 @@ async fn writemem_once(
     address: u16,
     data: Vec<u8>,
     password: Option<&str>,
-) -> Result<(), String> {
+) -> Result<(), DeviceError> {
     let url = format!("{}/v1/machine:writemem?address={:x}", host, address);
-    let client = crate::net_utils::build_device_client(5)?;
+    let client = crate::net_utils::build_device_client(5).map_err(DeviceError::Build)?;
     let req = crate::net_utils::with_password(
         client
             .post(&url)
@@ -406,25 +378,8 @@ async fn writemem_once(
             .body(data),
         password,
     );
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("writemem failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("writemem HTTP {}", resp.status()));
-    }
+    crate::net_utils::device_send(req).await?;
     Ok(())
-}
-
-fn is_transient_err(e: &str) -> bool {
-    let s = e.to_lowercase();
-    s.contains("empty reply")
-        || s.contains("connection")
-        || s.contains("reset")
-        || s.contains("broken")
-        || s.contains("eof")
-        || s.contains("timed out")
-        || s.contains("deadline")
 }
 
 /// writemem with retries on transient errors (DMA contention, cart activity).
@@ -434,7 +389,7 @@ pub async fn writemem_async(
     data: Vec<u8>,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let mut last_err = String::new();
+    let mut last_err: Option<DeviceError> = None;
     for attempt in 0..4 {
         if attempt > 0 {
             let delay = 500 + 500 * attempt as u64;
@@ -444,16 +399,17 @@ pub async fn writemem_async(
         match writemem_once(host, address, data.clone(), password).await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                if !is_transient_err(&e) {
-                    return Err(e);
+                if !e.is_transient() {
+                    return Err(e.to_string());
                 }
-                last_err = e;
+                last_err = Some(e);
             }
         }
     }
     Err(format!(
         "writemem 0x{:x} failed after 4 attempts: {}",
-        address, last_err
+        address,
+        last_err.map(|e| e.to_string()).unwrap_or_default()
     ))
 }
 
@@ -515,13 +471,9 @@ pub async fn upload_mount_disk_async(
     let url = format!("{}/v1/drives/{}:mount", host, drive);
     let client = crate::net_utils::build_device_client(60)?;
     let req = crate::net_utils::with_password(client.post(&url).multipart(form), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("Upload+mount failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("mount HTTP {}", resp.status()));
-    }
     Ok(())
 }
 
@@ -540,17 +492,9 @@ pub async fn unmount_disk_async(
     let url = format!("{}/v1/drives/{}:remove", host, drive);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req = crate::net_utils::with_password(client.put(&url), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("unmount Drive {}: {}", drive.to_uppercase(), e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "unmount Drive {}: HTTP {}",
-            drive.to_uppercase(),
-            resp.status()
-        ));
-    }
     Ok(())
 }
 
@@ -569,13 +513,9 @@ pub async fn upload_runner_async(
             .body(data),
         password,
     );
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
-        .map_err(|e| format!("{} failed: {}", runner, e))?;
-    if !resp.status().is_success() {
-        return Err(format!("{} HTTP {}", runner, resp.status()));
-    }
+        .map_err(|e| format!("{}: {}", runner, e))?;
     Ok(())
 }
 
@@ -596,17 +536,9 @@ pub async fn set_drive_mode_async(
     let url = format!("{}/v1/drives/{}:set_mode", host, drive);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req = crate::net_utils::with_password(client.put(&url).query(&[("mode", mode)]), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("Drive {} set mode: {}", drive.to_uppercase(), e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Drive {} set mode: HTTP {}",
-            drive.to_uppercase(),
-            resp.status()
-        ));
-    }
     Ok(format!("Drive {} → {}", drive.to_uppercase(), mode))
 }
 
@@ -622,18 +554,9 @@ pub async fn drive_power_async(
     let url = format!("{}/v1/drives/{}:{}", host, drive, action);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req = crate::net_utils::with_password(client.put(&url), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("Drive {} power {}: {}", drive.to_uppercase(), action, e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Drive {} power {}: HTTP {}",
-            drive.to_uppercase(),
-            action,
-            resp.status()
-        ));
-    }
     Ok(format!("Drive {} powered {}", drive.to_uppercase(), action))
 }
 
@@ -647,17 +570,9 @@ pub async fn drive_reset_async(
     let url = format!("{}/v1/drives/{}:reset", host, drive);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req = crate::net_utils::with_password(client.put(&url), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("Drive {} reset: {}", drive.to_uppercase(), e))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Drive {} reset: HTTP {}",
-            drive.to_uppercase(),
-            resp.status()
-        ));
-    }
     Ok(format!("Drive {} reset", drive.to_uppercase()))
 }
 
@@ -672,13 +587,9 @@ pub async fn load_prg_async(
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req =
         crate::net_utils::with_password(client.put(&url).query(&[("file", file_path)]), password);
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
-        .map_err(|e| format!("load_prg failed: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("load_prg HTTP {}", resp.status()));
-    }
+        .map_err(|e| format!("load_prg: {}", e))?;
     let filename = file_path.rsplit('/').next().unwrap_or(file_path);
     Ok(format!("Loaded: {}", filename))
 }
@@ -689,13 +600,9 @@ pub async fn read_debugreg_async(host: &str, password: Option<&str>) -> Result<u
     let url = format!("{}/v1/machine:debugreg", host);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
     let req = crate::net_utils::with_password(client.get(&url), password);
-    let resp = req
-        .send()
+    let resp = crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("debugreg read: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("debugreg read HTTP {}", resp.status()));
-    }
     let body = resp
         .text()
         .await
@@ -718,13 +625,9 @@ pub async fn write_debugreg_async(
         client.put(&url).query(&[("value", value_str.as_str())]),
         password,
     );
-    let resp = req
-        .send()
+    crate::net_utils::device_send(req)
         .await
         .map_err(|e| format!("debugreg write: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("debugreg write HTTP {}", resp.status()));
-    }
     Ok(format!("Debug register = ${:02X}", value))
 }
 

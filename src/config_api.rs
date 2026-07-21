@@ -16,14 +16,7 @@ pub async fn fetch_categories(
 
     let request = crate::net_utils::with_password(client.get(&url), password.as_deref());
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()));
-    }
+    let response = crate::net_utils::device_send(request).await?;
 
     let text = response
         .text()
@@ -101,14 +94,7 @@ pub async fn fetch_category_items(
 
     let request = crate::net_utils::with_password(client.get(&url), password.as_deref());
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()));
-    }
+    let response = crate::net_utils::device_send(request).await?;
 
     let text = response
         .text()
@@ -235,14 +221,7 @@ pub async fn fetch_item_details(
 
     let request = crate::net_utils::with_password(client.get(&url), password.as_deref());
 
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()));
-    }
+    let response = crate::net_utils::device_send(request).await?;
 
     let text = response
         .text()
@@ -402,22 +381,15 @@ pub async fn flash_operation(
 
     let request = crate::net_utils::with_password(client.put(&url), password.as_deref());
 
-    let response = request
-        .send()
+    crate::net_utils::device_send(request)
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Flash operation failed: {}", e))?;
 
-    if response.status().is_success() {
-        match operation {
-            "save_to_flash" => Ok("Configuration saved to flash memory".to_string()),
-            "load_from_flash" => Ok("Configuration loaded from flash memory".to_string()),
-            "reset_to_default" => Ok("Configuration reset to factory defaults".to_string()),
-            _ => Ok("Operation completed".to_string()),
-        }
-    } else {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        Err(format!("Flash operation failed: {} - {}", status, text))
+    match operation {
+        "save_to_flash" => Ok("Configuration saved to flash memory".to_string()),
+        "load_from_flash" => Ok("Configuration loaded from flash memory".to_string()),
+        "reset_to_default" => Ok("Configuration reset to factory defaults".to_string()),
+        _ => Ok("Operation completed".to_string()),
     }
 }
 

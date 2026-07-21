@@ -67,3 +67,24 @@ pub fn with_password(
         _ => request,
     }
 }
+
+/// Send a device request and validate the HTTP status, classifying any failure
+/// as a [`DeviceError`]. This is the single choke point for device REST calls:
+/// transport errors become `Timeout`/`Network`, and non-2xx responses become
+/// `Unauthorized`/`NotFound`/`Http`. Callers keep building the request (URL,
+/// method, query, body) and attach the password via [`with_password`]; this
+/// only owns the send + status classification.
+pub async fn device_send(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, crate::device_error::DeviceError> {
+    use crate::device_error::DeviceError;
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| DeviceError::from_reqwest(&e))?;
+    if resp.status().is_success() {
+        Ok(resp)
+    } else {
+        Err(DeviceError::from_status(resp.status().as_u16()))
+    }
+}

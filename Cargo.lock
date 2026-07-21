@@ -5493,7 +5493,7 @@ dependencies = [
 
 [[package]]
 name = "ultimate64-manager"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "chrono",
