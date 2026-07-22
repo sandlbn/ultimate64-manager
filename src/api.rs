@@ -132,31 +132,14 @@ pub async fn run_disk(
     // Small delay for mount to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // 2. Reset and type commands using Rest connection
+    // 2. Reset and autoload using the shared adaptive sequence (polls screen
+    //    RAM for the READY prompt instead of blind sleeps).
     if let Some(conn) = connection {
         let device = device_num.to_string();
 
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().unwrap();
-
-            // Reset the machine
-            c.reset().map_err(|e| format!("Reset failed: {}", e))?;
-
-            // Wait for C64 to boot up
-            std::thread::sleep(std::time::Duration::from_secs(3));
-
-            // Type LOAD"*",8,1 (or 9)
-            let load_cmd = format!("load\"*\",{},1\n", device);
-            c.type_text(&load_cmd)
-                .map_err(|e| format!("Type LOAD failed: {}", e))?;
-
-            // Wait for program to load
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            // Type RUN
-            c.type_text("run\n")
-                .map_err(|e| format!("Type RUN failed: {}", e))?;
-
+            crate::run_ops::autoload_mounted_disk(&*c, &device)?;
             Ok::<String, String>(format!("Running: {}", filename))
         })
         .await

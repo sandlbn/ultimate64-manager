@@ -96,6 +96,13 @@ impl Ultimate64Browser {
         let discovered_list: Element<'_, Message> = if self.discovered_devices.is_empty() {
             if self.is_discovering {
                 text("Scanning network...").size(fs.small).color(dim).into()
+            } else if self.discovery_ran {
+                // Scan finished with nothing — point the user at the manual
+                // IP field above rather than leaving a dead end.
+                text("No devices found. Enter the IP address above manually, then set the password and Connect.")
+                    .size(fs.small)
+                    .color(iced::Color::from_rgb(0.8, 0.6, 0.3))
+                    .into()
             } else {
                 Space::new().height(0).into()
             }

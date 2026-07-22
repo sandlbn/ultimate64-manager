@@ -28,6 +28,10 @@ pub enum RemoteBrowserMessage {
     DownloadFile(String),
     DownloadComplete(Result<(String, Vec<u8>), String>),
     UploadFile(PathBuf, String), // local path, remote destination
+    /// Upload into a directory that should be created if missing (local path,
+    /// remote directory). Used by the Assembly64 "send to device" flow to
+    /// recreate the `Assembly64/<Category>/` layout on the device.
+    UploadFileToDir(PathBuf, String),
     UploadComplete(Result<String, String>),
     UploadDirectory(PathBuf, String), // local directory path, remote destination
     UploadDirectoryComplete(Result<String, String>),
@@ -456,6 +460,42 @@ impl RemoteBrowser {
                     let progress = self.transfer_progress.clone();
                     Task::perform(
                         upload_file_ftp(host, local_path, remote_dest, password, progress),
+                        RemoteBrowserMessage::UploadComplete,
+                    )
+                } else {
+                    self.status_message = Some("Not connected".to_string());
+                    Task::none()
+                }
+            }
+
+            RemoteBrowserMessage::UploadFileToDir(local_path, remote_dir) => {
+                if let Some(host) = &self.host_address {
+                    let filename = local_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    self.status_message = Some(format!("Uploading {} → {}…", filename, remote_dir));
+                    if let Ok(mut g) = self.transfer_progress.lock() {
+                        *g = Some(TransferProgress {
+                            current: 0,
+                            total: 1,
+                            current_file: filename,
+                            operation: "Uploading".to_string(),
+                            done: false,
+                            cancelled: false,
+                            started_at: std::time::Instant::now(),
+                            bytes_transferred: 0,
+                            bytes_total: 0,
+                        });
+                    }
+                    let host = host.clone();
+                    let password = self.password.clone();
+                    let progress = self.transfer_progress.clone();
+                    Task::perform(
+                        crate::ftp_ops::upload_file_ftp_to_dir(
+                            host, local_path, remote_dir, password, progress,
+                        ),
                         RemoteBrowserMessage::UploadComplete,
                     )
                 } else {

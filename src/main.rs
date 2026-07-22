@@ -74,6 +74,31 @@ const HELP_BINDS: &[(&str, &str, &str)] = &[
     ("General", "?", "Show this help"),
     ("Memory editor", "Cmd/Ctrl + Z", "Undo last write"),
     ("Memory editor", "Cmd/Ctrl + Shift + Z", "Redo"),
+    (
+        "Memory editor",
+        "Enter",
+        "Confirm the focused field (run search · write byte · add bookmark)",
+    ),
+    (
+        "Assembly64",
+        "Enter",
+        "Submit the search from the query box",
+    ),
+    (
+        "Assembly64",
+        ": in query",
+        "Type a `:` to enter raw AQL (e.g. group:fairlight)",
+    ),
+    (
+        "Assembly64",
+        "🎵 button",
+        "Open a SID in the Music Player (subsongs + song lengths)",
+    ),
+    (
+        "Assembly64",
+        "📤 button",
+        "Copy a file to device storage (Remote pane's folder)",
+    ),
     ("Video / streaming", "Alt/Opt + F", "Toggle fullscreen"),
     ("Video / streaming", "Esc", "Exit fullscreen"),
 ];
@@ -123,6 +148,7 @@ mod profile_repo;
 mod profiles;
 mod remote_browser;
 mod remote_device;
+mod run_ops;
 mod screenshot_api;
 mod settings;
 mod sid_info;
@@ -645,6 +671,9 @@ pub struct Ultimate64Browser {
     // Device discovery
     is_discovering: bool,
     discovered_devices: Vec<DiscoveredDevice>,
+    /// True once a scan has completed at least once — lets the UI show an
+    /// actionable "enter the IP manually" hint when a scan finds nothing.
+    discovery_ran: bool,
 
     /// Shared progress state for copy operations between panes
     copy_progress: Arc<std::sync::Mutex<Option<crate::ftp_ops::TransferProgress>>>,
@@ -761,6 +790,7 @@ impl Ultimate64Browser {
             rename_profile_name: String::new(),
             is_discovering: false,
             discovered_devices: Vec::new(),
+            discovery_ran: false,
             copy_progress: Arc::new(std::sync::Mutex::new(None)),
             pending_copy: None,
             toast: None,
@@ -1426,10 +1456,38 @@ impl Ultimate64Browser {
             }
 
             Message::RenameProfile => self.handle_rename_profile(),
-            Message::Assembly64Browser(msg) => self
-                .assembly64_browser
-                .update(msg, ctx.clone())
-                .map(Message::Assembly64Browser),
+            Message::Assembly64Browser(msg) => {
+                // Cross-tab handoff: a SID chosen in Assembly64 opens in the
+                // Music Player (subsongs + song lengths). Intercept before
+                // forwarding so we can switch tabs and drive the other tab.
+                if let Assembly64BrowserMessage::OpenSidInMusicPlayer(path) = &msg {
+                    let path = path.clone();
+                    self.active_tab = Tab::MusicPlayer;
+                    return self
+                        .music_player
+                        .update(MusicPlayerMessage::PlayExternalSid(path), ctx.clone())
+                        .map(Message::MusicPlayer);
+                }
+                // Cross-tab handoff: FTP a downloaded file into
+                // <Remote pane cwd>/<subdir>, creating the folder chain (mirrors
+                // the local Assembly64/<Category>/ layout), then show the browser.
+                if let Assembly64BrowserMessage::UploadToDevice(path, subdir) = &msg {
+                    let path = path.clone();
+                    let base = self.remote_browser.current_path.trim_end_matches('/');
+                    let remote_dir = format!("{}/{}", base, subdir);
+                    self.active_tab = Tab::DualPaneBrowser;
+                    return self
+                        .remote_browser
+                        .update(
+                            RemoteBrowserMessage::UploadFileToDir(path, remote_dir),
+                            ctx.clone(),
+                        )
+                        .map(Message::RemoteBrowser);
+                }
+                self.assembly64_browser
+                    .update(msg, ctx.clone())
+                    .map(Message::Assembly64Browser)
+            }
             Message::BasicEditor(msg) => self
                 .basic_editor
                 .update(msg, ctx.clone())

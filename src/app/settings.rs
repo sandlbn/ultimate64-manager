@@ -65,6 +65,7 @@ impl Ultimate64Browser {
     ) -> Task<Message> {
         self.is_discovering = false;
         self.discovered_devices = devices.clone();
+        self.discovery_ran = true;
 
         if devices.is_empty() {
             self.user_message = Some(UserMessage::Info(
