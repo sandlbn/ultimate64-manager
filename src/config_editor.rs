@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 /// A single configuration item with full details (from /v1/configs/<category>/<item>)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,7 +147,7 @@ impl ConfigEditor {
     pub fn update_impl(
         &mut self,
         message: ConfigEditorMessage,
-        _connection: Option<Arc<Mutex<Rest>>>,
+        _connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
         host_url: Option<String>,
         password: Option<String>,
     ) -> Task<ConfigEditorMessage> {

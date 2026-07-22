@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 /// Everything a tab might need to talk to the device, gathered once per update.
 /// Tabs disagree on which pieces they use — some want the bare `host`, some the
@@ -18,7 +18,7 @@ use ultimate64::Rest;
 #[derive(Clone)]
 pub struct TabContext {
     /// Shared blocking REST client, when connected.
-    pub connection: Option<Arc<Mutex<Rest>>>,
+    pub connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     /// Bare host/IP, e.g. `"10.0.0.5"` (used by `api::run_prg`-style calls).
     pub host: Option<String>,
     /// Scheme-qualified host, e.g. `"http://10.0.0.5"` (config/profile REST).

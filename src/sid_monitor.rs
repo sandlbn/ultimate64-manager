@@ -14,7 +14,7 @@ use iced::{
 };
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 // ─────────────────────────────────────────────────────────────────
 //  Hardware constants
@@ -537,7 +537,7 @@ impl SidMonitor {
     pub fn update_impl(
         &mut self,
         message: SidMonitorMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<SidMonitorMessage> {
         match message {
             SidMonitorMessage::PanelChanged(p) => {
@@ -1390,7 +1390,7 @@ fn section_style(theme: &iced::Theme) -> container::Style {
 // ─────────────────────────────────────────────────────────────────
 
 async fn read_bytes(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u16,
 ) -> Result<Vec<u8>, String> {

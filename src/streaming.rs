@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use ultimate64::petscii::Petscii;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 /// Multicast group the device sends the VIC video stream to.
 const MULTICAST_VIDEO: Ipv4Addr = Ipv4Addr::new(239, 0, 1, 64);
@@ -305,7 +305,7 @@ impl VideoStreaming {
     pub fn update_impl(
         &mut self,
         message: StreamingMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<StreamingMessage> {
         match message {
             StreamingMessage::StartStream => {

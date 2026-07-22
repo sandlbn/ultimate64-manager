@@ -7,7 +7,7 @@ use iced::{
 };
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 use crate::port64;
 
@@ -539,7 +539,7 @@ impl MemoryEditor {
     pub fn update_impl(
         &mut self,
         message: MemoryEditorMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
         host: Option<String>,
         password: Option<String>,
     ) -> Task<MemoryEditorMessage> {
@@ -2155,7 +2155,7 @@ fn parse_length_input(input: &str) -> Option<u32> {
 // ─────────────────────────────────────────────────────────────────
 
 async fn read_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u32,
 ) -> Result<Vec<u8>, String> {
@@ -2163,7 +2163,7 @@ async fn read_memory_async(
 }
 
 async fn write_byte_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     value: u8,
 ) -> Result<(), String> {
@@ -2171,7 +2171,7 @@ async fn write_byte_async(
 }
 
 async fn fill_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u32,
     value: u8,
@@ -2180,7 +2180,7 @@ async fn fill_memory_async(
 }
 
 async fn write_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     data: Vec<u8>,
 ) -> Result<(), String> {

@@ -81,6 +81,7 @@ const HELP_BINDS: &[(&str, &str, &str)] = &[
 use std::sync::Arc;
 use std::sync::Mutex;
 use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
@@ -119,6 +120,7 @@ mod profile_manager;
 mod profile_repo;
 mod profiles;
 mod remote_browser;
+mod remote_device;
 mod screenshot_api;
 mod settings;
 mod sid_info;
@@ -583,7 +585,7 @@ pub struct Ultimate64Browser {
     settings: AppSettings,
     template_manager: TemplateManager,
     selected_template: Option<DiskTemplate>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     host_url: Option<String>, // Store host URL for direct HTTP requests
     status: StatusInfo,
     /// DEVICE tab: buffered text to inject into the running C64 keyboard.
@@ -2446,7 +2448,7 @@ impl Ultimate64Browser {
 }
 
 async fn execute_template_commands(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     commands: Vec<String>,
 ) -> Result<(), String> {
     for command in commands {
@@ -2526,7 +2528,7 @@ async fn execute_template_commands(
     Ok(())
 }
 
-async fn fetch_status(connection: Arc<Mutex<Rest>>) -> Result<StatusInfo, DeviceError> {
+async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<StatusInfo, DeviceError> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
     // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 /// Apply a pre-computed config diff plus mounts to the device.
 ///
@@ -33,7 +33,7 @@ pub async fn apply_profile(
     profile: &DeviceProfile,
     diff: ConfigTree,
     password: Option<String>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     pre_clean_mode: u8,
 ) -> Result<String, String> {
     let mut steps = Vec::new();
@@ -308,7 +308,7 @@ async fn mount_and_run(
     drive: &str,
     autoload: bool,
     password: Option<String>,
-    _connection: Option<Arc<Mutex<Rest>>>,
+    _connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
 ) -> Result<String, String> {
     let filename = path.rsplit('/').next().unwrap_or(path).to_string();
     let pwd = password.as_deref();
@@ -372,7 +372,7 @@ async fn apply_mounts(
     host: &str,
     profile: &DeviceProfile,
     password: Option<String>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
 ) -> Vec<Result<String, String>> {
     let mut results = Vec::new();
 
@@ -431,7 +431,7 @@ async fn run_program_entry(
     host: &str,
     path: &str,
     password: Option<String>,
-    _connection: Option<Arc<Mutex<Rest>>>,
+    _connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
 ) -> Result<String, String> {
     let pwd = password.as_deref();
     if is_device_path(path) {

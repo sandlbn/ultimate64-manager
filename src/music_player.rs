@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 use crate::music_ops;
 
@@ -302,7 +302,7 @@ impl MusicPlayer {
     pub fn update_impl(
         &mut self,
         message: MusicPlayerMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<MusicPlayerMessage> {
         match message {
             // === Playback Controls ===
@@ -2448,7 +2448,7 @@ impl MusicPlayer {
 // === Async Functions ===
 
 async fn play_music_file(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     path: PathBuf,
     song_number: Option<u8>,
     file_type: MusicFileType,
