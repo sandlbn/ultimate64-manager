@@ -3049,38 +3049,29 @@ async fn run_disk_async(
     // Determine device number based on drive
     let device_num = if drive == "a" { "8" } else { "9" };
 
-    // Use longer timeout because this operation includes boot delays (~8.5s of sleeps)
+    // Read the image up front so a single-PRG disk can skip mount/reset entirely.
+    let image = std::fs::read(&path).map_err(|e| format!("Failed to read image: {}", e))?;
+
+    // Use longer timeout because the mount path includes boot delays.
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(RUN_DISK_TIMEOUT_SECS),
         tokio::task::spawn_blocking(move || {
             let conn = connection.lock().unwrap();
 
-            // 1. Mount the disk image (read-only is fine for running)
+            // Fast path: a disk holding exactly one PRG runs directly, no mount,
+            // no reset, no autoload delays.
+            if let Some((_, prg)) = crate::disk_image::extract_single_prg(&image) {
+                return conn
+                    .run_prg(&prg)
+                    .map_err(|e| format!("Run PRG failed: {}", e));
+            }
+
+            // Multi-file disk: mount read-only, then autoload via the shared
+            // adaptive sequence.
             conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
                 .map_err(|e| format!("Mount failed: {}", e))?;
-
-            // Small delay to ensure mount completes
             std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // 2. Reset the machine
-            conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
-
-            // Wait for C64 to boot up
-            std::thread::sleep(std::time::Duration::from_secs(3));
-
-            // 3. Type LOAD"*",8,1 (or 9) and RUN
-            let load_cmd = format!("load \"*\",{},1\n", device_num);
-            conn.type_text(&load_cmd)
-                .map_err(|e| format!("Type LOAD failed: {}", e))?;
-
-            // Wait for program to load
-            std::thread::sleep(std::time::Duration::from_secs(5));
-
-            // 4. Type RUN
-            conn.type_text("run\n")
-                .map_err(|e| format!("Type RUN failed: {}", e))?;
-
-            Ok(())
+            crate::run_ops::autoload_mounted_disk(&*conn, device_num)
         }),
     )
     .await;

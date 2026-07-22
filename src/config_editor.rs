@@ -835,6 +835,12 @@ impl ConfigEditor {
             column![
                 rule::horizontal(1),
                 text("FLASH MEMORY").size(fs.small),
+                // Make the classic support trap unmissable: applying a change
+                // updates the running device only — it reverts on reboot until
+                // it's written to flash.
+                text("Applied changes are volatile — a reboot loses them until you Save to Flash.")
+                    .size(fs.tiny)
+                    .color(iced::Color::from_rgb(0.9, 0.7, 0.3)),
                 tooltip(
                     button(text("Save to Flash").size(fs.small))
                         .on_press(ConfigEditorMessage::SaveToFlash)

@@ -77,6 +77,10 @@ pub struct DirEntry {
     pub size_blocks: u16,
     pub locked: bool,
     pub closed: bool,
+    /// First track of the file's data chain (0 if the entry has no data).
+    pub first_track: u8,
+    /// First sector of the file's data chain.
+    pub first_sector: u8,
 }
 
 impl DirEntry {
@@ -356,6 +360,10 @@ fn read_directory(data: &[u8], kind: ImageKind) -> Result<Vec<DirEntry>, String>
             // File size in blocks (bytes 30-31, little-endian)
             let size_blocks = (entry_bytes[30] as u16) | ((entry_bytes[31] as u16) << 8);
 
+            // First track/sector of the file's data chain (bytes 3-4).
+            let first_track = entry_bytes[3];
+            let first_sector = entry_bytes[4];
+
             entries.push(DirEntry {
                 name,
                 raw_name,
@@ -363,6 +371,8 @@ fn read_directory(data: &[u8], kind: ImageKind) -> Result<Vec<DirEntry>, String>
                 size_blocks,
                 locked,
                 closed,
+                first_track,
+                first_sector,
             });
         }
 
@@ -397,6 +407,69 @@ pub fn get_disk_summary(path: &Path) -> Result<String, String> {
         "{}: \"{}\" - {} files ({} PRG), {} blocks free",
         info.kind, info.name, file_count, prg_count, info.blocks_free
     ))
+}
+
+// ─── File extraction ──────────────────────────────────────────────────────────
+
+/// Follow a CBM file's sector chain and return its raw bytes (including the
+/// 2-byte load-address header for a PRG). Returns `None` on a malformed chain.
+///
+/// Each data sector begins with a 2-byte link `(next_track, next_sector)`. When
+/// `next_track == 0` the sector is the last one and `next_sector` is the index
+/// of the final used byte, so the payload is `bytes[2..=next_sector]`.
+fn follow_file_chain(data: &[u8], kind: ImageKind, start_t: u8, start_s: u8) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut track, mut sector) = (start_t, start_s);
+    // A 1541 disk holds ~683 sectors; cap well above that to break loops on
+    // a corrupt (self-referential) chain rather than spin forever.
+    for _ in 0..4000 {
+        if track == 0 {
+            break;
+        }
+        let sec = read_sector(data, track, sector, kind)?;
+        let next_track = sec[0];
+        let next_sector = sec[1];
+        if next_track == 0 {
+            // Last sector: next_sector points at the last valid byte.
+            let end = (next_sector as usize + 1).min(256);
+            if end > 2 {
+                out.extend_from_slice(&sec[2..end]);
+            }
+            return Some(out);
+        }
+        out.extend_from_slice(&sec[2..256]);
+        track = next_track;
+        sector = next_sector;
+    }
+    None
+}
+
+/// If the image contains exactly one file and it is a PRG, extract and return
+/// `(name, prg_bytes)` ready to hand to `run_prg`. Returns `None` for empty,
+/// multi-file, or non-PRG disks so the caller falls back to mount + autoload.
+///
+/// A single-PRG disk is the safe case for a direct `run_prg`: multi-file disks
+/// usually carry a loader that expects the disk mounted in the drive, so those
+/// must go through the mount path instead.
+pub fn extract_single_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
+    let kind = detect_kind(data.len())?;
+    let entries = read_directory(data, kind).ok()?;
+    let files: Vec<&DirEntry> = entries
+        .iter()
+        .filter(|e| e.file_type != FileType::Del && e.first_track != 0)
+        .collect();
+    let [only] = files.as_slice() else {
+        return None;
+    };
+    if only.file_type != FileType::Prg {
+        return None;
+    }
+    let bytes = follow_file_chain(data, kind, only.first_track, only.first_sector)?;
+    // A valid PRG has at least the 2-byte load address plus one byte.
+    if bytes.len() < 3 {
+        return None;
+    }
+    Some((only.name.trim().to_string(), bytes))
 }
 
 // ─── Disk image creation ──────────────────────────────────────────────────────
@@ -708,6 +781,43 @@ mod tests {
         assert_eq!(info.kind, ImageKind::D64);
         assert_eq!(info.name.trim(), "HELLO WORLD");
         assert_eq!(info.entries.len(), 0);
+    }
+
+    #[test]
+    fn test_extract_single_prg_none_on_blank() {
+        let img = build_blank_d64("EMPTY", "00 2A");
+        assert!(extract_single_prg(&img).is_none());
+    }
+
+    #[test]
+    fn test_extract_single_prg_reads_chain() {
+        // Blank disk, then hand-place one PRG: a data sector at track 1 sector 0
+        // and a directory entry pointing at it.
+        let mut img = build_blank_d64("ONEFILE", "01 2A");
+
+        // Data sector at track 1, sector 0: last-sector link (0, last_used_idx).
+        let data_off = ts_offset(1, 0, ImageKind::D64).unwrap();
+        let payload = [0x01u8, 0x08, 0x99]; // load address $0800 + one byte
+        img[data_off] = 0; // next track = 0 → last sector
+        img[data_off + 1] = 2 + payload.len() as u8 - 1; // index of last used byte
+        img[data_off + 2..data_off + 2 + payload.len()].copy_from_slice(&payload);
+
+        // Directory entry 0 at track 18 sector 1. Bytes [0..2] double as the
+        // sector chain link (0 = end of directory).
+        let dir_off = ts_offset(18, 1, ImageKind::D64).unwrap();
+        img[dir_off] = 0; // dir chain: end
+        img[dir_off + 1] = 0xFF;
+        img[dir_off + 2] = 0x82; // closed PRG
+        img[dir_off + 3] = 1; // first track
+        img[dir_off + 4] = 0; // first sector
+        img[dir_off + 5] = b'P'; // name "P" then padded
+        for b in img[dir_off + 6..dir_off + 21].iter_mut() {
+            *b = 0xA0;
+        }
+
+        let (name, bytes) = extract_single_prg(&img).expect("one PRG present");
+        assert_eq!(name, "P");
+        assert_eq!(bytes, payload);
     }
 
     #[test]

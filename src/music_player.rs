@@ -110,6 +110,10 @@ pub enum MusicPlayerMessage {
     PlayFile(PathBuf, Option<u8>),
     PlaybackCompleted(Result<(), String>),
     SetSongNumber(u8),
+    /// Load an external SID file (e.g. handed off from the Assembly64 tab) into
+    /// the playlist and start playing it, gaining subsong navigation and HVSC
+    /// song-length lookup that a bare `sid_play` doesn't provide.
+    PlayExternalSid(PathBuf),
 
     // Timer
     TimerTick,
@@ -1016,6 +1020,42 @@ impl MusicPlayer {
                     log::error!("Playback failed: {}", e);
                 }
                 Task::none()
+            }
+
+            MusicPlayerMessage::PlayExternalSid(path) => {
+                // Build a playlist entry from the file (parses the SID header,
+                // computes the MD5, and looks up song lengths — see
+                // `create_playlist_entry`), then play it like AddAndPlay.
+                let fallback_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("SID")
+                    .to_string();
+                let browser_entry = BrowserEntry {
+                    path: path.clone(),
+                    name: fallback_name,
+                    entry_type: BrowserEntryType::MusicFile(MusicFileType::Sid),
+                    subsongs: 1,
+                    sid_tooltip: None,
+                };
+                let entry = self.create_playlist_entry(&browser_entry, MusicFileType::Sid);
+                let name = entry.name.clone();
+
+                // Jump to the file if it's already queued; otherwise append it.
+                let idx = match self.playlist.iter().position(|e| e.path == path) {
+                    Some(i) => i,
+                    None => {
+                        self.playlist.push(entry);
+                        self.playlist.len() - 1
+                    }
+                };
+                self.current_playing = Some(idx);
+                self.playlist_selected = Some(idx);
+                self.elapsed_seconds = 0;
+                self.current_subsong = 1;
+                self.playback_state = PlaybackState::Playing;
+                self.status_message = format!("Playing: {}", name);
+                self.update_impl(MusicPlayerMessage::Play, connection)
             }
 
             MusicPlayerMessage::SetSongNumber(num) => {
@@ -2515,5 +2555,49 @@ impl crate::tab::TabController for MusicPlayer {
         ctx: crate::tab::TabContext,
     ) -> iced::Task<MusicPlayerMessage> {
         self.update_impl(message, ctx.connection)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Assembly64 → Music Player handoff (A2): `PlayExternalSid` must queue
+    /// the file and make it the current track. Runs with no device connection,
+    /// so it exercises pure state transitions only.
+    fn temp_file(name: &str, bytes: &[u8]) -> PathBuf {
+        // Vary the name per test to avoid cross-test collisions; no timestamps
+        // available in this environment.
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn play_external_sid_queues_and_selects() {
+        let mut mp = MusicPlayer::new(None);
+        let path = temp_file("u64mgr_test_a2.sid", b"not-a-real-sid-but-a-file");
+
+        let _ = mp.update_impl(MusicPlayerMessage::PlayExternalSid(path.clone()), None);
+
+        assert_eq!(mp.playlist.len(), 1, "file should be queued");
+        assert_eq!(mp.current_playing, Some(0), "queued file becomes current");
+        assert_eq!(mp.playback_state, PlaybackState::Playing);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn play_external_sid_is_idempotent_on_same_path() {
+        let mut mp = MusicPlayer::new(None);
+        let path = temp_file("u64mgr_test_a2b.sid", b"file-contents");
+
+        let _ = mp.update_impl(MusicPlayerMessage::PlayExternalSid(path.clone()), None);
+        let _ = mp.update_impl(MusicPlayerMessage::PlayExternalSid(path.clone()), None);
+
+        // Second handoff of the same path jumps to the existing entry rather
+        // than appending a duplicate.
+        assert_eq!(mp.playlist.len(), 1, "no duplicate entry for same path");
+        assert_eq!(mp.current_playing, Some(0));
+        let _ = std::fs::remove_file(path);
     }
 }

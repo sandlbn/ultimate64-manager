@@ -382,12 +382,39 @@ pub enum Assembly64BrowserMessage {
     SelectFile(u64),
     DownloadFile(u64),
     DownloadCompleted(Result<PathBuf, String>),
+    /// Download every file in the selected entry into its category folder.
+    DownloadAll,
+    DownloadAllCompleted(Result<usize, String>),
+    /// Request cancellation of the in-flight batch download.
+    CancelDownloadAll,
     RunFile(u64),
     DoRunFile(u64),
     RunFileCompleted(Result<String, String>),
     MountFile(u64, MountMode),
     DoMountFile(u64, MountMode),
     MountCompleted(Result<String, String>),
+    /// Download a SID and open it in the Music Player tab (subsongs + song
+    /// lengths) instead of firing a bare `sid_play`.
+    PlayInMusicPlayer(u64),
+    /// Same for a file already extracted from a downloaded ZIP.
+    PlayExtractedInMusicPlayer(usize),
+    /// Download-to-disk finished; carries the saved path to hand off.
+    MusicPlayerHandoffReady(Result<PathBuf, String>),
+    /// Signal intercepted by `main` to switch to the Music Player tab and play
+    /// `path`. The browser itself does nothing with it.
+    OpenSidInMusicPlayer(PathBuf),
+
+    /// Download a file and copy it onto the device's storage via FTP, into an
+    /// `Assembly64/<Category>/` folder mirroring the local download layout.
+    SendToDevice(u64),
+    /// Same for a file already extracted from a downloaded ZIP.
+    SendExtractedToDevice(usize),
+    /// Download-to-disk finished; carries `(saved path, remote subdir)`.
+    SendToDeviceReady(Result<(PathBuf, String), String>),
+    /// Signal intercepted by `main` to FTP-upload `path` into
+    /// `<Remote pane cwd>/<subdir>`, creating the folder chain. The browser
+    /// itself does nothing with it.
+    UploadToDevice(PathBuf, String),
 
     // Drive enable dialog
     CheckDriveBeforeAction(AsmPendingAction),
@@ -474,6 +501,9 @@ pub struct Assembly64Browser {
     // Status
     status_message: Option<String>,
     is_loading: bool,
+    /// Set to request cancellation of the in-flight batch download; checked
+    /// between files so a long "Download all" can be stopped.
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 
     // Screenshot
     screenshot_handle: Option<iced::widget::image::Handle>,
@@ -533,6 +563,7 @@ impl Assembly64Browser {
             presets_loaded_from_server: false,
             status_message: None,
             is_loading: false,
+            cancel_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             screenshot_handle: None,
             screenshot_loading: false,
             download_dir,
@@ -981,26 +1012,7 @@ impl Assembly64Browser {
                     &self.category_registry.label(entry.category_id),
                 ));
                 Task::perform(
-                    async move {
-                        let client = Assembly64Client::with_defaults(&user_agent)
-                            .map_err(|e| e.to_string())?;
-                        let bytes = tokio::time::timeout(
-                            tokio::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
-                            client.download(&entry.item_id, entry.category_id, file.file_id),
-                        )
-                        .await
-                        .map_err(|_| "Download timed out".to_string())?
-                        .map_err(|e| e.to_string())?;
-                        tokio::fs::create_dir_all(&out_dir)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        let safe_name = sanitize_filename(&file.path);
-                        let out_path = out_dir.join(&safe_name);
-                        tokio::fs::write(&out_path, &bytes)
-                            .await
-                            .map_err(|e| e.to_string())?;
-                        Ok(out_path)
-                    },
+                    download_to_disk(user_agent, entry, file, out_dir),
                     M::DownloadCompleted,
                 )
             }
@@ -1014,6 +1026,73 @@ impl Assembly64Browser {
                         self.status_message = Some(format!("Download failed: {}", e));
                     }
                 }
+                Task::none()
+            }
+
+            M::DownloadAll => {
+                let Some(entry) = self.selected_entry.clone() else {
+                    return Task::none();
+                };
+                if self.entry_files.is_empty() {
+                    return Task::none();
+                }
+                self.is_loading = true;
+                self.cancel_flag
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                let total = self.entry_files.len();
+                self.status_message = Some(format!("Downloading {} files…", total));
+                let user_agent = self.user_agent.clone();
+                let out_dir = self.download_dir.join(sanitize_dirname(
+                    &self.category_registry.label(entry.category_id),
+                ));
+                let files = self.entry_files.clone();
+                let cancel = self.cancel_flag.clone();
+                Task::perform(
+                    async move {
+                        // Sequential to stay gentle on the shared Assembly64 server,
+                        // and so the cancel flag can stop it between files.
+                        use std::sync::atomic::Ordering;
+                        let mut ok = 0usize;
+                        let mut last_err = None;
+                        for file in files {
+                            if cancel.load(Ordering::SeqCst) {
+                                return Err(format!("Cancelled after {} file(s)", ok));
+                            }
+                            match download_to_disk(
+                                user_agent.clone(),
+                                entry.clone(),
+                                file,
+                                out_dir.clone(),
+                            )
+                            .await
+                            {
+                                Ok(_) => ok += 1,
+                                Err(e) => last_err = Some(e),
+                            }
+                        }
+                        if ok == 0 {
+                            Err(last_err.unwrap_or_else(|| "No files downloaded".into()))
+                        } else {
+                            Ok(ok)
+                        }
+                    },
+                    M::DownloadAllCompleted,
+                )
+            }
+
+            M::DownloadAllCompleted(result) => {
+                self.is_loading = false;
+                self.status_message = Some(match result {
+                    Ok(n) => format!("Downloaded {} file(s)", n),
+                    Err(e) => e, // includes the "Cancelled after N" message
+                });
+                Task::none()
+            }
+
+            M::CancelDownloadAll => {
+                self.cancel_flag
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.status_message = Some("Cancelling…".into());
                 Task::none()
             }
 
@@ -1058,6 +1137,123 @@ impl Assembly64Browser {
                 });
                 Task::none()
             }
+
+            M::PlayInMusicPlayer(file_id) => {
+                let Some(entry) = self.selected_entry.clone() else {
+                    return Task::none();
+                };
+                let Some(file) = self
+                    .entry_files
+                    .iter()
+                    .find(|f| f.file_id == file_id)
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                self.is_loading = true;
+                self.status_message = Some(format!("Fetching {}…", file.path));
+                let user_agent = self.user_agent.clone();
+                let out_dir = self.download_dir.join(sanitize_dirname(
+                    &self.category_registry.label(entry.category_id),
+                ));
+                Task::perform(
+                    download_to_disk(user_agent, entry, file, out_dir),
+                    M::MusicPlayerHandoffReady,
+                )
+            }
+
+            M::PlayExtractedInMusicPlayer(index) => {
+                let Some(extracted) = &self.extracted_zip else {
+                    return Task::none();
+                };
+                let Some(file) = extracted.files.iter().find(|f| f.index == index) else {
+                    return Task::none();
+                };
+                // Already on disk from the ZIP extraction — hand off directly.
+                Task::done(M::OpenSidInMusicPlayer(file.path.clone()))
+            }
+
+            M::MusicPlayerHandoffReady(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok(path) => {
+                        self.status_message = Some("Opening in Music Player…".into());
+                        Task::done(M::OpenSidInMusicPlayer(path))
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed: {}", e));
+                        Task::none()
+                    }
+                }
+            }
+
+            // Handled by `main` (tab switch + Music Player dispatch); no-op here.
+            M::OpenSidInMusicPlayer(_) => Task::none(),
+
+            M::SendToDevice(file_id) => {
+                let Some(entry) = self.selected_entry.clone() else {
+                    return Task::none();
+                };
+                let Some(file) = self
+                    .entry_files
+                    .iter()
+                    .find(|f| f.file_id == file_id)
+                    .cloned()
+                else {
+                    return Task::none();
+                };
+                self.is_loading = true;
+                self.status_message = Some(format!("Fetching {}…", file.path));
+                let user_agent = self.user_agent.clone();
+                let category = sanitize_dirname(&self.category_registry.label(entry.category_id));
+                let out_dir = self.download_dir.join(&category);
+                // Mirror the local Assembly64/<Category>/ layout on the device.
+                let subdir = format!("Assembly64/{}", category);
+                Task::perform(
+                    async move {
+                        let path = download_to_disk(user_agent, entry, file, out_dir).await?;
+                        Ok::<(PathBuf, String), String>((path, subdir))
+                    },
+                    M::SendToDeviceReady,
+                )
+            }
+
+            M::SendExtractedToDevice(index) => {
+                let Some(extracted) = &self.extracted_zip else {
+                    return Task::none();
+                };
+                let Some(file) = extracted.files.iter().find(|f| f.index == index) else {
+                    return Task::none();
+                };
+                let subdir = self
+                    .selected_entry
+                    .as_ref()
+                    .map(|e| {
+                        format!(
+                            "Assembly64/{}",
+                            sanitize_dirname(&self.category_registry.label(e.category_id))
+                        )
+                    })
+                    .unwrap_or_else(|| "Assembly64".to_string());
+                Task::done(M::UploadToDevice(file.path.clone(), subdir))
+            }
+
+            M::SendToDeviceReady(result) => {
+                self.is_loading = false;
+                match result {
+                    Ok((path, subdir)) => {
+                        self.status_message = Some("Sending to device…".into());
+                        Task::done(M::UploadToDevice(path, subdir))
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Failed: {}", e));
+                        Task::none()
+                    }
+                }
+            }
+
+            // Handled by `main` (FTP upload into the Remote pane); no-op here.
+            M::UploadToDevice(_, _) => Task::none(),
 
             // ── drive enable dialog ─────────────────────────────────────
             M::CheckDriveBeforeAction(action) => {
@@ -1466,6 +1662,14 @@ impl Assembly64Browser {
                                 .map(|_| format!("Playing: {}", safe_name))
                                 .map_err(|e| e.to_string()),
                             (None, "d64" | "d71" | "d81" | "g64") => {
+                                // Fast path: a single-PRG disk runs directly.
+                                if let Some((_, prg)) =
+                                    crate::disk_image::extract_single_prg(&bytes)
+                                {
+                                    conn.run_prg(&prg).map_err(|e| format!("run: {}", e))?;
+                                    return Ok(format!("Running: {}", safe_name));
+                                }
+                                // Multi-file disk: mount read-only + adaptive autoload.
                                 let temp = std::env::temp_dir().join(&safe_name);
                                 std::fs::write(&temp, &bytes)
                                     .map_err(|e| format!("temp write: {}", e))?;
@@ -1477,13 +1681,7 @@ impl Assembly64Browser {
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                conn.reset().map_err(|e| format!("reset: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_secs(3));
-                                conn.type_text(&format!("load \"*\",{},1\n", device_num))
-                                    .map_err(|e| format!("type: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_secs(5));
-                                conn.type_text("run\n")
-                                    .map_err(|e| format!("type: {}", e))?;
+                                crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
                                 Ok(format!("Running disk: {}", safe_name))
                             }
                             (None, other) => Err(format!("Unsupported file type: {}", other)),
@@ -1566,6 +1764,12 @@ impl Assembly64Browser {
                                 .map(|_| format!("Playing: {}", filename))
                                 .map_err(|e| e.to_string()),
                             (None, "d64" | "d71" | "d81" | "g64") => {
+                                // Fast path: a single-PRG disk runs directly.
+                                if let Some((_, prg)) = crate::disk_image::extract_single_prg(&data)
+                                {
+                                    conn.run_prg(&prg).map_err(|e| format!("run: {}", e))?;
+                                    return Ok(format!("Running: {}", filename));
+                                }
                                 conn.mount_disk_image(
                                     &path,
                                     drive,
@@ -1574,13 +1778,7 @@ impl Assembly64Browser {
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
                                 std::thread::sleep(std::time::Duration::from_millis(500));
-                                conn.reset().map_err(|e| format!("reset: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_secs(3));
-                                conn.type_text(&format!("load \"*\",{},1\n", device_num))
-                                    .map_err(|e| format!("type: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_secs(5));
-                                conn.type_text("run\n")
-                                    .map_err(|e| format!("type: {}", e))?;
+                                crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
                                 Ok(format!("Running disk: {}", filename))
                             }
                             (None, other) => Err(format!("Unsupported file type: {}", other)),
@@ -2320,6 +2518,31 @@ impl Assembly64Browser {
                 .into()
         };
 
+        let download_all: Element<'_, Assembly64BrowserMessage> = if self.is_loading {
+            // A batch is running — offer a cancel instead.
+            tooltip(
+                button(text("✕ Cancel").size(fs.normal))
+                    .on_press(Assembly64BrowserMessage::CancelDownloadAll)
+                    .padding([4, 10]),
+                text("Stop the batch download (finishes the current file)").size(fs.normal),
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box)
+            .into()
+        } else if self.entry_files.len() > 1 {
+            tooltip(
+                button(text("⬇ All").size(fs.normal))
+                    .on_press(Assembly64BrowserMessage::DownloadAll)
+                    .padding([4, 10]),
+                text("Download every file in this entry").size(fs.normal),
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box)
+            .into()
+        } else {
+            Space::new().width(0).into()
+        };
+
         let filter_row = row![
             text("Filter:").size(fs.small),
             pick_list(
@@ -2339,6 +2562,7 @@ impl Assembly64Browser {
             .text_size(fs.normal)
             .width(Length::Fixed(110.0)),
             Space::new().width(Length::Fill),
+            download_all,
             text(format!("{} file(s)", self.entry_files.len())).size(fs.small),
         ]
         .spacing(10)
@@ -2418,12 +2642,46 @@ impl Assembly64Browser {
                 .height(Length::Fill)
                 .into()
             } else {
-                // No screenshot available (non-CSDB source) — keep the file
-                // list full-width rather than showing a broken image slot.
-                column![filter_row, rule::horizontal(1), file_list]
-                    .spacing(5)
-                    .height(Length::Fill)
-                    .into()
+                // No screenshot. Assembly64 hosts no preview images, and only
+                // CSDB-derived entries can resolve one via the CSDB webservice —
+                // other repos (Gamebase64, c64.com, …) simply have none. Show an
+                // explicit, informative placeholder so the preview column stays
+                // consistent and the user understands *why* there's no image,
+                // rather than the panel silently vanishing.
+                let note = if entry.is_csdb_source() {
+                    "No screenshot on CSDB for this release"
+                } else {
+                    "No preview — this source has no images"
+                };
+                let placeholder = container(
+                    column![
+                        text("🖼").size(fs.icon),
+                        text(note).size(fs.small),
+                        text(format!(
+                            "Source: {}",
+                            self.category_registry.label(entry.category_id)
+                        ))
+                        .size(fs.tiny)
+                        .color(muted_color()),
+                    ]
+                    .spacing(8)
+                    .align_x(iced::Alignment::Center),
+                )
+                .width(Length::Fixed(390.0))
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(container::bordered_box);
+                row![
+                    column![filter_row, rule::horizontal(1), file_list]
+                        .spacing(5)
+                        .width(Length::Fill)
+                        .height(Length::Fill),
+                    Space::new().width(5),
+                    placeholder,
+                ]
+                .height(Length::Fill)
+                .into()
             };
 
         column![
@@ -2497,6 +2755,19 @@ impl Assembly64Browser {
             .style(container::bordered_box),
         );
 
+        if is_connected {
+            row_widget = row_widget.push(
+                tooltip(
+                    button(text("📤").size(fs.small))
+                        .on_press(Assembly64BrowserMessage::SendToDevice(file.file_id))
+                        .padding([4, 8]),
+                    text("Copy to device storage (Remote pane's current folder)").size(fs.normal),
+                    tooltip::Position::Left,
+                )
+                .style(container::bordered_box),
+            );
+        }
+
         if is_zip {
             row_widget = row_widget.push(
                 tooltip(
@@ -2534,6 +2805,19 @@ impl Assembly64Browser {
                         ))
                         .padding([4, 6]),
                     text(format!("Mount Drive {} (Read/Write)", drive_label)).size(fs.normal),
+                    tooltip::Position::Left,
+                )
+                .style(container::bordered_box),
+            );
+        }
+
+        if ext == "sid" {
+            row_widget = row_widget.push(
+                tooltip(
+                    button(text("🎵").size(fs.small))
+                        .on_press(Assembly64BrowserMessage::PlayInMusicPlayer(file.file_id))
+                        .padding([4, 8]),
+                    text("Open in Music Player (subsongs + song lengths)").size(fs.normal),
                     tooltip::Position::Left,
                 )
                 .style(container::bordered_box),
@@ -2726,6 +3010,34 @@ impl Assembly64Browser {
             );
         }
 
+        if is_connected {
+            row_widget = row_widget.push(
+                tooltip(
+                    button(text("📤").size(fs.small))
+                        .on_press(Assembly64BrowserMessage::SendExtractedToDevice(file.index))
+                        .padding([4, 8]),
+                    text("Copy to device storage (Remote pane's current folder)").size(fs.normal),
+                    tooltip::Position::Left,
+                )
+                .style(container::bordered_box),
+            );
+        }
+
+        if file.ext == "sid" {
+            row_widget = row_widget.push(
+                tooltip(
+                    button(text("🎵").size(fs.small))
+                        .on_press(Assembly64BrowserMessage::PlayExtractedInMusicPlayer(
+                            file.index,
+                        ))
+                        .padding([4, 8]),
+                    text("Open in Music Player (subsongs + song lengths)").size(fs.normal),
+                    tooltip::Position::Left,
+                )
+                .style(container::bordered_box),
+            );
+        }
+
         if is_runnable && is_connected {
             row_widget = row_widget.push(
                 tooltip(
@@ -2837,6 +3149,34 @@ fn sanitize_filename(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Download one Assembly64 file and write it into `out_dir`, returning the saved
+/// path. Shared by the plain download, the Music Player handoff, and batch
+/// download so the network + write logic lives in one place.
+async fn download_to_disk(
+    user_agent: String,
+    entry: AsmEntry,
+    file: AsmFile,
+    out_dir: PathBuf,
+) -> Result<PathBuf, String> {
+    let client = Assembly64Client::with_defaults(&user_agent).map_err(|e| e.to_string())?;
+    let bytes = tokio::time::timeout(
+        tokio::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS),
+        client.download(&entry.item_id, entry.category_id, file.file_id),
+    )
+    .await
+    .map_err(|_| "Download timed out".to_string())?
+    .map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&out_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let safe_name = sanitize_filename(&file.path);
+    let out_path = out_dir.join(&safe_name);
+    tokio::fs::write(&out_path, &bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out_path)
 }
 
 #[cfg(test)]

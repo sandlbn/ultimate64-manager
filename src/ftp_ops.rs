@@ -573,6 +573,97 @@ pub async fn download_file_ftp(
     }
 }
 
+/// Upload a file into `remote_dir`, creating that directory chain first.
+///
+/// Like [`upload_file_ftp`] but ensures every segment of `remote_dir` exists
+/// (creating missing ones, tolerating existing ones) before the transfer — used
+/// by the Assembly64 "send to device" flow to mirror the local
+/// `Assembly64/<Category>/` download layout on the device. One connection does
+/// the whole job.
+pub async fn upload_file_ftp_to_dir(
+    host: String,
+    local_path: PathBuf,
+    remote_dir: String,
+    password: Option<String>,
+    progress: Arc<std::sync::Mutex<Option<TransferProgress>>>,
+) -> Result<String, String> {
+    let result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(FTP_TIMEOUT_SECS),
+        tokio::task::spawn_blocking(move || {
+            use std::io::Cursor;
+            use std::time::Duration;
+            use suppaftp::FtpStream;
+
+            let data =
+                std::fs::read(&local_path).map_err(|e| format!("Cannot read file: {}", e))?;
+            let filename = local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file")
+                .to_string();
+
+            let addr = format!("{}:21", host);
+            let mut ftp =
+                FtpStream::connect(&addr).map_err(|e| format!("FTP connect failed: {}", e))?;
+            ftp.get_ref()
+                .set_write_timeout(Some(Duration::from_secs(120)))
+                .ok();
+
+            if let Some(ref pwd) = password {
+                if !pwd.is_empty() {
+                    ftp.login("admin", pwd)
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                } else {
+                    ftp.login("anonymous", "anonymous")
+                        .map_err(|e| format!("FTP login failed: {}", e))?;
+                }
+            } else {
+                ftp.login("anonymous", "anonymous")
+                    .map_err(|e| format!("FTP login failed: {}", e))?;
+            }
+
+            ftp.transfer_type(suppaftp::types::FileType::Binary)
+                .map_err(|e| format!("Failed to set binary mode: {}", e))?;
+
+            // Walk into remote_dir segment by segment from the root, creating any
+            // missing level. `cwd` failure on a segment means it doesn't exist
+            // yet, so mkdir then descend; an existing segment just cwd's through.
+            if remote_dir.starts_with('/') {
+                ftp.cwd("/")
+                    .map_err(|e| format!("Cannot cd to root: {}", e))?;
+            }
+            for segment in remote_dir.split('/').filter(|s| !s.is_empty()) {
+                if ftp.cwd(segment).is_err() {
+                    ftp.mkdir(segment)
+                        .map_err(|e| format!("Cannot create '{}': {}", segment, e))?;
+                    ftp.cwd(segment)
+                        .map_err(|e| format!("Cannot enter '{}': {}", segment, e))?;
+                }
+            }
+
+            let mut cursor = Cursor::new(data);
+            ftp.put_file(&filename, &mut cursor)
+                .map_err(|e| format!("FTP upload failed: {}", e))?;
+            let _ = ftp.quit();
+
+            if let Ok(mut g) = progress.lock() {
+                if let Some(ref mut p) = *g {
+                    p.current = 1;
+                    p.done = true;
+                }
+            }
+            Ok(filename)
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(e)) => Err(format!("Task error: {}", e)),
+        Err(_) => Err("FTP upload timed out - device may be offline".to_string()),
+    }
+}
+
 pub async fn upload_file_ftp(
     host: String,
     local_path: PathBuf,
