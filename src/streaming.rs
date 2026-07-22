@@ -18,13 +18,20 @@ use crate::video_scaling::{
 };
 
 use std::collections::VecDeque;
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use ultimate64::petscii::Petscii;
 use ultimate64::Rest;
+
+/// Multicast group the device sends the VIC video stream to.
+const MULTICAST_VIDEO: Ipv4Addr = Ipv4Addr::new(239, 0, 1, 64);
+/// Multicast group the device sends the audio stream to.
+const MULTICAST_AUDIO: Ipv4Addr = Ipv4Addr::new(239, 0, 1, 65);
+/// Local interface to bind multicast joins to (0.0.0.0 = any).
+const MULTICAST_IFACE: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 
 // Video frame dimensions
 pub const VIC_WIDTH: u32 = 384;
@@ -1310,8 +1317,8 @@ impl VideoStreaming {
             },
             StreamMode::Multicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
                 Ok(s) => {
-                    let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
-                    let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                    let multicast_addr = MULTICAST_VIDEO;
+                    let interface = MULTICAST_IFACE;
                     if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
                         log::error!("Failed to join multicast group: {}", e);
                         return;
@@ -1520,8 +1527,8 @@ impl VideoStreaming {
             }
 
             if mode == StreamMode::Multicast {
-                let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
-                let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                let multicast_addr = MULTICAST_VIDEO;
+                let interface = MULTICAST_IFACE;
                 let _ = socket.leave_multicast_v4(&multicast_addr, &interface);
             }
 
@@ -1907,8 +1914,8 @@ impl VideoStreaming {
                 },
                 StreamMode::Multicast => match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
                     Ok(s) => {
-                        let multicast_addr: std::net::Ipv4Addr = "239.0.1.65".parse().unwrap();
-                        let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                        let multicast_addr = MULTICAST_AUDIO;
+                        let interface = MULTICAST_IFACE;
                         if let Err(e) = s.join_multicast_v4(&multicast_addr, &interface) {
                             log::error!("Failed to join audio multicast group: {}", e);
                             return;
@@ -2033,8 +2040,8 @@ impl VideoStreaming {
             }
 
             if mode == StreamMode::Multicast {
-                let multicast_addr: std::net::Ipv4Addr = "239.0.1.65".parse().unwrap();
-                let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                let multicast_addr = MULTICAST_AUDIO;
+                let interface = MULTICAST_IFACE;
                 let _ = socket.leave_multicast_v4(&multicast_addr, &interface);
             }
 
@@ -2206,8 +2213,8 @@ pub async fn take_screenshot_async(port: u16, mode: StreamMode) -> Result<String
             StreamMode::Multicast => {
                 let s = UdpSocket::bind(format!("0.0.0.0:{}", port))
                     .map_err(|e| format!("Failed to bind socket: {}", e))?;
-                let multicast_addr: std::net::Ipv4Addr = "239.0.1.64".parse().unwrap();
-                let interface: std::net::Ipv4Addr = "0.0.0.0".parse().unwrap();
+                let multicast_addr = MULTICAST_VIDEO;
+                let interface = MULTICAST_IFACE;
                 s.join_multicast_v4(&multicast_addr, &interface)
                     .map_err(|e| format!("Failed to join multicast: {}", e))?;
                 s
