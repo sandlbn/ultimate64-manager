@@ -2,10 +2,10 @@
 
 use crate::device_error::DeviceError;
 use crate::net_utils::REST_TIMEOUT_SECS;
+use crate::remote_device::RemoteDevice;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 /// Run a PRG file from the Ultimate64 filesystem
 /// PUT /v1/runners:run_prg?file=<path>
@@ -679,5 +679,54 @@ mod tests {
     #[test]
     fn parse_debugreg_rejects_garbage() {
         assert_eq!(parse_debugreg_value("hello"), None);
+    }
+
+    // ── Mock-backed tests of the async device helpers ────────────────────
+    // These were impossible before the RemoteDevice trait: the connection was
+    // a concrete `ultimate64::Rest` that could only talk to a real device.
+    use crate::remote_device::mock::MockDevice;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn read_memory_small_reads_in_one_chunk() {
+        let mock = MockDevice::new();
+        let probe = mock.clone(); // shares recorders
+        let conn: Arc<Mutex<dyn crate::remote_device::RemoteDevice>> = Arc::new(Mutex::new(mock));
+
+        let bytes = read_memory_async(conn, 0x0400, 256).await.unwrap();
+
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(probe.reads(), vec![(0x0400, 256)]); // single round-trip
+    }
+
+    #[tokio::test]
+    async fn read_memory_large_splits_into_32k_chunks() {
+        let mock = MockDevice::new();
+        let probe = mock.clone();
+        let conn: Arc<Mutex<dyn crate::remote_device::RemoteDevice>> = Arc::new(Mutex::new(mock));
+
+        // 64 KiB can't be expressed as a single u16 length → must split.
+        let bytes = read_memory_async(conn, 0, 65_536).await.unwrap();
+
+        assert_eq!(bytes.len(), 65_536);
+        assert_eq!(probe.reads(), vec![(0, 0x8000), (0x8000, 0x8000)]);
+    }
+
+    #[tokio::test]
+    async fn write_byte_forwards_to_write_mem() {
+        let mock = MockDevice::new();
+        let probe = mock.clone();
+        let conn: Arc<Mutex<dyn crate::remote_device::RemoteDevice>> = Arc::new(Mutex::new(mock));
+
+        write_byte_async(conn, 0x02, 0x7F).await.unwrap();
+
+        assert_eq!(probe.writes(), vec![(0x02, vec![0x7F])]);
+    }
+
+    #[tokio::test]
+    async fn read_memory_surfaces_device_failure() {
+        let conn: Arc<Mutex<dyn crate::remote_device::RemoteDevice>> =
+            Arc::new(Mutex::new(MockDevice::failing()));
+        assert!(read_memory_async(conn, 0, 16).await.is_err());
     }
 }

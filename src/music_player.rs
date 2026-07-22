@@ -1,5 +1,6 @@
 use crate::mod_info;
 use crate::net_utils::REST_TIMEOUT_SECS;
+use crate::remote_device::RemoteDevice;
 use crate::sid_info;
 use iced::{
     widget::{
@@ -16,7 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use crate::remote_device::RemoteDevice;
 
 use crate::music_ops;
 

@@ -10,11 +10,11 @@
 
 use crate::config_api;
 use crate::device_profile::{ConfigTree, DeviceProfile};
+use crate::remote_device::RemoteDevice;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 /// Apply a pre-computed config diff plus mounts to the device.
 ///

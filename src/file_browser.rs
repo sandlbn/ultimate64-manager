@@ -1,3 +1,4 @@
+use crate::remote_device::RemoteDevice;
 use iced::widget::operation::scroll_to;
 use iced::widget::scrollable::{AbsoluteOffset, Viewport};
 use iced::widget::Id as WidgetId;
@@ -13,7 +14,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 use ultimate64::drives::MountMode;
 
 /// Stable ID for the main file-list scrollable widget
@@ -3092,7 +3092,10 @@ async fn run_disk_async(
     }
 }
 
-async fn load_and_run_async(connection: Arc<Mutex<dyn RemoteDevice>>, path: PathBuf) -> Result<(), String> {
+async fn load_and_run_async(
+    connection: Arc<Mutex<dyn RemoteDevice>>,
+    path: PathBuf,
+) -> Result<(), String> {
     log::info!("Loading and running: {}", path.display());
 
     let data = std::fs::read(&path).map_err(|e| {

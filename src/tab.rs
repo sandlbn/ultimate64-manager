@@ -7,9 +7,9 @@
 //! [`TabContext`] into whatever that tab needs. `main` builds one context via
 //! `Ultimate64Browser::tab_context()` and calls `tab.update(msg, ctx)`.
 
+use crate::remote_device::RemoteDevice;
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 /// Everything a tab might need to talk to the device, gathered once per update.
 /// Tabs disagree on which pieces they use — some want the bare `host`, some the

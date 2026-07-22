@@ -13,6 +13,7 @@
 //! Persistence (favorites + saved searches) lives in a small per-tab JSON
 //! file alongside `settings.json` — no changes to the global settings module.
 
+use crate::remote_device::RemoteDevice;
 use iced::{
     widget::{
         button, checkbox, column, container, pick_list, row, rule, scrollable, text, text_input,
@@ -24,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 use crate::archive::{extract_zip_to_dir, runnable_extracted_files, ExtractedFile, ExtractedZip};
 use crate::assembly64::{

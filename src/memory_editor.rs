@@ -1,3 +1,4 @@
+use crate::remote_device::RemoteDevice;
 use iced::{
     widget::{
         button, column, container, pick_list, row, rule, scrollable, text, text_input, tooltip,
@@ -7,7 +8,6 @@ use iced::{
 };
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 use crate::port64;
 

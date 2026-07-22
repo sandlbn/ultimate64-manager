@@ -8,13 +8,13 @@
 //! - **CIA #1 / #2** ($DC00 / $DD00) — timers, TOD clock, port states
 //!
 
+use crate::remote_device::RemoteDevice;
 use iced::{
     widget::{button, column, container, pick_list, row, rule, scrollable, text, Column, Space},
     Element, Length, Subscription, Task,
 };
 use std::sync::Arc;
 use std::sync::Mutex;
-use crate::remote_device::RemoteDevice;
 
 // ─────────────────────────────────────────────────────────────────
 //  Hardware constants

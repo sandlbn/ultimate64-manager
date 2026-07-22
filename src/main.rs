@@ -78,10 +78,10 @@ const HELP_BINDS: &[(&str, &str, &str)] = &[
     ("Video / streaming", "Esc", "Exit fullscreen"),
 ];
 
+use crate::remote_device::RemoteDevice;
 use std::sync::Arc;
 use std::sync::Mutex;
 use ultimate64::Rest;
-use crate::remote_device::RemoteDevice;
 use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
@@ -107,6 +107,8 @@ mod file_browser;
 mod file_types;
 mod folder_favorites;
 mod ftp_ops;
+#[cfg(test)]
+mod integration;
 mod memory_editor;
 mod mod_info;
 mod music_ops;

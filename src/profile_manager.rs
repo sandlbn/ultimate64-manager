@@ -10,11 +10,11 @@
 //! - Git operations (commit, view history)
 
 use crate::cfg_format;
-use crate::remote_device::RemoteDevice;
 use crate::config_api;
 use crate::device_profile::{self, ConfigTree, DeviceProfile, MountEntry, ProfileMode};
 use crate::profile_api;
 use crate::profile_repo::{self, ProfileEntry, ProfileRepo};
+use crate::remote_device::RemoteDevice;
 use iced::{
     widget::{
         button, column, container, pick_list, row, rule, scrollable, text, text_input, toggler,

@@ -17,6 +17,7 @@ use crate::video_scaling::{
     apply_crt_effect, apply_scanlines, integer_scale, scale2x, C64_PALETTE,
 };
 
+use crate::remote_device::RemoteDevice;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use ultimate64::petscii::Petscii;
-use crate::remote_device::RemoteDevice;
 
 /// Multicast group the device sends the VIC video stream to.
 const MULTICAST_VIDEO: Ipv4Addr = Ipv4Addr::new(239, 0, 1, 64);

@@ -1,3 +1,4 @@
+use crate::remote_device::RemoteDevice;
 use iced::{
     widget::{
         button, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, text,
@@ -10,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use crate::remote_device::RemoteDevice;
 
 use crate::api;
 use crate::dir_preview::ContentPreview;
