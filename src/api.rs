@@ -5,7 +5,7 @@ use crate::net_utils::REST_TIMEOUT_SECS;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 /// Run a PRG file from the Ultimate64 filesystem
 /// PUT /v1/runners:run_prg?file=<path>
@@ -110,7 +110,7 @@ pub async fn run_disk(
     file_path: &str,
     drive: &str,
     password: Option<String>,
-    connection: Option<Arc<Mutex<Rest>>>,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
 ) -> Result<String, String> {
     let device_num = if drive == "a" { "8" } else { "9" };
     let filename = file_path
@@ -183,7 +183,7 @@ const RAW_CHUNK: usize = 256;
 const READ_CHUNK: usize = 0x8000; // 32 KB
 
 pub async fn read_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u32,
 ) -> Result<Vec<u8>, String> {
@@ -216,7 +216,7 @@ pub async fn read_memory_async(
 }
 
 async fn read_chunk(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u16,
 ) -> Result<Vec<u8>, String> {
@@ -237,7 +237,7 @@ async fn read_chunk(
 }
 
 pub async fn write_byte_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     value: u8,
 ) -> Result<(), String> {
@@ -258,7 +258,7 @@ pub async fn write_byte_async(
 }
 
 pub async fn fill_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     length: u32,
     value: u8,
@@ -292,7 +292,7 @@ pub async fn fill_memory_async(
 }
 
 pub async fn write_memory_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     address: u16,
     data: Vec<u8>,
 ) -> Result<(), String> {

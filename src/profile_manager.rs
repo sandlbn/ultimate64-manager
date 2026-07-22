@@ -10,6 +10,7 @@
 //! - Git operations (commit, view history)
 
 use crate::cfg_format;
+use crate::remote_device::RemoteDevice;
 use crate::config_api;
 use crate::device_profile::{self, ConfigTree, DeviceProfile, MountEntry, ProfileMode};
 use crate::profile_api;
@@ -351,7 +352,7 @@ impl ProfileManager {
         message: ProfileManagerMessage,
         host_url: Option<String>,
         password: Option<String>,
-        connection: Option<Arc<std::sync::Mutex<ultimate64::Rest>>>,
+        connection: Option<Arc<std::sync::Mutex<dyn RemoteDevice>>>,
     ) -> Task<ProfileManagerMessage> {
         match message {
             // ── Repository ──

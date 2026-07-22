@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 use crate::archive::{extract_zip_to_dir, runnable_extracted_files, ExtractedFile, ExtractedZip};
 use crate::assembly64::{
@@ -567,7 +567,7 @@ impl Assembly64Browser {
     pub fn update_impl(
         &mut self,
         message: Assembly64BrowserMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
         host: Option<String>,
         password: Option<String>,
     ) -> Task<Assembly64BrowserMessage> {
@@ -1385,7 +1385,7 @@ impl Assembly64Browser {
         &mut self,
         file_id: u64,
         mount: Option<MountMode>,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<Assembly64BrowserMessage> {
         let Some(entry) = self.selected_entry.clone() else {
             return Task::none();
@@ -1503,7 +1503,7 @@ impl Assembly64Browser {
         &mut self,
         index: usize,
         mount: Option<MountMode>,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<Assembly64BrowserMessage> {
         let Some(extracted) = &self.extracted_zip else {
             return Task::none();

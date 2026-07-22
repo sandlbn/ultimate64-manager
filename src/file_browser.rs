@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use ultimate64::{drives::MountMode, Rest};
+use crate::remote_device::RemoteDevice;
+use ultimate64::drives::MountMode;
 
 /// Stable ID for the main file-list scrollable widget
 const FILE_LIST_SCROLLABLE_ID: &str = "file_browser_list";
@@ -428,7 +429,7 @@ impl FileBrowser {
     pub fn update_impl(
         &mut self,
         message: FileBrowserMessage,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
         host: Option<String>,
         password: Option<String>,
     ) -> Task<FileBrowserMessage> {
@@ -2825,7 +2826,7 @@ impl FileBrowser {
     fn dispatch_action(
         &mut self,
         action: PendingDriveAction,
-        connection: Option<Arc<Mutex<Rest>>>,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<FileBrowserMessage> {
         match action {
             PendingDriveAction::Mount(path, drive, mode) => {
@@ -2999,7 +3000,7 @@ async fn load_content_preview_async(path: PathBuf) -> Result<ContentPreview, Str
 }
 
 async fn mount_disk_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     path: PathBuf,
     drive: String,
     mode: MountMode,
@@ -3039,7 +3040,7 @@ async fn mount_disk_async(
 }
 
 async fn run_disk_async(
-    connection: Arc<Mutex<Rest>>,
+    connection: Arc<Mutex<dyn RemoteDevice>>,
     path: PathBuf,
     drive: String,
 ) -> Result<(), String> {
@@ -3091,7 +3092,7 @@ async fn run_disk_async(
     }
 }
 
-async fn load_and_run_async(connection: Arc<Mutex<Rest>>, path: PathBuf) -> Result<(), String> {
+async fn load_and_run_async(connection: Arc<Mutex<dyn RemoteDevice>>, path: PathBuf) -> Result<(), String> {
     log::info!("Loading and running: {}", path.display());
 
     let data = std::fs::read(&path).map_err(|e| {

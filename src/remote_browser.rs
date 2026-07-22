@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
-use ultimate64::Rest;
+use crate::remote_device::RemoteDevice;
 
 use crate::api;
 use crate::dir_preview::ContentPreview;
@@ -283,7 +283,7 @@ impl RemoteBrowser {
     pub fn update_impl(
         &mut self,
         message: RemoteBrowserMessage,
-        _connection: Option<Arc<Mutex<Rest>>>,
+        _connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
     ) -> Task<RemoteBrowserMessage> {
         match message {
             RemoteBrowserMessage::RefreshFiles => {
