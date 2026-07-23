@@ -159,7 +159,9 @@ mod styles;
 mod tab;
 mod templates;
 mod version_check;
+mod vic_shader;
 mod video_scaling;
+mod virtual_keyboard;
 
 use assembly64_browser::{Assembly64Browser, Assembly64BrowserMessage};
 use basic_editor::{BasicEditor, BasicEditorMessage};
@@ -190,6 +192,17 @@ pub fn main() -> iced::Result {
         // environment variables at this point.
         unsafe {
             std::env::set_var("WGPU_BACKEND", "gl");
+        }
+    }
+
+    // Force strict vsync (Fifo) for the video stream. iced's AutoVsync default can
+    // resolve to FifoRelaxed (adaptive vsync), which tears and judders whenever a
+    // frame misses the refresh deadline — very visible on the ~50 fps VIC stream.
+    // Strict Fifo gives clean, tear-free pacing. Users can still override.
+    if std::env::var_os("ICED_PRESENT_MODE").is_none() {
+        // SAFETY: startup, before any threads or the GPU backend initialize.
+        unsafe {
+            std::env::set_var("ICED_PRESENT_MODE", "fifo");
         }
     }
 
@@ -724,6 +737,14 @@ impl Ultimate64Browser {
         // Create file browser with configured starting directory
         let left_browser = FileBrowser::new(settings.default_paths.file_browser_start_dir.clone());
 
+        // QA hook: preload the video test pattern so the renderer can be verified
+        // without a device when U64_AUTO_TEST_PATTERN is set.
+        let mut video_streaming = VideoStreaming::new();
+        video_streaming.use_gpu_shader = settings.preferences.use_gpu_video_shader;
+        if std::env::var("U64_AUTO_TEST_PATTERN").is_ok() {
+            video_streaming.preload_test_pattern();
+        }
+
         // Load window icon
         let icon = load_window_icon();
 
@@ -740,11 +761,16 @@ impl Ultimate64Browser {
 
         let mut app = Self {
             // Restore the tab the user closed in last session, or fall back
-            // to the file browser for first-time launches.
-            active_tab: settings
-                .preferences
-                .last_active_tab
-                .unwrap_or(Tab::DualPaneBrowser),
+            // to the file browser for first-time launches. The QA hook forces the
+            // video tab so the renderer can be verified without a device.
+            active_tab: if std::env::var("U64_AUTO_TEST_PATTERN").is_ok() {
+                Tab::VideoViewer
+            } else {
+                settings
+                    .preferences
+                    .last_active_tab
+                    .unwrap_or(Tab::DualPaneBrowser)
+            },
             left_browser,
             remote_browser: RemoteBrowser::new(),
             active_pane: Pane::Left,
@@ -772,7 +798,7 @@ impl Ultimate64Browser {
             },
             consecutive_status_failures: 0,
             user_message: None,
-            video_streaming: VideoStreaming::new(),
+            video_streaming,
             assembly64_browser: Assembly64Browser::new(),
             basic_editor: BasicEditor::new(),
             pending_drop: None,
@@ -1518,6 +1544,13 @@ impl Ultimate64Browser {
 
                 self.video_streaming
                     .set_api_password(self.settings.connection.password.clone());
+                // Persist the video renderer choice when it changes.
+                if let StreamingMessage::GpuShaderToggled(on) = msg {
+                    self.settings.preferences.use_gpu_video_shader = on;
+                    if let Err(e) = self.settings.save() {
+                        log::warn!("Failed to save renderer preference: {}", e);
+                    }
+                }
                 // Handle screenshot result for user message
                 if let StreamingMessage::OpenInSeparateWindow = msg {
                     return Task::perform(async {}, |_| Message::OpenStreamingWindow);

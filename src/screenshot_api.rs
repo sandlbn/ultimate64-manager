@@ -325,7 +325,7 @@ fn smart_read(api: &U64Api, addr: u16, length: usize) -> Result<Vec<u8>, String>
 /// Returns 2 KB of the standard C64 uppercase/graphics character set.
 /// Used when the program points VIC at the built-in character ROM
 /// ($D000-$DFFF as seen through VIC bank 0 / bank 2).
-fn embedded_char_rom() -> Vec<u8> {
+pub(crate) fn embedded_char_rom() -> Vec<u8> {
     // Patterns for chars 0-127 (uppercase/graphics set).
     // Each entry is (char_code, [8 bytes]).
     #[rustfmt::skip]

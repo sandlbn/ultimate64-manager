@@ -7,7 +7,14 @@ authors = ["Marcin Spoczynski"]
 license = "MIT"
 
 [dependencies]
-iced = { version = "0.14.0", features = ["tokio", "image", "canvas", "advanced"] }
+iced = { version = "0.14.0", features = ["tokio", "image", "canvas", "advanced", "wgpu"] }
+# Custom VIC video shader widget renders through iced's wgpu backend; pin wgpu to
+# the same version iced 0.14 uses so our Pipeline/Primitive types match.
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+# Enlarge the UDP receive buffer for the VIC video stream (SO_RCVBUF) to avoid
+# packet drops during multi-packet frame bursts.
+socket2 = "0.5"
 tokio = { version = "1", features = ["full"] }
 ultimate64 = "0.5.5"
 anyhow = "1.0"

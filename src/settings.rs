@@ -79,6 +79,15 @@ pub struct Preferences {
     /// don't have this field) loading cleanly.
     #[serde(default)]
     pub last_active_tab: Option<crate::Tab>,
+    /// Render the video stream via the GPU shader (true) or the compatibility
+    /// image path (false). Defaults on; users on a no-GPU / tiny-skia fallback
+    /// can turn it off.
+    #[serde(default = "default_true")]
+    pub use_gpu_video_shader: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_font_size() -> u32 {
@@ -111,6 +120,7 @@ impl Default for AppSettings {
                 default_song_duration: 180, // 3 minutes
                 font_size: 12,
                 last_active_tab: None,
+                use_gpu_video_shader: true,
             },
         }
     }
