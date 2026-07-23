@@ -65,6 +65,7 @@ impl Ultimate64Browser {
         self.status.connected = false;
         self.status.device_info = None;
         self.status.mounted_disks.clear();
+        self.status.drives.clear();
         self.consecutive_status_failures = 0;
         self.remote_browser.set_host(None, None);
         // Clear telnet host for video streaming control
