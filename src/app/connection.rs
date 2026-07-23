@@ -34,6 +34,11 @@ impl Ultimate64Browser {
         };
         self.profile_manager.active_settings_mut().connection = conn_settings;
         self.settings = self.profile_manager.active_settings().clone();
+        // Persist the new host/password so the next launch's auto-connect uses it
+        // (otherwise the on-disk profile keeps the old address).
+        if let Err(e) = self.profile_manager.save() {
+            log::error!("Failed to save profiles: {}", e);
+        }
 
         self.establish_connection();
         // Trigger status refresh and remote browser refresh after a short delay

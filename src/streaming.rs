@@ -5,7 +5,7 @@ use iced::{
     keyboard::{self, Key, Modifiers},
     widget::{
         button, checkbox, column, container, image as iced_image, mouse_area, responsive, row,
-        rule, scrollable, text, text_input, tooltip, Column, Space,
+        rule, stack, text, text_input, tooltip, Space,
     },
     Element, Length, Subscription, Task,
 };
@@ -128,6 +128,10 @@ pub enum StreamingMessage {
     UltimateHostChanged(String), // Set the host for stream control
     // Separate window support
     OpenInSeparateWindow, // Open streaming in a separate window
+    // Virtual PETSCII keyboard
+    ToggleVirtualKeyboard,
+    VkSend(u8),     // inject one PETSCII byte
+    VkModifier(u8), // toggle SHIFT / C= / CTRL (see virtual_keyboard::MOD_*)
 }
 
 /// Simple linear resampler for converting Ultimate64's ~47983 Hz to 48000 Hz
@@ -321,6 +325,67 @@ fn waiting_placeholder<'a>(size: u32) -> Element<'a, StreamingMessage> {
         .into()
 }
 
+/// Inject one PETSCII byte into the device's KERNAL keyboard buffer: clear
+/// LSTX/NDX ($C5/$C6), write the byte to the buffer head ($0277), set NDX=1 so
+/// the KERNAL processes it. Only needs a live connection (no streaming required).
+/// Shared by the physical-key capture and the virtual keyboard.
+fn send_petscii(
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
+    code: u8,
+) -> Task<StreamingMessage> {
+    let Some(conn) = connection else {
+        return Task::none();
+    };
+    Task::perform(
+        async move {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::task::spawn_blocking(move || {
+                    let c = conn.lock().unwrap();
+                    c.write_mem(0x00C5, &[0, 0])
+                        .map_err(|e| format!("Clear failed: {}", e))?;
+                    c.write_mem(0x0277, &[code])
+                        .map_err(|e| format!("Buffer write failed: {}", e))?;
+                    c.write_mem(0x00C6, &[1])
+                        .map_err(|e| format!("Count write failed: {}", e))?;
+                    Ok(())
+                }),
+            )
+            .await;
+            match result {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => Err(format!("Task error: {}", e)),
+                Err(_) => Err("Keyboard write timed out".to_string()),
+            }
+        },
+        StreamingMessage::KeySent,
+    )
+}
+
+/// One icon button for the video overlay bar. `msg = None` renders it disabled.
+/// `active` highlights the button (e.g. audio/keyboard enabled).
+fn overlay_button(
+    glyph: &'static str,
+    msg: Option<StreamingMessage>,
+    active: bool,
+    tip: &'static str,
+    fs: &crate::styles::FontSizes,
+) -> Element<'static, StreamingMessage> {
+    let mut btn = button(text(glyph).size(fs.normal).color(iced::Color::WHITE))
+        .padding([4, 8])
+        .style(if active {
+            button::primary
+        } else {
+            button::text
+        });
+    if let Some(m) = msg {
+        btn = btn.on_press(m);
+    }
+    tooltip(btn, text(tip).size(fs.small), tooltip::Position::Top)
+        .style(container::bordered_box)
+        .into()
+}
+
 /// A uniform-width Video-Scale mode button (fills its cell so the buttons align
 /// in a tidy grid), highlighted when it's the active mode.
 fn mode_button(
@@ -398,7 +463,13 @@ pub struct VideoStreaming {
     last_click_time: Option<std::time::Instant>, // For double-click detection
     // Keyboard control
     pub keyboard_enabled: bool, // Whether keyboard capture is active
-    last_key_time: Option<std::time::Instant>, // Rate limiting for keyboard
+    // Virtual on-screen PETSCII keyboard
+    show_virtual_keyboard: bool,
+    vk_shift: bool,
+    vk_comm: bool,
+    vk_ctrl: bool,
+    vk_glyphs: Vec<iced::widget::image::Handle>, // char-ROM glyphs, built on first show
+    last_key_time: Option<std::time::Instant>,   // Rate limiting for keyboard
     // Ultimate64 host for stream control (binary protocol on port 64)
     pub ultimate_host: Option<String>,
     // API password for REST API fallback
@@ -441,6 +512,11 @@ impl VideoStreaming {
             is_fullscreen: false,
             last_click_time: None,
             keyboard_enabled: false,
+            show_virtual_keyboard: false,
+            vk_shift: false,
+            vk_comm: false,
+            vk_ctrl: false,
+            vk_glyphs: Vec::new(),
             last_key_time: None,
             ultimate_host: None,
             api_password: None,
@@ -789,48 +865,9 @@ impl VideoStreaming {
 
                 if let Some(code) = petscii {
                     log::debug!("KEYBOARD: {:?} -> PETSCII {} (0x{:02X})", key, code, code);
-
-                    if let Some(conn) = connection {
-                        return Task::perform(
-                            async move {
-                                // Use timeout to prevent hangs
-                                let result = tokio::time::timeout(
-                                    std::time::Duration::from_millis(500),
-                                    tokio::task::spawn_blocking(move || {
-                                        let c = conn.lock().unwrap();
-
-                                        // Match type_text behavior from ultimate64 library:
-                                        // 1. Clear LSTX ($C5) and NDX ($C6) - last key and buffer count
-                                        c.write_mem(0x00C5, &[0, 0])
-                                            .map_err(|e| format!("Clear failed: {}", e))?;
-
-                                        // 2. Write PETSCII code to keyboard buffer at $0277
-                                        c.write_mem(0x0277, &[code])
-                                            .map_err(|e| format!("Buffer write failed: {}", e))?;
-
-                                        // 3. Set buffer count to 1 at $C6 to trigger processing
-                                        c.write_mem(0x00C6, &[1])
-                                            .map_err(|e| format!("Count write failed: {}", e))?;
-
-                                        Ok(())
-                                    }),
-                                )
-                                .await;
-
-                                match result {
-                                    Ok(Ok(r)) => r,
-                                    Ok(Err(e)) => Err(format!("Task error: {}", e)),
-                                    Err(_) => Err("Keyboard write timed out".to_string()),
-                                }
-                            },
-                            StreamingMessage::KeySent,
-                        );
-                    } else {
-                        log::warn!("KEYBOARD: No connection available!");
-                    }
-                } else {
-                    log::trace!("KEYBOARD: Key {:?} not mapped", key);
+                    return send_petscii(connection, code);
                 }
+                log::trace!("KEYBOARD: Key {:?} not mapped", key);
                 Task::none()
             }
 
@@ -859,6 +896,32 @@ impl VideoStreaming {
             StreamingMessage::OpenInSeparateWindow => {
                 // Handled by main.rs which manages window creation
                 Task::none()
+            }
+
+            StreamingMessage::ToggleVirtualKeyboard => {
+                self.show_virtual_keyboard = !self.show_virtual_keyboard;
+                // Build the glyph atlas once, on first show.
+                if self.show_virtual_keyboard && self.vk_glyphs.is_empty() {
+                    self.vk_glyphs = crate::virtual_keyboard::build_glyphs();
+                }
+                Task::none()
+            }
+            StreamingMessage::VkModifier(id) => {
+                match id {
+                    crate::virtual_keyboard::MOD_SHIFT => self.vk_shift = !self.vk_shift,
+                    crate::virtual_keyboard::MOD_COMMODORE => self.vk_comm = !self.vk_comm,
+                    _ => self.vk_ctrl = !self.vk_ctrl,
+                }
+                Task::none()
+            }
+            StreamingMessage::VkSend(code) => {
+                // One-shot modifiers: applied to this key, then released — much
+                // less confusing than a latched SHIFT that turns everything into
+                // graphics.
+                self.vk_shift = false;
+                self.vk_comm = false;
+                self.vk_ctrl = false;
+                send_petscii(connection, code)
             }
         }
     }
@@ -894,6 +957,104 @@ impl VideoStreaming {
         };
         mouse_area(inner)
             .on_press(StreamingMessage::VideoClicked)
+            .into()
+    }
+
+    /// Media-player style control bar overlaid on the bottom of the video:
+    /// play/stop, screenshot, fullscreen, pop-out, audio, keyboard.
+    fn video_overlay_bar(&self, fs: &crate::styles::FontSizes) -> Element<'_, StreamingMessage> {
+        let live_stop = if self.is_streaming {
+            overlay_button(
+                "■",
+                Some(StreamingMessage::StopStream),
+                false,
+                "Stop stream",
+                fs,
+            )
+        } else {
+            overlay_button(
+                "▶",
+                Some(StreamingMessage::StartStream),
+                false,
+                "Start stream",
+                fs,
+            )
+        };
+        let shot = overlay_button(
+            "📸",
+            self.is_streaming
+                .then_some(StreamingMessage::TakeScreenshot),
+            false,
+            if self.is_streaming {
+                "Capture frame to Pictures"
+            } else {
+                "Start streaming to capture"
+            },
+            fs,
+        );
+        let full = overlay_button(
+            "⛶",
+            Some(StreamingMessage::ToggleFullscreen),
+            self.is_fullscreen,
+            "Fullscreen",
+            fs,
+        );
+        let popout = overlay_button(
+            "⧉",
+            Some(StreamingMessage::OpenInSeparateWindow),
+            false,
+            "Open in a separate window",
+            fs,
+        );
+        let audio = overlay_button(
+            "🔊",
+            Some(StreamingMessage::AudioToggled(!self.audio_enabled)),
+            self.audio_enabled,
+            "Toggle audio",
+            fs,
+        );
+        let keyboard = overlay_button(
+            "⌨",
+            self.is_streaming
+                .then_some(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled)),
+            self.keyboard_enabled,
+            "Capture the PC keyboard (type into the C64 while streaming)",
+            fs,
+        );
+        let vkbd = overlay_button(
+            "🎹",
+            Some(StreamingMessage::ToggleVirtualKeyboard),
+            self.show_virtual_keyboard,
+            "Show/hide the on-screen PETSCII keyboard",
+            fs,
+        );
+
+        let bar = row![
+            live_stop,
+            shot,
+            full,
+            popout,
+            Space::new().width(Length::Fill),
+            vkbd,
+            audio,
+            keyboard,
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        container(bar)
+            .width(Length::Fill)
+            .padding([6, 10])
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(
+                    0.0, 0.0, 0.0, 0.55,
+                ))),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
             .into()
     }
 
@@ -1019,121 +1180,106 @@ impl VideoStreaming {
 
     pub fn view(&self, font_size: u32) -> Element<'_, StreamingMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
-        // Video packets info
-        let video_packets = self.packets_received.lock().map(|p| *p).unwrap_or(0);
-        let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
         // === LEFT SIDE: Video display (fluid scaling) ===
-        let video_display: Element<'_, StreamingMessage> =
-            if self.is_streaming || self.current_frame.is_some() {
-                let scale_label = match self.scale_mode {
-                    ScaleMode::PixelPerfect => "Pixel Perfect",
-                    ScaleMode::Scale2x => "Smooth",
-                    ScaleMode::Scanlines => "Scanlines",
-                    ScaleMode::CRT => "CRT",
-                    ScaleMode::Glow => "Glow",
-                };
-
-                column![
-                    container(self.video_element(fs.large))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill),
-                    text(format!(
-                        "{}x{} [{}] | Video: {} | Audio: {} | Double-click for fullscreen",
-                        VIC_WIDTH, VIC_HEIGHT, scale_label, video_packets, audio_packets
-                    ))
-                    .size(fs.tiny),
-                ]
-                .spacing(5)
-                .align_x(iced::Alignment::Center)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-            } else {
-                let status_info = match self.stream_mode {
-                    StreamMode::Unicast => {
-                        format!("Unicast mode: Will send to Ultimate64 at port 64 to start stream",)
-                    }
-                    StreamMode::Multicast => {
-                        "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
-                    }
-                };
-
-                container(
-                    column![
-                        text("VIDEO STREAM INACTIVE").size(fs.large + 2),
-                        Space::new().height(10),
-                        text(status_info.clone()).size(fs.small),
-                        Space::new().height(5),
-                        text("Click START to begin streaming").size(fs.small),
-                    ]
-                    .align_x(iced::Alignment::Center),
-                )
+        // Base video content (the picture, or the inactive message).
+        let video_base: Element<'_, StreamingMessage> = if self.is_streaming
+            || self.current_frame.is_some()
+        {
+            container(self.video_element(fs.large))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
                 .into()
+        } else {
+            let status_info = match self.stream_mode {
+                StreamMode::Unicast => {
+                    "Unicast: the device streams here once you press ▶".to_string()
+                }
+                StreamMode::Multicast => "Multicast 239.0.1.64 (requires wired LAN)".to_string(),
             };
+            container(
+                column![
+                    text("VIDEO STREAM INACTIVE").size(fs.large + 2),
+                    Space::new().height(10),
+                    text(status_info).size(fs.small),
+                    Space::new().height(5),
+                    text("Press ▶ below to begin streaming").size(fs.small),
+                ]
+                .align_x(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .into()
+        };
+
+        // Bottom overlay stack on the video: the on-screen keyboard (if shown)
+        // sits just above the media-player control bar, both floating on the video.
+        let mut overlay_col = column![].spacing(6).align_x(iced::Alignment::Center);
+        if self.show_virtual_keyboard {
+            overlay_col = overlay_col.push(crate::virtual_keyboard::view(
+                &self.vk_glyphs,
+                self.vk_shift,
+                self.vk_comm,
+                self.vk_ctrl,
+                &fs,
+            ));
+        }
+        overlay_col = overlay_col.push(self.video_overlay_bar(&fs));
+
+        let video_display: Element<'_, StreamingMessage> = stack![
+            video_base,
+            container(overlay_col)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .align_y(iced::alignment::Vertical::Bottom)
+                .padding(8),
+        ]
+        .into();
 
         // === RIGHT SIDE: Controls panel ===
+        let dim = iced::Color::from_rgb(0.55, 0.57, 0.62);
 
-        // Mode selection
+        let source_button = |label: &'static str, mode: StreamMode| {
+            button(text(label).size(fs.small))
+                .on_press(StreamingMessage::StreamModeChanged(mode))
+                .padding([4, 8])
+                .width(Length::Fill)
+                .style(if self.stream_mode == mode {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+        };
+
+        // SOURCE — stream mode + port
         let mode_section = column![
-            text("Stream Mode").size(fs.normal),
+            text("SOURCE").size(fs.small).color(dim),
             row![
-                tooltip(
-                    button(text("Unicast").size(fs.small))
-                        .on_press(StreamingMessage::StreamModeChanged(StreamMode::Unicast))
-                        .padding([4, 8])
-                        .style(if self.stream_mode == StreamMode::Unicast {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "Direct UDP connection (requires Ethernet, WiFi not supported)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("Multicast").size(fs.small))
-                        .on_press(StreamingMessage::StreamModeChanged(StreamMode::Multicast))
-                        .padding([4, 8])
-                        .style(if self.stream_mode == StreamMode::Multicast {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "Multicast 239.0.1.64 (requires wired LAN)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
+                source_button("Unicast", StreamMode::Unicast),
+                source_button("Multicast", StreamMode::Multicast),
             ]
-            .spacing(5),
-            Space::new().height(5),
+            .spacing(4),
             row![
-                text("Port:").size(fs.small),
-                tooltip(
-                    text_input("11000", &self.listen_port)
-                        .on_input(StreamingMessage::PortChanged)
-                        .width(Length::Fixed(70.0))
-                        .size(fs.small),
-                    "Video port (audio uses port+1)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
+                text("Port").size(fs.small).color(dim),
+                text_input("11000", &self.listen_port)
+                    .on_input(StreamingMessage::PortChanged)
+                    .width(Length::Fill)
+                    .size(fs.small),
             ]
-            .spacing(5)
+            .spacing(6)
             .align_y(iced::Alignment::Center),
         ]
-        .spacing(5);
+        .spacing(6);
 
         // Scale mode selection — uniform-width buttons in a tidy 2-2-1 grid.
         let sm = self.scale_mode;
         let scale_section = column![
-            text("Video Scale").size(fs.normal),
+            text("DISPLAY").size(fs.small).color(dim),
             row![
                 mode_button(
                     sm,
@@ -1204,160 +1350,14 @@ impl VideoStreaming {
             )
             .style(container::bordered_box),
         ]
-        .spacing(6); // Stream controls with keyboard toggle
-                     // Screenshot works when streaming (instant frame grab) OR when connected
-                     // without streaming (REST API capture via screenshot_api module).
-        let screenshot_button = {
-            // Only allow capture while streaming (instant frame grab). The REST
-            // no-stream path is disabled — it was half-baked.
-            let btn = button(text("📸").size(fs.small)).padding([6, 10]);
-            if self.is_streaming {
-                btn.on_press(StreamingMessage::TakeScreenshot)
-            } else {
-                btn.style(button::secondary)
-            }
-        };
+        .spacing(6);
 
-        // Keyboard toggle button
-        let keyboard_button = if self.is_streaming {
-            tooltip(
-                button(
-                    text(if self.keyboard_enabled {
-                        "⌨️ Enabled"
-                    } else {
-                        "⌨️ Disabled"
-                    })
-                    .size(fs.small),
-                )
-                .on_press(StreamingMessage::ToggleKeyboard(!self.keyboard_enabled))
-                .padding([6, 10])
-                .style(if self.keyboard_enabled {
-                    button::primary
-                } else {
-                    button::secondary
-                }),
-                "Enable keyboard input to C64 (type in video window)",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box)
-        } else {
-            tooltip(
-                button(text("⌨ Disabled").size(fs.small)).padding([6, 10]),
-                "Start streaming first",
-                tooltip::Position::Bottom,
-            )
-            .style(container::bordered_box)
-        };
-
-        // Separate window button
-        let separate_window_button = tooltip(
-            button(text("⧉").size(fs.small))
-                .on_press(StreamingMessage::OpenInSeparateWindow)
-                .padding([6, 10]),
-            "Open video in separate window",
-            tooltip::Position::Bottom,
-        )
-        .style(container::bordered_box);
-
-        let stream_controls = column![
-            text("Stream Control").size(fs.normal),
-            row![
-                if self.is_streaming {
-                    tooltip(
-                        button(text("■ STOP").size(fs.small))
-                            .on_press(StreamingMessage::StopStream)
-                            .padding([6, 14]),
-                        "Stop video stream",
-                        tooltip::Position::Bottom,
-                    )
-                    .style(container::bordered_box)
-                } else {
-                    tooltip(
-                        button(text("▶ LIVE").size(fs.small))
-                            .on_press(StreamingMessage::StartStream)
-                            .padding([6, 14]),
-                        "Start video stream",
-                        tooltip::Position::Bottom,
-                    )
-                    .style(container::bordered_box)
-                },
-                tooltip(
-                    screenshot_button,
-                    if self.is_streaming {
-                        "Capture frame to Pictures folder"
-                    } else {
-                        "Start streaming to capture a frame"
-                    },
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                separate_window_button,
-            ]
-            .spacing(5)
-            .align_y(iced::Alignment::Center),
-            row![
-                tooltip(
-                    checkbox(self.audio_enabled)
-                        .label("🔊 Audio")
-                        .on_toggle(StreamingMessage::AudioToggled)
-                        .size(16)
-                        .text_size(fs.small),
-                    "Enable audio streaming (port+1)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                keyboard_button,
-            ]
-            .spacing(10)
-            .align_y(iced::Alignment::Center),
-        ]
-        .spacing(5)
-        .align_x(iced::Alignment::Center);
-
-        // Command prompt section
-        let command_history_items: Vec<Element<'_, StreamingMessage>> = self
-            .command_history
-            .iter()
-            .rev()
-            .take(10)
-            .map(|cmd| text(cmd).size(fs.tiny).into())
-            .collect();
-
-        let command_section = column![
-            text("COMMAND PROMPT").size(fs.normal),
-            row![
-                text("C64>").size(fs.small),
-                text_input("Enter BASIC command...", &self.command_input)
-                    .on_input(StreamingMessage::CommandInputChanged)
-                    .on_submit(StreamingMessage::SendCommand)
-                    .width(Length::Fill)
-                    .size(fs.small),
-            ]
-            .spacing(5)
-            .align_y(iced::Alignment::Center),
-            button(text("Send").size(fs.small))
-                .on_press(StreamingMessage::SendCommand)
-                .padding([4, 12])
-                .width(Length::Fill),
-            scrollable(Column::with_children(command_history_items).spacing(2))
-                .height(Length::Fill),
-        ]
-        .spacing(5);
-
-        // Right panel with all controls
+        // Right panel — SOURCE + DISPLAY (the console now lives in the bottom bar).
         let right_panel = container(
-            column![
-                mode_section,
-                rule::horizontal(1),
-                scale_section,
-                rule::horizontal(1),
-                stream_controls,
-                rule::horizontal(1),
-                command_section,
-            ]
-            .spacing(10)
-            .padding(10)
-            .width(Length::Fixed(220.0)),
+            column![mode_section, rule::horizontal(1), scale_section,]
+                .spacing(12)
+                .padding(10)
+                .width(Length::Fixed(210.0)),
         )
         .height(Length::Fill);
 
@@ -1374,10 +1374,27 @@ impl VideoStreaming {
         .spacing(10)
         .height(Length::Fill);
 
+        // On-screen PETSCII keyboard (toggled from the overlay 🎹 button).
+        // Command console, moved to a full-width bar at the bottom.
+        let console_bar = row![
+            text("C64>").size(fs.small).color(dim),
+            text_input("Enter BASIC command…", &self.command_input)
+                .on_input(StreamingMessage::CommandInputChanged)
+                .on_submit(StreamingMessage::SendCommand)
+                .width(Length::Fill)
+                .size(fs.small),
+            button(text("Send").size(fs.small))
+                .on_press(StreamingMessage::SendCommand)
+                .padding([4, 14]),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
         column![
             text("VIC VIDEO STREAM").size(fs.header + 2),
             rule::horizontal(1),
             main_content,
+            console_bar,
         ]
         .spacing(10)
         .height(Length::Fill)

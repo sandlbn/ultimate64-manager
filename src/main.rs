@@ -161,6 +161,7 @@ mod templates;
 mod version_check;
 mod vic_shader;
 mod video_scaling;
+mod virtual_keyboard;
 
 use assembly64_browser::{Assembly64Browser, Assembly64BrowserMessage};
 use basic_editor::{BasicEditor, BasicEditorMessage};
