@@ -8,6 +8,87 @@ use iced::{Element, Length};
 use crate::{Message, Pane, Ultimate64Browser};
 
 impl Ultimate64Browser {
+    /// Compact drive-control strip shown above the device (remote) pane: drive
+    /// type (1541/1571/1581), power on/off and reset for drives A and B. Moved
+    /// here from the old Device tab — it belongs where you mount disks.
+    fn device_drive_control_strip(&self) -> Element<'_, Message> {
+        let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
+        let dim = iced::Color::from_rgb(0.55, 0.57, 0.62);
+        let connected = self.status.connected;
+        const TYPES: [&str; 3] = ["1541", "1571", "1581"];
+
+        // One drive: a type dropdown, a state-aware power toggle, and a reset.
+        let drive_row = |label: &'static str, d: &'static str| -> Element<'_, Message> {
+            let st = self
+                .status
+                .drives
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(d));
+            let enabled = st.map(|s| s.enabled).unwrap_or(false);
+            let current: Option<&'static str> = st
+                .and_then(|s| s.drive_type.as_deref())
+                .and_then(|t| TYPES.iter().copied().find(|x| *x == t));
+
+            let type_pick = pick_list(&TYPES[..], current, move |sel| {
+                Message::DeviceSetDriveMode(d.to_string(), sel.to_string())
+            })
+            .text_size(fs.tiny as f32)
+            .padding([2, 6])
+            .width(Length::Fixed(76.0));
+
+            // Power toggle reflects the real state: highlighted when on.
+            let power = button(text(if enabled { "⏻ On" } else { "⭘ Off" }).size(fs.tiny))
+                .on_press_maybe(
+                    connected.then(|| Message::DeviceDrivePower(d.to_string(), !enabled)),
+                )
+                .padding([2, 8])
+                .style(if enabled {
+                    crate::styles::action_button
+                } else {
+                    crate::styles::nav_button
+                });
+
+            let reset = button(text("↻ Reset").size(fs.tiny))
+                .on_press_maybe(connected.then(|| Message::DeviceDriveReset(d.to_string())))
+                .padding([2, 8])
+                .style(crate::styles::nav_button);
+
+            row![
+                text(label).size(fs.tiny).width(Length::Fixed(16.0)),
+                type_pick,
+                power,
+                reset,
+            ]
+            .spacing(4)
+            .align_y(iced::Alignment::Center)
+            .into()
+        };
+
+        let refresh = button(text("↻ Refresh").size(fs.tiny))
+            .on_press_maybe(connected.then_some(Message::RefreshStatus))
+            .padding([2, 8])
+            .style(crate::styles::nav_button);
+
+        // Slim footer: rule, caption + refresh, then a row per drive.
+        container(
+            column![
+                rule::horizontal(1),
+                row![
+                    text("DRIVES").size(fs.tiny).color(dim),
+                    Space::new().width(Length::Fill),
+                    refresh,
+                ]
+                .align_y(iced::Alignment::Center),
+                drive_row("A", "a"),
+                drive_row("B", "b"),
+            ]
+            .spacing(4),
+        )
+        .width(Length::Fill)
+        .padding([4, 6])
+        .into()
+    }
+
     pub(crate) fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Left pane - Local files
         let left_content = container(
@@ -27,11 +108,19 @@ impl Ultimate64Browser {
         let left_pane =
             iced::widget::mouse_area(left_content).on_press(Message::ActivePaneChanged(Pane::Left));
 
-        // Right pane - Ultimate64 files
+        // Right pane - Ultimate64 files, with the drive-control strip as a slim
+        // footer beneath the file list.
         let right_content = container(
-            self.remote_browser
-                .view(self.settings.preferences.font_size)
-                .map(Message::RemoteBrowser),
+            column![
+                container(
+                    self.remote_browser
+                        .view(self.settings.preferences.font_size)
+                        .map(Message::RemoteBrowser),
+                )
+                .height(Length::Fill),
+                self.device_drive_control_strip(),
+            ]
+            .spacing(2),
         )
         .width(Length::FillPortion(1))
         .height(Length::Fill)

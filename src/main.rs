@@ -601,6 +601,16 @@ pub struct StatusInfo {
     pub connected: bool,
     pub device_info: Option<String>,
     pub mounted_disks: Vec<(String, String)>,
+    /// Live per-drive state (name, power, type) from `drive_list`, so the drive
+    /// control strip can reflect what's actually set on the device.
+    pub drives: Vec<DriveState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DriveState {
+    pub name: String,               // "a" / "b"
+    pub enabled: bool,              // powered on
+    pub drive_type: Option<String>, // "1541" / "1571" / "1581" / "DOS emulation"
 }
 
 #[derive(Debug, Clone)]
@@ -769,6 +779,8 @@ impl Ultimate64Browser {
                 settings
                     .preferences
                     .last_active_tab
+                    // Device/Profiles tabs are hidden — never restore into them.
+                    .filter(|t| !matches!(t, Tab::Device | Tab::Profiles))
                     .unwrap_or(Tab::DualPaneBrowser)
             },
             left_browser,
@@ -795,6 +807,7 @@ impl Ultimate64Browser {
                 connected: false,
                 device_info: None,
                 mounted_disks: Vec::new(),
+                drives: Vec::new(),
             },
             consecutive_status_failures: 0,
             user_message: None,
@@ -1844,22 +1857,34 @@ impl Ultimate64Browser {
             return self.view_help_overlay();
         }
 
-        // Tab bar with retro style
+        // Tab bar with retro style. Wrapped in a horizontal scrollable so the
+        // rightmost tabs stay reachable when the window is squeezed instead of
+        // being clipped off the edge.
         let tabs = container(
-            row![
-                self.tab_button("FILE BROWSER", Tab::DualPaneBrowser),
-                self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
-                self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
-                self.tab_button("MEMORY", Tab::MemoryEditor),
-                self.tab_button("MONITOR", Tab::Monitor),
-                self.tab_button("CONFIG", Tab::Configuration),
-                // The Profiles tab is intentionally not registered.
-                self.tab_button("ASSEMBLY64", Tab::Assembly64),
-                self.tab_button("BASIC", Tab::BasicEditor),
-                self.tab_button("DEVICE", Tab::Device),
-                self.tab_button("SETTINGS", Tab::Settings),
-            ]
-            .spacing(2),
+            scrollable(
+                row![
+                    self.tab_button("FILE BROWSER", Tab::DualPaneBrowser),
+                    self.tab_button("MUSIC PLAYER", Tab::MusicPlayer),
+                    self.tab_button("VIDEO VIEWER", Tab::VideoViewer),
+                    self.tab_button("MEMORY", Tab::MemoryEditor),
+                    self.tab_button("MONITOR", Tab::Monitor),
+                    self.tab_button("CONFIG", Tab::Configuration),
+                    // The Profiles tab is intentionally not registered.
+                    self.tab_button("ASSEMBLY64", Tab::Assembly64),
+                    self.tab_button("BASIC", Tab::BasicEditor),
+                    // The Device tab is hidden (its debug features aren't finished);
+                    // drive control now lives in the File Browser's device pane, and
+                    // machine control is in the bottom status bar.
+                    self.tab_button("SETTINGS", Tab::Settings),
+                ]
+                .spacing(2),
+            )
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::default()
+                    .width(4)
+                    .scroller_width(4),
+            ))
+            .width(Length::Fill),
         )
         .padding(5);
 
@@ -2472,6 +2497,7 @@ impl Ultimate64Browser {
         self.status.connected = false;
         self.status.device_info = None;
         self.status.mounted_disks.clear();
+        self.status.drives.clear();
 
         if self.settings.connection.host.is_empty() {
             log::error!("Host IP is empty");
@@ -2633,18 +2659,31 @@ async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<Status
                 Err(e) => return Err(classify_crate_error(&e.to_string())),
             };
 
-            let mounted_disks = match conn.drive_list() {
-                Ok(drives) => drives
-                    .into_iter()
-                    .filter_map(|(name, drive)| drive.image_file.map(|file| (name, file)))
-                    .collect(),
-                Err(_) => Vec::new(),
+            let (mounted_disks, drives) = match conn.drive_list() {
+                Ok(dl) => {
+                    let mut mounted = Vec::new();
+                    let mut drives = Vec::new();
+                    for (name, drive) in dl {
+                        drives.push(DriveState {
+                            name: name.clone(),
+                            enabled: drive.enabled,
+                            drive_type: drive.drive_type.as_ref().map(|t| t.to_string()),
+                        });
+                        if let Some(file) = drive.image_file {
+                            mounted.push((name, file));
+                        }
+                    }
+                    drives.sort_by(|a, b| a.name.cmp(&b.name));
+                    (mounted, drives)
+                }
+                Err(_) => (Vec::new(), Vec::new()),
             };
 
             Ok(StatusInfo {
                 connected: true,
                 device_info,
                 mounted_disks,
+                drives,
             })
         }),
     )

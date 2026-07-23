@@ -8,6 +8,18 @@ use crate::debug_stream;
 use crate::{Message, Ultimate64Browser, UserMessage};
 
 impl Ultimate64Browser {
+    /// Re-poll device status shortly after a drive change so the drive-control
+    /// strip reflects the new type/power. `RefreshStatus` is a no-op when
+    /// disconnected, so this only does work while connected.
+    fn refresh_drives_soon() -> Task<Message> {
+        Task::perform(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            },
+            |_| Message::RefreshStatus,
+        )
+    }
+
     pub(crate) fn handle_device_set_drive_mode(
         &mut self,
         drive: String,
@@ -18,10 +30,15 @@ impl Ultimate64Browser {
             return Task::none();
         };
         let password = self.settings.connection.password.clone();
-        Task::perform(
-            async move { api::set_drive_mode_async(&host, &drive, &mode, password.as_deref()).await },
-            Message::MachineCommandCompleted,
-        )
+        Task::batch([
+            Task::perform(
+                async move {
+                    api::set_drive_mode_async(&host, &drive, &mode, password.as_deref()).await
+                },
+                Message::MachineCommandCompleted,
+            ),
+            Self::refresh_drives_soon(),
+        ])
     }
 
     pub(crate) fn handle_device_drive_power(&mut self, drive: String, on: bool) -> Task<Message> {
@@ -30,10 +47,13 @@ impl Ultimate64Browser {
             return Task::none();
         };
         let password = self.settings.connection.password.clone();
-        Task::perform(
-            async move { api::drive_power_async(&host, &drive, on, password.as_deref()).await },
-            Message::MachineCommandCompleted,
-        )
+        Task::batch([
+            Task::perform(
+                async move { api::drive_power_async(&host, &drive, on, password.as_deref()).await },
+                Message::MachineCommandCompleted,
+            ),
+            Self::refresh_drives_soon(),
+        ])
     }
 
     pub(crate) fn handle_device_drive_reset(&mut self, drive: String) -> Task<Message> {
@@ -42,10 +62,13 @@ impl Ultimate64Browser {
             return Task::none();
         };
         let password = self.settings.connection.password.clone();
-        Task::perform(
-            async move { api::drive_reset_async(&host, &drive, password.as_deref()).await },
-            Message::MachineCommandCompleted,
-        )
+        Task::batch([
+            Task::perform(
+                async move { api::drive_reset_async(&host, &drive, password.as_deref()).await },
+                Message::MachineCommandCompleted,
+            ),
+            Self::refresh_drives_soon(),
+        ])
     }
 
     pub(crate) fn handle_device_send_keys(&mut self) -> Task<Message> {
