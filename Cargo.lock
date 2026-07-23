@@ -5496,6 +5496,7 @@ name = "ultimate64-manager"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "chrono",
  "cpal",
  "dirs",
@@ -5513,12 +5514,14 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "suppaftp",
  "tokio",
  "ultimate64",
  "url",
  "urlencoding",
  "walkdir",
+ "wgpu",
  "winapi",
  "windows 0.62.2",
  "winres",

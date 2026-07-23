@@ -229,7 +229,7 @@ pub struct ProfileManager {
     tags_input: String,
 
     // Streaming frame buffer reference for screenshot capture
-    streaming_frame: Option<Arc<std::sync::Mutex<Option<crate::streaming::ScaledFrame>>>>,
+    streaming_frame: Option<Arc<std::sync::Mutex<Option<crate::streaming::NativeFrame>>>>,
     // Captured screenshot PNG bytes (held in memory until profile is saved)
     pending_screenshot: Option<Vec<u8>>,
 
@@ -342,7 +342,7 @@ impl ProfileManager {
     /// Set the streaming frame buffer reference (called from main on each update).
     pub fn set_streaming_frame(
         &mut self,
-        frame: Arc<std::sync::Mutex<Option<crate::streaming::ScaledFrame>>>,
+        frame: Arc<std::sync::Mutex<Option<crate::streaming::NativeFrame>>>,
     ) {
         self.streaming_frame = Some(frame);
     }
@@ -1592,15 +1592,15 @@ impl ProfileManager {
                         {
                             let encoder = png::Encoder::new(
                                 std::io::Cursor::new(&mut png_bytes),
-                                frame.width,
-                                frame.height,
+                                crate::streaming::VIC_WIDTH,
+                                crate::streaming::VIC_HEIGHT,
                             );
                             let mut encoder = encoder;
                             encoder.set_color(png::ColorType::Rgba);
                             encoder.set_depth(png::BitDepth::Eight);
                             match encoder.write_header() {
                                 Ok(mut writer) => {
-                                    if let Err(e) = writer.write_image_data(&frame.data) {
+                                    if let Err(e) = writer.write_image_data(&frame.data[..]) {
                                         self.error_message =
                                             Some(format!("PNG encode failed: {}", e));
                                         return Task::none();

@@ -280,35 +280,3 @@ pub fn apply_crt_effect(input: &[u8], width: u32, height: u32) -> Vec<u8> {
 
     output
 }
-/// Integer scaling - perfect pixel replication with no filtering
-/// Fast integer scaling - copies entire rows at once
-pub fn integer_scale(input: &[u8], width: u32, height: u32, scale: u32) -> Vec<u8> {
-    let w = width as usize;
-    let h = height as usize;
-    let s = scale as usize;
-    let out_w = w * s;
-    let out_h = h * s;
-    let mut output = vec![0u8; out_w * out_h * 4];
-
-    for y in 0..h {
-        let src_row_start = y * w * 4;
-
-        // Build one scaled row
-        let mut scaled_row = Vec::with_capacity(out_w * 4);
-        for x in 0..w {
-            let src_idx = src_row_start + x * 4;
-            // Repeat each pixel 'scale' times horizontally
-            for _ in 0..s {
-                scaled_row.extend_from_slice(&input[src_idx..src_idx + 4]);
-            }
-        }
-
-        // Copy the scaled row 'scale' times vertically
-        for dy in 0..s {
-            let out_row_start = (y * s + dy) * out_w * 4;
-            output[out_row_start..out_row_start + scaled_row.len()].copy_from_slice(&scaled_row);
-        }
-    }
-
-    output
-}

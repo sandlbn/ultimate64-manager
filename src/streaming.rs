@@ -4,8 +4,8 @@ use iced::{
     event::{self, Event},
     keyboard::{self, Key, Modifiers},
     widget::{
-        button, checkbox, column, container, image as iced_image, mouse_area, row, rule,
-        scrollable, text, text_input, tooltip, Column, Space,
+        button, checkbox, column, container, image as iced_image, mouse_area, responsive, row,
+        rule, scrollable, text, text_input, tooltip, Column, Space,
     },
     Element, Length, Subscription, Task,
 };
@@ -13,9 +13,7 @@ use iced::{
 use crate::net_utils::get_local_ip;
 use crate::settings::StreamControlMethod;
 use crate::stream_control::{send_stop_command, send_stream_command};
-use crate::video_scaling::{
-    apply_crt_effect, apply_scanlines, integer_scale, scale2x, C64_PALETTE,
-};
+use crate::video_scaling::C64_PALETTE;
 
 use crate::remote_device::RemoteDevice;
 use std::collections::VecDeque;
@@ -88,13 +86,14 @@ impl std::fmt::Display for StreamMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleMode {
+    /// Pixel-perfect integer scaling: the frame is shown at the largest whole
+    /// multiple that fits, centered, with a letterbox border. No pixel effect.
     #[default]
-    Int2x, // Integer 2x scale (sharp pixels)
-    Int3x, // Integer 3x scale
-
+    PixelPerfect,
     Scale2x,   // EPX/Scale2x smoothing
     Scanlines, // CRT scanline effect
-    CRT,       // Shadow mask + scanlines
+    CRT,       // Shadow mask + scanlines + curvature
+    Glow,      // Phosphor bloom — bright pixels bleed light (GPU shader only)
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +109,12 @@ pub enum StreamingMessage {
     CommandSent(Result<String, String>),
     StreamModeChanged(StreamMode),
     ScaleModeChanged(ScaleMode),
+    /// Switch between the GPU shader renderer (true) and the compatibility image
+    /// renderer (false).
+    GpuShaderToggled(bool),
+    /// Load a static test pattern so the renderer/scaling/effects can be verified
+    /// without a live device.
+    LoadTestPattern,
     PortChanged(String),
     AudioToggled(bool),
     ToggleFullscreen,
@@ -190,41 +195,192 @@ impl AudioBufferState {
     }
 }
 impl ScaleMode {
-    fn to_u8(self) -> u8 {
+    /// Stable numeric id shared cross-thread via `scale_mode_shared` and used as
+    /// the fragment shader's effect selector.
+    pub fn to_u8(self) -> u8 {
         match self {
-            ScaleMode::Int2x => 0,
-            ScaleMode::Int3x => 1,
-            ScaleMode::Scale2x => 2,
-            ScaleMode::Scanlines => 3,
-            ScaleMode::CRT => 4,
+            ScaleMode::PixelPerfect => 0,
+            ScaleMode::Scale2x => 1,
+            ScaleMode::Scanlines => 2,
+            ScaleMode::CRT => 3,
+            ScaleMode::Glow => 4,
         }
     }
 
     fn from_u8(v: u8) -> Self {
         match v {
-            0 => ScaleMode::Int2x,
-            1 => ScaleMode::Int3x,
-            2 => ScaleMode::Scale2x,
-            3 => ScaleMode::Scanlines,
-            4 => ScaleMode::CRT,
-            _ => ScaleMode::Int2x,
+            0 => ScaleMode::PixelPerfect,
+            1 => ScaleMode::Scale2x,
+            2 => ScaleMode::Scanlines,
+            3 => ScaleMode::CRT,
+            4 => ScaleMode::Glow,
+            _ => ScaleMode::PixelPerfect,
         }
     }
 }
 
-/// Combined frame data and dimensions - must be updated atomically to prevent display corruption
+/// A static `VIC_WIDTH`×`VIC_HEIGHT` RGBA test pattern: 16 vertical C64 color
+/// bars over the top, a horizontal luminance ramp below, and a 1px white grid so
+/// integer scaling and the effects can be eyeballed without a live device.
+fn test_pattern_rgba() -> Vec<u8> {
+    let (w, h) = (VIC_WIDTH as usize, VIC_HEIGHT as usize);
+    let mut buf = vec![0u8; w * h * 4];
+    let bar_w = w / 16;
+    let split = h / 2;
+    for y in 0..h {
+        for x in 0..w {
+            let (r, g, b) = if y < split {
+                let c = C64_PALETTE[(x / bar_w).min(15)];
+                (c[0], c[1], c[2])
+            } else {
+                let v = (x * 255 / (w - 1)) as u8;
+                (v, v, v)
+            };
+            // 1px grid every 16 source pixels.
+            let grid = x % 16 == 0 || y % 16 == 0;
+            let idx = (y * w + x) * 4;
+            if grid {
+                buf[idx..idx + 4].copy_from_slice(&[255, 255, 255, 255]);
+            } else {
+                buf[idx..idx + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+    buf
+}
+
+/// Apply a scale mode's pixel effect to a native frame, returning the RGBA bytes
+/// and their dimensions. PixelPerfect is a passthrough (the GPU nearest-scales the
+/// native frame); the effect modes run their CPU kernel to bake a 2× buffer. Used
+/// by the compatibility render path and by screenshots — never per rendered frame
+/// on the shader path.
+fn render_effect(native: &[u8], mode: ScaleMode) -> (Vec<u8>, u32, u32) {
+    use crate::video_scaling::{apply_crt_effect, apply_scanlines, scale2x};
+    match mode {
+        // Glow is a GPU-shader-only effect; the compatibility path shows plain.
+        ScaleMode::PixelPerfect | ScaleMode::Glow => (native.to_vec(), VIC_WIDTH, VIC_HEIGHT),
+        ScaleMode::Scale2x => (
+            scale2x(native, VIC_WIDTH, VIC_HEIGHT),
+            VIC_WIDTH * 2,
+            VIC_HEIGHT * 2,
+        ),
+        ScaleMode::Scanlines => (
+            apply_scanlines(native, VIC_WIDTH, VIC_HEIGHT),
+            VIC_WIDTH * 2,
+            VIC_HEIGHT * 2,
+        ),
+        ScaleMode::CRT => (
+            apply_crt_effect(native, VIC_WIDTH, VIC_HEIGHT),
+            VIC_WIDTH * 2,
+            VIC_HEIGHT * 2,
+        ),
+    }
+}
+
+/// Build an image `Handle` for the compatibility (non-shader) render path. Only
+/// called once per changed frame, never in `view()`.
+fn build_compat_handle(native: &[u8], mode: ScaleMode) -> iced::widget::image::Handle {
+    let (data, w, h) = render_effect(native, mode);
+    iced::widget::image::Handle::from_rgba(w, h, data)
+}
+
+/// Pixel-perfect integer-fit display of `handle` (compatibility path): pick the
+/// largest whole multiple of the handle's native size that fits the available
+/// space, render at exactly that size with nearest sampling, centered with a
+/// letterbox border. `native` is the handle's own pixel size.
+fn vic_image_responsive<'a>(
+    handle: iced::widget::image::Handle,
+    native: (u32, u32),
+) -> Element<'a, StreamingMessage> {
+    let (nw, nh) = (native.0 as f32, native.1 as f32);
+    responsive(move |size| {
+        let scale = (size.width / nw)
+            .floor()
+            .min((size.height / nh).floor())
+            .max(1.0);
+        container(
+            iced_image(handle.clone())
+                .width(nw * scale)
+                .height(nh * scale)
+                .filter_method(FilterMethod::Nearest),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
+    })
+    .into()
+}
+
+/// "Waiting for frames" placeholder shared by the video views.
+fn waiting_placeholder<'a>(size: u32) -> Element<'a, StreamingMessage> {
+    text("Waiting for frames...")
+        .size(size as f32)
+        .color(iced::Color::WHITE)
+        .into()
+}
+
+/// A uniform-width Video-Scale mode button (fills its cell so the buttons align
+/// in a tidy grid), highlighted when it's the active mode.
+fn mode_button(
+    selected: ScaleMode,
+    mode: ScaleMode,
+    label: &'static str,
+    tip: &'static str,
+    fs: &crate::styles::FontSizes,
+) -> Element<'static, StreamingMessage> {
+    tooltip(
+        button(text(label).size(fs.tiny))
+            .on_press(StreamingMessage::ScaleModeChanged(mode))
+            .padding([4, 6])
+            .width(Length::Fill)
+            .style(if selected == mode {
+                button::primary
+            } else {
+                button::secondary
+            }),
+        text(tip).size(fs.small),
+        tooltip::Position::Bottom,
+    )
+    .style(container::bordered_box)
+    .into()
+}
+
+/// Native dimensions of the handle `build_compat_handle` produces for `mode`.
+fn compat_handle_dimensions(mode: ScaleMode) -> (u32, u32) {
+    match mode {
+        ScaleMode::PixelPerfect | ScaleMode::Glow => (VIC_WIDTH, VIC_HEIGHT),
+        _ => (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+    }
+}
+
+/// One assembled VIC frame at native resolution (always `VIC_WIDTH`×`VIC_HEIGHT`).
+///
+/// Scaling and pixel effects are applied on the GPU at render time (shader path)
+/// or lazily at display/screenshot time (compatibility path) — never per-frame on
+/// the stream thread. `version` increases on every stored frame so the renderer
+/// can skip redundant work / GPU uploads when the frame hasn't changed. `data` is
+/// `Arc`-wrapped so both the display and the shader program share it without
+/// copying the ~417 KB buffer.
 #[derive(Clone)]
-pub struct ScaledFrame {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
+pub struct NativeFrame {
+    pub data: Arc<Vec<u8>>,
+    pub version: u64,
 }
 
 pub struct VideoStreaming {
     pub is_streaming: bool,
-    pub frame_buffer: Arc<Mutex<Option<ScaledFrame>>>, // Scaled RGBA + dimensions for display
-    pub current_handle: Option<iced::widget::image::Handle>, // Cached image handle for display
-    pub current_dimensions: (u32, u32),                // Dimensions of current handle
+    pub frame_buffer: Arc<Mutex<Option<NativeFrame>>>, // Native RGBA, produced by the stream thread
+    pub current_handle: Option<iced::widget::image::Handle>, // Compatibility-path image handle
+    /// Latest native frame + its version, sampled from `frame_buffer` in
+    /// `FrameUpdate`. The shader program reads these directly.
+    pub current_frame: Option<Arc<Vec<u8>>>,
+    pub current_version: u64,
+    /// When true, render via the wgpu shader widget; when false, use the
+    /// compatibility responsive-image path (works on the tiny-skia fallback).
+    pub use_gpu_shader: bool,
+    pub current_dimensions: (u32, u32), // Dimensions of current handle
     pub stop_signal: Arc<AtomicBool>,
     stream_handle: Option<thread::JoinHandle<()>>, // Video receive thread
     audio_stream_handle: Option<thread::JoinHandle<()>>, // Audio playback thread
@@ -247,7 +403,6 @@ pub struct VideoStreaming {
     pub ultimate_host: Option<String>,
     // API password for REST API fallback
     pub api_password: Option<String>,
-    scale_mode_shared: Arc<std::sync::atomic::AtomicU8>, // For thread to read
     pub stream_control_method: StreamControlMethod, // Stream control method for communicating with Ultimate64
 }
 
@@ -263,7 +418,13 @@ impl VideoStreaming {
             is_streaming: false,
             frame_buffer: Arc::new(Mutex::new(None)),
             current_handle: None,
-            current_dimensions: (VIC_WIDTH * 2, VIC_HEIGHT * 2),
+            current_frame: None,
+            current_version: 0,
+            // GPU shader path by default; the Compatibility toggle switches to the
+            // image path for machines on iced's tiny-skia fallback. Overridden
+            // from persisted settings at startup.
+            use_gpu_shader: true,
+            current_dimensions: (VIC_WIDTH, VIC_HEIGHT),
             stop_signal: Arc::new(AtomicBool::new(false)),
             stream_handle: None,
             audio_stream_handle: None,
@@ -271,7 +432,7 @@ impl VideoStreaming {
             command_input: String::new(),
             command_history: Vec::new(),
             stream_mode: StreamMode::Unicast,
-            scale_mode: ScaleMode::Int2x,
+            scale_mode: ScaleMode::PixelPerfect,
             listen_port: "11000".to_string(),
             packets_received: Arc::new(Mutex::new(0)),
             audio_packets_received: Arc::new(Mutex::new(0)),
@@ -283,7 +444,6 @@ impl VideoStreaming {
             last_key_time: None,
             ultimate_host: None,
             api_password: None,
-            scale_mode_shared: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             stream_control_method: StreamControlMethod::default(),
         }
     }
@@ -302,6 +462,20 @@ impl VideoStreaming {
     pub fn set_stream_control_method(&mut self, method: StreamControlMethod) {
         self.stream_control_method = method;
     }
+
+    /// Preload the static test pattern (QA hook — lets the video path render
+    /// without a device, e.g. when `U64_AUTO_TEST_PATTERN` is set at launch).
+    pub fn preload_test_pattern(&mut self) {
+        let pattern = Arc::new(test_pattern_rgba());
+        self.current_version = self.current_version.wrapping_add(1);
+        self.current_frame = Some(pattern);
+        if !self.use_gpu_shader {
+            if let Some(frame) = &self.current_frame {
+                self.current_handle = Some(build_compat_handle(frame, self.scale_mode));
+                self.current_dimensions = compat_handle_dimensions(self.scale_mode);
+            }
+        }
+    }
     pub fn update_impl(
         &mut self,
         message: StreamingMessage,
@@ -317,23 +491,29 @@ impl VideoStreaming {
                 Task::none()
             }
             StreamingMessage::FrameUpdate => {
-                // Create the image Handle here, only once per frame update
-                // This avoids creating new Handles on every view() call
-                if let Ok(fb) = self.frame_buffer.lock() {
-                    if let Some(frame) = &*fb {
-                        self.current_handle = Some(iced::widget::image::Handle::from_rgba(
-                            frame.width,
-                            frame.height,
-                            frame.data.clone(),
-                        ));
-                        self.current_dimensions = (frame.width, frame.height);
+                // Sample the latest native frame once per tick (not per view()).
+                // Skip everything if the frame hasn't changed since last tick.
+                let latest = self.frame_buffer.lock().ok().and_then(|fb| fb.clone());
+                if let Some(frame) = latest {
+                    if frame.version != self.current_version {
+                        self.current_version = frame.version;
+                        self.current_frame = Some(frame.data.clone()); // Arc clone (cheap)
+                                                                       // The compatibility (image-widget) path needs a Handle;
+                                                                       // the shader path reads `current_frame` directly. Effects
+                                                                       // in compatibility mode are applied here, off the hot path.
+                        if !self.use_gpu_shader {
+                            self.current_handle =
+                                Some(build_compat_handle(&frame.data, self.scale_mode));
+                            self.current_dimensions = compat_handle_dimensions(self.scale_mode);
+                        }
                     }
                 }
                 Task::none()
             }
             StreamingMessage::TakeScreenshot => {
                 if self.is_streaming {
-                    // Fast path: grab the current frame directly from the stream buffer.
+                    // Fast path: grab the latest native frame from the stream buffer
+                    // and bake the current effect into it once, at capture time.
                     let frame_data = if let Ok(fb_guard) = self.frame_buffer.lock() {
                         fb_guard.clone()
                     } else {
@@ -341,8 +521,9 @@ impl VideoStreaming {
                     };
 
                     if let Some(frame) = frame_data {
+                        let (data, w, h) = render_effect(&frame.data, self.scale_mode);
                         Task::perform(
-                            save_screenshot_to_pictures(frame.data, frame.width, frame.height),
+                            save_screenshot_to_pictures(data, w, h),
                             StreamingMessage::ScreenshotComplete,
                         )
                     } else {
@@ -408,8 +589,39 @@ impl VideoStreaming {
             }
             StreamingMessage::ScaleModeChanged(mode) => {
                 self.scale_mode = mode;
-                self.scale_mode_shared
-                    .store(mode.to_u8(), Ordering::Relaxed);
+                // Rebuild the compatibility handle immediately so a mode switch is
+                // visible without waiting for the next frame (shader path reads the
+                // mode live in view()).
+                if !self.use_gpu_shader {
+                    if let Some(frame) = &self.current_frame {
+                        self.current_handle = Some(build_compat_handle(frame, mode));
+                        self.current_dimensions = compat_handle_dimensions(mode);
+                    }
+                }
+                Task::none()
+            }
+            StreamingMessage::GpuShaderToggled(on) => {
+                self.use_gpu_shader = on;
+                // Switching to the compatibility path needs a handle built from the
+                // current frame right away.
+                if !on {
+                    if let Some(frame) = &self.current_frame {
+                        self.current_handle = Some(build_compat_handle(frame, self.scale_mode));
+                        self.current_dimensions = compat_handle_dimensions(self.scale_mode);
+                    }
+                }
+                Task::none()
+            }
+            StreamingMessage::LoadTestPattern => {
+                let pattern = Arc::new(test_pattern_rgba());
+                self.current_version = self.current_version.wrapping_add(1);
+                self.current_frame = Some(pattern);
+                if !self.use_gpu_shader {
+                    if let Some(frame) = &self.current_frame {
+                        self.current_handle = Some(build_compat_handle(frame, self.scale_mode));
+                        self.current_dimensions = compat_handle_dimensions(self.scale_mode);
+                    }
+                }
                 Task::none()
             }
             StreamingMessage::PortChanged(port) => {
@@ -651,40 +863,52 @@ impl VideoStreaming {
         }
     }
 
+    /// The live video display element — GPU shader path or compatibility image
+    /// path — wrapped in a `mouse_area` for click-to-toggle-fullscreen. Shared by
+    /// all three views. Shows a "waiting" placeholder until the first frame lands.
+    fn video_element(&self, placeholder_size: u32) -> Element<'_, StreamingMessage> {
+        let inner: Element<'_, StreamingMessage> = if self.use_gpu_shader {
+            match &self.current_frame {
+                Some(frame) => crate::vic_shader::vic_video(
+                    frame.clone(),
+                    self.current_version,
+                    self.scale_mode,
+                ),
+                None => waiting_placeholder(placeholder_size),
+            }
+        } else {
+            match &self.current_handle {
+                // PixelPerfect gets crisp integer-fit; effect modes keep the
+                // fill/contain path (their output is already a baked 2× buffer).
+                Some(handle) if self.scale_mode == ScaleMode::PixelPerfect => {
+                    vic_image_responsive(handle.clone(), self.current_dimensions)
+                }
+                Some(handle) => iced_image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Contain)
+                    .filter_method(FilterMethod::Nearest)
+                    .into(),
+                None => waiting_placeholder(placeholder_size),
+            }
+        };
+        mouse_area(inner)
+            .on_press(StreamingMessage::VideoClicked)
+            .into()
+    }
+
     /// Fullscreen view - video fills the entire available space with black letterboxing
     pub fn view_fullscreen(&self, font_size: u32) -> Element<'_, StreamingMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
-        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use cached handle - created once in FrameUpdate, not on every view()
-            if let Some(ref handle) = self.current_handle {
-                // In fullscreen, fill the screen and let ContentFit::Contain handle aspect ratio
-                let video_image = mouse_area(
-                    iced_image(handle.clone())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain)
-                        .filter_method(FilterMethod::Nearest),
-                )
-                .on_press(StreamingMessage::VideoClicked);
-
-                container(video_image)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .into()
+        let video_content: Element<'_, StreamingMessage> =
+            if self.is_streaming || self.current_frame.is_some() {
+                self.video_element(fs.header + 2)
             } else {
-                text("Waiting for frames...")
+                text("Stream not active - press ESC to exit")
                     .size(fs.header + 2)
                     .color(iced::Color::WHITE)
                     .into()
-            }
-        } else {
-            text("Stream not active - press ESC to exit")
-                .size(fs.header + 2)
-                .color(iced::Color::WHITE)
-                .into()
-        };
+            };
 
         // Exit hint at the top with keyboard toggle
         let keyboard_btn = button(
@@ -738,36 +962,15 @@ impl VideoStreaming {
     /// Separate window view - similar to fullscreen but for dedicated streaming window
     pub fn view_separate_window(&self, font_size: u32) -> Element<'_, StreamingMessage> {
         let fs = crate::styles::FontSizes::from_base(font_size);
-        let video_content: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use cached handle - created once in FrameUpdate, not on every view()
-            if let Some(ref handle) = self.current_handle {
-                let video_image = mouse_area(
-                    iced_image(handle.clone())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain)
-                        .filter_method(FilterMethod::Nearest),
-                )
-                .on_press(StreamingMessage::VideoClicked);
-
-                container(video_image)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .into()
+        let video_content: Element<'_, StreamingMessage> =
+            if self.is_streaming || self.current_frame.is_some() {
+                self.video_element(fs.header + 2)
             } else {
-                text("Waiting for frames...")
+                text("Stream not active")
                     .size(fs.header + 2)
                     .color(iced::Color::WHITE)
                     .into()
-            }
-        } else {
-            text("Stream not active")
-                .size(fs.header + 2)
-                .color(iced::Color::WHITE)
-                .into()
-        };
+            };
 
         // Controls at the top with keyboard toggle
         let keyboard_btn = button(
@@ -821,28 +1024,18 @@ impl VideoStreaming {
         let audio_packets = self.audio_packets_received.lock().map(|p| *p).unwrap_or(0);
 
         // === LEFT SIDE: Video display (fluid scaling) ===
-        let video_display: Element<'_, StreamingMessage> = if self.is_streaming {
-            // Use cached handle - created once in FrameUpdate, not on every view()
-            if let Some(ref handle) = self.current_handle {
-                let video_image = mouse_area(
-                    iced_image(handle.clone())
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .content_fit(iced::ContentFit::Contain)
-                        .filter_method(FilterMethod::Nearest),
-                )
-                .on_press(StreamingMessage::VideoClicked);
-
+        let video_display: Element<'_, StreamingMessage> =
+            if self.is_streaming || self.current_frame.is_some() {
                 let scale_label = match self.scale_mode {
-                    ScaleMode::Int2x => "2x",
-                    ScaleMode::Int3x => "3x",
+                    ScaleMode::PixelPerfect => "Pixel Perfect",
                     ScaleMode::Scale2x => "Smooth",
                     ScaleMode::Scanlines => "Scanlines",
                     ScaleMode::CRT => "CRT",
+                    ScaleMode::Glow => "Glow",
                 };
 
                 column![
-                    container(video_image)
+                    container(self.video_element(fs.large))
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .center_x(Length::Fill)
@@ -859,87 +1052,31 @@ impl VideoStreaming {
                 .height(Length::Fill)
                 .into()
             } else {
-                // Image not decoded yet, show raw frame info
-                if let Ok(frame_guard) = self.frame_buffer.lock() {
-                    if let Some(frame) = &*frame_guard {
-                        container(
-                            column![
-                                text("RECEIVING FRAMES").size(fs.large + 2),
-                                text(format!(
-                                    "{} bytes ({}x{})",
-                                    frame.data.len(),
-                                    frame.width,
-                                    frame.height
-                                ))
-                                .size(fs.normal),
-                                text(format!(
-                                    "Video: {} | Audio: {}",
-                                    video_packets, audio_packets
-                                ))
-                                .size(fs.normal),
-                            ]
-                            .spacing(5)
-                            .align_x(iced::Alignment::Center),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .into()
-                    } else {
-                        container(
-                            column![
-                                text("Waiting for frames...").size(fs.large),
-                                text(format!(
-                                    "Video: {} | Audio: {}",
-                                    video_packets, audio_packets
-                                ))
-                                .size(fs.normal),
-                            ]
-                            .spacing(5)
-                            .align_x(iced::Alignment::Center),
-                        )
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .into()
+                let status_info = match self.stream_mode {
+                    StreamMode::Unicast => {
+                        format!("Unicast mode: Will send to Ultimate64 at port 64 to start stream",)
                     }
-                } else {
-                    container(text("Waiting for frames...").size(fs.large))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x(Length::Fill)
-                        .center_y(Length::Fill)
-                        .into()
-                }
-            }
-        } else {
-            let status_info = match self.stream_mode {
-                StreamMode::Unicast => {
-                    format!("Unicast mode: Will send to Ultimate64 at port 64 to start stream",)
-                }
-                StreamMode::Multicast => {
-                    "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
-                }
-            };
+                    StreamMode::Multicast => {
+                        "Multicast mode: 239.0.1.64 (requires wired LAN)".to_string()
+                    }
+                };
 
-            container(
-                column![
-                    text("VIDEO STREAM INACTIVE").size(fs.large + 2),
-                    Space::new().height(10),
-                    text(status_info.clone()).size(fs.small),
-                    Space::new().height(5),
-                    text("Click START to begin streaming").size(fs.small),
-                ]
-                .align_x(iced::Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .into()
-        };
+                container(
+                    column![
+                        text("VIDEO STREAM INACTIVE").size(fs.large + 2),
+                        Space::new().height(10),
+                        text(status_info.clone()).size(fs.small),
+                        Space::new().height(5),
+                        text("Click START to begin streaming").size(fs.small),
+                    ]
+                    .align_x(iced::Alignment::Center),
+                )
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .into()
+            };
 
         // === RIGHT SIDE: Controls panel ===
 
@@ -993,91 +1130,91 @@ impl VideoStreaming {
         ]
         .spacing(5);
 
-        // Scale mode selection
+        // Scale mode selection — uniform-width buttons in a tidy 2-2-1 grid.
+        let sm = self.scale_mode;
         let scale_section = column![
             text("Video Scale").size(fs.normal),
             row![
-                tooltip(
-                    button(text("2x").size(fs.tiny))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int2x))
-                        .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Int2x {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "Integer 2x (sharp pixels)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("3x").size(fs.tiny))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Int3x))
-                        .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Int3x {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "Integer 3x (sharp pixels)",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("Smooth").size(fs.tiny))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scale2x))
-                        .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Scale2x {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
+                mode_button(
+                    sm,
+                    ScaleMode::PixelPerfect,
+                    "Pixel Perfect",
+                    "Sharp integer scaling (largest whole multiple that fits)",
+                    &fs,
+                ),
+                mode_button(
+                    sm,
+                    ScaleMode::Scale2x,
+                    "Smooth",
                     "Scale2x edge smoothing",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
+                    &fs
+                ),
             ]
-            .spacing(3),
+            .spacing(4),
             row![
-                tooltip(
-                    button(text("Scanlines").size(fs.tiny))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::Scanlines))
-                        .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::Scanlines {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "CRT scanlines",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
-                tooltip(
-                    button(text("CRT").size(fs.tiny))
-                        .on_press(StreamingMessage::ScaleModeChanged(ScaleMode::CRT))
-                        .padding([4, 6])
-                        .style(if self.scale_mode == ScaleMode::CRT {
-                            button::primary
-                        } else {
-                            button::secondary
-                        }),
-                    "CRT shadow mask + scanlines",
-                    tooltip::Position::Bottom,
-                )
-                .style(container::bordered_box),
+                mode_button(
+                    sm,
+                    ScaleMode::Scanlines,
+                    "Scanlines",
+                    "Soft CRT scanlines",
+                    &fs,
+                ),
+                mode_button(
+                    sm,
+                    ScaleMode::CRT,
+                    "CRT",
+                    "CRT: curvature + shadow mask + scanlines",
+                    &fs,
+                ),
             ]
-            .spacing(3),
+            .spacing(4),
+            mode_button(
+                sm,
+                ScaleMode::Glow,
+                "Glow",
+                "Phosphor bloom on a curved CRT (GPU renderer only)",
+                &fs,
+            ),
+            tooltip(
+                row![
+                    checkbox(self.use_gpu_shader)
+                        .on_toggle(StreamingMessage::GpuShaderToggled)
+                        .size(fs.small as f32),
+                    text("GPU renderer").size(fs.small),
+                ]
+                .spacing(5)
+                .align_y(iced::Alignment::Center),
+                text(
+                    "GPU shader (crisp, fast). Uncheck for the compatibility renderer \
+                     if video doesn't appear (no-GPU / tiny-skia fallback)."
+                )
+                .size(fs.small),
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
+            tooltip(
+                button(text("Test Pattern").size(fs.tiny))
+                    .on_press(StreamingMessage::LoadTestPattern)
+                    .padding([4, 6])
+                    .width(Length::Fill)
+                    .style(button::secondary),
+                text("Show a static test pattern to verify the renderer without a device")
+                    .size(fs.small),
+                tooltip::Position::Bottom,
+            )
+            .style(container::bordered_box),
         ]
-        .spacing(5); // Stream controls with keyboard toggle
+        .spacing(6); // Stream controls with keyboard toggle
                      // Screenshot works when streaming (instant frame grab) OR when connected
                      // without streaming (REST API capture via screenshot_api module).
         let screenshot_button = {
-            let can_screenshot = self.is_streaming || self.ultimate_host.is_some();
+            // Only allow capture while streaming (instant frame grab). The REST
+            // no-stream path is disabled — it was half-baked.
             let btn = button(text("📸").size(fs.small)).padding([6, 10]);
-            if can_screenshot {
+            if self.is_streaming {
                 btn.on_press(StreamingMessage::TakeScreenshot)
             } else {
-                btn
+                btn.style(button::secondary)
             }
         };
 
@@ -1149,7 +1286,7 @@ impl VideoStreaming {
                     if self.is_streaming {
                         "Capture frame to Pictures folder"
                     } else {
-                        "Capture frame to Pictures folder"
+                        "Start streaming to capture a frame"
                     },
                     tooltip::Position::Bottom,
                 )
@@ -1250,10 +1387,14 @@ impl VideoStreaming {
     pub fn subscription(&self) -> Subscription<StreamingMessage> {
         let mut subscriptions = Vec::new();
 
-        // Frame update subscription (~25 fps)
+        // Sample the latest frame on a fixed timer that ticks a bit faster than
+        // the source (~50/60 fps) so no frame is skipped. A timer actively forces
+        // a redraw each tick; window::frames() only reports redraws iced already
+        // decided to do, which under-drove the display rate. FrameUpdate is a cheap
+        // no-op when the frame version is unchanged.
         if self.is_streaming {
             subscriptions.push(
-                iced::time::every(Duration::from_millis(40)).map(|_| StreamingMessage::FrameUpdate),
+                iced::time::every(Duration::from_millis(12)).map(|_| StreamingMessage::FrameUpdate),
             );
         }
 
@@ -1289,11 +1430,6 @@ impl VideoStreaming {
         let frame_buffer = self.frame_buffer.clone();
         let stop_signal = self.stop_signal.clone();
         let packets_counter = self.packets_received.clone();
-        let scale_mode_shared = self.scale_mode_shared.clone();
-
-        // Sync current scale mode to shared atomic
-        self.scale_mode_shared
-            .store(self.scale_mode.to_u8(), Ordering::Relaxed);
 
         log::info!("Starting video stream... mode={:?}, port={}", mode, port);
         self.stop_signal.store(false, Ordering::Relaxed);
@@ -1336,6 +1472,22 @@ impl VideoStreaming {
         if let Err(e) = socket.set_nonblocking(true) {
             log::error!("Failed to set non-blocking: {}", e);
             return;
+        }
+
+        // Enlarge the kernel receive buffer so bursts of a frame's packets aren't
+        // dropped (each VIC frame is many UDP packets at ~50 fps). The OS may clamp
+        // the request; that's fine — we still get more than the small default.
+        {
+            let sock_ref = socket2::SockRef::from(&socket);
+            let want = 4 * 1024 * 1024; // 4 MB
+            match sock_ref.set_recv_buffer_size(want) {
+                Ok(()) => log::info!(
+                    "UDP recv buffer: requested {} B, got {:?} B",
+                    want,
+                    sock_ref.recv_buffer_size()
+                ),
+                Err(e) => log::warn!("Could not enlarge UDP recv buffer: {}", e),
+            }
         }
 
         // 2. Small delay to ensure socket is fully ready
@@ -1396,6 +1548,7 @@ impl VideoStreaming {
             let rgba_size = (VIC_WIDTH * VIC_HEIGHT * 4) as usize;
             let mut rgba_frame: Vec<u8> = vec![0u8; rgba_size];
             let mut first_packet = true;
+            let mut frame_version: u64 = 0;
 
             // Build color lookup table
             let mut color_lut: Vec<[u8; 8]> = Vec::with_capacity(256);
@@ -1471,47 +1624,18 @@ impl VideoStreaming {
                             }
                         }
 
-                        // Frame complete - apply scaling and store
+                        // Frame complete — publish the native frame. Scaling and
+                        // effects happen at render time (GPU shader) or lazily in
+                        // the compatibility path, never here on the stream thread.
                         if is_frame_end {
-                            // Clone the frame BEFORE scaling - this prevents new packets
-                            // from corrupting the frame while we're scaling it
-                            let frame_snapshot = rgba_frame.clone();
-
-                            // Get current scale mode and apply scaling to the snapshot
-                            let current_mode =
-                                ScaleMode::from_u8(scale_mode_shared.load(Ordering::Relaxed));
-
-                            let (scaled, dims) = match current_mode {
-                                ScaleMode::Int2x => (
-                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
-                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-                                ),
-                                ScaleMode::Int3x => (
-                                    // Capped to 2x: true 3x scaling strobes on larger textures.
-                                    integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
-                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-                                ),
-                                ScaleMode::Scale2x => (
-                                    scale2x(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
-                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-                                ),
-                                ScaleMode::Scanlines => (
-                                    apply_scanlines(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
-                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-                                ),
-                                ScaleMode::CRT => (
-                                    apply_crt_effect(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT),
-                                    (VIC_WIDTH * 2, VIC_HEIGHT * 2),
-                                ),
-                            };
-
-                            // Store scaled frame with dimensions atomically
-                            // This prevents display corruption from dimension/data mismatch
+                            frame_version = frame_version.wrapping_add(1);
+                            // One copy out of the reused assembly buffer, wrapped in
+                            // an Arc the display and shader share without recopying.
+                            let snapshot = Arc::new(rgba_frame.clone());
                             if let Ok(mut fb) = frame_buffer.lock() {
-                                *fb = Some(ScaledFrame {
-                                    data: scaled,
-                                    width: dims.0,
-                                    height: dims.1,
+                                *fb = Some(NativeFrame {
+                                    data: snapshot,
+                                    version: frame_version,
                                 });
                             }
                         }
