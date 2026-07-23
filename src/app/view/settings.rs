@@ -298,6 +298,57 @@ impl Ultimate64Browser {
             .spacing(8)
         );
 
+        // ── Game library (Game Mode) ─────────────────────────────────────
+        // Each configured device folder's subfolders become games in the
+        // File Browser's "🎮 Games" launcher.
+        let roots = &self.settings.preferences.game_library_roots;
+        let mut roots_col = column![].spacing(4);
+        if roots.is_empty() {
+            roots_col = roots_col.push(
+                text("No library folders yet — add a device path like /Usb0/Games")
+                    .size(fs.small)
+                    .color(dim),
+            );
+        } else {
+            for (i, root) in roots.iter().enumerate() {
+                roots_col = roots_col.push(
+                    row![
+                        text(root.clone()).size(fs.small),
+                        Space::new().width(Length::Fill),
+                        button(text("Remove").size(fs.tiny))
+                            .on_press(Message::GameLibraryRemoveRoot(i))
+                            .padding([2, 8])
+                            .style(crate::styles::nav_button),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                );
+            }
+        }
+        let game_library_section = section!(
+            "Game library",
+            column![
+                text("Device folders whose subfolders are games in Game Mode.")
+                    .size(fs.small)
+                    .color(dim),
+                roots_col,
+                row![
+                    text_input("/Usb0/Games", &self.game_library_input)
+                        .on_input(Message::GameLibraryInputChanged)
+                        .on_submit(Message::GameLibraryAddRoot)
+                        .padding(6)
+                        .size(fs.small as f32)
+                        .width(Length::Fixed(260.0)),
+                    button(text("Add").size(fs.small))
+                        .on_press(Message::GameLibraryAddRoot)
+                        .padding([4, 12])
+                        .style(crate::styles::action_button),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            ]
+            .spacing(8)
+        );
+
         // ── Debug ────────────────────────────────────────────────────────
         let debug_section = section!(
             "Debug",
@@ -321,6 +372,7 @@ impl Ultimate64Browser {
                 connection_section,
                 dirs_section,
                 prefs_section,
+                game_library_section,
                 debug_section,
             ]
             .spacing(10)

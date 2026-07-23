@@ -1,10 +1,12 @@
 use crate::remote_device::RemoteDevice;
+use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::{
+    mouse,
     widget::{
-        button, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, text,
-        text_input, tooltip, Column, Space,
+        button, checkbox, column, container, pick_list, progress_bar, row, rule, scrollable, stack,
+        text, text_input, tooltip, Column, Space,
     },
-    Element, Length, Subscription, Task,
+    Color, Element, Length, Point, Rectangle, Subscription, Task, Theme,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -72,6 +74,25 @@ pub enum RemoteBrowserMessage {
     ShowContentPreview(String),
     ContentPreviewLoaded(Result<ContentPreview, String>),
     CloseContentPreview,
+    // ── Game Mode ─────────────────────────────────────────────────────────
+    /// Enter/leave the full-width launcher. Carries the library roots from
+    /// Settings; toggles off if already on.
+    ToggleGameMode(Vec<String>),
+    /// Subfolders under the library roots finished enumerating.
+    GamesEnumerated(Result<Vec<GameEntry>, String>),
+    /// Highlight a game by index (click or keyboard).
+    SelectGame(usize),
+    /// Move the highlight by a delta (keyboard ↑/↓).
+    GameNav(i32),
+    /// Box art + screenshot for a game folder finished downloading.
+    /// `(folder, Result<(cover_bytes, shot_bytes)>)`.
+    GameArtLoaded(String, Result<(Option<Vec<u8>>, Option<Vec<u8>>), String>),
+    /// Launch the highlighted game (resolve + run its primary file).
+    RunSelectedGame,
+    /// The selected game's folder listing came back — pick the runnable and run.
+    GameRunResolved(String, Result<Vec<RemoteFileEntry>, String>),
+    /// Advance the launcher's animated background one frame.
+    GameAnimTick,
     // Transfer progress (polled by subscription)
     ProgressTick,
 
@@ -216,6 +237,47 @@ pub struct RemoteBrowser {
     /// `current_path` after each navigation; user can type a path and
     /// press Enter to jump there.
     path_input: String,
+
+    // ── Game Mode (EmulationStation/Kodi-style launcher) ──────────────────
+    /// When true the File Browser renders the full-width launcher instead of
+    /// the two file panes.
+    pub game_mode: bool,
+    /// Games = subfolders under the configured library roots. Populated when
+    /// entering Game Mode.
+    games: Vec<GameEntry>,
+    games_loading: bool,
+    /// Index of the highlighted game in `games`.
+    game_selected: usize,
+    /// Error from the last enumeration (shown in the launcher).
+    game_error: Option<String>,
+    /// Cover + screenshot art keyed by the game's folder path. `loaded=true`
+    /// with `cover: None` means "we looked, there's no image" (placeholder).
+    game_art: std::collections::HashMap<String, GameArt>,
+    /// Folder paths whose art is being fetched (dedup guard).
+    game_art_loading: HashSet<String>,
+    /// True while resolving/launching the selected game's runnable file.
+    game_launching: bool,
+    /// Animation phase for the launcher's phosphor-glow background. Advanced
+    /// by `GameAnimTick` while Game Mode is open.
+    game_anim_phase: f32,
+}
+
+/// One entry in the Game Mode launcher: a subfolder under a library root.
+#[derive(Debug, Clone)]
+pub struct GameEntry {
+    /// Folder name, shown as the title.
+    pub title: String,
+    /// Full device path of the game folder.
+    pub path: String,
+}
+
+/// Decoded box art + screenshot for a game folder.
+#[derive(Debug, Clone, Default)]
+pub struct GameArt {
+    pub cover: Option<iced::widget::image::Handle>,
+    pub shot: Option<iced::widget::image::Handle>,
+    /// True once a fetch attempt has completed (success or "no image").
+    pub loaded: bool,
 }
 
 const FAVORITES_FILE: &str = "remote_favorites.json";
@@ -261,6 +323,15 @@ impl Default for RemoteBrowser {
             context_menu_for: None,
             pending_favorite_check: None,
             path_input: "/".to_string(),
+            game_mode: false,
+            games: Vec::new(),
+            games_loading: false,
+            game_selected: 0,
+            game_error: None,
+            game_art: std::collections::HashMap::new(),
+            game_art_loading: HashSet::new(),
+            game_launching: false,
+            game_anim_phase: 0.0,
         }
     }
 }
@@ -282,6 +353,27 @@ impl RemoteBrowser {
             self.files.clear();
             self.status_message = Some("Not connected".to_string());
         }
+    }
+
+    /// Kick off an async fetch of the highlighted game's box art + screenshot,
+    /// unless it's already cached or in flight. Lazy: only the selected game's
+    /// art is loaded, so a huge library doesn't hammer the device FTP.
+    fn load_game_art_for_selected(&mut self) -> Task<RemoteBrowserMessage> {
+        let Some(game) = self.games.get(self.game_selected) else {
+            return Task::none();
+        };
+        let folder = game.path.clone();
+        if self.game_art.contains_key(&folder) || self.game_art_loading.contains(&folder) {
+            return Task::none();
+        }
+        let Some(host) = self.host_address.clone() else {
+            return Task::none();
+        };
+        let password = self.password.clone();
+        self.game_art_loading.insert(folder.clone());
+        Task::perform(load_game_art(host, folder.clone(), password), move |res| {
+            RemoteBrowserMessage::GameArtLoaded(folder.clone(), res)
+        })
     }
 
     pub fn update_impl(
@@ -908,6 +1000,151 @@ impl RemoteBrowser {
             RemoteBrowserMessage::CloseContentPreview => {
                 self.content_preview = None;
                 self.content_preview_path = None;
+                Task::none()
+            }
+
+            // ── Game Mode ─────────────────────────────────────────────────
+            RemoteBrowserMessage::ToggleGameMode(roots) => {
+                if self.game_mode {
+                    self.game_mode = false;
+                    return Task::none();
+                }
+                self.game_mode = true;
+                self.game_error = None;
+                self.game_selected = 0;
+                self.games.clear();
+                let Some(host) = self.host_address.clone() else {
+                    self.game_error = Some("Connect to the device first.".to_string());
+                    return Task::none();
+                };
+                if roots.is_empty() {
+                    self.game_error = Some(
+                        "No game library set. Add a folder in Settings → Preferences → Game library."
+                            .to_string(),
+                    );
+                    return Task::none();
+                }
+                let password = self.password.clone();
+                self.games_loading = true;
+                Task::perform(
+                    enumerate_games(host, roots, password),
+                    RemoteBrowserMessage::GamesEnumerated,
+                )
+            }
+
+            RemoteBrowserMessage::GamesEnumerated(result) => {
+                self.games_loading = false;
+                match result {
+                    Ok(games) => {
+                        self.games = games;
+                        self.game_selected = 0;
+                        if self.games.is_empty() {
+                            self.game_error =
+                                Some("No games found under the configured library.".to_string());
+                            Task::none()
+                        } else {
+                            self.game_error = None;
+                            self.load_game_art_for_selected()
+                        }
+                    }
+                    Err(e) => {
+                        self.game_error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+
+            RemoteBrowserMessage::SelectGame(idx) => {
+                if idx < self.games.len() {
+                    self.game_selected = idx;
+                    return self.load_game_art_for_selected();
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::GameNav(delta) => {
+                if self.games.is_empty() {
+                    return Task::none();
+                }
+                let n = self.games.len() as i32;
+                let next = (self.game_selected as i32 + delta).rem_euclid(n) as usize;
+                if next != self.game_selected {
+                    self.game_selected = next;
+                    return self.load_game_art_for_selected();
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::GameArtLoaded(folder, result) => {
+                self.game_art_loading.remove(&folder);
+                let mut art = GameArt {
+                    loaded: true,
+                    ..Default::default()
+                };
+                if let Ok((cover, shot)) = result {
+                    art.cover = cover.map(iced::widget::image::Handle::from_bytes);
+                    art.shot = shot.map(iced::widget::image::Handle::from_bytes);
+                }
+                self.game_art.insert(folder, art);
+                Task::none()
+            }
+
+            RemoteBrowserMessage::RunSelectedGame => {
+                let Some(game) = self.games.get(self.game_selected).cloned() else {
+                    return Task::none();
+                };
+                let Some(host) = self.host_address.clone() else {
+                    self.status_message = Some("Not connected".to_string());
+                    return Task::none();
+                };
+                self.game_launching = true;
+                self.status_message = Some(format!("Launching {}…", game.title));
+                let password = self.password.clone();
+                let folder = game.path.clone();
+                Task::perform(
+                    fetch_files_ftp(host, folder.clone(), password),
+                    move |res| RemoteBrowserMessage::GameRunResolved(folder.clone(), res),
+                )
+            }
+
+            RemoteBrowserMessage::GameRunResolved(folder, result) => {
+                self.game_launching = false;
+                match result {
+                    Ok(files) => match primary_runnable(&files) {
+                        Some(entry) => {
+                            let ext = entry.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                            let path = entry.path.clone();
+                            if ext == "prg" {
+                                return self
+                                    .update_impl(RemoteBrowserMessage::RunPrg(path), _connection);
+                            } else if ext == "crt" {
+                                return self
+                                    .update_impl(RemoteBrowserMessage::RunCrt(path), _connection);
+                            } else if crate::file_types::is_disk_image(&ext) {
+                                return self.update_impl(
+                                    RemoteBrowserMessage::RunDisk(path, "a".to_string()),
+                                    _connection,
+                                );
+                            }
+                            self.status_message =
+                                Some(format!("Nothing runnable in {}", remote_basename(&folder)));
+                        }
+                        None => {
+                            self.status_message =
+                                Some(format!("Nothing runnable in {}", remote_basename(&folder)));
+                        }
+                    },
+                    Err(e) => {
+                        self.status_message = Some(format!("Launch failed: {}", e));
+                    }
+                }
+                Task::none()
+            }
+
+            RemoteBrowserMessage::GameAnimTick => {
+                // Wrap to keep the float bounded over long sessions.
+                self.game_anim_phase =
+                    (self.game_anim_phase + 0.05) % (std::f32::consts::TAU * 1000.0);
                 Task::none()
             }
 
@@ -1598,6 +1835,196 @@ impl RemoteBrowser {
         .spacing(4)
         .align_y(iced::Alignment::Center)
         .into()
+    }
+
+    /// Full-width, immersive Game Mode launcher: box art (left), a scrollable
+    /// list of titles (center), and a screenshot (right), EmulationStation /
+    /// Kodi style. Rendered by the File Browser tab in place of the two panes
+    /// when [`Self::game_mode`] is on.
+    pub fn view_game_mode(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
+        let fs = crate::styles::FontSizes::from_base(font_size);
+        let ink = iced::Color::from_rgb(0.90, 0.91, 0.95);
+        let dim = iced::Color::from_rgb(0.55, 0.57, 0.64);
+        let accent = iced::Color::from_rgb(0.35, 0.72, 1.0);
+
+        let exit_btn = button(text("✕ Exit (Esc)").size(fs.small))
+            .on_press(RemoteBrowserMessage::ToggleGameMode(Vec::new()))
+            .padding([5, 12])
+            .style(crate::styles::nav_button);
+
+        // Loading / error / empty states.
+        if self.games_loading {
+            return game_backdrop(
+                self.game_anim_phase,
+                column![
+                    row![
+                        text("🎮 GAME MODE").size(fs.large).color(accent),
+                        Space::new().width(Length::Fill),
+                        exit_btn,
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    Space::new().height(Length::Fill),
+                    text("Loading library…").size(fs.normal).color(dim),
+                    Space::new().height(Length::Fill),
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
+
+        if let Some(err) = &self.game_error {
+            return game_backdrop(
+                self.game_anim_phase,
+                column![
+                    row![
+                        text("🎮 GAME MODE").size(fs.large).color(accent),
+                        Space::new().width(Length::Fill),
+                        exit_btn,
+                    ]
+                    .align_y(iced::Alignment::Center),
+                    Space::new().height(Length::Fill),
+                    text(err.clone()).size(fs.normal).color(dim),
+                    Space::new().height(Length::Fill),
+                ]
+                .spacing(10)
+                .into(),
+            );
+        }
+
+        let total = self.games.len();
+        let selected = self.games.get(self.game_selected);
+        let selected_folder = selected.map(|g| g.path.clone());
+        let art = selected_folder.as_ref().and_then(|f| self.game_art.get(f));
+
+        // ── Box art (left) ────────────────────────────────────────────────
+        let art_loading = selected_folder
+            .as_ref()
+            .map(|f| self.game_art_loading.contains(f))
+            .unwrap_or(false);
+        let art_placeholder = |label: &str, sz| -> Element<'_, RemoteBrowserMessage> {
+            container(text(label.to_string()).size(sz).color(dim))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .style(|_t: &iced::Theme| container::Style {
+                    background: Some(iced::Color::from_rgb(0.10, 0.10, 0.14).into()),
+                    border: iced::border::rounded(6),
+                    ..Default::default()
+                })
+                .into()
+        };
+        let cover_el: Element<'_, RemoteBrowserMessage> = match art.and_then(|a| a.cover.as_ref()) {
+            Some(h) => iced::widget::image(h.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None if art_loading => art_placeholder("Loading art…", fs.small),
+            None => art_placeholder("No box art", fs.small),
+        };
+        let box_art = container(cover_el)
+            .width(Length::Fixed(320.0))
+            .height(Length::Fill);
+
+        // ── Screenshot (right) ────────────────────────────────────────────
+        let shot_el: Element<'_, RemoteBrowserMessage> = match art.and_then(|a| a.shot.as_ref()) {
+            Some(h) => iced::widget::image(h.clone())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .content_fit(iced::ContentFit::Contain)
+                .into(),
+            None if art_loading => art_placeholder("…", fs.small),
+            None => art_placeholder("No screenshot", fs.small),
+        };
+        let screenshot = container(shot_el)
+            .width(Length::Fixed(320.0))
+            .height(Length::Fill);
+
+        // ── Title list (center) ───────────────────────────────────────────
+        let mut list_items: Vec<Element<'_, RemoteBrowserMessage>> = Vec::new();
+        for (i, game) in self.games.iter().enumerate() {
+            let is_sel = i == self.game_selected;
+            let label =
+                text(game.title.clone())
+                    .size(fs.normal)
+                    .color(if is_sel { ink } else { dim });
+            let item = button(label)
+                .on_press(RemoteBrowserMessage::SelectGame(i))
+                .width(Length::Fill)
+                .padding([6, 10])
+                .style(move |_t: &iced::Theme, _s| {
+                    if is_sel {
+                        button::Style {
+                            background: Some(iced::Color::from_rgb(0.16, 0.22, 0.34).into()),
+                            text_color: iced::Color::from_rgb(0.95, 0.96, 1.0),
+                            border: iced::border::rounded(4),
+                            ..Default::default()
+                        }
+                    } else {
+                        button::Style {
+                            background: None,
+                            text_color: iced::Color::from_rgb(0.7, 0.72, 0.78),
+                            ..Default::default()
+                        }
+                    }
+                });
+            list_items.push(item.into());
+        }
+        let title_list = scrollable(Column::with_children(list_items).spacing(2))
+            .height(Length::Fill)
+            .width(Length::Fill);
+
+        let sel_title = selected
+            .map(|g| g.title.clone())
+            .unwrap_or_else(|| "—".to_string());
+
+        let run_btn = button(text("▶  Run  (Enter)").size(fs.normal))
+            .on_press_maybe(
+                (!self.game_launching && total > 0)
+                    .then_some(RemoteBrowserMessage::RunSelectedGame),
+            )
+            .padding([8, 20])
+            .style(crate::styles::action_button);
+
+        let center = column![
+            text(sel_title).size(fs.large).color(ink),
+            rule::horizontal(1),
+            title_list,
+            row![
+                run_btn,
+                Space::new().width(Length::Fill),
+                text(format!("{}/{}", self.game_selected + 1, total))
+                    .size(fs.small)
+                    .color(dim),
+            ]
+            .align_y(iced::Alignment::Center),
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        game_backdrop(
+            self.game_anim_phase,
+            column![
+                row![
+                    text("🎮 GAME MODE").size(fs.large).color(accent),
+                    Space::new().width(Length::Fill),
+                    text("↑/↓ select · Enter run · Esc exit")
+                        .size(fs.tiny)
+                        .color(dim),
+                    Space::new().width(12),
+                    exit_btn,
+                ]
+                .align_y(iced::Alignment::Center),
+                Space::new().height(6),
+                row![box_art, center, screenshot]
+                    .spacing(16)
+                    .height(Length::Fill),
+            ]
+            .spacing(8)
+            .into(),
+        )
     }
 
     pub fn view(&self, font_size: u32) -> Element<'_, RemoteBrowserMessage> {
@@ -2744,6 +3171,255 @@ impl std::fmt::Display for RemoteFavoriteChoice {
 }
 
 /// Last `/`-separated segment of a remote path, or "/" for the root.
+/// Lower-cased file stem (name without its final extension). `Game.PRG`
+/// and `game.jpg` both reduce to `game`, so a program and its cover match.
+fn stem_lower(name: impl AsRef<str>) -> String {
+    let name = name.as_ref();
+    let stem = match name.rfind('.') {
+        Some(idx) if idx > 0 => &name[..idx],
+        _ => name,
+    };
+    stem.to_ascii_lowercase()
+}
+
+/// Choose the cover image for a folder, RetroArch-style. Among the folder's
+/// image files, prefer (a) one whose stem matches the selected program
+/// (`game.prg` → `game.jpg`), else (b) a conventionally-named cover
+/// (`cover`, `box`, `front`, `screenshot`, `screen`, `title`), else (c) the
+/// first image. Returns the chosen image's remote path, or `None` if the
+/// folder holds no images. All matching is case-insensitive.
+fn pick_cover(files: &[RemoteFileEntry], selected_stem: Option<&str>) -> Option<String> {
+    let images: Vec<&RemoteFileEntry> = files
+        .iter()
+        .filter(|f| !f.is_dir && crate::file_types::is_image_file(&f.name))
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+
+    // (a) Stem-match to the selected program.
+    if let Some(sel) = selected_stem {
+        if let Some(m) = images.iter().find(|f| stem_lower(&f.name) == sel) {
+            return Some(m.path.clone());
+        }
+    }
+
+    // (b) Conventional cover names (match the stem as a whole or a prefix,
+    // so `cover.jpg`, `box_front.png`, `screenshot1.jpg` all count).
+    const CONVENTIONAL: [&str; 6] = ["cover", "box", "front", "screenshot", "screen", "title"];
+    if let Some(m) = images.iter().find(|f| {
+        let stem = stem_lower(&f.name);
+        CONVENTIONAL
+            .iter()
+            .any(|c| stem == *c || stem.starts_with(c))
+    }) {
+        return Some(m.path.clone());
+    }
+
+    // (c) Fall back to the first image.
+    Some(images[0].path.clone())
+}
+
+/// Dark, full-bleed backdrop wrapping the Game Mode launcher content, with an
+/// animated phosphor-glow canvas drifting behind it.
+fn game_backdrop(
+    phase: f32,
+    content: Element<'_, RemoteBrowserMessage>,
+) -> Element<'_, RemoteBrowserMessage> {
+    let bg: Element<'_, RemoteBrowserMessage> = Canvas::new(GameBg { phase })
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+    container(stack![bg, content])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(16)
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Color::from_rgb(0.04, 0.04, 0.07).into()),
+            text_color: Some(iced::Color::from_rgb(0.9, 0.9, 0.95)),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Ambient phosphor-glow background for the Game Mode launcher: a few
+/// horizontal sine waves drifting across a dark field, each drawn with
+/// Phosphor's 3-pass glow (wide+faint → medium → sharp+bright). Purely
+/// decorative and self-animating off `phase` — no device data needed.
+struct GameBg {
+    phase: f32,
+}
+
+impl canvas::Program<RemoteBrowserMessage> for GameBg {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let w = bounds.width;
+        let h = bounds.height;
+        if w < 2.0 || h < 2.0 {
+            return vec![frame.into_geometry()];
+        }
+        let tau = std::f32::consts::TAU;
+
+        // (color, drift speed, spatial frequency, vertical position).
+        let waves = [
+            (
+                Color::from_rgb(0.20, 0.85, 1.00),
+                0.60_f32,
+                1.7_f32,
+                0.28_f32,
+            ),
+            (Color::from_rgb(0.35, 1.00, 0.55), 0.90, 2.3, 0.52),
+            (Color::from_rgb(1.00, 0.72, 0.25), 0.42, 1.1, 0.74),
+        ];
+
+        for (color, speed, freq, y_frac) in waves {
+            let mid = h * y_frac;
+            let amp = h * 0.09;
+            // 3-pass phosphor bloom: wide+faint, medium, sharp+bright.
+            for pass in 0..3_u8 {
+                let (lw, alpha) = match pass {
+                    0 => (9.0_f32, 0.035_f32),
+                    1 => (3.0, 0.10),
+                    _ => (1.4, 0.32),
+                };
+                let path = Path::new(|b| {
+                    let steps = 96;
+                    for s in 0..=steps {
+                        let t = s as f32 / steps as f32;
+                        let x = t * w;
+                        let y = mid
+                            + (t * freq * tau + self.phase * speed).sin() * amp
+                            + (t * freq * 2.3 * tau - self.phase * speed * 0.7).sin() * amp * 0.32;
+                        if s == 0 {
+                            b.move_to(Point::new(x, y));
+                        } else {
+                            b.line_to(Point::new(x, y));
+                        }
+                    }
+                });
+                frame.stroke(
+                    &path,
+                    Stroke::default()
+                        .with_color(Color { a: alpha, ..color })
+                        .with_width(lw),
+                );
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Pick a screenshot image distinct from the cover: prefer names that look
+/// like gameplay shots (`screen`, `shot`, `ingame`, `gameplay`, `action`),
+/// else the first image that isn't the cover. `None` if the folder has no
+/// second image.
+fn pick_screenshot(files: &[RemoteFileEntry], cover_path: Option<&str>) -> Option<String> {
+    let images: Vec<&RemoteFileEntry> = files
+        .iter()
+        .filter(|f| !f.is_dir && crate::file_types::is_image_file(&f.name))
+        .filter(|f| Some(f.path.as_str()) != cover_path)
+        .collect();
+    if images.is_empty() {
+        return None;
+    }
+    const HINTS: [&str; 5] = ["screen", "shot", "ingame", "gameplay", "action"];
+    if let Some(m) = images.iter().find(|f| {
+        let n = f.name.to_ascii_lowercase();
+        HINTS.iter().any(|h| n.contains(h))
+    }) {
+        return Some(m.path.clone());
+    }
+    Some(images[0].path.clone())
+}
+
+/// The file a game folder should launch, in priority order: `.prg`, then
+/// `.crt`, then a disk image (`.d64`/`.d71`/`.d81`/`.g64`…). `None` if the
+/// folder holds nothing runnable.
+fn primary_runnable(files: &[RemoteFileEntry]) -> Option<&RemoteFileEntry> {
+    let ext_of = |f: &RemoteFileEntry| f.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    files
+        .iter()
+        .find(|f| !f.is_dir && ext_of(f) == "prg")
+        .or_else(|| files.iter().find(|f| !f.is_dir && ext_of(f) == "crt"))
+        .or_else(|| {
+            files
+                .iter()
+                .find(|f| !f.is_dir && crate::file_types::is_disk_image(&ext_of(f)))
+        })
+}
+
+/// Enumerate games: every immediate subfolder under each library root is one
+/// game (folder name = title). Roots are listed sequentially — the device FTP
+/// dislikes concurrent connections. Errors are only fatal if *no* root yields
+/// any game.
+async fn enumerate_games(
+    host: String,
+    roots: Vec<String>,
+    password: Option<String>,
+) -> Result<Vec<GameEntry>, String> {
+    let mut games = Vec::new();
+    let mut errors = Vec::new();
+    for root in roots {
+        match fetch_files_ftp(host.clone(), root.clone(), password.clone()).await {
+            Ok(files) => {
+                for f in files {
+                    if f.is_dir {
+                        games.push(GameEntry {
+                            title: f.name,
+                            path: f.path,
+                        });
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("{}: {}", root, e)),
+        }
+    }
+    if games.is_empty() && !errors.is_empty() {
+        return Err(errors.join("; "));
+    }
+    games.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    Ok(games)
+}
+
+/// Load a game folder's box art + screenshot: list the folder, smart-pick the
+/// cover and a distinct screenshot, download both. Image downloads are
+/// best-effort (a missing/failed image just yields `None`); only a failed
+/// folder listing is an error.
+async fn load_game_art(
+    host: String,
+    folder: String,
+    password: Option<String>,
+) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>), String> {
+    let files = fetch_files_ftp(host.clone(), folder, password.clone()).await?;
+    let cover_path = pick_cover(&files, None);
+    let shot_path = pick_screenshot(&files, cover_path.as_deref());
+    let cover = match cover_path {
+        Some(p) => download_file_ftp_preview(host.clone(), p, password.clone())
+            .await
+            .ok()
+            .map(|(_, b)| b),
+        None => None,
+    };
+    let shot = match shot_path {
+        Some(p) => download_file_ftp_preview(host.clone(), p, password.clone())
+            .await
+            .ok()
+            .map(|(_, b)| b),
+        None => None,
+    };
+    Ok((cover, shot))
+}
+
 fn remote_basename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -2790,5 +3466,128 @@ impl crate::tab::TabController for RemoteBrowser {
         ctx: crate::tab::TabContext,
     ) -> iced::Task<RemoteBrowserMessage> {
         self.update_impl(message, ctx.connection)
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> RemoteFileEntry {
+        RemoteFileEntry {
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            path: format!("/games/{}", name),
+        }
+    }
+
+    #[test]
+    fn pick_cover_none_when_no_images() {
+        let files = vec![entry("game.prg", false), entry("readme.txt", false)];
+        assert_eq!(pick_cover(&files, None), None);
+    }
+
+    #[test]
+    fn pick_cover_prefers_stem_match_to_selection() {
+        let files = vec![
+            entry("cover.jpg", false),
+            entry("game.png", false),
+            entry("game.prg", false),
+        ];
+        // Selecting game.prg should surface game.png over the generic cover.jpg.
+        assert_eq!(
+            pick_cover(&files, Some("game")).as_deref(),
+            Some("/games/game.png")
+        );
+    }
+
+    #[test]
+    fn pick_cover_falls_back_to_conventional_name() {
+        let files = vec![entry("aaa_screenshot.jpg", false), entry("box.png", false)];
+        // No selection → conventional name wins over first-image order.
+        assert_eq!(pick_cover(&files, None).as_deref(), Some("/games/box.png"));
+    }
+
+    #[test]
+    fn pick_cover_falls_back_to_first_image() {
+        let files = vec![entry("zzz.jpg", false), entry("aaa.png", false)];
+        assert_eq!(pick_cover(&files, None).as_deref(), Some("/games/zzz.jpg"));
+    }
+
+    #[test]
+    fn pick_cover_is_case_insensitive() {
+        let files = vec![entry("COVER.JPG", false)];
+        assert_eq!(
+            pick_cover(&files, None).as_deref(),
+            Some("/games/COVER.JPG")
+        );
+    }
+
+    #[test]
+    fn stem_lower_strips_extension() {
+        assert_eq!(stem_lower("Game.PRG"), "game");
+        assert_eq!(stem_lower("no_ext"), "no_ext");
+        assert_eq!(stem_lower(".hidden"), ".hidden");
+    }
+
+    #[test]
+    fn pick_screenshot_skips_the_cover() {
+        let files = vec![entry("cover.jpg", false), entry("play.png", false)];
+        let cover = pick_cover(&files, None);
+        assert_eq!(cover.as_deref(), Some("/games/cover.jpg"));
+        assert_eq!(
+            pick_screenshot(&files, cover.as_deref()).as_deref(),
+            Some("/games/play.png")
+        );
+    }
+
+    #[test]
+    fn pick_screenshot_prefers_hint_names() {
+        let files = vec![
+            entry("cover.jpg", false),
+            entry("aaa.png", false),
+            entry("ingame.png", false),
+        ];
+        let cover = pick_cover(&files, None);
+        assert_eq!(
+            pick_screenshot(&files, cover.as_deref()).as_deref(),
+            Some("/games/ingame.png")
+        );
+    }
+
+    #[test]
+    fn pick_screenshot_none_with_single_image() {
+        let files = vec![entry("cover.jpg", false), entry("game.prg", false)];
+        let cover = pick_cover(&files, None);
+        assert_eq!(pick_screenshot(&files, cover.as_deref()), None);
+    }
+
+    #[test]
+    fn primary_runnable_prefers_prg_then_crt_then_disk() {
+        let disk_only = vec![entry("game.d64", false), entry("readme.txt", false)];
+        assert_eq!(
+            primary_runnable(&disk_only).map(|f| f.name.as_str()),
+            Some("game.d64")
+        );
+
+        let crt_and_disk = vec![entry("game.d64", false), entry("game.crt", false)];
+        assert_eq!(
+            primary_runnable(&crt_and_disk).map(|f| f.name.as_str()),
+            Some("game.crt")
+        );
+
+        let all = vec![
+            entry("game.d64", false),
+            entry("game.crt", false),
+            entry("loader.prg", false),
+        ];
+        assert_eq!(
+            primary_runnable(&all).map(|f| f.name.as_str()),
+            Some("loader.prg")
+        );
+
+        let none = vec![entry("cover.jpg", false), entry("readme.txt", false)];
+        assert!(primary_runnable(&none).is_none());
     }
 }

@@ -246,6 +246,61 @@ impl Ultimate64Browser {
         Task::none()
     }
 
+    /// Settings: user is typing a new Game Mode library root path.
+    pub(crate) fn handle_game_library_input_changed(&mut self, value: String) -> Task<Message> {
+        self.game_library_input = value;
+        Task::none()
+    }
+
+    /// Settings: add the staged path as a Game Mode library root (deduped),
+    /// persist, and clear the input.
+    pub(crate) fn handle_game_library_add_root(&mut self) -> Task<Message> {
+        let root = self
+            .game_library_input
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        if root.is_empty() {
+            return Task::none();
+        }
+        let root = if root.starts_with('/') {
+            root
+        } else {
+            format!("/{}", root)
+        };
+        {
+            let prefs = &mut self.profile_manager.active_settings_mut().preferences;
+            if !prefs.game_library_roots.iter().any(|r| r == &root) {
+                prefs.game_library_roots.push(root);
+            }
+        }
+        self.settings = self.profile_manager.active_settings().clone();
+        self.game_library_input.clear();
+        if let Err(e) = self.profile_manager.save() {
+            log::error!("Failed to save profiles: {}", e);
+        }
+        Task::none()
+    }
+
+    /// Settings: remove the library root at `idx`, persist.
+    pub(crate) fn handle_game_library_remove_root(&mut self, idx: usize) -> Task<Message> {
+        {
+            let roots = &mut self
+                .profile_manager
+                .active_settings_mut()
+                .preferences
+                .game_library_roots;
+            if idx < roots.len() {
+                roots.remove(idx);
+            }
+        }
+        self.settings = self.profile_manager.active_settings().clone();
+        if let Err(e) = self.profile_manager.save() {
+            log::error!("Failed to save profiles: {}", e);
+        }
+        Task::none()
+    }
+
     pub(crate) fn handle_file_browser_start_dir_selected(
         &mut self,
         path: Option<PathBuf>,

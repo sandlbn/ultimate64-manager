@@ -425,6 +425,10 @@ pub enum Message {
     // Settings
     DefaultSongDurationChanged(String),
     FontSizeChanged(String),
+    // Game library roots (Game Mode). Text field + add/remove.
+    GameLibraryInputChanged(String),
+    GameLibraryAddRoot,
+    GameLibraryRemoveRoot(usize),
 
     // Starting directory settings
     BrowseFileBrowserStartDir,
@@ -657,6 +661,8 @@ pub struct Ultimate64Browser {
     host_input: String,
     password_input: String,
     font_size_input: String,
+    /// Settings: staged text for adding a new Game Mode library root.
+    game_library_input: String,
 
     // Video streaming
     video_streaming: VideoStreaming,
@@ -793,6 +799,7 @@ impl Ultimate64Browser {
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
             font_size_input: settings.preferences.font_size.to_string(),
+            game_library_input: String::new(),
             settings: settings.clone(),
             host_url: None,
             device_keyboard_input: String::new(),
@@ -1045,6 +1052,7 @@ impl Ultimate64Browser {
                         | RemoteBrowserMessage::PlaySid(_)
                         | RemoteBrowserMessage::PlayMod(_)
                         | RemoteBrowserMessage::RunDisk(_, _)
+                        | RemoteBrowserMessage::RunSelectedGame
                 ) && self.music_player.playback_state
                     == PlaybackState::Playing;
 
@@ -1113,6 +1121,20 @@ impl Ultimate64Browser {
                 };
                 iced::widget::operation::focus(id)
             }
+            // In Game Mode the arrow keys drive the launcher, not the file
+            // panes. Route ↑/↓/Enter to the remote browser's game handlers.
+            Message::PaneCursorUp if self.remote_browser.game_mode => self
+                .remote_browser
+                .update(RemoteBrowserMessage::GameNav(-1), ctx.clone())
+                .map(Message::RemoteBrowser),
+            Message::PaneCursorDown if self.remote_browser.game_mode => self
+                .remote_browser
+                .update(RemoteBrowserMessage::GameNav(1), ctx.clone())
+                .map(Message::RemoteBrowser),
+            Message::PaneActivate if self.remote_browser.game_mode => self
+                .remote_browser
+                .update(RemoteBrowserMessage::RunSelectedGame, ctx.clone())
+                .map(Message::RemoteBrowser),
             Message::PaneCursorUp => {
                 self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionUp)
             }
@@ -1772,6 +1794,11 @@ impl Ultimate64Browser {
             }
 
             Message::FontSizeChanged(value) => self.handle_font_size_changed(value),
+            Message::GameLibraryInputChanged(value) => {
+                self.handle_game_library_input_changed(value)
+            }
+            Message::GameLibraryAddRoot => self.handle_game_library_add_root(),
+            Message::GameLibraryRemoveRoot(idx) => self.handle_game_library_remove_root(idx),
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -2200,6 +2227,15 @@ impl Ultimate64Browser {
             Subscription::none()
         };
 
+        // Drive the Game Mode launcher's animated phosphor background (~30fps)
+        // only while it's on screen.
+        let game_anim_tick = if self.remote_browser.game_mode {
+            iced::time::every(Duration::from_millis(33))
+                .map(|_| Message::RemoteBrowser(RemoteBrowserMessage::GameAnimTick))
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
@@ -2214,6 +2250,7 @@ impl Ultimate64Browser {
             copy_progress_tick,
             toast_tick,
             debug_stream_tick,
+            game_anim_tick,
         ])
     }
 

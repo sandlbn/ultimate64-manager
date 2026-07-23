@@ -42,6 +42,11 @@ impl Ultimate64Browser {
             self.pending_drop = None;
             return Task::none();
         }
+        // Esc leaves the Game Mode launcher.
+        if self.remote_browser.game_mode {
+            self.remote_browser.game_mode = false;
+            return Task::none();
+        }
         if self.video_streaming.is_fullscreen {
             return self.update(Message::ExitFullscreen);
         }

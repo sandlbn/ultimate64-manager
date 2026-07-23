@@ -5,6 +5,7 @@ use iced::widget::{
 };
 use iced::{Element, Length};
 
+use crate::remote_browser::RemoteBrowserMessage;
 use crate::{Message, Pane, Ultimate64Browser};
 
 impl Ultimate64Browser {
@@ -90,6 +91,15 @@ impl Ultimate64Browser {
     }
 
     pub(crate) fn view_dual_pane_browser(&self) -> Element<'_, Message> {
+        // Game Mode takes over the whole tab — a full-width immersive launcher
+        // instead of the two file panes.
+        if self.remote_browser.game_mode {
+            return self
+                .remote_browser
+                .view_game_mode(self.settings.preferences.font_size)
+                .map(Message::RemoteBrowser);
+        }
+
         // Left pane - Local files
         let left_content = container(
             self.left_browser
@@ -189,6 +199,17 @@ impl Ultimate64Browser {
                     .on_press_maybe(self.status.connected.then_some(Message::EjectAllDrives),)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
+                // Game Mode — full-width EmulationStation-style launcher over
+                // the folders in the configured game library. Needs a live
+                // connection to enumerate the device.
+                button(text("🎮 Games").size(small))
+                    .on_press_maybe(self.status.connected.then(|| {
+                        Message::RemoteBrowser(RemoteBrowserMessage::ToggleGameMode(
+                            self.settings.preferences.game_library_roots.clone(),
+                        ))
+                    }))
+                    .padding([4, 8])
+                    .style(crate::styles::action_button),
                 // Run last — re-fires the most recent PRG/CRT/SID/disk
                 // the local browser sent. Greys out when nothing's been
                 // run yet OR when the device is offline.
