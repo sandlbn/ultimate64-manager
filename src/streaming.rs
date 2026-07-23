@@ -1487,7 +1487,7 @@ impl VideoStreaming {
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
                                 ScaleMode::Int3x => (
-                                    // WORKAROUND: Use 2x to avoid strobing with large textures
+                                    // Capped to 2x: true 3x scaling strobes on larger textures.
                                     integer_scale(&frame_snapshot, VIC_WIDTH, VIC_HEIGHT, 2),
                                     (VIC_WIDTH * 2, VIC_HEIGHT * 2),
                                 ),
@@ -1578,7 +1578,6 @@ impl VideoStreaming {
             let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
             log::info!("Using audio device: {}", device_name);
 
-            // Log supported configs for debugging
             match device.supported_output_configs() {
                 Ok(configs) => {
                     for config in configs {
@@ -1964,7 +1963,6 @@ impl VideoStreaming {
                         // Parse sequence number for gap detection
                         let packet_seq = u16::from_le_bytes([recv_buf[0], recv_buf[1]]);
 
-                        // Log first packet for debugging
                         if first_packet {
                             first_packet = false;
                             log::info!(

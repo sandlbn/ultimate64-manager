@@ -1,5 +1,4 @@
-// Remove the windows_subsystem attribute during development to see console output
-// Uncomment for release builds:
+// On Windows, run as a GUI app (no console window). Has no effect on other platforms.
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use iced::{
@@ -234,8 +233,7 @@ pub fn main() -> iced::Result {
 }
 
 fn load_window_icon() -> Option<iced::window::Icon> {
-    // Embedded icon - icon.png MUST exist in icons/ folder at compile time
-    // If you don't have icons/icon.png, compilation will fail
+    // Window icon, embedded at compile time from icons/icon.png.
     const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
 
     if let Ok(img) = image::load_from_memory(ICON_BYTES) {
@@ -849,7 +847,7 @@ impl Ultimate64Browser {
         "Ultimate64 Manager".to_string()
     }
     fn theme(&self, _window_id: iced::window::Id) -> Theme {
-        // Custom dark theme with lighter blue (like the reference screenshot)
+        // Custom dark theme with a lighter blue accent.
         Theme::custom(
             "Ultimate64 Dark".to_string(),
             iced::theme::Palette {
@@ -1822,8 +1820,7 @@ impl Ultimate64Browser {
                 self.tab_button("MEMORY", Tab::MemoryEditor),
                 self.tab_button("MONITOR", Tab::Monitor),
                 self.tab_button("CONFIG", Tab::Configuration),
-                // PROFILES tab hidden — feature is WIP. Re-enable when ready.
-                // self.tab_button("PROFILES", Tab::Profiles),
+                // The Profiles tab is intentionally not registered.
                 self.tab_button("ASSEMBLY64", Tab::Assembly64),
                 self.tab_button("BASIC", Tab::BasicEditor),
                 self.tab_button("DEVICE", Tab::Device),

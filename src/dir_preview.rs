@@ -440,7 +440,7 @@ pub async fn load_text_file_async(path: PathBuf) -> Result<ContentPreview, Strin
 }
 
 /// Async wrapper for loading image file. 15s cap as above (image decoding
-/// can spin on corrupt PNGs / weird JPEGs).
+/// can spin on malformed image data).
 pub async fn load_image_file_async(path: PathBuf) -> Result<ContentPreview, String> {
     match tokio::time::timeout(
         std::time::Duration::from_secs(15),

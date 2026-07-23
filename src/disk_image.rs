@@ -392,7 +392,6 @@ pub fn is_disk_image(path: &Path) -> bool {
 
 /// Get a brief summary of the disk (for tooltips, etc.)
 #[allow(dead_code)]
-/// TODO: use it for tooltip
 pub fn get_disk_summary(path: &Path) -> Result<String, String> {
     let info = read_disk_info(path)?;
 
