@@ -1,12 +1,14 @@
 # Game Mode
 
-Game Mode is a full-screen list for browsing and running game collections. It
+Game Mode is a list for browsing and running game collections. It
 reads folders you point it at — on the device (over FTP) or on your local
 disk — figures out how the collection is laid out, and shows each game with its
 box art and screenshot when available.
 
 This guide walks through setting it up with a **OneLoad64** collection, which is
 the easiest case because OneLoad64 already ships cover art keyed by game name.
+
+![Game Mode window](docs/images/game-mode.png)
 
 ---
 
@@ -25,6 +27,8 @@ ways:
 You can add several libraries; they all appear together in Game Mode. Remove one
 from **Settings → Game library**.
 
+![Settings → Game library](docs/images/settings-game-library.png)
+
 > Tip: add **one** clean folder. If you point at a parent that contains several
 > copies of a collection (e.g. the raw set *and* a converted copy), each game
 > shows up more than once.
@@ -32,6 +36,9 @@ from **Settings → Game library**.
 ## 2. Open Game Mode
 
 In the **File Browser** tab, click **🎮 Games** in the bottom function bar.
+
+![Open Game Mode](docs/images/open-game-mode.png)
+
 It scans your libraries and lists the games. Controls:
 
 | Key / button | Action |
@@ -92,7 +99,11 @@ LINK=1 python3 tools/build_oneload_library.py \
     ~/Downloads/OneLoad64-Games-Collection-v5 ~/Games/OneLoad64
 ```
 
-It produces, for each game:
+It creates a `… Arted` folder next to the original:
+
+![OneLoad64-Arted output folder](docs/images/oneload-arted-output.png)
+
+…with one folder per game, holding the cartridge plus its matched art:
 
 ```
 <out>/<Game>/
@@ -100,6 +111,8 @@ It produces, for each game:
   cover.png        (loading screen, or the screenshot if there is no loading screen)
   screenshot.png   (the in-game screenshot)
 ```
+
+![A game folder: crt + cover + screenshot](docs/images/game-folder-layout.png)
 
 Then add that output folder as a library. Game Mode detects the
 **one-folder-per-game** layout and shows `cover.png` as box art and
