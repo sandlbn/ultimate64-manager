@@ -153,6 +153,43 @@ pub async fn run_disk(
     }
 }
 
+/// Upload a *local* disk image, mount it (readonly) on `drive`, then reset +
+/// autoload — the local-file equivalent of [`run_disk`]. Used by Game Mode to
+/// launch disk images from an on-disk collection.
+pub async fn run_local_disk_async(
+    host: &str,
+    local_path: &Path,
+    drive: &str,
+    password: Option<&str>,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
+) -> Result<String, String> {
+    let filename = local_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("disk")
+        .to_string();
+
+    upload_mount_disk_async(host, local_path, drive, "readonly", password).await?;
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let device_num = if drive == "a" { "8" } else { "9" };
+    if let Some(conn) = connection {
+        let device = device_num.to_string();
+        tokio::task::spawn_blocking(move || {
+            let c = conn.lock().unwrap();
+            crate::run_ops::autoload_mounted_disk(&*c, &device)?;
+            Ok::<String, String>(format!("Running: {}", filename))
+        })
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
+    } else {
+        Ok(format!(
+            "Mounted: {} (no connection for auto-run)",
+            filename
+        ))
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  Memory read/write operations (via ultimate64 crate)
 // ─────────────────────────────────────────────────────────────────

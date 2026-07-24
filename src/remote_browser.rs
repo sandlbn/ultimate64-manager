@@ -72,6 +72,8 @@ pub enum RemoteBrowserMessage {
     ShowContentPreview(String),
     ContentPreviewLoaded(Result<ContentPreview, String>),
     CloseContentPreview,
+    /// Game Mode launcher messages — delegated to [`crate::game_mode::GameMode`].
+    Game(crate::game_mode::GameModeMessage),
     // Transfer progress (polled by subscription)
     ProgressTick,
 
@@ -110,6 +112,10 @@ pub enum RemoteBrowserMessage {
     CreateDirCancel,
     /// Async mkdir finished
     CreateDirComplete(Result<String, String>),
+
+    /// Register the current device folder as a Game Mode library root. Handled
+    /// by the app (which owns Settings); the browser just signals the request.
+    AddAsGameLibrary,
 
     // ── Favorites ────────────────────────────────────────────────────────
     /// Toggle the *current* path in/out of favorites (toolbar star).
@@ -216,6 +222,9 @@ pub struct RemoteBrowser {
     /// `current_path` after each navigation; user can type a path and
     /// press Enter to jump there.
     path_input: String,
+
+    /// Game Mode launcher — self-contained in [`crate::game_mode`].
+    pub game: crate::game_mode::GameMode,
 }
 
 const FAVORITES_FILE: &str = "remote_favorites.json";
@@ -261,6 +270,7 @@ impl Default for RemoteBrowser {
             context_menu_for: None,
             pending_favorite_check: None,
             path_input: "/".to_string(),
+            game: crate::game_mode::GameMode::new(),
         }
     }
 }
@@ -282,6 +292,53 @@ impl RemoteBrowser {
             self.files.clear();
             self.status_message = Some("Not connected".to_string());
         }
+    }
+
+    /// Launch a game that lives on the local filesystem: read its bytes and
+    /// upload+run them on the device (`.prg`/`.crt`/`.sid`), or upload+mount+
+    /// autoload for a disk image. Device-resident games use the path-based run
+    /// handlers instead.
+    fn launch_local_game(
+        &mut self,
+        path: String,
+        ext: &str,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
+    ) -> Task<RemoteBrowserMessage> {
+        let Some(host_ip) = self.host_address.clone() else {
+            self.status_message = Some("Not connected".to_string());
+            return Task::none();
+        };
+        let host = format!("http://{}", host_ip);
+        let password = self.password.clone();
+
+        if crate::file_types::is_disk_image(ext) {
+            let disk = std::path::PathBuf::from(path);
+            return Task::perform(
+                async move {
+                    api::run_local_disk_async(&host, &disk, "a", password.as_deref(), connection)
+                        .await
+                },
+                RemoteBrowserMessage::MountComplete,
+            );
+        }
+
+        let runner = match ext {
+            "crt" => "run_crt",
+            "sid" => "sidplay",
+            _ => "run_prg", // prg/p00/… and anything else runnable
+        }
+        .to_string();
+        Task::perform(
+            async move {
+                let bytes = tokio::fs::read(&path)
+                    .await
+                    .map_err(|e| format!("Read failed: {}", e))?;
+                api::upload_runner_async(&host, &runner, bytes, password.as_deref())
+                    .await
+                    .map(|_| format!("Launched {}", path.rsplit('/').next().unwrap_or("game")))
+            },
+            RemoteBrowserMessage::RunnerComplete,
+        )
     }
 
     pub fn update_impl(
@@ -911,6 +968,37 @@ impl RemoteBrowser {
                 Task::none()
             }
 
+            // Game Mode is self-contained: forward to the module, then turn a
+            // requested launch into a run/mount action.
+            RemoteBrowserMessage::Game(msg) => {
+                let ctx = crate::game_mode::GameCtx {
+                    host: self.host_address.clone(),
+                    password: self.password.clone(),
+                };
+                let up = self.game.update(msg, ctx);
+                let task = up.task.map(RemoteBrowserMessage::Game);
+                let Some(launch) = up.launch else {
+                    return task;
+                };
+                self.status_message = Some(format!("Launching {}…", remote_basename(&launch.path)));
+                let ext = launch.path.rsplit('.').next().unwrap_or("").to_lowercase();
+                if launch.local {
+                    // Local game: upload its bytes to the device and run.
+                    let run = self.launch_local_game(launch.path, &ext, _connection);
+                    Task::batch([task, run])
+                } else {
+                    // Device game: run from the device filesystem by path.
+                    let run = if ext == "crt" {
+                        RemoteBrowserMessage::RunCrt(launch.path)
+                    } else if crate::file_types::is_disk_image(&ext) {
+                        RemoteBrowserMessage::RunDisk(launch.path, "a".to_string())
+                    } else {
+                        RemoteBrowserMessage::RunPrg(launch.path)
+                    };
+                    Task::batch([task, self.update_impl(run, _connection)])
+                }
+            }
+
             RemoteBrowserMessage::ProgressTick => {
                 if let Ok(guard) = self.transfer_progress.lock() {
                     if let Some(ref progress) = *guard {
@@ -1196,6 +1284,9 @@ impl RemoteBrowser {
                 Task::none()
             }
 
+            // Handled by the app (it owns Settings); no-op here.
+            RemoteBrowserMessage::AddAsGameLibrary => Task::none(),
+
             // ── Favorites ────────────────────────────────────────────────
             RemoteBrowserMessage::ToggleCurrentFavorite => {
                 let path = self.current_path.clone();
@@ -1359,6 +1450,21 @@ impl RemoteBrowser {
             .style(crate::styles::subtle_tooltip)
             .into(),
         );
+
+        // Register the current folder as a Game Mode library root.
+        items.push(
+            tooltip(
+                button(text("🎮+").size(small))
+                    .on_press(RemoteBrowserMessage::AddAsGameLibrary)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                "Add this folder as a Game Mode library",
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+
         if !self.favorites.is_empty() {
             let choices: Vec<RemoteFavoriteChoice> = self
                 .favorites
@@ -2707,12 +2813,15 @@ impl RemoteBrowser {
             .map(|g| g.is_some())
             .unwrap_or(false);
 
-        if has_progress {
+        let progress = if has_progress {
             iced::time::every(Duration::from_millis(250))
                 .map(|_| RemoteBrowserMessage::ProgressTick)
         } else {
             Subscription::none()
-        }
+        };
+        // The Game Mode launcher drives its own animation tick while open.
+        let game = self.game.subscription().map(RemoteBrowserMessage::Game);
+        Subscription::batch([progress, game])
     }
 
     pub fn is_transferring(&self) -> bool {
@@ -2743,7 +2852,6 @@ impl std::fmt::Display for RemoteFavoriteChoice {
     }
 }
 
-/// Last `/`-separated segment of a remote path, or "/" for the root.
 fn remote_basename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {

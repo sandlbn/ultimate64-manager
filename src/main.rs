@@ -131,6 +131,7 @@ mod file_browser;
 mod file_types;
 mod folder_favorites;
 mod ftp_ops;
+mod game_mode;
 #[cfg(test)]
 mod integration;
 mod memory_editor;
@@ -425,6 +426,13 @@ pub enum Message {
     // Settings
     DefaultSongDurationChanged(String),
     FontSizeChanged(String),
+    // Game library roots (Game Mode). Text field + add/remove.
+    GameLibraryInputChanged(String),
+    GameLibraryAddRoot,
+    GameLibraryRemoveRoot(usize),
+    /// Open a folder picker to add a local disk folder as a library root.
+    GameLibraryBrowseLocal,
+    GameLibraryLocalPicked(Option<PathBuf>),
 
     // Starting directory settings
     BrowseFileBrowserStartDir,
@@ -657,6 +665,8 @@ pub struct Ultimate64Browser {
     host_input: String,
     password_input: String,
     font_size_input: String,
+    /// Settings: staged text for adding a new Game Mode library root.
+    game_library_input: String,
 
     // Video streaming
     video_streaming: VideoStreaming,
@@ -793,6 +803,7 @@ impl Ultimate64Browser {
             host_input: settings.connection.host.clone(),
             password_input: settings.connection.password.clone().unwrap_or_default(),
             font_size_input: settings.preferences.font_size.to_string(),
+            game_library_input: String::new(),
             settings: settings.clone(),
             host_url: None,
             device_keyboard_input: String::new(),
@@ -1033,6 +1044,7 @@ impl Ultimate64Browser {
                         | RemoteBrowserMessage::DeleteComplete(_)
                         | RemoteBrowserMessage::RenameComplete(_)
                         | RemoteBrowserMessage::ProgressTick
+                        | RemoteBrowserMessage::Game(_)
                 ) {
                     self.active_pane = Pane::Right;
                 }
@@ -1045,8 +1057,41 @@ impl Ultimate64Browser {
                         | RemoteBrowserMessage::PlaySid(_)
                         | RemoteBrowserMessage::PlayMod(_)
                         | RemoteBrowserMessage::RunDisk(_, _)
+                        | RemoteBrowserMessage::Game(game_mode::GameModeMessage::Run)
                 ) && self.music_player.playback_state
                     == PlaybackState::Playing;
+
+                // Track Game Mode fullscreen across the update so any transition
+                // (toggle, or leaving the launcher while fullscreen) also drives
+                // the OS window mode.
+                let was_fullscreen = self.remote_browser.game.fullscreen;
+
+                // "Add as game library" — the browser signals; the app owns
+                // Settings, so register the current device folder here.
+                if let RemoteBrowserMessage::AddAsGameLibrary = msg {
+                    let root = self.remote_browser.current_path.clone();
+                    let already = self
+                        .settings
+                        .preferences
+                        .game_library_roots
+                        .iter()
+                        .any(|r| r == &root);
+                    if already {
+                        self.show_toast(format!("Already a game library: {}", root));
+                    } else {
+                        self.profile_manager
+                            .active_settings_mut()
+                            .preferences
+                            .game_library_roots
+                            .push(root.clone());
+                        self.settings = self.profile_manager.active_settings().clone();
+                        if let Err(e) = self.profile_manager.save() {
+                            log::error!("Failed to save game library root: {}", e);
+                        }
+                        self.show_toast(format!("🎮 Added game library: {}", root));
+                    }
+                    return Task::none();
+                }
 
                 // Intercept DownloadBatchComplete to show result and refresh local browser
                 if let RemoteBrowserMessage::DownloadBatchComplete(ref result) = msg {
@@ -1086,17 +1131,27 @@ impl Ultimate64Browser {
                     .update(msg, ctx.clone())
                     .map(Message::RemoteBrowser);
 
+                let mut tasks = vec![cmd];
                 if should_stop_music {
                     log::info!("Stopping music player - running file from Ultimate64");
-                    Task::batch(vec![
-                        cmd,
+                    tasks.push(
                         self.music_player
                             .update(MusicPlayerMessage::Stop, ctx.clone())
                             .map(Message::MusicPlayer),
-                    ])
-                } else {
-                    cmd
+                    );
                 }
+                let now_fullscreen = self.remote_browser.game.fullscreen;
+                if now_fullscreen != was_fullscreen {
+                    let mode = if now_fullscreen {
+                        iced::window::Mode::Fullscreen
+                    } else {
+                        iced::window::Mode::Windowed
+                    };
+                    if let Some(id) = self.main_window_id {
+                        tasks.push(window::set_mode(id, mode).map(|_: ()| Message::RefreshStatus));
+                    }
+                }
+                Task::batch(tasks)
             }
             Message::ActivePaneChanged(pane) => {
                 self.active_pane = pane;
@@ -1113,6 +1168,29 @@ impl Ultimate64Browser {
                 };
                 iced::widget::operation::focus(id)
             }
+            // In Game Mode the arrow keys drive the launcher, not the file
+            // panes. Route ↑/↓/Enter to the game module.
+            Message::PaneCursorUp if self.remote_browser.game.active => self
+                .remote_browser
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Nav(-1)),
+                    ctx.clone(),
+                )
+                .map(Message::RemoteBrowser),
+            Message::PaneCursorDown if self.remote_browser.game.active => self
+                .remote_browser
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Nav(1)),
+                    ctx.clone(),
+                )
+                .map(Message::RemoteBrowser),
+            Message::PaneActivate if self.remote_browser.game.active => self
+                .remote_browser
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Run),
+                    ctx.clone(),
+                )
+                .map(Message::RemoteBrowser),
             Message::PaneCursorUp => {
                 self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionUp)
             }
@@ -1121,6 +1199,22 @@ impl Ultimate64Browser {
             }
             Message::PaneActivate => {
                 self.dispatch_local_pane_message(FileBrowserMessage::ActivateSelection)
+            }
+            // In Game Mode a letter key jumps to that A–Z section.
+            Message::PaneQuickSearch(ch) if self.remote_browser.game.active => {
+                let target = if ch.is_ascii_alphabetic() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '#'
+                };
+                self.remote_browser
+                    .update(
+                        RemoteBrowserMessage::Game(game_mode::GameModeMessage::JumpToLetter(
+                            target,
+                        )),
+                        ctx.clone(),
+                    )
+                    .map(Message::RemoteBrowser)
             }
             Message::PaneQuickSearch(ch) => {
                 self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchInput(ch))
@@ -1772,6 +1866,21 @@ impl Ultimate64Browser {
             }
 
             Message::FontSizeChanged(value) => self.handle_font_size_changed(value),
+            Message::GameLibraryInputChanged(value) => {
+                self.handle_game_library_input_changed(value)
+            }
+            Message::GameLibraryAddRoot => self.handle_game_library_add_root(),
+            Message::GameLibraryRemoveRoot(idx) => self.handle_game_library_remove_root(idx),
+            Message::GameLibraryBrowseLocal => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::GameLibraryLocalPicked,
+            ),
+            Message::GameLibraryLocalPicked(path) => self.handle_game_library_local_picked(path),
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -1822,6 +1931,16 @@ impl Ultimate64Browser {
                 .video_streaming
                 .view_fullscreen(self.settings.preferences.font_size)
                 .map(Message::Streaming);
+        }
+
+        // Game Mode fullscreen — immersive launcher with no app chrome (tab bar
+        // and status bar hidden).
+        if self.remote_browser.game.active && self.remote_browser.game.fullscreen {
+            return self
+                .remote_browser
+                .game
+                .view(self.settings.preferences.font_size)
+                .map(|m| Message::RemoteBrowser(RemoteBrowserMessage::Game(m)));
         }
 
         // Overwrite-confirmation dialog — shown when a local→remote copy would

@@ -1,0 +1,22 @@
+# Secrets — signing / notarization credentials. Never commit.
+.env
+.env.*
+!.env.example
+
+# Rust build output
+/target
+/target-linux
+
+# Packaged build artifacts (produced by build-macos.sh / release workflow)
+/dist/
+/*.zip
+/*.dmg
+/*.universal
+/*.exe
+
+# AppImage build tooling (downloaded, not source)
+/*.AppImage
+/tools/*.AppImage
+
+# macOS cruft
+.DS_Store

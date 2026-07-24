@@ -23,6 +23,12 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Disk Image Viewer** – Display **D64/D71 directory contents** (C64-style listing)
 - **Disk Management** – Mount D64, D71, D81, G64, G71, G81 images to Drive A/B
 - **Run Programs** – Direct load and run for PRG, CRT, and SID files (PRG files also offer **Load** without running)
+- **Game Mode** – A full-screen list for browsing and running game collections
+  - Reads game folders on the device (FTP) or on local disk, configured in Settings (or add the current device folder with **🎮+**)
+  - Handles common collection layouts: flat files, letter buckets, one-folder-per-game, and nested folders
+  - Shows a folder's box art and screenshot when present, including a central art folder such as OneLoad64's `Extras/Images`
+  - A–Z jump, keyboard navigation, and Run (local games are uploaded to the device first)
+  - Caches the scanned list and re-scans on change or via **Refresh**; **Fullscreen** hides the app chrome
 - **Supported File Types** – D64, D71, D81, G64, G71, G81, PRG, P00, CRT, SID, MOD, XM, S3M, TAP, T64, REU, ROM, BIN, CFG, ZIP, and firmware updates (U2L, U2P, U2R, U64, UE2)
 - **Music Player** – Play SID and MOD files with playlist support
   - Shuffle and repeat modes
@@ -105,6 +111,15 @@ https://github.com/sandlbn/ultimate64-manager/releases
 | `Cmd/Ctrl+L` | Focus the path field (type a path, press Enter to navigate) |
 | `a`–`z`, `0`–`9` | Quick search — type to jump to first matching file |
 | `Cmd/Ctrl+A` | Select all in active pane |
+
+### Game Mode
+
+| Shortcut | Action |
+|----------|--------|
+| `↑` / `↓` | Move selection |
+| `a`–`z`, `0`–`9` | Jump to that letter section |
+| `Enter` | Run the selected game |
+| `Esc` | Exit fullscreen, then exit Game Mode |
 
 ## Song Length Database
 

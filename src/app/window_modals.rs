@@ -42,6 +42,20 @@ impl Ultimate64Browser {
             self.pending_drop = None;
             return Task::none();
         }
+        // In Game Mode: Esc first drops out of fullscreen (restoring the app
+        // chrome), then a second Esc leaves the launcher.
+        if self.remote_browser.game.active {
+            if self.remote_browser.game.fullscreen {
+                self.remote_browser.game.fullscreen = false;
+                if let Some(id) = self.main_window_id {
+                    return iced::window::set_mode(id, iced::window::Mode::Windowed)
+                        .map(|_: ()| Message::RefreshStatus);
+                }
+                return Task::none();
+            }
+            self.remote_browser.game.exit();
+            return Task::none();
+        }
         if self.video_streaming.is_fullscreen {
             return self.update(Message::ExitFullscreen);
         }
@@ -153,12 +167,15 @@ impl Ultimate64Browser {
             // Mark main window as gone so subscriptions stop
             self.main_window_id = None;
 
-            // Close any remaining windows and exit
-            if let Some(streaming_id) = self.streaming_window_id {
-                self.streaming_window_id = None;
-                return Task::batch(vec![iced::window::close(streaming_id), iced::exit()]);
-            }
-            iced::exit()
+            // Hard-exit the process. A graceful `iced::exit()` would let the
+            // tokio runtime wait on `spawn_blocking` threads at shutdown — and
+            // when the device is unreachable those threads sit stuck in a
+            // blocking network call (their outer timeout cancels the future but
+            // can't kill the thread), so the app appears to hang on close.
+            // Exiting immediately sidesteps that; nothing here needs a graceful
+            // teardown (settings persist as they change).
+            log::info!("Exiting.");
+            std::process::exit(0)
         } else {
             Task::none()
         }
