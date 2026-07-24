@@ -179,7 +179,7 @@ MIT License
 
 ## Acknowledgments
 
+- Big thanks to **Adam Kazmierski** ([ExploraArt](https://www.youtube.com/@exploraart)) for many ideas and testing
 - [Ultimate64](https://github.com/GideonZ/1541ultimate) team
 - [Ultimate64 Rust Library](https://github.com/mlund/ultimate64)
-- [Iced](https://github.com/iced-rs/iced) GUI framework
 - **Fredrik Åberg** for opening up the [Assembly64 API](https://hackerswithstyle.se/leet/swagger-ui/index.html)
