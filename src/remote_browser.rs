@@ -113,6 +113,10 @@ pub enum RemoteBrowserMessage {
     /// Async mkdir finished
     CreateDirComplete(Result<String, String>),
 
+    /// Register the current device folder as a Game Mode library root. Handled
+    /// by the app (which owns Settings); the browser just signals the request.
+    AddAsGameLibrary,
+
     // ── Favorites ────────────────────────────────────────────────────────
     /// Toggle the *current* path in/out of favorites (toolbar star).
     ToggleCurrentFavorite,
@@ -1280,6 +1284,9 @@ impl RemoteBrowser {
                 Task::none()
             }
 
+            // Handled by the app (it owns Settings); no-op here.
+            RemoteBrowserMessage::AddAsGameLibrary => Task::none(),
+
             // ── Favorites ────────────────────────────────────────────────
             RemoteBrowserMessage::ToggleCurrentFavorite => {
                 let path = self.current_path.clone();
@@ -1443,6 +1450,21 @@ impl RemoteBrowser {
             .style(crate::styles::subtle_tooltip)
             .into(),
         );
+
+        // Register the current folder as a Game Mode library root.
+        items.push(
+            tooltip(
+                button(text("🎮+").size(small))
+                    .on_press(RemoteBrowserMessage::AddAsGameLibrary)
+                    .padding([2, 6])
+                    .style(crate::styles::nav_button),
+                "Add this folder as a Game Mode library",
+                tooltip::Position::Bottom,
+            )
+            .style(crate::styles::subtle_tooltip)
+            .into(),
+        );
+
         if !self.favorites.is_empty() {
             let choices: Vec<RemoteFavoriteChoice> = self
                 .favorites

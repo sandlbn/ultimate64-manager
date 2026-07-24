@@ -99,7 +99,10 @@ impl Ultimate64Browser {
             text(video_status).size(fs.normal).into()
         };
 
-        let connected = self.status.connected;
+        // Enable machine control whenever a connection exists, rather than
+        // only when the last status poll succeeded — a transient poll failure
+        // on a reachable device shouldn't disable Reset/Reboot/etc.
+        let connected = self.connection.is_some();
 
         container(
             row![

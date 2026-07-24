@@ -82,6 +82,10 @@ pub enum GameModeMessage {
     ArtLoaded(String, (Option<Vec<u8>>, Option<Vec<u8>>)),
     /// Launch the highlighted game.
     Run,
+    /// Toggle immersive fullscreen (hide app chrome + OS fullscreen).
+    ToggleFullscreen,
+    /// The list scrolled — carries the current viewport height (for centering).
+    ListScrolled(f32),
     /// Advance the animated background one frame.
     AnimTick,
 }
@@ -227,6 +231,9 @@ impl ArtIndex {
 pub struct GameMode {
     /// When true the File Browser renders this launcher instead of the panes.
     pub active: bool,
+    /// When true the launcher fills the window with no app chrome (tab bar /
+    /// status bar hidden). The host also puts the OS window in fullscreen.
+    pub fullscreen: bool,
     /// Library roots (device paths and/or local folders) from Settings, kept so
     /// Refresh can re-scan without re-plumbing them.
     roots: Vec<String>,
@@ -241,6 +248,8 @@ pub struct GameMode {
     art_loading: HashSet<String>,
     /// Phase for the phosphor-glow background.
     anim_phase: f32,
+    /// Last observed height of the list viewport, used to center the selection.
+    list_viewport_h: f32,
 }
 
 impl GameMode {
@@ -251,6 +260,7 @@ impl GameMode {
     /// Leave the launcher (Esc / exit button path).
     pub fn exit(&mut self) {
         self.active = false;
+        self.fullscreen = false;
     }
 
     pub fn subscription(&self) -> Subscription<GameModeMessage> {
@@ -268,6 +278,7 @@ impl GameMode {
             GameModeMessage::Toggle(roots) => {
                 if self.active {
                     self.active = false;
+                    self.fullscreen = false;
                     return GameUpdate::none();
                 }
                 self.active = true;
@@ -393,6 +404,18 @@ impl GameMode {
                 }
             }
 
+            GameModeMessage::ToggleFullscreen => {
+                self.fullscreen = !self.fullscreen;
+                // The host reads `self.fullscreen` after this returns to put the
+                // OS window in/out of fullscreen.
+                GameUpdate::none()
+            }
+
+            GameModeMessage::ListScrolled(viewport_h) => {
+                self.list_viewport_h = viewport_h;
+                GameUpdate::none()
+            }
+
             GameModeMessage::AnimTick => {
                 self.anim_phase = (self.anim_phase + 0.05) % (std::f32::consts::TAU * 1000.0);
                 GameUpdate::none()
@@ -431,16 +454,24 @@ impl GameMode {
         )
     }
 
-    /// Scroll the list so the highlighted game is visible. Offset accounts for
-    /// the section-header rows above the target.
+    /// Scroll the list so the highlighted game is centered. Rows are a uniform
+    /// fixed height (see the view), so `rows_above * ROW_HEIGHT_PX` is the exact
+    /// top of the selection; we then bias up by half the viewport to center it.
     fn scroll_to_selected(&self) -> Task<GameModeMessage> {
         if self.games.is_empty() {
             return Task::none();
         }
         let headers_above = headers_before(&self.games, self.selected);
         let rows_above = self.selected + headers_above;
-        let target_y = (rows_above as f32 * ROW_HEIGHT_PX).max(0.0);
-        let y = (target_y - VIEWPORT_GUESS_PX / 3.0).max(0.0);
+        let row_top = rows_above as f32 * ROW_HEIGHT_PX;
+        // Center on the real viewport when known; fall back to a guess before
+        // the first scroll event arrives.
+        let half = if self.list_viewport_h > 1.0 {
+            self.list_viewport_h / 2.0
+        } else {
+            VIEWPORT_GUESS_PX / 2.0
+        };
+        let y = (row_top + ROW_HEIGHT_PX / 2.0 - half).max(0.0);
         iced::widget::operation::scroll_to(
             iced::widget::Id::new(GAME_LIST_SCROLLABLE_ID),
             iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
@@ -464,6 +495,17 @@ impl GameMode {
         let refresh_btn = || {
             button(text("↻ Refresh").size(fs.small))
                 .on_press_maybe((!self.loading).then_some(GameModeMessage::Refresh))
+                .padding([5, 12])
+                .style(crate::styles::nav_button)
+        };
+        let fullscreen_btn = || {
+            let label = if self.fullscreen {
+                "🗗 Windowed"
+            } else {
+                "⛶ Fullscreen"
+            };
+            button(text(label).size(fs.small))
+                .on_press(GameModeMessage::ToggleFullscreen)
                 .padding([5, 12])
                 .style(crate::styles::nav_button)
         };
@@ -563,26 +605,51 @@ impl GameMode {
                 prev_letter = Some(game.letter);
                 list_items.push(
                     container(text(game.letter.to_string()).size(fs.small).color(accent))
-                        .padding([4, 10])
+                        .padding([0, 10])
+                        // Uniform row height so scroll offsets are exact.
+                        .center_y(Length::Fixed(ROW_HEIGHT_PX))
                         .into(),
                 );
             }
             let is_sel = i == self.selected;
+            // Selected title is a distinct warm gold; others stay muted grey.
+            let sel_gold = Color::from_rgb(1.0, 0.82, 0.28);
             let label =
                 text(game.title.clone())
                     .size(fs.normal)
-                    .color(if is_sel { ink } else { dim });
+                    .color(if is_sel { sel_gold } else { dim });
             list_items.push(
                 button(label)
                     .on_press(GameModeMessage::Select(i))
                     .width(Length::Fill)
-                    .padding([6, 10])
+                    .height(Length::Fixed(ROW_HEIGHT_PX))
+                    .padding([4, 10])
                     .style(move |_t: &Theme, _s| {
                         if is_sel {
+                            // Translucent accent fill + a brighter accent outline
+                            // so the highlight reads over the animated backdrop
+                            // without hiding it.
                             button::Style {
-                                background: Some(Color::from_rgb(0.16, 0.22, 0.34).into()),
-                                text_color: Color::from_rgb(0.95, 0.96, 1.0),
-                                border: iced::border::rounded(4),
+                                background: Some(
+                                    Color {
+                                        r: 0.35,
+                                        g: 0.72,
+                                        b: 1.0,
+                                        a: 0.30,
+                                    }
+                                    .into(),
+                                ),
+                                text_color: sel_gold,
+                                border: iced::Border {
+                                    color: Color {
+                                        r: 1.0,
+                                        g: 0.82,
+                                        b: 0.28,
+                                        a: 0.85,
+                                    },
+                                    width: 1.0,
+                                    radius: 4.0.into(),
+                                },
                                 ..Default::default()
                             }
                         } else {
@@ -596,24 +663,68 @@ impl GameMode {
                     .into(),
             );
         }
-        let title_list = scrollable(Column::with_children(list_items).spacing(2))
+        let title_list = scrollable(Column::with_children(list_items).spacing(0))
             .id(iced::widget::Id::new(GAME_LIST_SCROLLABLE_ID))
+            .on_scroll(|vp| GameModeMessage::ListScrolled(vp.bounds().height))
             .height(Length::Fill)
             .width(Length::Fill);
 
         // ── A–Z jump rail ─────────────────────────────────────────────────
+        // No scrolling: the letters are distributed evenly down the full height
+        // so the whole index is always visible, regardless of font size or how
+        // short the window is. Each letter's slot shares the height equally.
+        let current_letter = selected.map(|g| g.letter);
         let mut rail_letters: Vec<char> = self.games.iter().map(|g| g.letter).collect();
         rail_letters.dedup();
-        let mut rail = Column::new().spacing(1).align_x(iced::Alignment::Center);
+        // Keep the rail font modest and independent of the (large) content font
+        // so ~27 letters keep fitting; clamp to a readable range.
+        let rail_font = (fs.tiny as f32 + 1.0).clamp(11.0, 14.0);
+        let mut rail_col = Column::new()
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::Alignment::Center);
         for c in rail_letters {
-            rail = rail.push(
-                button(text(c.to_string()).size(fs.tiny).color(dim))
-                    .on_press(GameModeMessage::JumpToLetter(c))
-                    .padding([1, 4])
-                    .style(button::text),
-            );
+            let is_cur = Some(c) == current_letter;
+            let cell = container(text(c.to_string()).size(rail_font).color(if is_cur {
+                Color::from_rgb(1.0, 0.82, 0.28)
+            } else {
+                Color::from_rgb(0.80, 0.82, 0.90)
+            }))
+            .width(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill) // fills its equal share of the column height
+            .style(move |_t: &Theme| {
+                if is_cur {
+                    container::Style {
+                        background: Some(
+                            Color {
+                                r: 1.0,
+                                g: 0.82,
+                                b: 0.28,
+                                a: 0.18,
+                            }
+                            .into(),
+                        ),
+                        border: iced::border::rounded(3),
+                        ..Default::default()
+                    }
+                } else {
+                    container::Style::default()
+                }
+            });
+            rail_col = rail_col
+                .push(iced::widget::mouse_area(cell).on_press(GameModeMessage::JumpToLetter(c)));
         }
-        let rail = scrollable(rail).height(Length::Fill);
+        // Fixed-width faint panel so the letters read clearly over the backdrop.
+        let rail = container(rail_col)
+            .width(Length::Fixed(26.0))
+            .height(Length::Fill)
+            .padding([2, 2])
+            .style(|_t: &Theme| container::Style {
+                background: Some(Color::from_rgb(0.08, 0.09, 0.13).into()),
+                border: iced::border::rounded(5),
+                ..Default::default()
+            });
 
         let sel_title = selected
             .map(|g| g.title.clone())
@@ -655,11 +766,12 @@ impl GameMode {
                     Space::new().width(12),
                     text(subtitle).size(fs.tiny).color(dim),
                     Space::new().width(Length::Fill),
-                    text("↑/↓ select · Enter run · Esc exit")
+                    text("↑/↓ select · A–Z jump · Enter run · Esc exit")
                         .size(fs.tiny)
                         .color(dim),
                     Space::new().width(12),
                     refresh_btn(),
+                    fullscreen_btn(),
                     exit_btn(),
                 ]
                 .spacing(6)

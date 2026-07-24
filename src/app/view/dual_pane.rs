@@ -15,7 +15,10 @@ impl Ultimate64Browser {
     fn device_drive_control_strip(&self) -> Element<'_, Message> {
         let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
         let dim = iced::Color::from_rgb(0.55, 0.57, 0.62);
-        let connected = self.status.connected;
+        // Gate on "we have a connection", not "the last status poll succeeded":
+        // the poll can transiently fail on a reachable device, and gating device
+        // actions on it would wrongly lock the user out.
+        let connected = self.connection.is_some();
         const TYPES: [&str; 3] = ["1541", "1571", "1581"];
 
         // One drive: a type dropdown, a state-aware power toggle, and a reset.
@@ -197,20 +200,21 @@ impl Ultimate64Browser {
                 // Device-control quick actions — gated on connection so an
                 // offline click can't fire a hopeless REST request.
                 button(text("⏏ Eject A+B").size(small))
-                    .on_press_maybe(self.status.connected.then_some(Message::EjectAllDrives),)
+                    .on_press_maybe(self.connection.is_some().then_some(Message::EjectAllDrives),)
                     .padding([4, 8])
                     .style(crate::styles::nav_button),
                 // Game Mode — full-width EmulationStation-style launcher over
-                // the folders in the configured game library. Needs a live
-                // connection to enumerate the device.
+                // the folders in the configured game library. Always available:
+                // local libraries need no device, and a device library shows a
+                // clear error if it can't be reached.
                 button(text("🎮 Games").size(small))
-                    .on_press_maybe(self.status.connected.then(|| {
-                        Message::RemoteBrowser(RemoteBrowserMessage::Game(
+                    .on_press(Message::RemoteBrowser(
+                        crate::remote_browser::RemoteBrowserMessage::Game(
                             crate::game_mode::GameModeMessage::Toggle(
                                 self.settings.preferences.game_library_roots.clone(),
                             ),
-                        ))
-                    }))
+                        ),
+                    ))
                     .padding([4, 8])
                     .style(crate::styles::action_button),
                 // Run last — re-fires the most recent PRG/CRT/SID/disk
@@ -225,7 +229,7 @@ impl Ultimate64Browser {
                         .size(small),
                     )
                     .on_press_maybe(
-                        (self.status.connected && self.left_browser.last_run().is_some())
+                        (self.connection.is_some() && self.left_browser.last_run().is_some())
                             .then_some(Message::RunLast),
                     )
                     .padding([4, 8])
