@@ -131,6 +131,7 @@ mod file_browser;
 mod file_types;
 mod folder_favorites;
 mod ftp_ops;
+mod game_mode;
 #[cfg(test)]
 mod integration;
 mod memory_editor;
@@ -429,6 +430,9 @@ pub enum Message {
     GameLibraryInputChanged(String),
     GameLibraryAddRoot,
     GameLibraryRemoveRoot(usize),
+    /// Open a folder picker to add a local disk folder as a library root.
+    GameLibraryBrowseLocal,
+    GameLibraryLocalPicked(Option<PathBuf>),
 
     // Starting directory settings
     BrowseFileBrowserStartDir,
@@ -1040,6 +1044,7 @@ impl Ultimate64Browser {
                         | RemoteBrowserMessage::DeleteComplete(_)
                         | RemoteBrowserMessage::RenameComplete(_)
                         | RemoteBrowserMessage::ProgressTick
+                        | RemoteBrowserMessage::Game(_)
                 ) {
                     self.active_pane = Pane::Right;
                 }
@@ -1052,7 +1057,7 @@ impl Ultimate64Browser {
                         | RemoteBrowserMessage::PlaySid(_)
                         | RemoteBrowserMessage::PlayMod(_)
                         | RemoteBrowserMessage::RunDisk(_, _)
-                        | RemoteBrowserMessage::RunSelectedGame
+                        | RemoteBrowserMessage::Game(game_mode::GameModeMessage::Run)
                 ) && self.music_player.playback_state
                     == PlaybackState::Playing;
 
@@ -1122,18 +1127,27 @@ impl Ultimate64Browser {
                 iced::widget::operation::focus(id)
             }
             // In Game Mode the arrow keys drive the launcher, not the file
-            // panes. Route ↑/↓/Enter to the remote browser's game handlers.
-            Message::PaneCursorUp if self.remote_browser.game_mode => self
+            // panes. Route ↑/↓/Enter to the game module.
+            Message::PaneCursorUp if self.remote_browser.game.active => self
                 .remote_browser
-                .update(RemoteBrowserMessage::GameNav(-1), ctx.clone())
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Nav(-1)),
+                    ctx.clone(),
+                )
                 .map(Message::RemoteBrowser),
-            Message::PaneCursorDown if self.remote_browser.game_mode => self
+            Message::PaneCursorDown if self.remote_browser.game.active => self
                 .remote_browser
-                .update(RemoteBrowserMessage::GameNav(1), ctx.clone())
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Nav(1)),
+                    ctx.clone(),
+                )
                 .map(Message::RemoteBrowser),
-            Message::PaneActivate if self.remote_browser.game_mode => self
+            Message::PaneActivate if self.remote_browser.game.active => self
                 .remote_browser
-                .update(RemoteBrowserMessage::RunSelectedGame, ctx.clone())
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::Run),
+                    ctx.clone(),
+                )
                 .map(Message::RemoteBrowser),
             Message::PaneCursorUp => {
                 self.dispatch_local_pane_message(FileBrowserMessage::MoveSelectionUp)
@@ -1799,6 +1813,16 @@ impl Ultimate64Browser {
             }
             Message::GameLibraryAddRoot => self.handle_game_library_add_root(),
             Message::GameLibraryRemoveRoot(idx) => self.handle_game_library_remove_root(idx),
+            Message::GameLibraryBrowseLocal => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::GameLibraryLocalPicked,
+            ),
+            Message::GameLibraryLocalPicked(path) => self.handle_game_library_local_picked(path),
             // Starting directory settings
             Message::BrowseFileBrowserStartDir => Task::perform(
                 async {
@@ -2227,15 +2251,6 @@ impl Ultimate64Browser {
             Subscription::none()
         };
 
-        // Drive the Game Mode launcher's animated phosphor background (~30fps)
-        // only while it's on screen.
-        let game_anim_tick = if self.remote_browser.game_mode {
-            iced::time::every(Duration::from_millis(33))
-                .map(|_| Message::RemoteBrowser(RemoteBrowserMessage::GameAnimTick))
-        } else {
-            Subscription::none()
-        };
-
         Subscription::batch([
             self.video_streaming.subscription().map(Message::Streaming),
             self.music_player.subscription().map(Message::MusicPlayer),
@@ -2250,7 +2265,6 @@ impl Ultimate64Browser {
             copy_progress_tick,
             toast_tick,
             debug_stream_tick,
-            game_anim_tick,
         ])
     }
 

@@ -93,11 +93,12 @@ impl Ultimate64Browser {
     pub(crate) fn view_dual_pane_browser(&self) -> Element<'_, Message> {
         // Game Mode takes over the whole tab — a full-width immersive launcher
         // instead of the two file panes.
-        if self.remote_browser.game_mode {
+        if self.remote_browser.game.active {
             return self
                 .remote_browser
-                .view_game_mode(self.settings.preferences.font_size)
-                .map(Message::RemoteBrowser);
+                .game
+                .view(self.settings.preferences.font_size)
+                .map(|m| Message::RemoteBrowser(RemoteBrowserMessage::Game(m)));
         }
 
         // Left pane - Local files
@@ -204,8 +205,10 @@ impl Ultimate64Browser {
                 // connection to enumerate the device.
                 button(text("🎮 Games").size(small))
                     .on_press_maybe(self.status.connected.then(|| {
-                        Message::RemoteBrowser(RemoteBrowserMessage::ToggleGameMode(
-                            self.settings.preferences.game_library_roots.clone(),
+                        Message::RemoteBrowser(RemoteBrowserMessage::Game(
+                            crate::game_mode::GameModeMessage::Toggle(
+                                self.settings.preferences.game_library_roots.clone(),
+                            ),
                         ))
                     }))
                     .padding([4, 8])

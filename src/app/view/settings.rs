@@ -327,7 +327,7 @@ impl Ultimate64Browser {
         let game_library_section = section!(
             "Game library",
             column![
-                text("Device folders whose subfolders are games in Game Mode.")
+                text("Device folders (e.g. /Usb0/Games) or local disk folders whose games appear in Game Mode.")
                     .size(fs.small)
                     .color(dim),
                 roots_col,
@@ -338,10 +338,14 @@ impl Ultimate64Browser {
                         .padding(6)
                         .size(fs.small as f32)
                         .width(Length::Fixed(260.0)),
-                    button(text("Add").size(fs.small))
+                    button(text("Add device path").size(fs.small))
                         .on_press(Message::GameLibraryAddRoot)
                         .padding([4, 12])
                         .style(crate::styles::action_button),
+                    button(text("📁 Add local folder…").size(fs.small))
+                        .on_press(Message::GameLibraryBrowseLocal)
+                        .padding([4, 12])
+                        .style(crate::styles::nav_button),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),

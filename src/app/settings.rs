@@ -282,6 +282,29 @@ impl Ultimate64Browser {
         Task::none()
     }
 
+    /// Settings: a local folder was picked — add its absolute path as a library
+    /// root (deduped) and persist.
+    pub(crate) fn handle_game_library_local_picked(
+        &mut self,
+        path: Option<PathBuf>,
+    ) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let root = path.to_string_lossy().to_string();
+        {
+            let prefs = &mut self.profile_manager.active_settings_mut().preferences;
+            if !prefs.game_library_roots.iter().any(|r| r == &root) {
+                prefs.game_library_roots.push(root);
+            }
+        }
+        self.settings = self.profile_manager.active_settings().clone();
+        if let Err(e) = self.profile_manager.save() {
+            log::error!("Failed to save profiles: {}", e);
+        }
+        Task::none()
+    }
+
     /// Settings: remove the library root at `idx`, persist.
     pub(crate) fn handle_game_library_remove_root(&mut self, idx: usize) -> Task<Message> {
         {
