@@ -8,6 +8,10 @@ box art and screenshot when available.
 This guide walks through setting it up with a **OneLoad64** collection, which is
 the easiest case because OneLoad64 already ships cover art keyed by game name.
 
+▶️ **Video walkthrough:** https://www.youtube.com/watch?v=4HcPgJHaoC8
+
+[![Game Mode — video walkthrough](https://img.youtube.com/vi/4HcPgJHaoC8/hqdefault.jpg)](https://www.youtube.com/watch?v=4HcPgJHaoC8)
+
 ![Game Mode window](docs/images/game-mode.png)
 
 ---

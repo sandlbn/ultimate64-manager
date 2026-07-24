@@ -29,7 +29,7 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Shows a folder's box art and screenshot when present, including a central art folder such as OneLoad64's `Extras/Images`
   - A–Z jump, keyboard navigation, and Run (local games are uploaded to the device first)
   - Caches the scanned list and re-scans on change or via **Refresh**; **Fullscreen** hides the app chrome
-  - See [GAME_MODE.md](GAME_MODE.md) for setup, including preparing a OneLoad64 collection
+  - ▶️ [Video walkthrough](https://www.youtube.com/watch?v=4HcPgJHaoC8) · see [GAME_MODE.md](GAME_MODE.md) for setup, including preparing a OneLoad64 collection
 - **Supported File Types** – D64, D71, D81, G64, G71, G81, PRG, P00, CRT, SID, MOD, XM, S3M, TAP, T64, REU, ROM, BIN, CFG, ZIP, and firmware updates (U2L, U2P, U2R, U64, UE2)
 - **Music Player** – Play SID and MOD files with playlist support
   - Shuffle and repeat modes
