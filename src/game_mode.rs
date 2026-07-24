@@ -84,6 +84,8 @@ pub enum GameModeMessage {
     Run,
     /// Toggle immersive fullscreen (hide app chrome + OS fullscreen).
     ToggleFullscreen,
+    /// Show/hide same-title duplicate versions.
+    ToggleDuplicates,
     /// The list scrolled — carries the current viewport height (for centering).
     ListScrolled(f32),
     /// Advance the animated background one frame.
@@ -237,7 +239,14 @@ pub struct GameMode {
     /// Library roots (device paths and/or local folders) from Settings, kept so
     /// Refresh can re-scan without re-plumbing them.
     roots: Vec<String>,
+    /// Full scan result. `games` is derived from this (deduped unless
+    /// `show_duplicates`).
+    raw_games: Vec<GameEntry>,
+    /// The list actually shown — `raw_games` with same-title duplicates removed
+    /// (the arted copy is kept), unless `show_duplicates` is on.
     games: Vec<GameEntry>,
+    /// When true, show every scanned entry including same-title duplicates.
+    show_duplicates: bool,
     loading: bool,
     selected: usize,
     error: Option<String>,
@@ -322,9 +331,10 @@ impl GameMode {
                 self.loading = false;
                 match result {
                     Ok(scan) => {
-                        self.games = scan.games;
+                        self.raw_games = scan.games;
                         self.layout_label = scan.layout_label;
                         self.selected = 0;
+                        self.rebuild_games();
                         if self.games.is_empty() {
                             self.error =
                                 Some("No games found under the configured library.".to_string());
@@ -339,6 +349,16 @@ impl GameMode {
                         GameUpdate::none()
                     }
                 }
+            }
+
+            GameModeMessage::ToggleDuplicates => {
+                self.show_duplicates = !self.show_duplicates;
+                self.selected = 0;
+                self.rebuild_games();
+                GameUpdate::task(Task::batch([
+                    self.load_art_for_selected(&ctx),
+                    self.scroll_to_selected(),
+                ]))
             }
 
             GameModeMessage::Select(idx) => {
@@ -420,6 +440,19 @@ impl GameMode {
                 self.anim_phase = (self.anim_phase + 0.05) % (std::f32::consts::TAU * 1000.0);
                 GameUpdate::none()
             }
+        }
+    }
+
+    /// Rebuild the displayed `games` from `raw_games`, applying the duplicate
+    /// filter unless the user asked to see everything.
+    fn rebuild_games(&mut self) {
+        self.games = if self.show_duplicates {
+            self.raw_games.clone()
+        } else {
+            dedupe_by_title(&self.raw_games)
+        };
+        if self.selected >= self.games.len() {
+            self.selected = 0;
         }
     }
 
@@ -506,6 +539,17 @@ impl GameMode {
             };
             button(text(label).size(fs.small))
                 .on_press(GameModeMessage::ToggleFullscreen)
+                .padding([5, 12])
+                .style(crate::styles::nav_button)
+        };
+        let dupes_btn = || {
+            let label = if self.show_duplicates {
+                "⧉ Hide dupes"
+            } else {
+                "⧉ Show dupes"
+            };
+            button(text(label).size(fs.small))
+                .on_press(GameModeMessage::ToggleDuplicates)
                 .padding([5, 12])
                 .style(crate::styles::nav_button)
         };
@@ -614,10 +658,26 @@ impl GameMode {
             let is_sel = i == self.selected;
             // Selected title is a distinct warm gold; others stay muted grey.
             let sel_gold = Color::from_rgb(1.0, 0.82, 0.28);
-            let label =
+            // Right-aligned file-type badge (CRT / D64 / PRG / …).
+            let kind = game
+                .run_path
+                .as_deref()
+                .map(file_ext)
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let label = row![
                 text(game.title.clone())
                     .size(fs.normal)
-                    .color(if is_sel { sel_gold } else { dim });
+                    .color(if is_sel { sel_gold } else { dim }),
+                Space::new().width(Length::Fill),
+                text(kind)
+                    .size(fs.tiny)
+                    .color(Color::from_rgb(0.55, 0.60, 0.70)),
+                // Keep the type badge clear of the scrollbar / A–Z rail.
+                Space::new().width(14),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
             list_items.push(
                 button(label)
                     .on_press(GameModeMessage::Select(i))
@@ -738,7 +798,7 @@ impl GameMode {
         let center = column![
             text(sel_title).size(fs.large).color(ink),
             rule::horizontal(1),
-            row![title_list, rail].spacing(6).height(Length::Fill),
+            row![title_list, rail].spacing(10).height(Length::Fill),
             row![
                 run_btn,
                 Space::new().width(Length::Fill),
@@ -752,11 +812,15 @@ impl GameMode {
         .width(Length::Fill)
         .height(Length::Fill);
 
-        let subtitle = if self.layout_label.is_empty() {
+        let mut subtitle = if self.layout_label.is_empty() {
             format!("{} games", total)
         } else {
             format!("{} games · {}", total, self.layout_label)
         };
+        let hidden = self.raw_games.len().saturating_sub(self.games.len());
+        if !self.show_duplicates && hidden > 0 {
+            subtitle.push_str(&format!(" · {} duplicates hidden", hidden));
+        }
 
         game_backdrop(
             self.anim_phase,
@@ -770,6 +834,7 @@ impl GameMode {
                         .size(fs.tiny)
                         .color(dim),
                     Space::new().width(12),
+                    dupes_btn(),
                     refresh_btn(),
                     fullscreen_btn(),
                     exit_btn(),
@@ -886,6 +951,32 @@ impl canvas::Program<GameModeMessage> for GameBg {
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pure helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Collapse same-title entries to one. Titles that differ (e.g. `1942 (Music
+/// v1)` vs `(v2)`) are kept — only exact case-insensitive title duplicates,
+/// which come from the same game appearing in several formats or several copies
+/// of a collection, are merged. When merging, the copy that has cover art wins,
+/// so the deduped list keeps the nicest entry. Order is preserved.
+fn dedupe_by_title(games: &[GameEntry]) -> Vec<GameEntry> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<GameEntry> = Vec::new();
+    for g in games {
+        let key = g.title.to_lowercase();
+        match seen.get(&key) {
+            Some(&idx) => {
+                // Prefer the copy with art over one without.
+                if out[idx].cover_path.is_none() && g.cover_path.is_some() {
+                    out[idx] = g.clone();
+                }
+            }
+            None => {
+                seen.insert(key, out.len());
+                out.push(g.clone());
+            }
+        }
+    }
+    out
+}
 
 /// Number of section-header rows that precede game index `sel` (one per
 /// distinct leading letter in `games[0..=sel]`).
@@ -1854,6 +1945,35 @@ mod tests {
         assert_eq!(back.games[0].title, "Arkanoid");
         assert_eq!(back.games[0].letter, 'A');
         assert!(!back.games[0].local);
+    }
+
+    #[test]
+    fn dedupe_keeps_arted_copy_and_distinct_titles() {
+        let mk = |title: &str, cover: Option<&str>| GameEntry {
+            title: title.to_string(),
+            run_path: Some(format!("/x/{title}.crt")),
+            cover_path: cover.map(|c| c.to_string()),
+            shot_path: None,
+            key: format!("{title}-{cover:?}"),
+            letter: leading_letter(title),
+            local: false,
+        };
+        let games = vec![
+            mk("Commando", None),           // no art
+            mk("Commando", Some("/a.png")), // same title, arted → should win
+            mk("COMMANDO", None),           // case-insensitive dup
+            mk("1942 (Music v1)", None),
+            mk("1942 (Music v2)", None), // distinct title — kept
+        ];
+        let out = dedupe_by_title(&games);
+        assert_eq!(out.len(), 3, "3 unique titles");
+        let commando = out.iter().find(|g| g.title == "Commando").unwrap();
+        assert!(
+            commando.cover_path.is_some(),
+            "should keep the copy that has art"
+        );
+        assert!(out.iter().any(|g| g.title == "1942 (Music v1)"));
+        assert!(out.iter().any(|g| g.title == "1942 (Music v2)"));
     }
 
     #[test]
