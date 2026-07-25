@@ -1680,7 +1680,7 @@ impl Assembly64Browser {
                                     false,
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                // autoload confirms the mount before resetting.
                                 crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
                                 Ok(format!("Running disk: {}", safe_name))
                             }
@@ -1777,7 +1777,7 @@ impl Assembly64Browser {
                                     false,
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                // autoload confirms the mount before resetting.
                                 crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
                                 Ok(format!("Running disk: {}", filename))
                             }

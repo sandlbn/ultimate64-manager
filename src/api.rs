@@ -129,11 +129,9 @@ pub async fn run_disk(
     // 1. Mount the disk (readonly) via HTTP API
     mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
 
-    // Small delay for mount to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // 2. Reset and autoload using the shared adaptive sequence (polls screen
-    //    RAM for the READY prompt instead of blind sleeps).
+    // 2. Reset and autoload using the shared adaptive sequence (confirms the
+    //    mount, then polls screen RAM for the READY prompt instead of blind
+    //    sleeps).
     if let Some(conn) = connection {
         let device = device_num.to_string();
 
@@ -170,7 +168,8 @@ pub async fn run_local_disk_async(
         .to_string();
 
     upload_mount_disk_async(host, local_path, drive, "readonly", password).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // The shared autoload sequence confirms the mount via the drive list before
+    // resetting, so no fixed post-mount delay is needed here.
 
     let device_num = if drive == "a" { "8" } else { "9" };
     if let Some(conn) = connection {

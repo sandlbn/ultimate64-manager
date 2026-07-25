@@ -40,8 +40,46 @@ const PROMPT_SETTLE: Duration = Duration::from_millis(600);
 /// firmware that rejects the memory read) — mirrors the old fixed behavior.
 const FALLBACK_BOOT: Duration = Duration::from_secs(3);
 
-/// Interval between screen polls.
+/// Upper bound on how long to wait for the freshly-mounted disk to show up in
+/// the drive list before resetting anyway. Normally satisfied in a poll or two.
+const MOUNT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Interval between screen / drive-list polls.
 const POLL: Duration = Duration::from_millis(200);
+
+/// Which drive letter `device_num` (`"8"`/`"9"`) maps to in the drive list.
+fn drive_key_for(device_num: &str) -> &'static str {
+    if device_num == "9" {
+        "b"
+    } else {
+        "a"
+    }
+}
+
+/// Poll the drive list until the target drive reports a mounted image, so we
+/// never reset the machine before the disk is actually in place. Same return
+/// contract as [`poll_screen`]: `Some(true)` = confirmed, `Some(false)` = timed
+/// out but the list was readable, `None` = the list never read.
+fn wait_for_mount(conn: &dyn RemoteDevice, device_num: &str, timeout: Duration) -> Option<bool> {
+    let want = drive_key_for(device_num);
+    let deadline = Instant::now() + timeout;
+    let mut ever_read = false;
+    loop {
+        if let Ok(list) = conn.drive_list() {
+            ever_read = true;
+            if list
+                .iter()
+                .any(|(name, d)| name.eq_ignore_ascii_case(want) && d.image_file.is_some())
+            {
+                return Some(true);
+            }
+        }
+        if Instant::now() >= deadline {
+            return if ever_read { Some(false) } else { None };
+        }
+        std::thread::sleep(POLL);
+    }
+}
 
 /// Count non-overlapping-enough occurrences of `READY.` in a screen snapshot.
 fn ready_count(screen: &[u8]) -> usize {
@@ -81,7 +119,14 @@ fn poll_screen(
 /// → wait for the load to finish → `RUN`. Timing is adaptive; fixed sleeps are
 /// used only as a fallback when screen RAM can't be read.
 pub fn autoload_mounted_disk(conn: &dyn RemoteDevice, device_num: &str) -> Result<(), String> {
-    autoload_with(conn, device_num, READY_TIMEOUT, LOAD_TIMEOUT, PROMPT_SETTLE)
+    autoload_with(
+        conn,
+        device_num,
+        READY_TIMEOUT,
+        LOAD_TIMEOUT,
+        PROMPT_SETTLE,
+        MOUNT_TIMEOUT,
+    )
 }
 
 /// Core of [`autoload_mounted_disk`] with injectable timeouts + settle (tests
@@ -92,7 +137,16 @@ fn autoload_with(
     ready_timeout: Duration,
     load_timeout: Duration,
     settle: Duration,
+    mount_timeout: Duration,
 ) -> Result<(), String> {
+    // Confirm the disk is actually mounted before touching reset — otherwise a
+    // fast reset could beat the mount and the machine would boot to an empty or
+    // stale drive. If the drive list can't be read at all, fall back to a short
+    // fixed settle (the mount request itself already returned success).
+    if wait_for_mount(conn, device_num, mount_timeout).is_none() {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
     conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
 
     // Phase 1: wait for the reset to clear the previous screen. A `READY.` left
@@ -161,10 +215,19 @@ mod tests {
             Duration::from_millis(30),
             Duration::from_millis(30),
             Duration::from_millis(1),
+            Duration::from_millis(30),
         )
         .unwrap();
         let calls = handle.lock().unwrap().clone();
-        assert_eq!(calls.first().map(String::as_str), Some("reset"));
+        // Mount is confirmed (drive_list) before the machine is reset.
+        let drive_pos = calls
+            .iter()
+            .position(|c| c == "drive_list")
+            .expect("mount confirmed");
+        let reset_pos = calls
+            .iter()
+            .position(|c| c == "reset")
+            .expect("reset issued");
         let load_pos = calls
             .iter()
             .position(|c| c.contains("type_text") && c.contains("load"))
@@ -173,6 +236,8 @@ mod tests {
             .iter()
             .position(|c| c == "type_text(\"run\\n\")")
             .expect("RUN issued");
+        assert!(drive_pos < reset_pos, "mount confirmed before reset");
+        assert!(reset_pos < load_pos, "reset must precede LOAD");
         assert!(load_pos < run_pos, "LOAD must precede RUN");
     }
 }
