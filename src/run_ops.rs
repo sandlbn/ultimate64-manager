@@ -22,12 +22,19 @@ const SCREEN_LEN: u16 = 1000;
 const READY_CODES: [u8; 6] = [18, 5, 1, 4, 25, 46];
 
 /// Upper bound on how long to wait for BASIC to reach the `READY.` prompt after
-/// a reset. Real boot is ~2 s; the cap only matters if screen reads keep failing.
-const READY_TIMEOUT: Duration = Duration::from_secs(8);
+/// a reset. Real boot is ~2 s, but a device that's mid-reboot or busy mounting a
+/// large disk can take noticeably longer, so the cap is generous.
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Upper bound on how long to wait for a `LOAD` to complete before issuing `RUN`
 /// anyway. Generous because large disks legitimately take tens of seconds.
 const LOAD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// After the boot/load `READY.` appears, wait this long before typing so the
+/// screen editor is actually accepting keystrokes. Without it the first
+/// characters of `LOAD"*",8,1` can be dropped and only the tail (e.g. `,1`)
+/// lands on screen.
+const PROMPT_SETTLE: Duration = Duration::from_millis(600);
 
 /// Fallback delay used only when the screen can't be read at all (e.g. a
 /// firmware that rejects the memory read) — mirrors the old fixed behavior.
@@ -44,17 +51,21 @@ fn ready_count(screen: &[u8]) -> usize {
         .count()
 }
 
-/// Poll screen RAM until `READY.` appears at least `min_count` times, or the
-/// deadline passes. Returns `Some(true)` if the target was reached, `Some(false)`
-/// if it timed out but screen reads worked, and `None` if screen reads never
-/// succeeded (so the caller can apply a time-based fallback).
-fn wait_for_ready(conn: &dyn RemoteDevice, min_count: usize, timeout: Duration) -> Option<bool> {
+/// Poll screen RAM until `pred` holds, or the deadline passes. Returns
+/// `Some(true)` if `pred` was satisfied, `Some(false)` if it timed out but
+/// screen reads worked, and `None` if screen reads never succeeded (so the
+/// caller can apply a time-based fallback).
+fn poll_screen(
+    conn: &dyn RemoteDevice,
+    timeout: Duration,
+    pred: impl Fn(&[u8]) -> bool,
+) -> Option<bool> {
     let deadline = Instant::now() + timeout;
     let mut ever_read = false;
     loop {
         if let Ok(screen) = conn.read_mem(SCREEN_BASE, SCREEN_LEN) {
             ever_read = true;
-            if ready_count(&screen) >= min_count {
+            if pred(&screen) {
                 return Some(true);
             }
         }
@@ -66,42 +77,55 @@ fn wait_for_ready(conn: &dyn RemoteDevice, min_count: usize, timeout: Duration) 
 }
 
 /// Reset the machine and autoload the disk currently mounted on `device_num`
-/// (`"8"` or `"9"`): `RESET` → wait for `READY.` → `LOAD"*",<dev>,1` → wait for
-/// the load to finish → `RUN`. Timing is adaptive; fixed sleeps are used only as
-/// a fallback when screen RAM can't be read.
+/// (`"8"` or `"9"`): `RESET` → wait for the *fresh* `READY.` → `LOAD"*",<dev>,1`
+/// → wait for the load to finish → `RUN`. Timing is adaptive; fixed sleeps are
+/// used only as a fallback when screen RAM can't be read.
 pub fn autoload_mounted_disk(conn: &dyn RemoteDevice, device_num: &str) -> Result<(), String> {
-    autoload_with(conn, device_num, READY_TIMEOUT, LOAD_TIMEOUT)
+    autoload_with(conn, device_num, READY_TIMEOUT, LOAD_TIMEOUT, PROMPT_SETTLE)
 }
 
-/// Core of [`autoload_mounted_disk`] with injectable timeouts (tests pass tiny
-/// values so they don't wait out the real multi-second caps).
+/// Core of [`autoload_mounted_disk`] with injectable timeouts + settle (tests
+/// pass tiny values so they don't wait out the real multi-second caps).
 fn autoload_with(
     conn: &dyn RemoteDevice,
     device_num: &str,
     ready_timeout: Duration,
     load_timeout: Duration,
+    settle: Duration,
 ) -> Result<(), String> {
     conn.reset().map_err(|e| format!("Reset failed: {}", e))?;
 
-    // Wait for the boot `READY.` prompt, then note how many are on screen so we
-    // can detect a *fresh* one after the load.
-    let baseline = match wait_for_ready(conn, 1, ready_timeout) {
-        Some(_) => ready_count(&conn.read_mem(SCREEN_BASE, SCREEN_LEN).unwrap_or_default()),
-        None => {
-            // Screen unreadable — fall back to the old fixed delay.
-            std::thread::sleep(FALLBACK_BOOT);
-            0
-        }
-    };
+    // Phase 1: wait for the reset to clear the previous screen. A `READY.` left
+    // over from before the reset is still in screen RAM for a moment, so without
+    // this we'd latch onto it and start typing while the machine is still
+    // rebooting — which is exactly why only the tail of the LOAD line survives.
+    let cleared = poll_screen(conn, ready_timeout, |s| ready_count(s) == 0);
+
+    // Phase 2: wait for the fresh boot `READY.` prompt.
+    let booted = poll_screen(conn, ready_timeout, |s| ready_count(s) >= 1);
+
+    if cleared.is_none() && booted.is_none() {
+        // Screen never readable — fall back to a fixed boot delay.
+        std::thread::sleep(FALLBACK_BOOT);
+    } else {
+        // Let the editor settle so the whole LOAD line is accepted, not just its
+        // last characters.
+        std::thread::sleep(settle);
+    }
+
+    // Number of `READY.` now on screen, so we can detect a *fresh* one post-load.
+    let baseline = ready_count(&conn.read_mem(SCREEN_BASE, SCREEN_LEN).unwrap_or_default());
 
     let load_cmd = format!("load\"*\",{},1\n", device_num);
     conn.type_text(&load_cmd)
         .map_err(|e| format!("Type LOAD failed: {}", e))?;
 
     // Wait for the load to finish: a fresh `READY.` beyond the boot one. If the
-    // screen can't be read, fall back to a fixed wait so RUN isn't sent mid-load.
-    if wait_for_ready(conn, baseline + 1, load_timeout).is_none() {
-        std::thread::sleep(Duration::from_secs(5));
+    // screen can't be read, fall back to a fixed wait so RUN isn't sent mid-load;
+    // otherwise settle briefly so the RUN line is fully accepted too.
+    match poll_screen(conn, load_timeout, |s| ready_count(s) > baseline) {
+        None => std::thread::sleep(Duration::from_secs(5)),
+        _ => std::thread::sleep(settle),
     }
 
     conn.type_text("run\n")
@@ -136,6 +160,7 @@ mod tests {
             "8",
             Duration::from_millis(30),
             Duration::from_millis(30),
+            Duration::from_millis(1),
         )
         .unwrap();
         let calls = handle.lock().unwrap().clone();
