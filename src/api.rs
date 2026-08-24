@@ -103,8 +103,13 @@ pub async fn mount_disk(
     Ok(format!("Mounted: {}", filename))
 }
 
-/// Run a disk image with full sequence: mount, reset, LOAD"*",8,1, RUN
-/// Uses Rest connection for type_text (from ultimate64 crate)
+/// Run a disk image on the device.
+///
+/// Preferred for `.d64` on drive A: the native port-64 `CMD_RUN_IMG` — the
+/// firmware mounts and boots the disk itself (no client-side `LOAD"*"`). Falls
+/// back to REST mount + [`crate::run_ops::boot_mounted_disk`] (DMA-load the
+/// first PRG, else keyboard) for other formats, drive B, or when port 64 is
+/// unavailable.
 pub async fn run_disk(
     host: &str,
     file_path: &str,
@@ -118,6 +123,11 @@ pub async fn run_disk(
         .next()
         .unwrap_or(file_path)
         .to_string();
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
     log::info!(
         "API: run_disk {} on drive {} (device {})",
@@ -126,20 +136,39 @@ pub async fn run_disk(
         device_num
     );
 
-    // 1. Mount the disk (readonly) via HTTP API
+    // Fetch the image bytes once — needed for the native port-64 boot and as the
+    // DMA source for the REST fallback. Best-effort.
+    let image = crate::ftp_ops::download_file_ftp_preview(
+        host.to_string(),
+        file_path.to_string(),
+        password.clone(),
+    )
+    .await
+    .ok()
+    .map(|(_, bytes)| bytes);
+
+    // Preferred: native firmware mount+run for .d64 on drive A. `host` is the
+    // device IP (no scheme), which is exactly what the port-64 socket needs.
+    if drive == "a" && ext == "d64" {
+        if let Some(bytes) = &image {
+            if crate::port64::run_disk_image(host.to_string(), password.clone(), bytes.clone())
+                .await
+                .is_ok()
+            {
+                log::info!("run_disk: booted via port-64 CMD_RUN_IMG");
+                return Ok(format!("Running: {}", filename));
+            }
+            log::info!("run_disk: port-64 unavailable — REST mount + boot");
+        }
+    }
+
+    // Fallback: REST mount, then boot (DMA first PRG, else keyboard LOAD).
     mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
-
-    // Small delay for mount to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // 2. Reset and autoload using the shared adaptive sequence (polls screen
-    //    RAM for the READY prompt instead of blind sleeps).
     if let Some(conn) = connection {
         let device = device_num.to_string();
-
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().unwrap();
-            crate::run_ops::autoload_mounted_disk(&*c, &device)?;
+            crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
             Ok::<String, String>(format!("Running: {}", filename))
         })
         .await
@@ -153,9 +182,9 @@ pub async fn run_disk(
     }
 }
 
-/// Upload a *local* disk image, mount it (readonly) on `drive`, then reset +
-/// autoload — the local-file equivalent of [`run_disk`]. Used by Game Mode to
-/// launch disk images from an on-disk collection.
+/// Run a *local* disk image — the local-file equivalent of [`run_disk`]. Used by
+/// Game Mode. Prefers the native port-64 `CMD_RUN_IMG` for `.d64` on drive A,
+/// falling back to REST upload+mount + boot. `host` is the device IP (no scheme).
 pub async fn run_local_disk_async(
     host: &str,
     local_path: &Path,
@@ -168,16 +197,53 @@ pub async fn run_local_disk_async(
         .and_then(|s| s.to_str())
         .unwrap_or("disk")
         .to_string();
+    let ext = local_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
 
-    upload_mount_disk_async(host, local_path, drive, "readonly", password).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Read the image bytes: the native port-64 boot uploads them, and the REST
+    // fallback uses them as the DMA source.
+    let image = tokio::fs::read(local_path).await.ok();
+
+    // Preferred: native firmware mount+run for .d64 on drive A (no client-side
+    // LOAD"*"/keyboard). The firmware boots the disk itself. `host` is the
+    // device IP — exactly what the port-64 socket needs.
+    if drive == "a" && ext == "d64" {
+        if let Some(bytes) = &image {
+            if crate::port64::run_disk_image(
+                host.to_string(),
+                password.map(str::to_string),
+                bytes.clone(),
+            )
+            .await
+            .is_ok()
+            {
+                log::info!("run_local_disk: booted via port-64 CMD_RUN_IMG");
+                return Ok(format!("Running: {}", filename));
+            }
+            log::info!("run_local_disk: port-64 unavailable — REST upload+mount+boot");
+        }
+    }
+
+    // Fallback: REST upload+mount, then boot (DMA first PRG, else keyboard LOAD).
+    // The REST client needs the scheme; the device IP is `host`.
+    upload_mount_disk_async(
+        &format!("http://{}", host),
+        local_path,
+        drive,
+        "readonly",
+        password,
+    )
+    .await?;
 
     let device_num = if drive == "a" { "8" } else { "9" };
     if let Some(conn) = connection {
         let device = device_num.to_string();
         tokio::task::spawn_blocking(move || {
             let c = conn.lock().unwrap();
-            crate::run_ops::autoload_mounted_disk(&*c, &device)?;
+            crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
             Ok::<String, String>(format!("Running: {}", filename))
         })
         .await

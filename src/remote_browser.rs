@@ -313,9 +313,11 @@ impl RemoteBrowser {
 
         if crate::file_types::is_disk_image(ext) {
             let disk = std::path::PathBuf::from(path);
+            // Pass the raw device IP (from config) — run_local_disk_async uses it
+            // for the port-64 socket and builds the REST URL itself.
             return Task::perform(
                 async move {
-                    api::run_local_disk_async(&host, &disk, "a", password.as_deref(), connection)
+                    api::run_local_disk_async(&host_ip, &disk, "a", password.as_deref(), connection)
                         .await
                 },
                 RemoteBrowserMessage::MountComplete,

@@ -471,6 +471,34 @@ pub fn extract_single_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
     Some((only.name.trim().to_string(), bytes))
 }
 
+/// Extract the disk's **first** directory file when it is a PRG, ready to hand to
+/// `run_prg`. This mirrors `LOAD"*",8,1`: the C64 loads the first real directory
+/// entry, so we DMA-boot that same entry (to its embedded load address) — but
+/// only when it is a PRG. If the first entry is SEQ/USR/etc. (or the disk is
+/// GCR/unparseable) this returns `None` and the caller falls back to the
+/// keyboard `LOAD"*",8,1` path, which loads whatever the first file is.
+///
+/// Unlike [`extract_single_prg`] (which requires a single-file disk and is used
+/// for the no-mount fast path), this is used *after mounting* so multi-load
+/// games and disk-based loaders still find the emulated drive present.
+pub fn extract_first_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
+    let kind = detect_kind(data.len())?;
+    let entries = read_directory(data, kind).ok()?;
+    // The first real (closed, non-scratched) directory entry is what LOAD"*"
+    // targets. Only DMA-boot it if it is a PRG.
+    let first = entries
+        .iter()
+        .find(|e| e.file_type != FileType::Del && e.first_track != 0)?;
+    if first.file_type != FileType::Prg {
+        return None;
+    }
+    let bytes = follow_file_chain(data, kind, first.first_track, first.first_sector)?;
+    if bytes.len() < 3 {
+        return None;
+    }
+    Some((first.name.trim().to_string(), bytes))
+}
+
 // ─── Disk image creation ──────────────────────────────────────────────────────
 
 /// Write a PETSCII disk name into a 16-byte slice, padding with 0xA0 (shifted space).
@@ -817,6 +845,66 @@ mod tests {
         let (name, bytes) = extract_single_prg(&img).expect("one PRG present");
         assert_eq!(name, "P");
         assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn test_extract_first_prg_picks_first_when_prg() {
+        // First dir entry is a PRG (points at a data sector), second is a SEQ.
+        // extract_first_prg must return the first (PRG) file.
+        let mut img = build_blank_d64("TWOFILES", "01 2A");
+        let data_off = ts_offset(1, 0, ImageKind::D64).unwrap();
+        let payload = [0x00u8, 0x08, 0x99];
+        img[data_off] = 0;
+        img[data_off + 1] = 2 + payload.len() as u8 - 1;
+        img[data_off + 2..data_off + 2 + payload.len()].copy_from_slice(&payload);
+
+        let dir_off = ts_offset(18, 1, ImageKind::D64).unwrap();
+        img[dir_off] = 0; // dir chain end
+        img[dir_off + 1] = 0xFF;
+        // entry 0: closed PRG "A" at track 1 sector 0
+        img[dir_off + 2] = 0x82;
+        img[dir_off + 3] = 1;
+        img[dir_off + 4] = 0;
+        img[dir_off + 5] = b'A';
+        for b in img[dir_off + 6..dir_off + 21].iter_mut() {
+            *b = 0xA0;
+        }
+        // entry 1 (offset +32): closed SEQ "B"
+        img[dir_off + 32 + 2] = 0x81; // closed SEQ
+        img[dir_off + 32 + 3] = 1;
+        img[dir_off + 32 + 4] = 1;
+        img[dir_off + 32 + 5] = b'B';
+        for b in img[dir_off + 32 + 6..dir_off + 32 + 21].iter_mut() {
+            *b = 0xA0;
+        }
+
+        let (name, bytes) = extract_first_prg(&img).expect("first PRG present");
+        assert_eq!(name, "A");
+        assert_eq!(bytes, payload);
+    }
+
+    #[test]
+    fn test_extract_first_prg_none_when_first_is_seq() {
+        // First dir entry is a SEQ → LOAD"*" would load it; we return None so the
+        // keyboard path handles it rather than DMA-booting a later PRG.
+        let mut img = build_blank_d64("SEQFIRST", "01 2A");
+        let dir_off = ts_offset(18, 1, ImageKind::D64).unwrap();
+        img[dir_off] = 0;
+        img[dir_off + 1] = 0xFF;
+        img[dir_off + 2] = 0x81; // closed SEQ
+        img[dir_off + 3] = 1;
+        img[dir_off + 4] = 0;
+        img[dir_off + 5] = b'S';
+        for b in img[dir_off + 6..dir_off + 21].iter_mut() {
+            *b = 0xA0;
+        }
+        assert!(extract_first_prg(&img).is_none());
+    }
+
+    #[test]
+    fn test_extract_first_prg_none_on_gcr() {
+        // Unparseable length (not a decoded D64/D71/D81) → None → keyboard path.
+        assert!(extract_first_prg(&vec![0u8; 12345]).is_none());
     }
 
     #[test]

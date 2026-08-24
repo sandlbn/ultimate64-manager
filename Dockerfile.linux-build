@@ -1,0 +1,66 @@
+# Reproducible Linux x86_64 build environment for Ultimate64 Manager.
+#
+# Ubuntu 20.04 base → glibc 2.31 → the resulting AppImage runs on
+# Ubuntu 20.04+, Debian 11+, Fedora 33+, and most distros from 2020
+# onward. Building on a newer host links against newer glibc symbols
+# (e.g. GLIBC_2.38) which would break compatibility.
+#
+# We deliberately AVOID running `linuxdeploy`/`appimagetool` inside the
+# build (both are themselves AppImages, whose runtimes can't bootstrap
+# inside Docker without FUSE/binfmt support — fatal under QEMU
+# emulation on ARM hosts). Instead, the `linux_docker` make target
+# assembles the AppImage from raw parts using `mksquashfs` + the
+# pre-downloaded AppImage runtime ELF baked into this image.
+#
+# Build the image once:
+#   make linux_docker_image
+#
+# Build the AppImage:
+#   make linux_docker
+
+# Platform is pinned to linux/amd64 by the caller (see Makefile:
+# `docker build --platform=linux/amd64`), not here — BuildKit lints
+# against hard-coded `--platform` in FROM.
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PATH="/root/.cargo/bin:${PATH}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        file \
+        build-essential \
+        pkg-config \
+        libudev-dev \
+        libasound2-dev \
+        libgtk-3-dev \
+        libssl-dev \
+        libxkbcommon-dev \
+        libfontconfig1-dev \
+        libfreetype6-dev \
+        libwayland-dev \
+        libxcb1-dev \
+        libxcb-render0-dev \
+        libxcb-shape0-dev \
+        libxcb-xfixes0-dev \
+        squashfs-tools \
+        desktop-file-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal
+
+# Pre-download the standalone AppImage runtime. This is a tiny ELF (~190 KB)
+# from the AppImage project that knows how to mount its own squashfs payload
+# at run time on the user's machine — exactly what `appimagetool` produces.
+# Baking it here means `make linux_docker` is fully offline and doesn't need
+# any AppImage tooling at build time.
+RUN set -eux \
+    && curl -fSL -o /opt/appimage-runtime \
+        https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64 \
+    && file /opt/appimage-runtime | grep -q 'ELF 64-bit' \
+    && chmod +x /opt/appimage-runtime
+
+WORKDIR /src

@@ -3058,20 +3058,19 @@ async fn run_disk_async(
         tokio::task::spawn_blocking(move || {
             let conn = connection.lock().unwrap();
 
-            // Fast path: a disk holding exactly one PRG runs directly, no mount,
-            // no reset, no autoload delays.
+            // Fast path: a disk holding exactly one PRG runs directly, no mount.
             if let Some((_, prg)) = crate::disk_image::extract_single_prg(&image) {
                 return conn
                     .run_prg(&prg)
                     .map_err(|e| format!("Run PRG failed: {}", e));
             }
 
-            // Multi-file disk: mount read-only, then autoload via the shared
-            // adaptive sequence.
+            // Multi-file disk: mount read-only, then boot — DMA-load the first
+            // directory PRG (deterministic), or fall back to the keyboard LOAD
+            // for GCR / non-PRG-first disks.
             conn.mount_disk_image(&path, drive.clone(), MountMode::ReadOnly, false)
                 .map_err(|e| format!("Mount failed: {}", e))?;
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            crate::run_ops::autoload_mounted_disk(&*conn, device_num)
+            crate::run_ops::boot_mounted_disk(&*conn, device_num, Some(&image))
         }),
     )
     .await;
