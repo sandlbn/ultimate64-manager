@@ -4,7 +4,8 @@ use crate::remote_device::RemoteDevice;
 use crate::sid_info;
 use iced::{
     widget::{
-        button, column, container, progress_bar, row, rule, scrollable, text, text_input, tooltip,
+        button, column, container, progress_bar, responsive, row, rule, scrollable, text,
+        text_input, tooltip,
         Column, Space,
     },
     Element, Length, Subscription, Task,
@@ -1627,6 +1628,11 @@ impl MusicPlayer {
             .padding(10)
             .into()
         } else {
+            responsive(move |size| {
+            // Budget the label to the *measured* pane width so long paths only
+            // shorten when they genuinely don't fit. Reserve for the [SID] icon,
+            // subsong count, and the two trailing action buttons.
+            let name_budget = chars_that_fit(size.width, fs.normal as f32, 160.0);
             // Filter entries based on filter text (skip when showing search results)
             let filtered_entries: Vec<(usize, &BrowserEntry)> = self
                 .browser_entries
@@ -1674,9 +1680,10 @@ impl MusicPlayer {
                                 String::new()
                             };
 
-                            let max_name_len = 40;
-                            let display = truncate_string(&entry.name, max_name_len);
-                            let is_truncated = entry.name.chars().count() > max_name_len;
+                            // Keep the filename whole; elide only leading dirs,
+                            // and only when it overflows the measured width.
+                            let display = fit_path(&entry.name, name_budget);
+                            let is_truncated = display != entry.name;
 
                             let file_button = button(
                                 text(format!("{}{} {}", icon, subsong_info, display))
@@ -1755,6 +1762,8 @@ impl MusicPlayer {
                     .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
             )
             .height(Length::Fill)
+            .into()
+            })
             .into()
         };
 
@@ -1852,6 +1861,10 @@ impl MusicPlayer {
                 .padding(10)
                 .into()
         } else {
+            responsive(move |size| {
+            // Reserve for the play-state prefix, [badge], (duration) and the
+            // up/down/remove buttons that trail every playlist row.
+            let name_budget = chars_that_fit(size.width, fs.small as f32, 200.0);
             let items: Vec<Element<'_, MusicPlayerMessage>> = self
                 .playlist
                 .iter()
@@ -1909,9 +1922,10 @@ impl MusicPlayer {
                     } else {
                         entry.name.clone()
                     };
-                    let max_name_len = 40;
-                    let name = truncate_string(&display_name, max_name_len);
-                    let is_truncated = display_name.chars().count() > max_name_len;
+                    // Keep the filename whole; elide only leading dirs, and only
+                    // when the row overflows the measured pane width.
+                    let name = fit_path(&display_name, name_budget);
+                    let is_truncated = name != display_name;
 
                     let playlist_button = button(
                         text(format!(
@@ -2003,6 +2017,8 @@ impl MusicPlayer {
                     .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
             )
             .height(Length::Fill)
+            .into()
+            })
             .into()
         };
 
@@ -2537,6 +2553,27 @@ fn music_type_from_path(path: &Path) -> Option<MusicFileType> {
 
 fn truncate_string(s: &str, max_len: usize) -> String {
     crate::string_utils::truncate_string(s, max_len)
+}
+
+/// Fit a relative path into `max_chars`, always keeping the filename in full
+/// (elides the leading directory instead of the filename). See
+/// [`crate::string_utils::fit_path`].
+fn fit_path(s: &str, max_chars: usize) -> String {
+    crate::string_utils::fit_path(s, max_chars)
+}
+
+/// Approximate how many characters of the proportional UI font fit in a row of
+/// `width_px`, after reserving `reserved_px` for fixed chrome (icons, action
+/// buttons, padding). Deliberately conservative — it rounds the per-glyph
+/// advance up so labels stay inside the measured pane rather than overflow it.
+/// The exact full text is always available via the row's tooltip.
+fn chars_that_fit(width_px: f32, font_px: f32, reserved_px: f32) -> usize {
+    // iced's default sans-serif averages ~0.5×em per glyph; use 0.6 so we
+    // under-count (fewer chars) rather than overrun the available width.
+    let per_char = (font_px * 0.6).max(1.0);
+    let avail = (width_px - reserved_px).max(0.0);
+    // Never collapse below a floor that still shows a usable filename tail.
+    ((avail / per_char).floor() as usize).max(12)
 }
 
 fn truncate_path(path: &Path, max_len: usize) -> String {
