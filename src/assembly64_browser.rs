@@ -1669,7 +1669,8 @@ impl Assembly64Browser {
                                     conn.run_prg(&prg).map_err(|e| format!("run: {}", e))?;
                                     return Ok(format!("Running: {}", safe_name));
                                 }
-                                // Multi-file disk: mount read-only + adaptive autoload.
+                                // Multi-file disk: mount read-only, then boot by
+                                // DMA-loading the first PRG (keyboard fallback for GCR).
                                 let temp = std::env::temp_dir().join(&safe_name);
                                 std::fs::write(&temp, &bytes)
                                     .map_err(|e| format!("temp write: {}", e))?;
@@ -1680,8 +1681,11 @@ impl Assembly64Browser {
                                     false,
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
+                                crate::run_ops::boot_mounted_disk(
+                                    &*conn,
+                                    &device_num,
+                                    Some(&bytes),
+                                )?;
                                 Ok(format!("Running disk: {}", safe_name))
                             }
                             (None, other) => Err(format!("Unsupported file type: {}", other)),
@@ -1777,8 +1781,11 @@ impl Assembly64Browser {
                                     false,
                                 )
                                 .map_err(|e| format!("mount: {}", e))?;
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                crate::run_ops::autoload_mounted_disk(&*conn, &device_num)?;
+                                crate::run_ops::boot_mounted_disk(
+                                    &*conn,
+                                    &device_num,
+                                    Some(&data),
+                                )?;
                                 Ok(format!("Running disk: {}", filename))
                             }
                             (None, other) => Err(format!("Unsupported file type: {}", other)),
