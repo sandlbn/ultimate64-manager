@@ -181,7 +181,7 @@ use streaming::{StreamingMessage, VideoStreaming};
 use tab::{TabContext, TabController};
 use templates::{DiskTemplate, TemplateManager};
 
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn main() -> iced::Result {
     // Force OpenGL backend on Linux for better compatibility with multi-GPU systems

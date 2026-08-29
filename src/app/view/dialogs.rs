@@ -361,8 +361,14 @@ impl Ultimate64Browser {
             Space::new().into()
         };
 
+        let app_name_text = text(format!("Ultimate64 Manager v{}", crate::APP_VERSION))
+            .size(fs.normal)
+            .color(iced::Color::from_rgb(0.6, 0.6, 0.7));
+
         container(
             row![
+                app_name_text,
+                text(" | ").size(fs.normal),
                 status_indicator,
                 text(" | ").size(fs.normal),
                 device_text,
