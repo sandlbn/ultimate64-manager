@@ -120,6 +120,29 @@ fn encode_image_frame(cmd: u16, data: &[u8]) -> Vec<u8> {
     pkt
 }
 
+/// Write `pkt` in full within `budget`, mapping an overrun to
+/// [`Port64Error::Timeout`].
+///
+/// Generic over the sink rather than taking a `TcpStream` so the guard can be
+/// tested against a writer that never completes. Testing it through a real
+/// socket does not work portably: it relies on the peer not draining the
+/// connection to create backpressure, which holds on unix loopback but not on
+/// Windows, where the stack buffered a 16 MB payload outright and the write
+/// returned success.
+async fn write_all_within<W>(w: &mut W, pkt: &[u8], budget: std::time::Duration) -> Port64Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(budget, async {
+        w.write_all(pkt).await?;
+        w.flush().await
+    })
+    .await
+    .map_err(|_| Port64Error::Timeout)?
+    .map_err(|e| Port64Error::Send(e.to_string()))?;
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  Error type
 // ─────────────────────────────────────────────────────────────────
@@ -193,7 +216,6 @@ pub enum StreamKind {
 pub struct Port64Client {
     host: String,
     password: Option<String>,
-    port: u16,
     timeout: std::time::Duration,
     image_timeout: std::time::Duration,
 }
@@ -204,19 +226,9 @@ impl Port64Client {
         Self {
             host: host.into(),
             password,
-            port: PORT,
             timeout: std::time::Duration::from_secs(TIMEOUT_SECS),
             image_timeout: std::time::Duration::from_secs(IMAGE_TIMEOUT_SECS),
         }
-    }
-
-    /// Point the client at a non-default TCP port. The device always uses
-    /// [`PORT`]; this exists so tests can drive the client against a local
-    /// stub listener (port 64 is privileged and can't be bound in a test).
-    #[cfg(test)]
-    fn with_port(mut self, port: u16) -> Self {
-        self.port = port;
-        self
     }
 
     /// Override the default per-operation timeout.
@@ -238,7 +250,7 @@ impl Port64Client {
     /// Open a TCP connection and authenticate if a password is set.
     /// Returns the authenticated stream ready to receive commands.
     async fn open(&self) -> Port64Result<TcpStream> {
-        let addr = format!("{}:{}", self.host, self.port);
+        let addr = format!("{}:{}", self.host, PORT);
 
         let stream = tokio::time::timeout(self.timeout, TcpStream::connect(&addr))
             .await
@@ -487,14 +499,7 @@ impl Port64Client {
     async fn send_image_cmd(&self, cmd: u16, data: &[u8]) -> Port64Result<()> {
         let pkt = encode_image_frame(cmd, data);
         let mut s = self.open().await?;
-        tokio::time::timeout(self.image_timeout, async {
-            s.write_all(&pkt).await?;
-            s.flush().await
-        })
-        .await
-        .map_err(|_| Port64Error::Timeout)?
-        .map_err(|e| Port64Error::Send(e.to_string()))?;
-        Ok(())
+        write_all_within(&mut s, &pkt, self.image_timeout).await
     }
 
     // ── Developer / undocumented ──────────────────────────────────
@@ -799,44 +804,72 @@ mod tests {
         assert_eq!(decoded as usize, D64_LEN);
     }
 
-    /// The stalled-transfer guard: a peer that accepts the connection but never
-    /// reads. Once the kernel socket buffers fill, `write_all` blocks forever —
-    /// which is exactly the hang this timeout was added to bound. Uses a 1s
-    /// override so the test doesn't wait out the 60s production budget.
+    /// A sink that accepts nothing and never completes — models a device that
+    /// has stopped draining the socket.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The stalled-transfer guard. A write that never completes must surface as
+    /// `Timeout` rather than hanging forever — the bug this budget was added to
+    /// bound.
+    ///
+    /// Driven through a stalled writer instead of a real socket so the result is
+    /// identical on every platform: an earlier version used a TCP peer that
+    /// simply never read, which produced backpressure on unix but not on
+    /// Windows (the stack buffered the whole payload and the write succeeded),
+    /// so the test failed there for reasons unrelated to the guard.
     #[tokio::test]
-    async fn image_send_times_out_when_the_peer_stops_reading() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        // Accept, then hold the connection open without ever reading from it.
-        let _accepter = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            drop(stream);
-        });
-
-        // Payload far larger than any plausible socket buffer, so the write
-        // cannot drain into the kernel and must block.
-        let big = vec![0u8; 16 * 1024 * 1024];
-        let client = Port64Client::new("127.0.0.1", None)
-            .with_port(port)
-            .with_image_timeout(1);
-
+    async fn image_write_times_out_when_the_sink_never_completes() {
         let started = std::time::Instant::now();
-        let err = client
-            .send_image_cmd(CMD_RUN_IMG, &big)
-            .await
-            .expect_err("a non-reading peer must not look like success");
+        let err = write_all_within(
+            &mut StalledWriter,
+            &[0u8; 64],
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a sink that never completes must not look like success");
 
         assert!(
             matches!(err, Port64Error::Timeout),
             "expected Timeout, got {err:?}"
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(10),
-            "guard should fire at ~1s, took {:?}",
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "guard should fire at ~150ms, took {:?}",
             started.elapsed()
         );
+    }
+
+    /// The happy path still writes the complete frame through to the sink.
+    #[tokio::test]
+    async fn image_write_delivers_the_whole_frame_when_the_sink_drains() {
+        let mut sink: Vec<u8> = Vec::new();
+        let pkt = encode_image_frame(CMD_RUN_IMG, &[0xAA; 300]);
+        write_all_within(&mut sink, &pkt, std::time::Duration::from_secs(5))
+            .await
+            .expect("a draining sink must succeed");
+        assert_eq!(sink, pkt, "frame must arrive byte-for-byte");
     }
 
     /// A d81 (~800 KB) still fits the 24-bit field with room to spare.
