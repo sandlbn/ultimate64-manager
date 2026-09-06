@@ -37,8 +37,17 @@ use tokio::net::TcpStream;
 /// TCP port the Ultimate DMA service listens on.
 pub const PORT: u16 = 64;
 
-/// Default per-operation timeout in seconds.
+/// Default per-operation timeout in seconds. Applies to connect and to reads of
+/// small replies — *not* to bulk image transfers, which use
+/// [`IMAGE_TIMEOUT_SECS`].
 pub const TIMEOUT_SECS: u64 = 5;
+
+/// Budget for pushing a whole disk/cartridge image over the socket.
+///
+/// Images run from 175 KB (d64) to ~800 KB (d81), far beyond what the 5 s
+/// per-operation default is meant to cover; matches the 60 s already used for
+/// the REST multipart upload and the FTP fetch of the same images.
+pub const IMAGE_TIMEOUT_SECS: u64 = 60;
 
 // All 25 command codes from socket_dma.cc
 pub const CMD_DMA: u16 = 0xFF01; // Load PRG via DMA
@@ -70,6 +79,69 @@ pub const CMD_LOADSIDCRT: u16 = 0xFF71;
 pub const CMD_LOADBOOTCRT: u16 = 0xFF72;
 pub const CMD_READFLASH: u16 = 0xFF75;
 pub const CMD_DEBUG_REG: u16 = 0xFF76;
+
+// ─────────────────────────────────────────────────────────────────
+//  Wire framing
+// ─────────────────────────────────────────────────────────────────
+
+/// Build one command frame: `cmd (2B LE) | len (2B LE) | payload`.
+///
+/// `len_field` is passed separately rather than derived from `payload.len()`
+/// because the protocol does not always use it as a byte count — `CMD_WAIT`
+/// encodes a millisecond delay there and sends no payload at all. Keeping this
+/// a pure function (rather than inlining it into the socket writers) is what
+/// makes the framing testable without a device or a TCP listener.
+fn encode_frame(cmd: u16, len_field: u16, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(4 + payload.len());
+    pkt.extend_from_slice(&cmd.to_le_bytes());
+    pkt.extend_from_slice(&len_field.to_le_bytes());
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+/// Build an image-command frame: `cmd (2B LE) | len_lo (2B LE) | len_hi (1B)`
+/// followed by the payload.
+///
+/// The three image commands (`CMD_MOUNT_IMG`, `CMD_RUN_IMG`, `CMD_RUN_CRT`)
+/// carry payloads larger than 64 KB, so the server reads a **24-bit** length:
+/// two bytes little-endian, then one more high byte. Getting this wrong
+/// truncates or corrupts a whole disk image, which is exactly why it is worth
+/// testing as a pure function.
+fn encode_image_frame(cmd: u16, data: &[u8]) -> Vec<u8> {
+    let len = data.len();
+    let len_lo = (len & 0xFFFF) as u16;
+    let len_hi = ((len >> 16) & 0xFF) as u8;
+
+    let mut pkt = Vec::with_capacity(5 + data.len());
+    pkt.extend_from_slice(&cmd.to_le_bytes());
+    pkt.extend_from_slice(&len_lo.to_le_bytes());
+    pkt.push(len_hi);
+    pkt.extend_from_slice(data);
+    pkt
+}
+
+/// Write `pkt` in full within `budget`, mapping an overrun to
+/// [`Port64Error::Timeout`].
+///
+/// Generic over the sink rather than taking a `TcpStream` so the guard can be
+/// tested against a writer that never completes. Testing it through a real
+/// socket does not work portably: it relies on the peer not draining the
+/// connection to create backpressure, which holds on unix loopback but not on
+/// Windows, where the stack buffered a 16 MB payload outright and the write
+/// returned success.
+async fn write_all_within<W>(w: &mut W, pkt: &[u8], budget: std::time::Duration) -> Port64Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(budget, async {
+        w.write_all(pkt).await?;
+        w.flush().await
+    })
+    .await
+    .map_err(|_| Port64Error::Timeout)?
+    .map_err(|e| Port64Error::Send(e.to_string()))?;
+    Ok(())
+}
 
 // ─────────────────────────────────────────────────────────────────
 //  Error type
@@ -145,6 +217,7 @@ pub struct Port64Client {
     host: String,
     password: Option<String>,
     timeout: std::time::Duration,
+    image_timeout: std::time::Duration,
 }
 
 impl Port64Client {
@@ -154,12 +227,21 @@ impl Port64Client {
             host: host.into(),
             password,
             timeout: std::time::Duration::from_secs(TIMEOUT_SECS),
+            image_timeout: std::time::Duration::from_secs(IMAGE_TIMEOUT_SECS),
         }
     }
 
     /// Override the default per-operation timeout.
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout = std::time::Duration::from_secs(secs);
+        self
+    }
+
+    /// Override the bulk-image transfer budget (see [`IMAGE_TIMEOUT_SECS`]).
+    /// Exists so the stalled-transfer guard can be exercised in a test without
+    /// waiting out the full production budget.
+    pub fn with_image_timeout(mut self, secs: u64) -> Self {
+        self.image_timeout = std::time::Duration::from_secs(secs);
         self
     }
 
@@ -220,11 +302,7 @@ impl Port64Client {
     /// Send a command packet with a raw payload (no extra framing).
     /// `payload` is the complete byte sequence after the 4-byte header.
     async fn send_cmd(&self, stream: &mut TcpStream, cmd: u16, payload: &[u8]) -> Port64Result<()> {
-        let len = payload.len() as u16;
-        let mut pkt = Vec::with_capacity(4 + payload.len());
-        pkt.extend_from_slice(&cmd.to_le_bytes());
-        pkt.extend_from_slice(&len.to_le_bytes());
-        pkt.extend_from_slice(payload);
+        let pkt = encode_frame(cmd, payload.len() as u16, payload);
         stream
             .write_all(&pkt)
             .await
@@ -246,10 +324,7 @@ impl Port64Client {
         len_field: u16,
         payload: &[u8],
     ) -> Port64Result<()> {
-        let mut pkt = Vec::with_capacity(4 + payload.len());
-        pkt.extend_from_slice(&cmd.to_le_bytes());
-        pkt.extend_from_slice(&len_field.to_le_bytes());
-        pkt.extend_from_slice(payload);
+        let pkt = encode_frame(cmd, len_field, payload);
         stream
             .write_all(&pkt)
             .await
@@ -417,25 +492,14 @@ impl Port64Client {
     ///
     /// The C++ server reads 2 bytes for the length then reads one extra byte
     /// to form a 24-bit total length for these larger payloads.
+    /// A disk image is 175 KB (d64) to ~800 KB (d81), so the write needs its own
+    /// budget — but it does need *a* budget: an unbounded `write_all` blocks
+    /// forever if the device stops draining the socket (TCP backpressure while
+    /// the firmware is busy), and this runs before any caller-side guard.
     async fn send_image_cmd(&self, cmd: u16, data: &[u8]) -> Port64Result<()> {
-        let len = data.len();
-        let len_lo = (len & 0xFFFF) as u16;
-        let len_hi = ((len >> 16) & 0xFF) as u8;
-
-        let mut pkt = Vec::with_capacity(5 + data.len());
-        pkt.extend_from_slice(&cmd.to_le_bytes());
-        pkt.extend_from_slice(&len_lo.to_le_bytes());
-        pkt.push(len_hi);
-        pkt.extend_from_slice(data);
-
+        let pkt = encode_image_frame(cmd, data);
         let mut s = self.open().await?;
-        s.write_all(&pkt)
-            .await
-            .map_err(|e| Port64Error::Send(e.to_string()))?;
-        s.flush()
-            .await
-            .map_err(|e| Port64Error::Send(e.to_string()))?;
-        Ok(())
+        write_all_within(&mut s, &pkt, self.image_timeout).await
     }
 
     // ── Developer / undocumented ──────────────────────────────────
@@ -684,4 +748,136 @@ pub async fn flash_page(
         .await
         .map(|data| (page, data))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_header_is_cmd_then_len_little_endian() {
+        let f = encode_frame(CMD_RESET, 0, &[]);
+        // 0xFF04 little-endian = 04 FF, then a zero length.
+        assert_eq!(f, vec![0x04, 0xFF, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn frame_carries_payload_after_the_4_byte_header() {
+        let f = encode_frame(CMD_DMAWRITE, 3, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(&f[..2], &[0x06, 0xFF]); // cmd 0xFF06
+        assert_eq!(&f[2..4], &[0x03, 0x00]); // len = 3
+        assert_eq!(&f[4..], &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(f.len(), 4 + 3);
+    }
+
+    /// `CMD_WAIT` puts a millisecond delay in the length field and sends no
+    /// payload — the reason the length is a separate parameter.
+    #[test]
+    fn raw_len_field_is_independent_of_payload_length() {
+        let f = encode_frame(CMD_WAIT, 500, &[]);
+        assert_eq!(&f[2..4], &[0xF4, 0x01]); // 500 = 0x01F4, little-endian
+        assert_eq!(f.len(), 4, "no payload bytes follow CMD_WAIT");
+    }
+
+    #[test]
+    fn image_frame_uses_a_5_byte_24bit_header() {
+        let data = vec![0u8; 10];
+        let f = encode_image_frame(CMD_RUN_IMG, &data);
+        assert_eq!(&f[..2], &[0x0B, 0xFF]); // cmd 0xFF0B
+        assert_eq!(&f[2..4], &[0x0A, 0x00]); // len_lo = 10
+        assert_eq!(f[4], 0x00); // len_hi
+        assert_eq!(f.len(), 5 + 10);
+    }
+
+    /// A standard d64 is 174848 bytes — past 64 KB, so it exercises the high
+    /// byte. Getting this wrong truncates the image and the disk won't boot.
+    #[test]
+    fn image_frame_encodes_a_real_d64_length_across_the_16bit_boundary() {
+        const D64_LEN: usize = 174_848; // 0x02AB00
+        let f = encode_image_frame(CMD_RUN_IMG, &vec![0u8; D64_LEN]);
+        assert_eq!(&f[2..4], &[0x00, 0xAB], "low 16 bits of 0x02AB00");
+        assert_eq!(f[4], 0x02, "high byte must carry bits 16..24");
+        assert_eq!(f.len(), 5 + D64_LEN);
+
+        // Round-trip: decode the way the firmware does.
+        let decoded = u32::from(f[2]) | (u32::from(f[3]) << 8) | (u32::from(f[4]) << 16);
+        assert_eq!(decoded as usize, D64_LEN);
+    }
+
+    /// A sink that accepts nothing and never completes — models a device that
+    /// has stopped draining the socket.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// The stalled-transfer guard. A write that never completes must surface as
+    /// `Timeout` rather than hanging forever — the bug this budget was added to
+    /// bound.
+    ///
+    /// Driven through a stalled writer instead of a real socket so the result is
+    /// identical on every platform: an earlier version used a TCP peer that
+    /// simply never read, which produced backpressure on unix but not on
+    /// Windows (the stack buffered the whole payload and the write succeeded),
+    /// so the test failed there for reasons unrelated to the guard.
+    #[tokio::test]
+    async fn image_write_times_out_when_the_sink_never_completes() {
+        let started = std::time::Instant::now();
+        let err = write_all_within(
+            &mut StalledWriter,
+            &[0u8; 64],
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a sink that never completes must not look like success");
+
+        assert!(
+            matches!(err, Port64Error::Timeout),
+            "expected Timeout, got {err:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "guard should fire at ~150ms, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The happy path still writes the complete frame through to the sink.
+    #[tokio::test]
+    async fn image_write_delivers_the_whole_frame_when_the_sink_drains() {
+        let mut sink: Vec<u8> = Vec::new();
+        let pkt = encode_image_frame(CMD_RUN_IMG, &[0xAA; 300]);
+        write_all_within(&mut sink, &pkt, std::time::Duration::from_secs(5))
+            .await
+            .expect("a draining sink must succeed");
+        assert_eq!(sink, pkt, "frame must arrive byte-for-byte");
+    }
+
+    /// A d81 (~800 KB) still fits the 24-bit field with room to spare.
+    #[test]
+    fn image_frame_handles_a_d81_sized_payload() {
+        const D81_LEN: usize = 819_200; // 0x0C8000
+        let f = encode_image_frame(CMD_MOUNT_IMG, &vec![0u8; D81_LEN]);
+        let decoded = u32::from(f[2]) | (u32::from(f[3]) << 8) | (u32::from(f[4]) << 16);
+        assert_eq!(decoded as usize, D81_LEN);
+    }
 }

@@ -3098,32 +3098,24 @@ async fn load_and_run_async(
         .and_then(|s| s.to_str())
         .map(|s| s.to_lowercase());
 
-    // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
-    // Wrap in timeout to prevent hangs when device is offline
-    let result = tokio::time::timeout(
-        tokio::time::Duration::from_secs(REST_TIMEOUT_SECS),
-        tokio::task::spawn_blocking(move || {
-            let conn = connection.lock().unwrap();
-            match ext.as_deref() {
-                Some("crt") => {
-                    log::info!("Running as CRT cartridge");
-                    conn.run_crt(&data).map_err(|e| e.to_string())
-                }
-                Some("prg") => {
-                    log::info!("Running as PRG");
-                    conn.run_prg(&data).map_err(|e| e.to_string())
-                }
-                _ => Err("Unsupported file type".to_string()),
+    // Runners reset the machine and DMA-load before answering — ~8 s on an
+    // Ultimate II+ (fw 3.14), regardless of program size. The old 5 s cap here
+    // reported successful loads as "device may be offline"; use the run budget.
+    crate::net_utils::run_blocking(crate::net_utils::REST_RUN_TIMEOUT_SECS, "Load", move || {
+        let conn = connection.lock().unwrap();
+        match ext.as_deref() {
+            Some("crt") => {
+                log::info!("Running as CRT cartridge");
+                conn.run_crt(&data).map_err(|e| e.to_string())
             }
-        }),
-    )
-    .await;
-
-    match result {
-        Ok(Ok(inner)) => inner,
-        Ok(Err(e)) => Err(format!("Task error: {}", e)),
-        Err(_) => Err("Load timed out - device may be offline".to_string()),
-    }
+            Some("prg") => {
+                log::info!("Running as PRG");
+                conn.run_prg(&data).map_err(|e| e.to_string())
+            }
+            _ => Err("Unsupported file type".to_string()),
+        }
+    })
+    .await
 }
 
 /// Outcome of the one-shot CSDB → Assembly64 folder migration.
