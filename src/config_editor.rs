@@ -144,6 +144,12 @@ impl ConfigEditor {
         }
     }
 
+    /// Whether the editor holds config edits that have not been applied or
+    /// saved. Consulted by the window-close guard.
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.has_unsaved_changes
+    }
+
     pub fn update_impl(
         &mut self,
         message: ConfigEditorMessage,

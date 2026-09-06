@@ -34,10 +34,36 @@ impl std::fmt::Display for AssemblyError {
         match self {
             AssemblyError::AqlSyntax => f.write_str("AQL syntax error"),
             AssemblyError::Http(s) => write!(f, "HTTP {}", s),
-            AssemblyError::Network(e) => write!(f, "{}", e),
-            AssemblyError::Json(e) => write!(f, "{}", e),
+            // Assembly64 is the app's most internet-dependent feature, so
+            // transport failures are routine (offline, DNS, server down) and
+            // used to reach the status bar as raw reqwest text like
+            // "error sending request for url (…): dns error: …". Classify into
+            // something the user can act on; the raw error still goes to the log.
+            AssemblyError::Network(e) => f.write_str(describe_network_error(e)),
+            AssemblyError::Json(_) => {
+                f.write_str("Assembly64 returned an unexpected response — try again shortly")
+            }
             AssemblyError::Other(s) => f.write_str(s),
         }
+    }
+}
+
+/// Turn a `reqwest` transport failure into a short, actionable sentence.
+///
+/// Deliberately returns `&'static str`: these are user-facing and must not
+/// embed URLs or library internals. Ordered most-specific first, since a
+/// connect failure is also "not a timeout" and would otherwise fall through.
+fn describe_network_error(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "Assembly64 took too long to respond — it may be busy; try again"
+    } else if e.is_connect() {
+        "Can't reach Assembly64 — check your internet connection"
+    } else if e.is_decode() {
+        "Assembly64 sent a malformed response — try again shortly"
+    } else if e.is_body() || e.is_request() {
+        "The request to Assembly64 failed — try again"
+    } else {
+        "Assembly64 is unreachable — check your internet connection"
     }
 }
 
@@ -45,6 +71,10 @@ impl std::error::Error for AssemblyError {}
 
 impl From<reqwest::Error> for AssemblyError {
     fn from(e: reqwest::Error) -> Self {
+        // The Display impl deliberately hides library detail from the user, so
+        // record the real error here — otherwise diagnosing a report becomes
+        // guesswork.
+        log::warn!("Assembly64 request failed: {}", e);
         AssemblyError::Network(e)
     }
 }
@@ -1379,5 +1409,52 @@ mod tests {
             ..csdb.clone()
         };
         assert!(oneload.csdb_release_url().is_none());
+    }
+}
+
+#[cfg(test)]
+mod error_messages_tests {
+    use super::*;
+
+    /// User-facing text must never leak library internals — no URLs, no
+    /// "reqwest", no "dns error:" fragments.
+    #[test]
+    fn network_messages_are_human_readable() {
+        for msg in [
+            "Assembly64 took too long to respond — it may be busy; try again",
+            "Can't reach Assembly64 — check your internet connection",
+            "Assembly64 sent a malformed response — try again shortly",
+            "The request to Assembly64 failed — try again",
+            "Assembly64 is unreachable — check your internet connection",
+        ] {
+            let lower = msg.to_lowercase();
+            assert!(!lower.contains("reqwest"), "{msg}");
+            assert!(!lower.contains("http://"), "{msg}");
+            assert!(!lower.contains("dns error"), "{msg}");
+            assert!(msg.len() < 90, "too long for a status bar: {msg}");
+        }
+    }
+
+    /// A decode failure surfaces as guidance, not a serde dump.
+    #[test]
+    fn json_errors_do_not_expose_serde_detail() {
+        let raw = serde_json::from_str::<u32>("nope").unwrap_err();
+        let raw_text = raw.to_string();
+        let shown = AssemblyError::Json(raw).to_string();
+
+        assert!(
+            !shown.contains(&raw_text),
+            "leaked the serde message verbatim: {shown}"
+        );
+        // serde's text mentions a line/column position; ours must not.
+        assert!(!shown.contains("line "), "leaked parser position: {shown}");
+        assert!(shown.contains("Assembly64"), "{shown}");
+    }
+
+    /// AQL syntax errors are shown verbatim — they are the user's own input
+    /// problem and the browser renders them as an inline hint.
+    #[test]
+    fn aql_syntax_error_is_unchanged() {
+        assert_eq!(AssemblyError::AqlSyntax.to_string(), "AQL syntax error");
     }
 }

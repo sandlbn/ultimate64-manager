@@ -158,8 +158,13 @@ pub async fn run_disk(
                 .await
                 .is_ok()
             {
-                log::info!("run_disk: booted via port-64 CMD_RUN_IMG");
-                return Ok(format!("Running: {}", filename));
+                log::info!("run_disk: mounted+started via port-64 CMD_RUN_IMG");
+                // CMD_RUN_IMG returns as soon as the image is mounted and the
+                // machine reset — the C64 then loads from the emulated 1541 at
+                // authentic speed, which measured ~60s for a real game disk.
+                // Saying "Running" here reads as a failure while the drive is
+                // still working, so report what is actually true.
+                return Ok(format!("Loading {} — watch the C64", filename));
             }
             log::info!("run_disk: port-64 unavailable — REST mount + boot");
         }
@@ -172,7 +177,7 @@ pub async fn run_disk(
         run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
             let c = conn.lock().unwrap();
             crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok(format!("Running: {}", filename))
+            Ok(format!("Loading {} — watch the C64", filename))
         })
         .await
     } else {
@@ -222,8 +227,8 @@ pub async fn run_local_disk_async(
             .await
             .is_ok()
             {
-                log::info!("run_local_disk: booted via port-64 CMD_RUN_IMG");
-                return Ok(format!("Running: {}", filename));
+                log::info!("run_local_disk: mounted+started via port-64 CMD_RUN_IMG");
+                return Ok(format!("Loading {} — watch the C64", filename));
             }
             log::info!("run_local_disk: port-64 unavailable — REST upload+mount+boot");
         }
@@ -246,7 +251,7 @@ pub async fn run_local_disk_async(
         run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
             let c = conn.lock().unwrap();
             crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok(format!("Running: {}", filename))
+            Ok(format!("Loading {} — watch the C64", filename))
         })
         .await
     } else {

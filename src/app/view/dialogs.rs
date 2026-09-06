@@ -224,10 +224,45 @@ impl Ultimate64Browser {
     pub(crate) fn view_close_confirm_dialog(&self) -> Element<'_, Message> {
         let fs = crate::styles::FontSizes::from_base(self.settings.preferences.font_size);
 
+        // The dialog fires for two different reasons — an in-flight transfer
+        // and unsaved edits — and they carry different stakes, so say which
+        // one applies rather than always blaming a transfer.
+        let transferring = self.is_transfer_in_flight();
+        let unsaved = self.unsaved_work();
+
+        let (title, detail) = match (transferring, unsaved.is_empty()) {
+            (true, true) => (
+                "Quit while transfer is in progress?".to_string(),
+                "A file transfer or download hasn't finished yet. Closing now will abort it; partial files may be left behind.".to_string(),
+            ),
+            (false, false) => (
+                "Quit with unsaved changes?".to_string(),
+                format!(
+                    "Your {} {} not been saved. Closing now discards {}.",
+                    unsaved.join(" and "),
+                    if unsaved.len() > 1 { "have" } else { "has" },
+                    if unsaved.len() > 1 { "them" } else { "it" },
+                ),
+            ),
+            (true, false) => (
+                "Quit now?".to_string(),
+                format!(
+                    "A transfer is still running, and your {} {} not been saved. Closing now aborts the transfer and discards those changes.",
+                    unsaved.join(" and "),
+                    if unsaved.len() > 1 { "have" } else { "has" },
+                ),
+            ),
+            // Guard is only armed when something is at risk; harmless default.
+            (false, true) => (
+                "Quit?".to_string(),
+                "Close the application?".to_string(),
+            ),
+        };
+
         let dialog = container(
             column![
-                text("Quit while transfer is in progress?").size(fs.large),
-                text("A file transfer or download hasn't finished yet. Closing now will abort it; partial files may be left behind.")
+                text(title).size(fs.large),
+                text(detail)
                     .size(fs.small)
                     .color(iced::Color::from_rgb(0.7, 0.7, 0.75)),
                 Space::new().height(12),

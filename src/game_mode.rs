@@ -78,6 +78,12 @@ pub enum GameModeMessage {
     Nav(i32),
     /// Jump to the first game whose section letter matches.
     JumpToLetter(char),
+    /// Append a typed character to the incremental title search.
+    SearchPush(char),
+    /// Delete the last character of the search.
+    SearchBackspace,
+    /// Abandon the search and show the whole library again.
+    SearchClear,
     /// Box art + screenshot for a game finished downloading (best-effort).
     ArtLoaded(String, (Option<Vec<u8>>, Option<Vec<u8>>)),
     /// Launch the highlighted game.
@@ -247,6 +253,11 @@ pub struct GameMode {
     games: Vec<GameEntry>,
     /// When true, show every scanned entry including same-title duplicates.
     show_duplicates: bool,
+    /// Incremental title search. Typing filters the list; empty means "show
+    /// everything". A letter rail alone doesn't scale to libraries of a couple
+    /// of thousand games — jumping to "T" still leaves a long scroll to reach
+    /// Turrican — so typed characters filter rather than jump.
+    search: String,
     loading: bool,
     selected: usize,
     error: Option<String>,
@@ -399,6 +410,26 @@ impl GameMode {
                 GameUpdate::none()
             }
 
+            GameModeMessage::SearchPush(ch) => {
+                self.update_search(&ctx, |s| s.push(ch.to_ascii_lowercase()))
+            }
+
+            GameModeMessage::SearchBackspace => {
+                if self.search.is_empty() {
+                    return GameUpdate::none();
+                }
+                self.update_search(&ctx, |s| {
+                    s.pop();
+                })
+            }
+
+            GameModeMessage::SearchClear => {
+                if self.search.is_empty() {
+                    return GameUpdate::none();
+                }
+                self.update_search(&ctx, |s| s.clear())
+            }
+
             GameModeMessage::ArtLoaded(key, (cover, shot)) => {
                 self.art_loading.remove(&key);
                 self.art.insert(
@@ -446,14 +477,41 @@ impl GameMode {
     /// Rebuild the displayed `games` from `raw_games`, applying the duplicate
     /// filter unless the user asked to see everything.
     fn rebuild_games(&mut self) {
-        self.games = if self.show_duplicates {
+        let mut games = if self.show_duplicates {
             self.raw_games.clone()
         } else {
             dedupe_by_title(&self.raw_games)
         };
+        // Substring rather than prefix match: users recall a game by a word
+        // anywhere in the title ("tanx" for "Duo Tanx"), not just its first
+        // letters — and the A–Z rail already covers the by-initial case.
+        if !self.search.is_empty() {
+            let needle = self.search.to_lowercase();
+            games.retain(|g| g.title.to_lowercase().contains(&needle));
+        }
+        self.games = games;
         if self.selected >= self.games.len() {
             self.selected = 0;
         }
+    }
+
+    /// Whether a title search is currently narrowing the list. The host reads
+    /// this to decide whether Esc/Backspace should edit the search or fall
+    /// through to their usual meanings (leave Game Mode / navigate up).
+    pub fn is_searching(&self) -> bool {
+        !self.search.is_empty()
+    }
+
+    /// Apply a change to the search string, then re-filter and re-home the
+    /// selection. Shared by the push/backspace/clear messages.
+    fn update_search(&mut self, ctx: &GameCtx, edit: impl FnOnce(&mut String)) -> GameUpdate {
+        edit(&mut self.search);
+        self.selected = 0;
+        self.rebuild_games();
+        GameUpdate::task(Task::batch(vec![
+            self.load_art_for_selected(ctx),
+            self.scroll_to_selected(),
+        ]))
     }
 
     /// Fetch the highlighted game's already-resolved art unless cached / in
@@ -817,10 +875,43 @@ impl GameMode {
         } else {
             format!("{} games · {}", total, self.layout_label)
         };
+        // While filtering, `total` is the match count, so the duplicate tally
+        // (which compares against the whole library) would be nonsense.
         let hidden = self.raw_games.len().saturating_sub(self.games.len());
-        if !self.show_duplicates && hidden > 0 {
+        if !self.show_duplicates && hidden > 0 && !self.is_searching() {
             subtitle.push_str(&format!(" · {} duplicates hidden", hidden));
         }
+
+        // Search indicator: shown only while filtering, and coloured red on a
+        // dead end so an over-typed query is obvious rather than looking like
+        // an empty library.
+        let searching = self.is_searching();
+        let no_matches = searching && self.games.is_empty();
+        let search_row: Element<'_, GameModeMessage> = if searching {
+            let label = if no_matches {
+                format!(
+                    "search: {}  (no matches — ⌫ to edit, Esc to clear)",
+                    self.search
+                )
+            } else {
+                format!(
+                    "search: {}  ({} of {})",
+                    self.search,
+                    total,
+                    self.raw_games.len()
+                )
+            };
+            text(label)
+                .size(fs.tiny)
+                .color(if no_matches {
+                    iced::Color::from_rgb(0.95, 0.45, 0.45)
+                } else {
+                    accent
+                })
+                .into()
+        } else {
+            Space::new().width(0).into()
+        };
 
         game_backdrop(
             self.anim_phase,
@@ -829,8 +920,10 @@ impl GameMode {
                     text("🎮 GAME MODE").size(fs.large).color(accent),
                     Space::new().width(12),
                     text(subtitle).size(fs.tiny).color(dim),
+                    Space::new().width(12),
+                    search_row,
                     Space::new().width(Length::Fill),
-                    text("↑/↓ select · A–Z jump · Enter run · Esc exit")
+                    text("↑/↓ select · type to search · Enter run · Esc back")
                         .size(fs.tiny)
                         .color(dim),
                     Space::new().width(12),
@@ -1623,6 +1716,113 @@ mod tests {
             size: 0,
             path: format!("/games/{}", name),
         }
+    }
+
+    // ── Incremental title search ─────────────────────────────────────
+
+    fn game(title: &str) -> GameEntry {
+        GameEntry {
+            title: title.to_string(),
+            run_path: Some(format!("/games/{}.crt", title)),
+            cover_path: None,
+            shot_path: None,
+            key: title.to_string(),
+            letter: leading_letter(title),
+            local: true,
+        }
+    }
+
+    fn library(titles: &[&str]) -> GameMode {
+        let mut gm = GameMode {
+            raw_games: titles.iter().map(|t| game(t)).collect(),
+            ..GameMode::default()
+        };
+        gm.rebuild_games();
+        gm
+    }
+
+    fn shown(gm: &GameMode) -> Vec<String> {
+        gm.games.iter().map(|g| g.title.clone()).collect()
+    }
+
+    #[test]
+    fn no_search_shows_the_whole_library() {
+        let gm = library(&["Turrican", "Duo Tanx", "Wizball"]);
+        assert_eq!(shown(&gm).len(), 3);
+        assert!(!gm.is_searching());
+    }
+
+    #[test]
+    fn search_narrows_to_matching_titles() {
+        let mut gm = library(&["Turrican", "Turrican II", "Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("turr"));
+        assert_eq!(shown(&gm), vec!["Turrican", "Turrican II"]);
+        assert!(gm.is_searching());
+    }
+
+    /// Matching mid-title is the point — users recall a word, not the initial.
+    #[test]
+    fn search_matches_anywhere_in_the_title_not_just_the_start() {
+        let mut gm = library(&["Duo Tanx", "Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("tanx"));
+        assert_eq!(shown(&gm), vec!["Duo Tanx"]);
+    }
+
+    #[test]
+    fn search_is_case_insensitive() {
+        let mut gm = library(&["Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("WIZ"));
+        assert_eq!(shown(&gm), vec!["Wizball"]);
+    }
+
+    /// An over-typed query yields an empty list — the view flags this rather
+    /// than letting it look like an empty library.
+    #[test]
+    fn an_unmatched_search_yields_no_games() {
+        let mut gm = library(&["Turrican", "Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("zzzz"));
+        assert!(shown(&gm).is_empty());
+        assert!(gm.is_searching());
+    }
+
+    #[test]
+    fn backspace_widens_the_search_again() {
+        let mut gm = library(&["Turrican", "Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("turx"));
+        assert!(shown(&gm).is_empty());
+        gm.update_search(&GameCtx::default(), |s| {
+            s.pop();
+        });
+        assert_eq!(shown(&gm), vec!["Turrican"]);
+    }
+
+    #[test]
+    fn clearing_the_search_restores_the_whole_library() {
+        let mut gm = library(&["Turrican", "Wizball"]);
+        gm.update_search(&GameCtx::default(), |s| s.push_str("turr"));
+        gm.update_search(&GameCtx::default(), |s| s.clear());
+        assert_eq!(shown(&gm).len(), 2);
+        assert!(!gm.is_searching());
+    }
+
+    /// Filtering must re-home the highlight: leaving it at an old index would
+    /// point past the end of a shorter list, or at an unrelated game.
+    #[test]
+    fn search_resets_the_selection_into_range() {
+        let mut gm = library(&["Turrican", "Wizball", "Zynaps"]);
+        gm.selected = 2;
+        gm.update_search(&GameCtx::default(), |s| s.push_str("turr"));
+        assert_eq!(gm.selected, 0);
+        assert!(gm.selected < gm.games.len().max(1));
+    }
+
+    /// Search composes with duplicate-hiding rather than bypassing it.
+    #[test]
+    fn search_still_hides_duplicates() {
+        let mut gm = library(&["Turrican", "Turrican", "Wizball"]);
+        assert_eq!(shown(&gm).len(), 2, "dedupe applies before filtering");
+        gm.update_search(&GameCtx::default(), |s| s.push_str("turr"));
+        assert_eq!(shown(&gm), vec!["Turrican"]);
     }
 
     #[test]
