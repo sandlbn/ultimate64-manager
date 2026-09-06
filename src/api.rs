@@ -1,7 +1,7 @@
 // Ultimate64 REST API client
 
 use crate::device_error::DeviceError;
-use crate::net_utils::REST_TIMEOUT_SECS;
+use crate::net_utils::{run_blocking, REST_RUN_TIMEOUT_SECS, REST_TIMEOUT_SECS};
 use crate::remote_device::RemoteDevice;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,7 +57,10 @@ async fn run_file(
     let url = format!("http://{}:80/v1/runners:{}", host, runner);
     log::info!("API: {} -> {}", runner, file_path);
 
-    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
+    // Runners hold the response until the device finishes resetting and
+    // DMA-loading (~8 s measured) — the ordinary 5 s cap reported successful
+    // loads as "device may be offline". See REST_RUN_TIMEOUT_SECS.
+    let client = crate::net_utils::build_device_client(REST_RUN_TIMEOUT_SECS)?;
     let request = crate::net_utils::with_password(
         client.put(&url).query(&[("file", file_path)]),
         password.as_deref(),
@@ -166,13 +169,12 @@ pub async fn run_disk(
     mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
     if let Some(conn) = connection {
         let device = device_num.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
             let c = conn.lock().unwrap();
             crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok::<String, String>(format!("Running: {}", filename))
+            Ok(format!("Running: {}", filename))
         })
         .await
-        .map_err(|e| format!("Task error: {}", e))?
     } else {
         // No connection available - just mount (reset requires connection or separate HTTP call)
         Ok(format!(
@@ -241,13 +243,12 @@ pub async fn run_local_disk_async(
     let device_num = if drive == "a" { "8" } else { "9" };
     if let Some(conn) = connection {
         let device = device_num.to_string();
-        tokio::task::spawn_blocking(move || {
+        run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
             let c = conn.lock().unwrap();
             crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok::<String, String>(format!("Running: {}", filename))
+            Ok(format!("Running: {}", filename))
         })
         .await
-        .map_err(|e| format!("Task error: {}", e))?
     } else {
         Ok(format!(
             "Mounted: {} (no connection for auto-run)",

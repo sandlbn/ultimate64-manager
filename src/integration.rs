@@ -386,6 +386,156 @@ fn live_type_text() {
     println!("Typed test keystrokes to {}", host);
 }
 
+/// Guards the fix for the "Load timed out — device may be offline" reports:
+/// `run_prg` answers only after the device has reset and DMA-loaded, which took
+/// a fixed ~8s on an Ultimate II+ (fw 3.14) and ~1.9s on a C64 Ultimate
+/// (fw 1.1.0). The old 5s cap sat between those two figures, so the II+ failed
+/// every load while this machine passed — which is why it went unnoticed.
+///
+/// Asserts the real latency still fits inside REST_RUN_TIMEOUT_SECS, and prints
+/// it so a firmware regression shows up as a number rather than a mystery.
+#[test]
+#[ignore = "DESTRUCTIVE: resets the C64 and runs a program. Set U64_TEST_DESTRUCTIVE=1"]
+fn live_run_prg_completes_within_the_run_timeout() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+
+    // `10 SYS 2061` plus real 6502 code at 2061 ($080D) that stamps a marker
+    // into unused RAM. An earlier version of this test stopped at the BASIC
+    // stub — but 2061 was then past the end of the payload, so it SYS'd into
+    // uninitialised RAM and proved nothing. The marker is what makes this a
+    // test of *execution* rather than of upload latency.
+    //
+    //   $0801  0B 08 0A 00 9E "2061" 00   line 10: SYS 2061
+    //   $080B  00 00                      end of program
+    //   $080D  A9 42     LDA #$42
+    //          8D 00 C0  STA $C000
+    //          A9 43     LDA #$43
+    //          8D 01 C0  STA $C001
+    //          60        RTS
+    let prg: &[u8] = &[
+        0x01, 0x08, // load address $0801
+        0x0b, 0x08, 0x0a, 0x00, 0x9e, 0x32, 0x30, 0x36, 0x31, 0x00, // 10 SYS 2061
+        0x00, 0x00, // end of BASIC program
+        0xa9, 0x42, 0x8d, 0x00, 0xc0, // LDA #$42 : STA $C000
+        0xa9, 0x43, 0x8d, 0x01, 0xc0, // LDA #$43 : STA $C001
+        0x60, // RTS
+    ];
+    let conn = connect(&host, test_password());
+
+    // Clear the marker bytes first, so a stale value can't fake a pass.
+    on_device(&conn, |d| d.write_mem(0xC000, &[0x00, 0x00])).expect("failed to clear marker");
+    let before = read_mem(&conn, 0xC000, 2).expect("marker read failed");
+    assert_eq!(before, vec![0x00, 0x00], "marker did not clear");
+
+    let started = std::time::Instant::now();
+    block_on(crate::net_utils::run_blocking(
+        crate::net_utils::REST_RUN_TIMEOUT_SECS,
+        "Load",
+        {
+            let prg = prg.to_vec();
+            let conn = conn.clone();
+            move || {
+                let c = conn.lock().unwrap();
+                c.run_prg(&prg).map_err(|e| e.to_string())
+            }
+        },
+    ))
+    .expect("run_prg failed (or exceeded REST_RUN_TIMEOUT_SECS)");
+    let elapsed = started.elapsed();
+
+    println!(
+        "run_prg on {} answered in {:.2}s",
+        host,
+        elapsed.as_secs_f32()
+    );
+    assert!(
+        elapsed < Duration::from_secs(crate::net_utils::REST_RUN_TIMEOUT_SECS),
+        "run_prg took {:?}, at or beyond the {}s budget",
+        elapsed,
+        crate::net_utils::REST_RUN_TIMEOUT_SECS
+    );
+
+    // The program must actually have executed, not merely been uploaded.
+    std::thread::sleep(Duration::from_millis(1500));
+    let marker = read_mem(&conn, 0xC000, 2).expect("marker read failed");
+    assert_eq!(
+        marker,
+        vec![0x42, 0x43],
+        "program was loaded but never ran (marker at $C000 is {marker:02X?})"
+    );
+    println!("marker $C000 = {marker:02X?} — program executed");
+}
+
+/// Exercises the port-64 `CMD_RUN_IMG` disk path end to end with a real 174848
+/// byte d64 — the payload that crosses the 24-bit length field's 16-bit
+/// boundary, and the transfer that previously had no timeout at all.
+///
+/// Needs a d64: set `U64_TEST_D64=/path/to/image.d64`.
+#[test]
+#[ignore = "DESTRUCTIVE: mounts and boots a disk. Set U64_TEST_DESTRUCTIVE=1 + U64_TEST_D64=<path>"]
+fn live_run_d64_over_port64() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+
+    let Some(path) = std::env::var("U64_TEST_D64").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("SKIP: set U64_TEST_D64=<path to a .d64> to run the disk-boot test");
+        return;
+    };
+    let image = std::fs::read(&path).expect("could not read U64_TEST_D64");
+    println!("Booting {} ({} bytes) on {}", path, image.len(), host);
+
+    let started = std::time::Instant::now();
+    block_on(crate::port64::run_disk_image(
+        host.clone(),
+        test_password(),
+        image,
+    ))
+    .expect("port-64 CMD_RUN_IMG failed");
+    println!(
+        "CMD_RUN_IMG accepted in {:.2}s",
+        started.elapsed().as_secs_f32()
+    );
+
+    // What this test can assert deterministically, and what it deliberately
+    // cannot:
+    //
+    // The firmware mounts the image and resets the machine; the C64 then loads
+    // the game through the *emulated 1541 at authentic speed*. Measured on this
+    // device, a real game disk took ~60s to reach its title screen — and the
+    // figure is game-dependent (a fastloader is much quicker, a plain KERNAL
+    // loader much slower). So asserting "the game is on screen" by a fixed
+    // deadline is inherently flaky: an earlier draft of this test waited 8s,
+    // concluded the disk "did not boot", and was simply looking too early.
+    //
+    // Instead assert the two things the command is actually responsible for:
+    // the image is mounted on drive A, and the machine was reset to BASIC ready
+    // to load it. Whether the game finishes loading is the 1541's business.
+    std::thread::sleep(Duration::from_secs(5));
+    let conn = connect(&host, test_password());
+
+    let drives = on_device(&conn, |d| d.drive_list()).expect("drive_list failed");
+    let drive_a = drives.get("a").expect("no drive A reported");
+    let mounted = format!("{:?}", drive_a);
+    assert!(
+        mounted.contains("tcpimage"),
+        "drive A is not carrying the uploaded image: {mounted}"
+    );
+    println!("drive A mounted: {mounted}");
+
+    // The machine must have been reset by the command — at this point it is at
+    // the BASIC banner, loading. (Later it will leave the banner on its own.)
+    let screen = read_mem(&conn, 0x0400, 1000).expect("screen read failed");
+    let blank = screen.iter().all(|&b| b == 0x20);
+    assert!(
+        !blank,
+        "screen is entirely blank — machine did not come back up"
+    );
+    println!("Image mounted and machine reset; the 1541 loads from here (~60s for this disk)");
+}
+
 #[test]
 #[ignore = "DESTRUCTIVE: resets drive A. Set U64_TEST_DESTRUCTIVE=1"]
 fn live_drive_reset() {

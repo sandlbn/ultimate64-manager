@@ -5,8 +5,7 @@ use crate::sid_info;
 use iced::{
     widget::{
         button, column, container, progress_bar, responsive, row, rule, scrollable, text,
-        text_input, tooltip,
-        Column, Space,
+        text_input, tooltip, Column, Space,
     },
     Element, Length, Subscription, Task,
 };
@@ -1629,140 +1628,140 @@ impl MusicPlayer {
             .into()
         } else {
             responsive(move |size| {
-            // Budget the label to the *measured* pane width so long paths only
-            // shorten when they genuinely don't fit. Reserve for the [SID] icon,
-            // subsong count, and the two trailing action buttons.
-            let name_budget = chars_that_fit(size.width, fs.normal as f32, 160.0);
-            // Filter entries based on filter text (skip when showing search results)
-            let filtered_entries: Vec<(usize, &BrowserEntry)> = self
-                .browser_entries
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| {
-                    self.browser_search_active
-                        || self.browser_filter.is_empty()
-                        || entry
-                            .name
-                            .to_lowercase()
-                            .contains(&self.browser_filter.to_lowercase())
-                })
-                .collect();
+                // Budget the label to the *measured* pane width so long paths only
+                // shorten when they genuinely don't fit. Reserve for the [SID] icon,
+                // subsong count, and the two trailing action buttons.
+                let name_budget = chars_that_fit(size.width, fs.normal as f32, 160.0);
+                // Filter entries based on filter text (skip when showing search results)
+                let filtered_entries: Vec<(usize, &BrowserEntry)> = self
+                    .browser_entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        self.browser_search_active
+                            || self.browser_filter.is_empty()
+                            || entry
+                                .name
+                                .to_lowercase()
+                                .contains(&self.browser_filter.to_lowercase())
+                    })
+                    .collect();
 
-            let items: Vec<Element<'_, MusicPlayerMessage>> = filtered_entries
-                .iter()
-                .map(|(idx, entry)| {
-                    let is_selected = self.browser_selected == Some(*idx);
+                let items: Vec<Element<'_, MusicPlayerMessage>> = filtered_entries
+                    .iter()
+                    .map(|(idx, entry)| {
+                        let is_selected = self.browser_selected == Some(*idx);
 
-                    match &entry.entry_type {
-                        BrowserEntryType::Directory => {
-                            // Directory entry - click to navigate
-                            row![
-                                button(text(format!("[DIR] {}", entry.name)).size(fs.normal))
-                                    .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
-                                    .padding([6, 8])
-                                    .width(Length::Fill)
-                                    .style(button::text),
-                            ]
-                            .into()
-                        }
-                        BrowserEntryType::MusicFile(ft) => {
-                            // Music file entry - show add and play buttons
-                            let icon = match ft {
-                                MusicFileType::Sid => "[SID]",
-                                MusicFileType::Mod => "[MOD]",
-                                MusicFileType::Prg => "[PRG]",
-                            };
-
-                            // Show subsong count for multi-subsong files
-                            let subsong_info = if entry.subsongs > 1 {
-                                format!(" ({})", entry.subsongs)
-                            } else {
-                                String::new()
-                            };
-
-                            // Keep the filename whole; elide only leading dirs,
-                            // and only when it overflows the measured width.
-                            let display = fit_path(&entry.name, name_budget);
-                            let is_truncated = display != entry.name;
-
-                            let file_button = button(
-                                text(format!("{}{} {}", icon, subsong_info, display))
-                                    .size(fs.normal),
-                            )
-                            .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
-                            .padding([6, 8])
-                            .width(Length::Fill)
-                            .style(if is_selected {
-                                button::primary
-                            } else {
-                                button::text
-                            });
-
-                            // Tooltip: SID info takes priority, include full name if truncated
-                            let file_element: Element<'_, MusicPlayerMessage> =
-                                if let Some(ref tip) = entry.sid_tooltip {
-                                    // SID tooltip: show header metadata (author, title, PAL/NTSC, etc.)
-                                    let tip_text = if is_truncated {
-                                        format!("{}\n\n{}", entry.name, tip)
-                                    } else {
-                                        tip.clone()
-                                    };
-                                    tooltip(
-                                        file_button,
-                                        text(tip_text).size(fs.small),
-                                        tooltip::Position::Top,
-                                    )
-                                    .style(crate::styles::subtle_tooltip)
-                                    .into()
-                                } else if is_truncated {
-                                    // Just show full filename for truncated names
-                                    tooltip(
-                                        file_button,
-                                        text(&entry.name).size(fs.normal),
-                                        tooltip::Position::Top,
-                                    )
-                                    .style(crate::styles::subtle_tooltip)
-                                    .into()
-                                } else {
-                                    file_button.into()
+                        match &entry.entry_type {
+                            BrowserEntryType::Directory => {
+                                // Directory entry - click to navigate
+                                row![
+                                    button(text(format!("[DIR] {}", entry.name)).size(fs.normal))
+                                        .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
+                                        .padding([6, 8])
+                                        .width(Length::Fill)
+                                        .style(button::text),
+                                ]
+                                .into()
+                            }
+                            BrowserEntryType::MusicFile(ft) => {
+                                // Music file entry - show add and play buttons
+                                let icon = match ft {
+                                    MusicFileType::Sid => "[SID]",
+                                    MusicFileType::Mod => "[MOD]",
+                                    MusicFileType::Prg => "[PRG]",
                                 };
 
-                            row![
-                                file_element,
-                                tooltip(
-                                    button(text(">").size(fs.small))
-                                        .on_press(MusicPlayerMessage::AddAndPlay(*idx))
-                                        .padding([4, 8])
-                                        .style(crate::styles::action_button),
-                                    "Add to playlist and play immediately",
-                                    tooltip::Position::Bottom,
-                                )
-                                .style(crate::styles::subtle_tooltip),
-                                tooltip(
-                                    button(text("+").size(fs.small))
-                                        .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
-                                        .padding([4, 8])
-                                        .style(crate::styles::action_button),
-                                    "Add to playlist",
-                                    tooltip::Position::Bottom,
-                                )
-                                .style(crate::styles::subtle_tooltip),
-                            ]
-                            .spacing(4)
-                            .align_y(iced::Alignment::Center)
-                            .into()
-                        }
-                    }
-                })
-                .collect();
+                                // Show subsong count for multi-subsong files
+                                let subsong_info = if entry.subsongs > 1 {
+                                    format!(" ({})", entry.subsongs)
+                                } else {
+                                    String::new()
+                                };
 
-            scrollable(
-                Column::with_children(items)
-                    .spacing(2)
-                    .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
-            )
-            .height(Length::Fill)
-            .into()
+                                // Keep the filename whole; elide only leading dirs,
+                                // and only when it overflows the measured width.
+                                let display = fit_path(&entry.name, name_budget);
+                                let is_truncated = display != entry.name;
+
+                                let file_button = button(
+                                    text(format!("{}{} {}", icon, subsong_info, display))
+                                        .size(fs.normal),
+                                )
+                                .on_press(MusicPlayerMessage::BrowserItemClicked(*idx))
+                                .padding([6, 8])
+                                .width(Length::Fill)
+                                .style(if is_selected {
+                                    button::primary
+                                } else {
+                                    button::text
+                                });
+
+                                // Tooltip: SID info takes priority, include full name if truncated
+                                let file_element: Element<'_, MusicPlayerMessage> =
+                                    if let Some(ref tip) = entry.sid_tooltip {
+                                        // SID tooltip: show header metadata (author, title, PAL/NTSC, etc.)
+                                        let tip_text = if is_truncated {
+                                            format!("{}\n\n{}", entry.name, tip)
+                                        } else {
+                                            tip.clone()
+                                        };
+                                        tooltip(
+                                            file_button,
+                                            text(tip_text).size(fs.small),
+                                            tooltip::Position::Top,
+                                        )
+                                        .style(crate::styles::subtle_tooltip)
+                                        .into()
+                                    } else if is_truncated {
+                                        // Just show full filename for truncated names
+                                        tooltip(
+                                            file_button,
+                                            text(&entry.name).size(fs.normal),
+                                            tooltip::Position::Top,
+                                        )
+                                        .style(crate::styles::subtle_tooltip)
+                                        .into()
+                                    } else {
+                                        file_button.into()
+                                    };
+
+                                row![
+                                    file_element,
+                                    tooltip(
+                                        button(text(">").size(fs.small))
+                                            .on_press(MusicPlayerMessage::AddAndPlay(*idx))
+                                            .padding([4, 8])
+                                            .style(crate::styles::action_button),
+                                        "Add to playlist and play immediately",
+                                        tooltip::Position::Bottom,
+                                    )
+                                    .style(crate::styles::subtle_tooltip),
+                                    tooltip(
+                                        button(text("+").size(fs.small))
+                                            .on_press(MusicPlayerMessage::AddToPlaylist(*idx))
+                                            .padding([4, 8])
+                                            .style(crate::styles::action_button),
+                                        "Add to playlist",
+                                        tooltip::Position::Bottom,
+                                    )
+                                    .style(crate::styles::subtle_tooltip),
+                                ]
+                                .spacing(4)
+                                .align_y(iced::Alignment::Center)
+                                .into()
+                            }
+                        }
+                    })
+                    .collect();
+
+                scrollable(
+                    Column::with_children(items)
+                        .spacing(2)
+                        .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
+                )
+                .height(Length::Fill)
+                .into()
             })
             .into()
         };
@@ -1862,162 +1861,162 @@ impl MusicPlayer {
                 .into()
         } else {
             responsive(move |size| {
-            // Reserve for the play-state prefix, [badge], (duration) and the
-            // up/down/remove buttons that trail every playlist row.
-            let name_budget = chars_that_fit(size.width, fs.small as f32, 200.0);
-            let items: Vec<Element<'_, MusicPlayerMessage>> = self
-                .playlist
-                .iter()
-                .enumerate()
-                .map(|(idx, entry)| {
-                    let is_selected = self.playlist_selected == Some(idx);
-                    let is_playing = self.current_playing == Some(idx);
+                // Reserve for the play-state prefix, [badge], (duration) and the
+                // up/down/remove buttons that trail every playlist row.
+                let name_budget = chars_that_fit(size.width, fs.small as f32, 200.0);
+                let items: Vec<Element<'_, MusicPlayerMessage>> = self
+                    .playlist
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, entry)| {
+                        let is_selected = self.playlist_selected == Some(idx);
+                        let is_playing = self.current_playing == Some(idx);
 
-                    let prefix = if is_playing {
-                        match self.playback_state {
-                            PlaybackState::Playing => ">",
-                            PlaybackState::Paused => "=",
-                            PlaybackState::Stopped => "*",
-                        }
-                    } else {
-                        " "
-                    };
-
-                    // Build compact badge: [S NTSC 2SID x3] or [M] or [P]
-                    // PAL is omitted (default), NTSC shown explicitly
-                    let badge = match entry.file_type {
-                        MusicFileType::Sid => {
-                            let mut parts = vec!["S".to_string()];
-                            if let Some(ref m) = entry.sid_metadata {
-                                // Only show NTSC (PAL is default/assumed)
-                                if m.video_std == "NTSC" {
-                                    parts.push("NTSC".to_string());
-                                }
-                                if m.num_sids > 1 {
-                                    parts.push(format!("{}SID", m.num_sids));
-                                }
+                        let prefix = if is_playing {
+                            match self.playback_state {
+                                PlaybackState::Playing => ">",
+                                PlaybackState::Paused => "=",
+                                PlaybackState::Stopped => "*",
                             }
-                            if entry.max_subsongs > 1 {
-                                parts.push(format!("x{}", entry.max_subsongs));
-                            }
-                            parts.join(" ")
-                        }
-                        MusicFileType::Mod => "M".to_string(),
-                        MusicFileType::Prg => "P".to_string(),
-                    };
-
-                    let duration_str = if let Some(dur) = entry.duration {
-                        format!("{}:{:02}", dur / 60, dur % 60)
-                    } else {
-                        "3:00".to_string()
-                    };
-
-                    // Show parsed name or filename
-                    let display_name = if entry.name.is_empty() {
-                        entry
-                            .path
-                            .file_name()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "Unknown".to_string())
-                    } else {
-                        entry.name.clone()
-                    };
-                    // Keep the filename whole; elide only leading dirs, and only
-                    // when the row overflows the measured pane width.
-                    let name = fit_path(&display_name, name_budget);
-                    let is_truncated = name != display_name;
-
-                    let playlist_button = button(
-                        text(format!(
-                            "{} [{}] {} ({})",
-                            prefix, badge, name, duration_str
-                        ))
-                        .size(fs.small),
-                    )
-                    .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
-                    .padding([6, 8])
-                    .width(Length::Fill)
-                    .style(if is_selected || is_playing {
-                        button::primary
-                    } else {
-                        button::text
-                    });
-
-                    // Tooltip: show full name + SID metadata details
-                    let playlist_element: Element<'_, MusicPlayerMessage> = {
-                        let has_meta = entry.sid_metadata.is_some();
-                        if is_truncated || has_meta {
-                            let mut tip_parts = Vec::new();
-                            if is_truncated {
-                                tip_parts.push(display_name.clone());
-                            }
-                            if let Some(ref m) = entry.sid_metadata {
-                                if is_truncated {
-                                    tip_parts.push(String::new()); // blank line separator
-                                }
-                                tip_parts.push(format!(
-                                    "{} | {} | {} tunes",
-                                    m.video_std, m.sid_info, entry.max_subsongs
-                                ));
-                                if !m.released.is_empty() {
-                                    tip_parts.push(format!("© {}", m.released));
-                                }
-                            }
-                            tooltip(
-                                playlist_button,
-                                text(tip_parts.join("\n")).size(fs.small),
-                                tooltip::Position::Top,
-                            )
-                            .style(crate::styles::subtle_tooltip)
-                            .into()
                         } else {
-                            playlist_button.into()
-                        }
-                    };
+                            " "
+                        };
 
-                    row![
-                        playlist_element,
-                        tooltip(
-                            button(text("^").size(fs.tiny))
-                                .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
-                                .padding([4, 6])
-                                .style(crate::styles::nav_button),
-                            "Move up in playlist",
-                            tooltip::Position::Bottom,
-                        )
-                        .style(crate::styles::subtle_tooltip),
-                        tooltip(
-                            button(text("v").size(fs.tiny))
-                                .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
-                                .padding([4, 6])
-                                .style(crate::styles::nav_button),
-                            "Move down in playlist",
-                            tooltip::Position::Bottom,
-                        )
-                        .style(crate::styles::subtle_tooltip),
-                        tooltip(
-                            button(text("X").size(fs.tiny))
-                                .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
-                                .padding([4, 6])
-                                .style(crate::styles::nav_button),
-                            "Remove from playlist",
-                            tooltip::Position::Bottom,
-                        )
-                        .style(crate::styles::subtle_tooltip),
-                    ]
-                    .spacing(2)
-                    .align_y(iced::Alignment::Center)
-                    .into()
-                })
-                .collect();
+                        // Build compact badge: [S NTSC 2SID x3] or [M] or [P]
+                        // PAL is omitted (default), NTSC shown explicitly
+                        let badge = match entry.file_type {
+                            MusicFileType::Sid => {
+                                let mut parts = vec!["S".to_string()];
+                                if let Some(ref m) = entry.sid_metadata {
+                                    // Only show NTSC (PAL is default/assumed)
+                                    if m.video_std == "NTSC" {
+                                        parts.push("NTSC".to_string());
+                                    }
+                                    if m.num_sids > 1 {
+                                        parts.push(format!("{}SID", m.num_sids));
+                                    }
+                                }
+                                if entry.max_subsongs > 1 {
+                                    parts.push(format!("x{}", entry.max_subsongs));
+                                }
+                                parts.join(" ")
+                            }
+                            MusicFileType::Mod => "M".to_string(),
+                            MusicFileType::Prg => "P".to_string(),
+                        };
 
-            scrollable(
-                Column::with_children(items)
-                    .spacing(2)
-                    .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
-            )
-            .height(Length::Fill)
-            .into()
+                        let duration_str = if let Some(dur) = entry.duration {
+                            format!("{}:{:02}", dur / 60, dur % 60)
+                        } else {
+                            "3:00".to_string()
+                        };
+
+                        // Show parsed name or filename
+                        let display_name = if entry.name.is_empty() {
+                            entry
+                                .path
+                                .file_name()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "Unknown".to_string())
+                        } else {
+                            entry.name.clone()
+                        };
+                        // Keep the filename whole; elide only leading dirs, and only
+                        // when the row overflows the measured pane width.
+                        let name = fit_path(&display_name, name_budget);
+                        let is_truncated = name != display_name;
+
+                        let playlist_button = button(
+                            text(format!(
+                                "{} [{}] {} ({})",
+                                prefix, badge, name, duration_str
+                            ))
+                            .size(fs.small),
+                        )
+                        .on_press(MusicPlayerMessage::PlaylistItemSelected(idx))
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .style(if is_selected || is_playing {
+                            button::primary
+                        } else {
+                            button::text
+                        });
+
+                        // Tooltip: show full name + SID metadata details
+                        let playlist_element: Element<'_, MusicPlayerMessage> = {
+                            let has_meta = entry.sid_metadata.is_some();
+                            if is_truncated || has_meta {
+                                let mut tip_parts = Vec::new();
+                                if is_truncated {
+                                    tip_parts.push(display_name.clone());
+                                }
+                                if let Some(ref m) = entry.sid_metadata {
+                                    if is_truncated {
+                                        tip_parts.push(String::new()); // blank line separator
+                                    }
+                                    tip_parts.push(format!(
+                                        "{} | {} | {} tunes",
+                                        m.video_std, m.sid_info, entry.max_subsongs
+                                    ));
+                                    if !m.released.is_empty() {
+                                        tip_parts.push(format!("© {}", m.released));
+                                    }
+                                }
+                                tooltip(
+                                    playlist_button,
+                                    text(tip_parts.join("\n")).size(fs.small),
+                                    tooltip::Position::Top,
+                                )
+                                .style(crate::styles::subtle_tooltip)
+                                .into()
+                            } else {
+                                playlist_button.into()
+                            }
+                        };
+
+                        row![
+                            playlist_element,
+                            tooltip(
+                                button(text("^").size(fs.tiny))
+                                    .on_press(MusicPlayerMessage::MovePlaylistItemUp(idx))
+                                    .padding([4, 6])
+                                    .style(crate::styles::nav_button),
+                                "Move up in playlist",
+                                tooltip::Position::Bottom,
+                            )
+                            .style(crate::styles::subtle_tooltip),
+                            tooltip(
+                                button(text("v").size(fs.tiny))
+                                    .on_press(MusicPlayerMessage::MovePlaylistItemDown(idx))
+                                    .padding([4, 6])
+                                    .style(crate::styles::nav_button),
+                                "Move down in playlist",
+                                tooltip::Position::Bottom,
+                            )
+                            .style(crate::styles::subtle_tooltip),
+                            tooltip(
+                                button(text("X").size(fs.tiny))
+                                    .on_press(MusicPlayerMessage::RemoveFromPlaylist(idx))
+                                    .padding([4, 6])
+                                    .style(crate::styles::nav_button),
+                                "Remove from playlist",
+                                tooltip::Position::Bottom,
+                            )
+                            .style(crate::styles::subtle_tooltip),
+                        ]
+                        .spacing(2)
+                        .align_y(iced::Alignment::Center)
+                        .into()
+                    })
+                    .collect();
+
+                scrollable(
+                    Column::with_children(items)
+                        .spacing(2)
+                        .padding(iced::Padding::new(5.0).right(15.0)), // Extra right padding for scrollbar
+                )
+                .height(Length::Fill)
+                .into()
             })
             .into()
         };
@@ -2636,5 +2635,75 @@ mod tests {
         assert_eq!(mp.playlist.len(), 1, "no duplicate entry for same path");
         assert_eq!(mp.current_playing, Some(0));
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── Width-aware truncation (search results + playlist rows) ──────────
+
+    /// The budget must grow with the pane: a wider window shows more of the
+    /// path, which is the whole point of measuring instead of hardcoding 40.
+    #[test]
+    fn char_budget_grows_with_pane_width() {
+        let narrow = chars_that_fit(400.0, 14.0, 160.0);
+        let wide = chars_that_fit(1200.0, 14.0, 160.0);
+        assert!(wide > narrow, "wide={wide} should exceed narrow={narrow}");
+    }
+
+    /// Bigger font, same pane → fewer characters fit.
+    #[test]
+    fn char_budget_shrinks_as_font_grows() {
+        let small = chars_that_fit(800.0, 11.0, 160.0);
+        let large = chars_that_fit(800.0, 22.0, 160.0);
+        assert!(large < small, "large={large} should be under small={small}");
+    }
+
+    /// Reserved chrome is subtracted from the usable width.
+    #[test]
+    fn reserved_chrome_reduces_the_budget() {
+        let none = chars_that_fit(800.0, 14.0, 0.0);
+        let some = chars_that_fit(800.0, 14.0, 300.0);
+        assert!(some < none);
+    }
+
+    /// Degenerate geometry (zero-width pane on first layout pass, or chrome
+    /// wider than the pane) must not underflow or return 0 — a 0 budget would
+    /// blank every row. The floor keeps a usable filename tail visible.
+    #[test]
+    fn budget_never_collapses_below_the_floor() {
+        for (w, f, r) in [(0.0, 14.0, 160.0), (100.0, 14.0, 900.0), (0.0, 0.0, 0.0)] {
+            let n = chars_that_fit(w, f, r);
+            assert!(n >= 12, "width={w} font={f} reserved={r} gave {n}");
+        }
+    }
+
+    /// The estimate is deliberately conservative: it must not promise more
+    /// characters than the pane can actually show at ~0.5em average advance.
+    #[test]
+    fn budget_stays_conservative_against_average_glyph_width() {
+        let font = 14.0;
+        let width = 800.0;
+        let budget = chars_that_fit(width, font, 0.0);
+        let optimistic = (width / (font * 0.5)) as usize;
+        assert!(
+            budget <= optimistic,
+            "budget {budget} exceeds optimistic {optimistic} — labels would overflow"
+        );
+    }
+
+    /// End to end: the two helpers together keep the filename whole when the
+    /// pane is roomy, and still fit the budget when it is not.
+    #[test]
+    fn wide_pane_shows_the_whole_path_narrow_pane_keeps_the_filename() {
+        let path = "MUSICIANS/C/Crosspider/Turrican_III_Demo_part_2.sid";
+
+        let wide = fit_path(path, chars_that_fit(1600.0, 12.0, 160.0));
+        assert_eq!(wide, path, "a wide pane should not truncate at all");
+
+        let budget = chars_that_fit(420.0, 12.0, 160.0);
+        let narrow = fit_path(path, budget);
+        assert!(narrow.chars().count() <= budget);
+        assert!(
+            narrow.ends_with("Turrican_III_Demo_part_2.sid"),
+            "filename must survive: {narrow}"
+        );
     }
 }
