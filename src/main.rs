@@ -1200,22 +1200,17 @@ impl Ultimate64Browser {
             Message::PaneActivate => {
                 self.dispatch_local_pane_message(FileBrowserMessage::ActivateSelection)
             }
-            // In Game Mode a letter key jumps to that A–Z section.
-            Message::PaneQuickSearch(ch) if self.remote_browser.game.active => {
-                let target = if ch.is_ascii_alphabetic() {
-                    ch.to_ascii_uppercase()
-                } else {
-                    '#'
-                };
-                self.remote_browser
-                    .update(
-                        RemoteBrowserMessage::Game(game_mode::GameModeMessage::JumpToLetter(
-                            target,
-                        )),
-                        ctx.clone(),
-                    )
-                    .map(Message::RemoteBrowser)
-            }
+            // In Game Mode typing filters the library by title. This replaces
+            // the old jump-to-letter binding, which didn't scale: on a
+            // OneLoad64-sized collection, jumping to "T" still left a long
+            // scroll to reach Turrican. The A–Z rail still jumps on click.
+            Message::PaneQuickSearch(ch) if self.remote_browser.game.active => self
+                .remote_browser
+                .update(
+                    RemoteBrowserMessage::Game(game_mode::GameModeMessage::SearchPush(ch)),
+                    ctx.clone(),
+                )
+                .map(Message::RemoteBrowser),
             Message::PaneQuickSearch(ch) => {
                 self.dispatch_local_pane_message(FileBrowserMessage::QuickSearchInput(ch))
             }
@@ -1384,6 +1379,19 @@ impl Ultimate64Browser {
                 Task::none()
             }
 
+            // Backspace edits the Game Mode search rather than navigating a
+            // pane the launcher is covering. Only while a search is active, so
+            // the binding is unchanged otherwise.
+            Message::NavigateUpActivePane
+                if self.remote_browser.game.active && self.remote_browser.game.is_searching() =>
+            {
+                self.remote_browser
+                    .update(
+                        RemoteBrowserMessage::Game(game_mode::GameModeMessage::SearchBackspace),
+                        ctx.clone(),
+                    )
+                    .map(Message::RemoteBrowser)
+            }
             Message::NavigateUpActivePane => match self.active_pane {
                 Pane::Left => self
                     .left_browser
@@ -2364,6 +2372,22 @@ impl Ultimate64Browser {
     /// ticks every 500ms while one is active and clears it after 4s.
     fn show_toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), std::time::Instant::now()));
+    }
+
+    /// Work that quitting would destroy: edits the user made and hasn't
+    /// persisted. Unlike an aborted transfer (which can simply be retried),
+    /// this content exists nowhere else once the window closes.
+    ///
+    /// Returns the names of the affected areas, for the close dialog to list.
+    fn unsaved_work(&self) -> Vec<&'static str> {
+        let mut areas = Vec::new();
+        if self.basic_editor.is_dirty() {
+            areas.push("BASIC program");
+        }
+        if self.config_editor.has_unsaved_changes() {
+            areas.push("device configuration");
+        }
+        areas
     }
 
     /// True when any long-running transfer is in flight — used to gate the

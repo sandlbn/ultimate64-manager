@@ -42,9 +42,18 @@ impl Ultimate64Browser {
             self.pending_drop = None;
             return Task::none();
         }
-        // In Game Mode: Esc first drops out of fullscreen (restoring the app
-        // chrome), then a second Esc leaves the launcher.
+        // In Game Mode: Esc first abandons an active title search, then drops
+        // out of fullscreen (restoring the app chrome), then leaves the
+        // launcher. Clearing the search comes first so a mistyped query is
+        // undone without also throwing the user out of the launcher.
         if self.remote_browser.game.active {
+            if self.remote_browser.game.is_searching() {
+                return self.update(Message::RemoteBrowser(
+                    crate::remote_browser::RemoteBrowserMessage::Game(
+                        crate::game_mode::GameModeMessage::SearchClear,
+                    ),
+                ));
+            }
             if self.remote_browser.game.fullscreen {
                 self.remote_browser.game.fullscreen = false;
                 if let Some(id) = self.main_window_id {
@@ -110,7 +119,10 @@ impl Ultimate64Browser {
         if self.streaming_window_id == Some(id) {
             return iced::window::close(id);
         }
-        if self.main_window_id == Some(id) && self.is_transfer_in_flight() {
+        // Confirm before closing if quitting would lose something: a transfer
+        // that would be aborted, or edits that exist nowhere but this window.
+        let at_risk = self.is_transfer_in_flight() || !self.unsaved_work().is_empty();
+        if self.main_window_id == Some(id) && at_risk {
             self.pending_close = Some(id);
             Task::none()
         } else {

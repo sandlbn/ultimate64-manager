@@ -57,6 +57,10 @@ pub struct BasicEditor {
     send_handle: Option<Handle>,
     status_message: Option<String>,
     current_file: Option<PathBuf>,
+    /// Whether the source has been edited since it was last opened, saved, or
+    /// reset to a new program. Read by the window-close guard so quitting can't
+    /// silently discard a program the user typed.
+    dirty: bool,
 }
 
 impl Default for BasicEditor {
@@ -74,7 +78,14 @@ impl BasicEditor {
             send_handle: None,
             status_message: None,
             current_file: None,
+            dirty: false,
         }
+    }
+
+    /// Whether the buffer holds edits that have not been saved. Consulted by
+    /// the window-close guard.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     fn source(&self) -> String {
@@ -97,6 +108,11 @@ impl BasicEditor {
                     Action::Edit(_) | Action::Drag(_) | Action::SelectAll
                 ) {
                     self.last_validation = None;
+                }
+                // Only a real edit makes the buffer unsaved — selecting or
+                // dragging changes nothing the user would mind losing.
+                if matches!(action, Action::Edit(_)) {
+                    self.dirty = true;
                 }
                 self.content.perform(action);
                 Task::none()
@@ -182,6 +198,7 @@ impl BasicEditor {
                 self.content = Content::with_text("10 \n");
                 self.current_file = None;
                 self.last_validation = None;
+                self.dirty = false;
                 self.status_message = Some("New program".into());
                 Task::none()
             }
@@ -207,6 +224,7 @@ impl BasicEditor {
                         self.content = Content::with_text(&text);
                         self.current_file = Some(path.clone());
                         self.last_validation = None;
+                        self.dirty = false;
                         self.status_message = Some(format!("Opened {}", path.display()));
                     }
                     Err(e) if e == "Cancelled" => {}
@@ -255,6 +273,7 @@ impl BasicEditor {
             M::SavePrgCompleted(result) => {
                 match result {
                     Ok(path) => {
+                        self.dirty = false;
                         self.status_message = Some(format!("Saved {}", path.display()));
                     }
                     Err(e) if e == "Cancelled" => {}
@@ -713,6 +732,106 @@ mod tests {
             .into_iter()
             .map(|(_, k)| k)
             .collect()
+    }
+
+    // ── Unsaved-work tracking (feeds the window-close guard) ─────────
+
+    use iced::widget::text_editor::Edit;
+
+    #[test]
+    fn a_fresh_editor_has_nothing_to_lose() {
+        assert!(!BasicEditor::new().is_dirty());
+    }
+
+    #[test]
+    fn typing_marks_the_program_unsaved() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('X'))),
+            None,
+            None,
+        );
+        assert!(ed.is_dirty(), "an edit must arm the close guard");
+    }
+
+    /// Moving the cursor or selecting text loses nothing, so it must not
+    /// trigger a "you have unsaved changes" prompt on quit.
+    #[test]
+    fn selecting_text_does_not_mark_it_unsaved() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(BasicEditorMessage::Edit(Action::SelectAll), None, None);
+        assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn starting_a_new_program_clears_the_unsaved_flag() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('X'))),
+            None,
+            None,
+        );
+        ed.update_impl(BasicEditorMessage::NewProgram, None, None);
+        assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn opening_a_file_clears_the_unsaved_flag() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('X'))),
+            None,
+            None,
+        );
+        ed.update_impl(
+            BasicEditorMessage::OpenCompleted(Ok((PathBuf::from("/tmp/x.bas"), "10 END\n".into()))),
+            None,
+            None,
+        );
+        assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn saving_clears_the_unsaved_flag_and_editing_again_re_arms_it() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('X'))),
+            None,
+            None,
+        );
+        ed.update_impl(
+            BasicEditorMessage::SavePrgCompleted(Ok(PathBuf::from("/tmp/x.prg"))),
+            None,
+            None,
+        );
+        assert!(!ed.is_dirty(), "a successful save means nothing is at risk");
+
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('Y'))),
+            None,
+            None,
+        );
+        assert!(
+            ed.is_dirty(),
+            "editing after a save must arm the guard again"
+        );
+    }
+
+    /// A cancelled save leaves the work unsaved — the guard must stay armed.
+    #[test]
+    fn a_cancelled_save_keeps_the_program_unsaved() {
+        let mut ed = BasicEditor::new();
+        ed.update_impl(
+            BasicEditorMessage::Edit(Action::Edit(Edit::Insert('X'))),
+            None,
+            None,
+        );
+        ed.update_impl(
+            BasicEditorMessage::SavePrgCompleted(Err("Cancelled".into())),
+            None,
+            None,
+        );
+        assert!(ed.is_dirty());
     }
 
     #[test]
