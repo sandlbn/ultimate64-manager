@@ -130,6 +130,14 @@ pub enum StreamingMessage {
     OpenInSeparateWindow, // Open streaming in a separate window
     // Virtual PETSCII keyboard
     ToggleVirtualKeyboard,
+    /// Show/hide the Ultimate's own menu screen.
+    ToggleMenuScreen,
+    /// Timer tick: re-read the menu screen.
+    MenuScreenPoll,
+    /// Send one named C64 key combo (cursor keys, RETURN, F-keys) via machine:input.
+    SendKeyCombo(&'static [&'static str]),
+    /// A menu-screen poll came back. `None` means the menu isn't on screen.
+    MenuScreenLoaded(Result<Option<crate::api_315::MenuScreen>, String>),
     /// Turn gamepad-to-joystick control on or off.
     ToggleJoystick,
     /// Choose which C64 control port the pad drives (1 or 2).
@@ -499,12 +507,39 @@ pub struct VideoStreaming {
     input_ctl: crate::input_315::InputController,
     /// Last failure from `machine:input`, shown once rather than per tick.
     input_error: Option<String>,
+    /// Set once the device answers 501: it has the call but not the hardware.
+    /// Latched so the UI stops offering injection instead of failing per click.
+    input_unsupported: Option<String>,
+    /// Whether the Ultimate menu view is open.
+    show_menu_screen: bool,
+    /// Latest menu snapshot; `None` while the menu isn't on screen.
+    menu_screen: Option<crate::api_315::MenuScreen>,
+    /// Last menu-poll failure.
+    menu_error: Option<String>,
 }
 
 impl Default for VideoStreaming {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Key combos for navigating the Ultimate menu.
+///
+/// The C64 keyboard has no dedicated up or left cursor keys: both are the
+/// shifted forms of the down and right keys, which is why these are combos.
+mod menu_keys {
+    pub const UP: &[&str] = &["left_shift", "cursor_up_down"];
+    pub const DOWN: &[&str] = &["cursor_up_down"];
+    pub const LEFT: &[&str] = &["left_shift", "cursor_left_right"];
+    pub const RIGHT: &[&str] = &["cursor_left_right"];
+    pub const RETURN: &[&str] = &["return"];
+    pub const RUN_STOP: &[&str] = &["run_stop"];
+    pub const DEL: &[&str] = &["inst_del"];
+    pub const F1: &[&str] = &["f1"];
+    pub const F3: &[&str] = &["f3"];
+    pub const F5: &[&str] = &["f5"];
+    pub const F7: &[&str] = &["f7"];
 }
 
 impl VideoStreaming {
@@ -551,6 +586,10 @@ impl VideoStreaming {
             gamepad_status: crate::gamepad::GamepadSnapshot::default(),
             input_ctl: crate::input_315::InputController::new(),
             input_error: None,
+            input_unsupported: None,
+            show_menu_screen: false,
+            menu_screen: None,
+            menu_error: None,
             stream_control_method: StreamControlMethod::default(),
         }
     }
@@ -621,6 +660,160 @@ impl VideoStreaming {
         )
         .padding(6)
         .into()
+    }
+
+    /// Render the Ultimate's own menu screen.
+    ///
+    /// This is the firmware's UI, not a C64 program, and its buffer holds
+    /// plain ASCII rather than C64 screen codes — `0x55` really is `U`. The one
+    /// non-text code in practice is `0x02`, the horizontal rule the menu draws
+    /// its separators with.
+    ///
+    /// Cells are coloured individually, but 1000 separate widgets per redraw
+    /// would be wasteful, so each row is emitted as runs of equal colour —
+    /// typically a handful per line.
+    fn menu_screen_view(&self, fs: &crate::styles::FontSizes) -> Element<'_, StreamingMessage> {
+        use crate::api_315::{MENU_COLS, MENU_ROWS};
+        use crate::video_scaling::C64_PALETTE;
+
+        let dim = iced::Color::from_rgb(0.7, 0.7, 0.75);
+
+        if let Some(err) = &self.menu_error {
+            return container(
+                text(format!("Menu unavailable: {}", err))
+                    .size(fs.tiny)
+                    .color(iced::Color::from_rgb(0.95, 0.45, 0.45)),
+            )
+            .padding(8)
+            .into();
+        }
+        let Some(screen) = &self.menu_screen else {
+            return container(
+                text("The Ultimate menu isn't on screen — press the menu button to open it")
+                    .size(fs.tiny)
+                    .color(dim),
+            )
+            .padding(8)
+            .into();
+        };
+
+        let colour = |idx: u8| {
+            let [r, g, b] = C64_PALETTE[(idx & 0x0F) as usize];
+            iced::Color::from_rgb8(r, g, b)
+        };
+        let glyph = |c: u8| -> char {
+            match c {
+                0x20..=0x7e => c as char,
+                0x02 => '\u{2500}', // the menu's horizontal rule
+                _ => ' ',
+            }
+        };
+
+        let mut rows: Vec<Element<'_, StreamingMessage>> = Vec::with_capacity(MENU_ROWS);
+        for r in 0..MENU_ROWS {
+            let codes = screen.row(r);
+            let colors = &screen.colors[r * MENU_COLS..(r + 1) * MENU_COLS];
+
+            let mut runs: Vec<Element<'_, StreamingMessage>> = Vec::new();
+            let mut buf = String::new();
+            let mut run_colour = colors.first().copied().unwrap_or(1);
+            for (i, &code) in codes.iter().enumerate() {
+                let cell_colour = colors[i];
+                if cell_colour != run_colour && !buf.is_empty() {
+                    runs.push(
+                        text(std::mem::take(&mut buf))
+                            .size(fs.small)
+                            .font(iced::Font::MONOSPACE)
+                            .color(colour(run_colour))
+                            .into(),
+                    );
+                }
+                run_colour = cell_colour;
+                buf.push(glyph(code));
+            }
+            if !buf.is_empty() {
+                runs.push(
+                    text(buf)
+                        .size(fs.small)
+                        .font(iced::Font::MONOSPACE)
+                        .color(colour(run_colour))
+                        .into(),
+                );
+            }
+            rows.push(iced::widget::Row::with_children(runs).into());
+        }
+
+        // Navigation. With the menu open the firmware takes the keyboard, so
+        // these reach the menu rather than the running program — but only on
+        // hardware that can inject at all (a cartridge answers 501).
+        let nav: Element<'_, StreamingMessage> = if self.can_inject() {
+            let key = |label: &'static str, combo: &'static [&'static str]| {
+                button(text(label).size(fs.tiny))
+                    .on_press(StreamingMessage::SendKeyCombo(combo))
+                    .padding([2, 6])
+                    .style(iced::widget::button::secondary)
+            };
+            iced::widget::Column::with_children(vec![
+                row![
+                    key("↑", menu_keys::UP),
+                    key("↓", menu_keys::DOWN),
+                    key("←", menu_keys::LEFT),
+                    key("→", menu_keys::RIGHT),
+                    key("RETURN", menu_keys::RETURN),
+                    key("R/S", menu_keys::RUN_STOP),
+                    key("DEL", menu_keys::DEL),
+                ]
+                .spacing(4)
+                .into(),
+                row![
+                    key("F1", menu_keys::F1),
+                    key("F3", menu_keys::F3),
+                    key("F5", menu_keys::F5),
+                    key("F7", menu_keys::F7),
+                ]
+                .spacing(4)
+                .into(),
+            ])
+            .spacing(4)
+            .into()
+        } else if let Some(why) = &self.input_unsupported {
+            text(why.clone()).size(fs.tiny).color(dim).into()
+        } else {
+            text("Navigation needs Ultimate 64-class hardware")
+                .size(fs.tiny)
+                .color(dim)
+                .into()
+        };
+
+        rows.push(Space::new().height(6).into());
+        rows.push(nav);
+
+        container(iced::widget::Column::with_children(rows).spacing(0))
+            .padding(8)
+            .style(|_t| container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgb(
+                    0.0, 0.0, 0.25,
+                ))),
+                border: iced::Border {
+                    color: iced::Color::from_rgb(0.4, 0.4, 0.7),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    /// Fetch the Ultimate's menu screen once.
+    fn poll_menu_screen(&self) -> Task<StreamingMessage> {
+        let Some(host) = self.ultimate_host.clone() else {
+            return Task::none();
+        };
+        let password = self.api_password.clone();
+        Task::perform(
+            async move { crate::api_315::menu_screen(&host, password.as_deref()).await },
+            StreamingMessage::MenuScreenLoaded,
+        )
     }
 
     /// Forget everything the joystick is holding, without telling the device.
@@ -706,6 +899,54 @@ impl VideoStreaming {
     /// Whether this device exposes the 3.15 `machine:input` call.
     pub fn supports_input_api(&self) -> bool {
         crate::device_caps::DeviceCaps::from_firmware(self.device_firmware.as_deref()).has_315_api()
+    }
+
+    /// Whether keys and joystick moves can actually be injected.
+    ///
+    /// Distinct from [`Self::supports_input_api`]: a cartridge on 3.15 has the
+    /// call but answers 501, because it has no keyboard or joystick lines to
+    /// drive. That is only knowable once something is sent, so it is latched
+    /// from the first refusal and the UI then stops offering injection rather
+    /// than failing on every click.
+    pub fn can_inject(&self) -> bool {
+        self.supports_input_api() && self.input_unsupported.is_none()
+    }
+
+    /// Tap a combination of named C64 keys — cursor keys, RETURN, function
+    /// keys and the rest, which have no printable character and so cannot go
+    /// through the text path.
+    ///
+    /// This is what makes the Ultimate menu navigable remotely: with the menu
+    /// open the firmware takes the keyboard, so injected keys reach the menu
+    /// rather than the running program.
+    ///
+    /// A combo rather than a single key because the C64 has no dedicated up or
+    /// left cursor keys — they are the shifted forms of down and right, so
+    /// moving up means tapping `left_shift` and `cursor_up_down` together.
+    fn send_key_combo(&self, keys: &'static [&'static str]) -> Task<StreamingMessage> {
+        if !self.can_inject() || keys.is_empty() {
+            return Task::none();
+        }
+        let Some(host) = self.ultimate_host.clone() else {
+            return Task::none();
+        };
+        debug_assert!(
+            keys.iter().all(|k| crate::input_315::is_valid_key(k)),
+            "{keys:?} contains a key the firmware does not accept"
+        );
+        let password = self.api_password.clone();
+        let events = vec![crate::api_315::InputEvent::Keyboard {
+            inputs: keys.iter().map(|k| k.to_string()).collect(),
+            transition: crate::api_315::Transition::Tap,
+        }];
+        Task::perform(
+            async move {
+                crate::api_315::send_input(&host, password.as_deref(), &events)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            StreamingMessage::KeySent,
+        )
     }
 
     /// Set the API password for REST API stream control
@@ -1077,6 +1318,37 @@ impl VideoStreaming {
                 Task::none()
             }
 
+            StreamingMessage::ToggleMenuScreen => {
+                self.show_menu_screen = !self.show_menu_screen;
+                self.menu_error = None;
+                if !self.show_menu_screen {
+                    self.menu_screen = None;
+                    return Task::none();
+                }
+                self.poll_menu_screen()
+            }
+
+            StreamingMessage::MenuScreenPoll => self.poll_menu_screen(),
+
+            StreamingMessage::SendKeyCombo(keys) => self.send_key_combo(keys),
+
+            StreamingMessage::MenuScreenLoaded(result) => {
+                match result {
+                    // `None` is the documented answer for "the menu is not on
+                    // screen", not a failure.
+                    Ok(screen) => {
+                        self.menu_screen = screen;
+                        self.menu_error = None;
+                    }
+                    Err(e) => {
+                        log::warn!("menu_screen poll failed: {}", e);
+                        self.menu_error = Some(e);
+                        self.menu_screen = None;
+                    }
+                }
+                Task::none()
+            }
+
             StreamingMessage::ToggleJoystick => {
                 self.joystick_enabled = !self.joystick_enabled;
                 self.input_error = None;
@@ -1125,6 +1397,12 @@ impl VideoStreaming {
                         // Report once and stop driving, rather than retrying a
                         // failing call every tick.
                         log::warn!("machine:input failed: {}", e);
+                        // The firmware's own wording for a device that has the
+                        // call but not the hardware. Latching it retires the
+                        // controls instead of letting every click fail.
+                        if e.contains("Ultimate 64-class hardware") {
+                            self.input_unsupported = Some(e.clone());
+                        }
                         self.input_error = Some(e);
                         self.joystick_enabled = false;
                     }
@@ -1265,7 +1543,7 @@ impl VideoStreaming {
 
         // Gamepad → joystick. Only offered on firmware that has machine:input;
         // on anything older the call 404s, and on a cartridge it 501s.
-        let joy_supported = self.supports_input_api();
+        let joy_supported = self.can_inject();
         let joy = overlay_button(
             "🕹",
             joy_supported.then_some(StreamingMessage::ToggleJoystick),
@@ -1278,9 +1556,23 @@ impl VideoStreaming {
             fs,
         );
 
+        let menu_btn = overlay_button(
+            "☰",
+            self.supports_input_api()
+                .then_some(StreamingMessage::ToggleMenuScreen),
+            self.show_menu_screen,
+            if self.supports_input_api() {
+                "Show the Ultimate's own menu screen"
+            } else {
+                "Needs Ultimate firmware 3.15 or newer"
+            },
+            fs,
+        );
+
         let bar = row![
             live_stop,
             joy,
+            menu_btn,
             shot,
             full,
             popout,
@@ -1469,6 +1761,9 @@ impl VideoStreaming {
         // Bottom overlay stack on the video: the on-screen keyboard (if shown)
         // sits just above the media-player control bar, both floating on the video.
         let mut overlay_col = column![].spacing(6).align_x(iced::Alignment::Center);
+        if self.show_menu_screen {
+            overlay_col = overlay_col.push(self.menu_screen_view(&fs));
+        }
         if self.joystick_enabled || self.input_error.is_some() {
             overlay_col = overlay_col.push(self.joystick_strip(&fs));
         }
@@ -1665,6 +1960,15 @@ impl VideoStreaming {
         if self.is_streaming {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(12)).map(|_| StreamingMessage::FrameUpdate),
+            );
+        }
+
+        // The menu redraws rarely and each poll is a fresh HTTP request, so
+        // twice a second is plenty and keeps the device's little server idle.
+        if self.show_menu_screen {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(500))
+                    .map(|_| StreamingMessage::MenuScreenPoll),
             );
         }
 
@@ -2877,5 +3181,158 @@ mod reset_desync_tests {
         vs.forget_held_inputs();
         assert!(vs.input_ctl.held(1).is_empty());
         assert!(vs.input_ctl.held(2).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod menu_screen_tests {
+    use super::*;
+    use crate::api_315::{MenuScreen, MENU_CELLS, MENU_COLS};
+
+    /// Build a screen whose first row carries `text`.
+    fn screen_with(text: &str) -> MenuScreen {
+        let mut raw = vec![0x20u8; MENU_CELLS * 2];
+        for (i, b) in text.bytes().take(MENU_COLS).enumerate() {
+            raw[i] = b;
+        }
+        // colour every cell white so runs collapse into one
+        for c in raw.iter_mut().skip(MENU_CELLS) {
+            *c = 1;
+        }
+        MenuScreen::from_bytes(&raw).expect("valid size")
+    }
+
+    /// The menu buffer is ASCII, not C64 screen codes — verified against a real
+    /// device, where `55 6c 74 69 6d 61 74 65` is literally "Ultimate". A
+    /// screen-code decoder would render that as garbage.
+    #[test]
+    fn the_menu_buffer_is_ascii() {
+        let s = screen_with("Ultimate II+L 3.15");
+        let row: String = s.row(0).iter().map(|&c| c as char).collect();
+        assert!(row.starts_with("Ultimate II+L 3.15"), "got {row:?}");
+    }
+
+    #[test]
+    fn menu_view_renders_without_a_screen_or_on_error() {
+        let fs = crate::styles::FontSizes::from_base(14);
+        let mut vs = VideoStreaming::new();
+        // No snapshot yet -> the "menu isn't open" hint, not a panic.
+        let _ = vs.menu_screen_view(&fs);
+        vs.menu_error = Some("boom".into());
+        let _ = vs.menu_screen_view(&fs);
+        vs.menu_error = None;
+        vs.menu_screen = Some(screen_with("Ultimate"));
+        let _ = vs.menu_screen_view(&fs);
+    }
+
+    /// Closing the view drops the snapshot so a stale menu can't linger.
+    #[test]
+    fn closing_the_view_clears_the_snapshot() {
+        let mut vs = VideoStreaming::new();
+        vs.show_menu_screen = true;
+        vs.menu_screen = Some(screen_with("x"));
+        let _ = vs.update_impl(StreamingMessage::ToggleMenuScreen, None);
+        assert!(!vs.show_menu_screen);
+        assert!(vs.menu_screen.is_none(), "stale menu must not linger");
+    }
+
+    /// A 404 means "menu not on screen" and must clear the view, not raise an
+    /// error.
+    #[test]
+    fn menu_not_open_is_not_an_error() {
+        let mut vs = VideoStreaming::new();
+        vs.menu_screen = Some(screen_with("x"));
+        let _ = vs.update_impl(StreamingMessage::MenuScreenLoaded(Ok(None)), None);
+        assert!(vs.menu_screen.is_none());
+        assert!(
+            vs.menu_error.is_none(),
+            "404 is a normal answer, not a failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod menu_navigation_tests {
+    use super::*;
+
+    /// Every combo must name keys the firmware accepts — the firmware
+    /// validates a batch as a whole and applies none of it on rejection, so one
+    /// bad name silently kills the keypress.
+    #[test]
+    fn every_menu_key_combo_is_valid() {
+        for combo in [
+            menu_keys::UP,
+            menu_keys::DOWN,
+            menu_keys::LEFT,
+            menu_keys::RIGHT,
+            menu_keys::RETURN,
+            menu_keys::RUN_STOP,
+            menu_keys::DEL,
+            menu_keys::F1,
+            menu_keys::F3,
+            menu_keys::F5,
+            menu_keys::F7,
+        ] {
+            assert!(!combo.is_empty());
+            for k in combo {
+                assert!(
+                    crate::input_315::is_valid_key(k),
+                    "{k:?} is not a firmware key name"
+                );
+            }
+        }
+    }
+
+    /// The C64 has no up or left cursor key: both are shifted forms. Sending a
+    /// bare `cursor_up_down` for "up" would move *down* — the exact opposite.
+    #[test]
+    fn up_and_left_are_shifted_forms_of_down_and_right() {
+        assert_eq!(menu_keys::DOWN, ["cursor_up_down"]);
+        assert_eq!(menu_keys::UP, ["left_shift", "cursor_up_down"]);
+        assert_eq!(menu_keys::RIGHT, ["cursor_left_right"]);
+        assert_eq!(menu_keys::LEFT, ["left_shift", "cursor_left_right"]);
+    }
+
+    /// A cartridge has the call but not the hardware. Once it says so, the
+    /// controls must retire instead of failing on every click.
+    #[test]
+    fn a_501_latches_and_retires_injection() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        assert!(
+            vs.can_inject(),
+            "3.15 offers injection until proven otherwise"
+        );
+
+        let _ = vs.update_impl(
+            StreamingMessage::InputSent(Err(
+                "Keyboard and joystick injection require Ultimate 64-class hardware.".to_string(),
+            )),
+            None,
+        );
+        assert!(!vs.can_inject(), "must stop offering injection after a 501");
+        assert!(vs.input_unsupported.is_some());
+        // The version gate itself is unchanged — the firmware still has the call.
+        assert!(vs.supports_input_api());
+    }
+
+    /// An ordinary transient failure must not permanently retire the controls.
+    #[test]
+    fn a_transient_failure_does_not_latch() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        let _ = vs.update_impl(
+            StreamingMessage::InputSent(Err("connection reset".to_string())),
+            None,
+        );
+        assert!(vs.input_unsupported.is_none(), "only a 501 should latch");
+        assert!(vs.can_inject(), "a network blip is not a hardware verdict");
+    }
+
+    #[test]
+    fn nav_sends_nothing_when_injection_is_unavailable() {
+        let vs = VideoStreaming::new(); // no firmware -> gate closed
+        assert!(!vs.can_inject());
+        let _ = vs.send_key_combo(menu_keys::UP);
     }
 }

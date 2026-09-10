@@ -604,12 +604,14 @@ fn live_315_menu_screen() {
         Some(screen) => {
             assert_eq!(screen.codes.len(), crate::api_315::MENU_CELLS);
             assert_eq!(screen.colors.len(), crate::api_315::MENU_CELLS);
+            // The menu buffer is ASCII, not C64 screen codes — 0x55 is "U".
+            // 0x02 is the horizontal rule the menu draws separators with.
             let decode = |row: &[u8]| -> String {
                 row.iter()
                     .map(|&c| match c {
-                        1..=26 => (b'A' + c - 1) as char,
-                        32..=63 => c as char,
-                        _ => '.',
+                        0x20..=0x7e => c as char,
+                        0x02 => '\u{2500}',
+                        _ => ' ',
                     })
                     .collect()
             };
@@ -789,4 +791,37 @@ fn live_reboot_machine() {
     ))
     .expect("reboot failed");
     println!("Reboot sent to {}", host);
+}
+
+/// Drives the app's own key-injection path against the device and checks the
+/// result is classified the way the UI depends on: a cartridge must report
+/// `Unsupported` (so the controls retire) rather than a generic failure.
+#[test]
+#[ignore = "requires an Ultimate on firmware 3.15+; set U64_TEST_HOST=<ip>"]
+fn live_315_named_key_injection_is_classified_correctly() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    // RUN/STOP is harmless at a BASIC prompt and in the menu alike.
+    let events = [crate::api_315::InputEvent::Keyboard {
+        inputs: vec!["run_stop".to_string()],
+        transition: crate::api_315::Transition::Tap,
+    }];
+    match block_on(crate::api_315::send_input(
+        &host,
+        test_password().as_deref(),
+        &events,
+    )) {
+        Ok(()) => println!("key injection works on this hardware"),
+        Err(crate::device_caps::CapError::Unsupported(why)) => {
+            println!("key injection unsupported here (expected on a cartridge): {why}");
+            assert!(
+                why.contains("Ultimate 64-class hardware"),
+                "the UI latches on this exact wording: {why}"
+            );
+        }
+        Err(other) => panic!("unexpected failure: {other}"),
+    }
 }
