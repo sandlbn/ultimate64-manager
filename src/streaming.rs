@@ -130,6 +130,14 @@ pub enum StreamingMessage {
     OpenInSeparateWindow, // Open streaming in a separate window
     // Virtual PETSCII keyboard
     ToggleVirtualKeyboard,
+    /// Turn gamepad-to-joystick control on or off.
+    ToggleJoystick,
+    /// Choose which C64 control port the pad drives (1 or 2).
+    JoystickPort(u8),
+    /// Timer tick: sample the pad and send any change to the device.
+    GamepadPoll,
+    /// Result of a `machine:input` batch.
+    InputSent(Result<(), String>),
     VkSend(u8),     // inject one PETSCII byte
     VkModifier(u8), // toggle SHIFT / C= / CTRL (see virtual_keyboard::MOD_*)
 }
@@ -475,6 +483,22 @@ pub struct VideoStreaming {
     // API password for REST API fallback
     pub api_password: Option<String>,
     pub stream_control_method: StreamControlMethod, // Stream control method for communicating with Ultimate64
+    // ── Gamepad → C64 joystick (firmware 3.15 `machine:input`) ──
+    /// Firmware the connected device reports, for the 3.15 gate.
+    pub device_firmware: Option<String>,
+    /// Whether pad-to-joystick control is active.
+    pub joystick_enabled: bool,
+    /// C64 control port the pad drives. Port 2 is where most games look.
+    pub joystick_port: u8,
+    /// Host-side pad reader; started on first use so no thread exists for
+    /// users who never turn this on.
+    gamepad: Option<crate::gamepad::GamepadReader>,
+    /// What the pad reader last reported, cached for the view.
+    gamepad_status: crate::gamepad::GamepadSnapshot,
+    /// Tracks held inputs so only changes go to the device.
+    input_ctl: crate::input_315::InputController,
+    /// Last failure from `machine:input`, shown once rather than per tick.
+    input_error: Option<String>,
 }
 
 impl Default for VideoStreaming {
@@ -520,13 +544,168 @@ impl VideoStreaming {
             last_key_time: None,
             ultimate_host: None,
             api_password: None,
+            device_firmware: None,
+            joystick_enabled: false,
+            joystick_port: 2,
+            gamepad: None,
+            gamepad_status: crate::gamepad::GamepadSnapshot::default(),
+            input_ctl: crate::input_315::InputController::new(),
+            input_error: None,
             stream_control_method: StreamControlMethod::default(),
         }
+    }
+
+    /// Status line for gamepad-driven joystick control: which pad is attached,
+    /// which port it drives, and what it is doing right now.
+    ///
+    /// The live direction readout is the point — without it there is no way to
+    /// tell a mis-mapped pad from a device that is ignoring the events.
+    fn joystick_strip(&self, fs: &crate::styles::FontSizes) -> Element<'_, StreamingMessage> {
+        let dim = iced::Color::from_rgb(0.75, 0.75, 0.8);
+        let accent = iced::Color::from_rgb(0.55, 0.85, 0.55);
+        let bad = iced::Color::from_rgb(0.95, 0.45, 0.45);
+
+        if let Some(err) = &self.input_error {
+            return container(
+                text(format!("Joystick stopped: {}", err))
+                    .size(fs.tiny)
+                    .color(bad),
+            )
+            .padding(6)
+            .into();
+        }
+
+        let status: Element<'_, StreamingMessage> =
+            match (&self.gamepad_status.error, &self.gamepad_status.name) {
+                (Some(e), _) => text(e.clone()).size(fs.tiny).color(bad).into(),
+                (None, Some(name)) => text(name.clone()).size(fs.tiny).color(accent).into(),
+                (None, None) => text("no gamepad detected — plug one in")
+                    .size(fs.tiny)
+                    .color(dim)
+                    .into(),
+            };
+
+        // Show what is actually held, so a dead zone or an inverted axis is
+        // obvious at a glance.
+        let held = self.input_ctl.held(self.joystick_port);
+        let held_label = if held.is_empty() {
+            "centred".to_string()
+        } else {
+            held.iter()
+                .map(|i| format!("{:?}", i).to_lowercase())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
+
+        let port_btn = |p: u8| {
+            button(text(format!("port {}", p)).size(fs.tiny))
+                .on_press(StreamingMessage::JoystickPort(p))
+                .padding([2, 6])
+                .style(if self.joystick_port == p {
+                    iced::widget::button::primary
+                } else {
+                    iced::widget::button::text
+                })
+        };
+
+        container(
+            row![
+                text("🕹").size(fs.small),
+                status,
+                port_btn(1),
+                port_btn(2),
+                text(held_label).size(fs.tiny).color(dim),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .padding(6)
+        .into()
+    }
+
+    /// Forget everything the joystick is holding, without telling the device.
+    ///
+    /// Ultimate 64 firmware releases every held key and joystick direction as
+    /// part of a reset or reboot, so after one the device holds nothing while
+    /// this side still believes it does. Left alone, the controller then sees
+    /// no change for a direction that is genuinely still pushed and never
+    /// re-presses it — the stick silently stops working until it is moved to
+    /// something else and back.
+    ///
+    /// Sending a release here would be wrong as well as pointless: the machine
+    /// is mid-reset and there is nothing to release.
+    pub fn forget_held_inputs(&mut self) {
+        self.input_ctl = crate::input_315::InputController::new();
+    }
+
+    /// Send one PETSCII character as a key press.
+    ///
+    /// On firmware 3.15 this goes through `machine:input`, which drives the
+    /// real key matrix: the KERNAL sees a genuine keypress rather than a byte
+    /// dropped into its buffer, so shifted characters and keys the buffer
+    /// cannot express behave correctly. Older firmware keeps the
+    /// `$C5`/`$0277`/`$C6` poke, which is the only option there.
+    fn send_key(
+        &self,
+        connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
+        code: u8,
+    ) -> Task<StreamingMessage> {
+        if self.supports_input_api() {
+            if let Some(host) = self.ultimate_host.clone() {
+                let ch = crate::petscii::byte_to_char(code);
+                let events = crate::input_315::type_text_events(&ch.to_string());
+                if !events.is_empty() {
+                    let password = self.api_password.clone();
+                    return Task::perform(
+                        async move {
+                            crate::api_315::send_input(&host, password.as_deref(), &events)
+                                .await
+                                .map_err(|e| e.to_string())
+                        },
+                        StreamingMessage::KeySent,
+                    );
+                }
+            }
+        }
+        send_petscii(connection, code)
+    }
+
+    /// Send a batch of input events, if there are any.
+    ///
+    /// Empty batches are the normal case while a direction is simply held, so
+    /// this returns without touching the network for them.
+    fn flush_input(&self, events: Vec<crate::api_315::InputEvent>) -> Task<StreamingMessage> {
+        if events.is_empty() {
+            return Task::none();
+        }
+        let Some(host) = self.ultimate_host.clone() else {
+            return Task::none();
+        };
+        let password = self.api_password.clone();
+        Task::perform(
+            async move {
+                crate::api_315::send_input(&host, password.as_deref(), &events)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            StreamingMessage::InputSent,
+        )
     }
 
     /// Set the Ultimate64 host for stream control
     pub fn set_ultimate_host(&mut self, host: Option<String>) {
         self.ultimate_host = host;
+    }
+
+    /// Record the firmware the device reports, so the 3.15-only joystick
+    /// control can gate itself.
+    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
+        self.device_firmware = firmware;
+    }
+
+    /// Whether this device exposes the 3.15 `machine:input` call.
+    pub fn supports_input_api(&self) -> bool {
+        crate::device_caps::DeviceCaps::from_firmware(self.device_firmware.as_deref()).has_315_api()
     }
 
     /// Set the API password for REST API stream control
@@ -865,7 +1044,7 @@ impl VideoStreaming {
 
                 if let Some(code) = petscii {
                     log::debug!("KEYBOARD: {:?} -> PETSCII {} (0x{:02X})", key, code, code);
-                    return send_petscii(connection, code);
+                    return self.send_key(connection, code);
                 }
                 log::trace!("KEYBOARD: Key {:?} not mapped", key);
                 Task::none()
@@ -898,6 +1077,61 @@ impl VideoStreaming {
                 Task::none()
             }
 
+            StreamingMessage::ToggleJoystick => {
+                self.joystick_enabled = !self.joystick_enabled;
+                self.input_error = None;
+                if self.joystick_enabled {
+                    // Start the reader lazily — no thread for users who never
+                    // switch this on.
+                    if self.gamepad.is_none() {
+                        self.gamepad = Some(crate::gamepad::GamepadReader::start());
+                    }
+                } else {
+                    // Hand control back cleanly: a direction still held on the
+                    // device would otherwise stick with nothing to release it.
+                    let events = self.input_ctl.release_all();
+                    return self.flush_input(events);
+                }
+                Task::none()
+            }
+
+            StreamingMessage::JoystickPort(port) => {
+                if port != self.joystick_port {
+                    // Release on the old port before moving, or it keeps
+                    // whatever was held at the moment of the switch.
+                    let events = self.input_ctl.release_all();
+                    self.joystick_port = port;
+                    return self.flush_input(events);
+                }
+                Task::none()
+            }
+
+            StreamingMessage::GamepadPoll => {
+                let Some(reader) = self.gamepad.as_ref() else {
+                    return Task::none();
+                };
+                self.gamepad_status = reader.snapshot();
+                let desired = self.gamepad_status.pad.to_inputs();
+                let port = self.joystick_port;
+                let events = self.input_ctl.set_joystick(port, desired);
+                // The common case is "nothing changed", which costs no request.
+                self.flush_input(events)
+            }
+
+            StreamingMessage::InputSent(result) => {
+                match result {
+                    Ok(()) => self.input_error = None,
+                    Err(e) => {
+                        // Report once and stop driving, rather than retrying a
+                        // failing call every tick.
+                        log::warn!("machine:input failed: {}", e);
+                        self.input_error = Some(e);
+                        self.joystick_enabled = false;
+                    }
+                }
+                Task::none()
+            }
+
             StreamingMessage::ToggleVirtualKeyboard => {
                 self.show_virtual_keyboard = !self.show_virtual_keyboard;
                 // Build the glyph atlas once, on first show.
@@ -921,7 +1155,7 @@ impl VideoStreaming {
                 self.vk_shift = false;
                 self.vk_comm = false;
                 self.vk_ctrl = false;
-                send_petscii(connection, code)
+                self.send_key(connection, code)
             }
         }
     }
@@ -1029,8 +1263,24 @@ impl VideoStreaming {
             fs,
         );
 
+        // Gamepad → joystick. Only offered on firmware that has machine:input;
+        // on anything older the call 404s, and on a cartridge it 501s.
+        let joy_supported = self.supports_input_api();
+        let joy = overlay_button(
+            "🕹",
+            joy_supported.then_some(StreamingMessage::ToggleJoystick),
+            self.joystick_enabled,
+            if joy_supported {
+                "Drive a C64 joystick from a USB gamepad"
+            } else {
+                "Needs Ultimate firmware 3.15 or newer"
+            },
+            fs,
+        );
+
         let bar = row![
             live_stop,
+            joy,
             shot,
             full,
             popout,
@@ -1219,6 +1469,9 @@ impl VideoStreaming {
         // Bottom overlay stack on the video: the on-screen keyboard (if shown)
         // sits just above the media-player control bar, both floating on the video.
         let mut overlay_col = column![].spacing(6).align_x(iced::Alignment::Center);
+        if self.joystick_enabled || self.input_error.is_some() {
+            overlay_col = overlay_col.push(self.joystick_strip(&fs));
+        }
         if self.show_virtual_keyboard {
             overlay_col = overlay_col.push(crate::virtual_keyboard::view(
                 &self.vk_glyphs,
@@ -1412,6 +1665,15 @@ impl VideoStreaming {
         if self.is_streaming {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(12)).map(|_| StreamingMessage::FrameUpdate),
+            );
+        }
+
+        // Sample the gamepad while joystick control is on. 60 Hz is the rate
+        // the pad is read at; it does NOT imply a request per tick — the
+        // controller only emits events when the position actually changes.
+        if self.joystick_enabled {
+            subscriptions.push(
+                iced::time::every(Duration::from_millis(16)).map(|_| StreamingMessage::GamepadPoll),
             );
         }
 
@@ -2471,5 +2733,149 @@ impl crate::tab::TabController for VideoStreaming {
         ctx: crate::tab::TabContext,
     ) -> iced::Task<StreamingMessage> {
         self.update_impl(message, ctx.connection)
+    }
+}
+
+#[cfg(test)]
+mod joystick_gate_tests {
+    use super::*;
+    use crate::api_315::JoyInput;
+
+    #[test]
+    fn joystick_control_is_offered_only_on_firmware_315_or_newer() {
+        let mut vs = VideoStreaming::new();
+
+        vs.set_device_firmware(Some("3.15".into()));
+        assert!(vs.supports_input_api(), "3.15 has machine:input");
+
+        vs.set_device_firmware(Some("3.16".into()));
+        assert!(vs.supports_input_api());
+
+        vs.set_device_firmware(Some("3.14".into()));
+        assert!(!vs.supports_input_api(), "3.14 predates machine:input");
+
+        // The Commodore-fork C64 Ultimate numbers itself separately and 404s
+        // on this call today.
+        vs.set_device_firmware(Some("1.1.0".into()));
+        assert!(!vs.supports_input_api());
+
+        vs.set_device_firmware(None);
+        assert!(
+            !vs.supports_input_api(),
+            "unknown firmware is treated as old"
+        );
+    }
+
+    /// Turning the feature off must release whatever the pad was holding, or a
+    /// direction stays pressed on the device with nothing left to release it.
+    #[test]
+    fn disabling_joystick_releases_whatever_was_held() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        vs.joystick_enabled = true;
+
+        let held: std::collections::BTreeSet<JoyInput> =
+            [JoyInput::Left, JoyInput::Fire].into_iter().collect();
+        assert!(!vs.input_ctl.set_joystick(2, held).is_empty());
+        assert!(!vs.input_ctl.held(2).is_empty());
+
+        let _ = vs.update_impl(StreamingMessage::ToggleJoystick, None);
+        assert!(!vs.joystick_enabled);
+        assert!(
+            vs.input_ctl.held(2).is_empty(),
+            "toggling off must clear held inputs"
+        );
+    }
+
+    /// Switching ports must not leave the old port holding a direction.
+    #[test]
+    fn switching_port_releases_the_previous_one() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        let held: std::collections::BTreeSet<JoyInput> = [JoyInput::Up].into_iter().collect();
+        vs.input_ctl.set_joystick(2, held);
+
+        let _ = vs.update_impl(StreamingMessage::JoystickPort(1), None);
+        assert_eq!(vs.joystick_port, 1);
+        assert!(vs.input_ctl.held(2).is_empty(), "old port must be released");
+    }
+
+    /// A failing device call stops the loop rather than retrying every tick.
+    #[test]
+    fn an_input_failure_stops_driving_and_surfaces_once() {
+        let mut vs = VideoStreaming::new();
+        vs.joystick_enabled = true;
+        let _ = vs.update_impl(StreamingMessage::InputSent(Err("boom".to_string())), None);
+        assert!(!vs.joystick_enabled, "should stop after a failure");
+        assert_eq!(vs.input_error.as_deref(), Some("boom"));
+    }
+}
+
+#[cfg(test)]
+mod keyboard_route_tests {
+    use super::*;
+
+    /// The 3.15 path needs a host to POST to; without one it must still fall
+    /// back to the memory-poke route rather than dropping the keystroke.
+    #[test]
+    fn key_routing_falls_back_when_no_host_is_known() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        vs.set_ultimate_host(None);
+        // No connection and no host: both routes are unavailable, so this is a
+        // no-op Task rather than a panic.
+        let _ = vs.send_key(None, b'A');
+    }
+
+    #[test]
+    fn old_firmware_keeps_the_memory_poke_route() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.14".into()));
+        vs.set_ultimate_host(Some("10.0.0.1".into()));
+        assert!(!vs.supports_input_api());
+        let _ = vs.send_key(None, b'A');
+    }
+}
+
+#[cfg(test)]
+mod reset_desync_tests {
+    use super::*;
+    use crate::api_315::JoyInput;
+    use std::collections::BTreeSet;
+
+    /// After a reset the device holds nothing. If this side still thinks a
+    /// direction is held, the next poll sees "no change" and never re-presses
+    /// it — the stick dies until it is moved away and back.
+    #[test]
+    fn a_reset_lets_a_still_pushed_direction_be_pressed_again() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        let right: BTreeSet<JoyInput> = [JoyInput::Right].into_iter().collect();
+
+        // Stick pushed right, device now holding it.
+        assert!(!vs.input_ctl.set_joystick(2, right.clone()).is_empty());
+        // Same position again: nothing to send, as designed.
+        assert!(vs.input_ctl.set_joystick(2, right.clone()).is_empty());
+
+        // Reset — the firmware releases everything on its own.
+        vs.forget_held_inputs();
+
+        // The stick is still pushed right, and that must now be re-pressed.
+        assert!(
+            !vs.input_ctl.set_joystick(2, right).is_empty(),
+            "after a reset the held direction must be sent again"
+        );
+    }
+
+    #[test]
+    fn forgetting_held_inputs_clears_every_port() {
+        let mut vs = VideoStreaming::new();
+        vs.input_ctl
+            .set_joystick(1, [JoyInput::Up].into_iter().collect());
+        vs.input_ctl
+            .set_joystick(2, [JoyInput::Fire].into_iter().collect());
+        vs.forget_held_inputs();
+        assert!(vs.input_ctl.held(1).is_empty());
+        assert!(vs.input_ctl.held(2).is_empty());
     }
 }

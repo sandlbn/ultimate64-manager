@@ -169,6 +169,8 @@ pub struct RemoteBrowser {
     pub is_loading: bool,
     pub is_connected: bool,
     pub host_address: Option<String>,
+    /// Firmware the device reports, for the 3.15 feature gate.
+    pub device_firmware: Option<String>,
     pub password: Option<String>,
     pub filter: String,
     // Checked files for batch operations
@@ -242,6 +244,7 @@ impl Default for RemoteBrowser {
             is_loading: false,
             is_connected: false,
             host_address: None,
+            device_firmware: None,
             password: None,
             filter: String::new(),
             checked_files: HashSet::new(),
@@ -278,6 +281,16 @@ impl Default for RemoteBrowser {
 impl RemoteBrowser {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the firmware the device reports, so 3.15-only calls can gate.
+    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
+        self.device_firmware = firmware;
+    }
+
+    /// Whether the device can format disk images itself (firmware 3.15+).
+    pub fn supports_native_disk_create(&self) -> bool {
+        crate::device_caps::DeviceCaps::from_firmware(self.device_firmware.as_deref()).has_315_api()
     }
 
     pub fn set_host(&mut self, host: Option<String>, password: Option<String>) {
@@ -873,8 +886,22 @@ impl RemoteBrowser {
                     let disk_type = self.create_disk_type;
                     let dest = self.current_path.clone();
                     let password = self.password.clone();
+                    // Firmware 3.15 formats the image on the device from one
+                    // call; older firmware needs the build-locally-then-upload
+                    // path below.
+                    let native = self.supports_native_disk_create();
                     Task::perform(
                         async move {
+                            if native {
+                                return create_disk_native(
+                                    &host,
+                                    &name,
+                                    disk_type,
+                                    &dest,
+                                    password.as_deref(),
+                                )
+                                .await;
+                            }
                             // 60s hard cap — the inner work is "build a few KB
                             // disk image then FTP-upload it". On a healthy
                             // device this finishes in well under a second;
@@ -2854,6 +2881,35 @@ impl std::fmt::Display for RemoteFavoriteChoice {
     }
 }
 
+/// Format an empty disk image on the device itself (firmware 3.15+).
+///
+/// Replaces the build-locally-then-FTP-upload path: the firmware writes and
+/// formats the image in place, so nothing crosses the network but the request.
+async fn create_disk_native(
+    host: &str,
+    name: &str,
+    disk_type: crate::ftp_ops::DiskCreateType,
+    dest: &str,
+    password: Option<&str>,
+) -> Result<String, String> {
+    use crate::api_315::DiskKind;
+    use crate::ftp_ops::DiskCreateType;
+
+    let kind = match disk_type {
+        DiskCreateType::D64 => DiskKind::D64 { tracks: None },
+        DiskCreateType::D71 => DiskKind::D71,
+        DiskCreateType::D81 => DiskKind::D81,
+    };
+    // Match the FTP path's naming so a disk lands in the same place with the
+    // same name whichever route created it.
+    let filename = format!("{}.{}", name.replace(' ', "_"), kind.extension());
+    let path = format!("{}/{}", dest.trim_end_matches('/'), filename);
+
+    let written =
+        crate::api_315::create_disk_image(host, password, &path, kind, Some(name)).await?;
+    Ok(format!("Created {} ({} bytes)", filename, written))
+}
+
 fn remote_basename(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
@@ -2900,5 +2956,29 @@ impl crate::tab::TabController for RemoteBrowser {
         ctx: crate::tab::TabContext,
     ) -> iced::Task<RemoteBrowserMessage> {
         self.update_impl(message, ctx.connection)
+    }
+}
+
+#[cfg(test)]
+mod disk_create_gate_tests {
+    use super::*;
+
+    #[test]
+    fn native_disk_creation_needs_firmware_315() {
+        let mut rb = RemoteBrowser::new();
+        rb.set_device_firmware(Some("3.15".into()));
+        assert!(rb.supports_native_disk_create());
+        rb.set_device_firmware(Some("3.14".into()));
+        assert!(
+            !rb.supports_native_disk_create(),
+            "3.14 has no files:create_*"
+        );
+        rb.set_device_firmware(Some("1.1.0".into()));
+        assert!(!rb.supports_native_disk_create());
+        rb.set_device_firmware(None);
+        assert!(
+            !rb.supports_native_disk_create(),
+            "unknown firmware falls back to FTP"
+        );
     }
 }

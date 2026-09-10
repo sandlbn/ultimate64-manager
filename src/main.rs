@@ -110,6 +110,7 @@ use url::Host;
 use version_check::{NewVersionInfo, VersionCheckMessage};
 
 mod api;
+mod api_315;
 mod app;
 mod archive;
 mod assembly64;
@@ -122,6 +123,7 @@ mod config_editor;
 mod config_presets;
 mod csdb_screenshots;
 mod debug_stream;
+mod device_caps;
 mod device_error;
 mod device_profile;
 mod dir_preview;
@@ -132,6 +134,8 @@ mod file_types;
 mod folder_favorites;
 mod ftp_ops;
 mod game_mode;
+mod gamepad;
+mod input_315;
 #[cfg(test)]
 mod integration;
 mod memory_editor;
@@ -608,6 +612,11 @@ pub enum Pane {
 pub struct StatusInfo {
     pub connected: bool,
     pub device_info: Option<String>,
+    /// Firmware version exactly as reported, kept structured alongside the
+    /// display string so feature gates can compare it (see
+    /// [`crate::device_caps`]). The display string flattens it into prose and
+    /// can't be parsed back reliably.
+    pub firmware: Option<String>,
     pub mounted_disks: Vec<(String, String)>,
     /// Live per-drive state (name, power, type) from `drive_list`, so the drive
     /// control strip can reflect what's actually set on the device.
@@ -817,6 +826,7 @@ impl Ultimate64Browser {
             status: StatusInfo {
                 connected: false,
                 device_info: None,
+                firmware: None,
                 mounted_disks: Vec::new(),
                 drives: Vec::new(),
             },
@@ -2795,8 +2805,11 @@ async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<Status
         tokio::task::spawn_blocking(move || {
             let conn = connection.lock().unwrap();
 
-            let device_info = match conn.info() {
-                Ok(info) => Some(format!("{} ({})", info.product, info.firmware_version)),
+            let (device_info, firmware) = match conn.info() {
+                Ok(info) => (
+                    Some(format!("{} ({})", info.product, info.firmware_version)),
+                    Some(info.firmware_version),
+                ),
                 // The ultimate64 crate surfaces HTTP failures as strings; classify
                 // a 403 so the UI can say "wrong password" instead of "offline".
                 Err(e) => return Err(classify_crate_error(&e.to_string())),
@@ -2825,6 +2838,7 @@ async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<Status
             Ok(StatusInfo {
                 connected: true,
                 device_info,
+                firmware,
                 mounted_disks,
                 drives,
             })

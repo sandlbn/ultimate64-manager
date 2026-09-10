@@ -536,6 +536,184 @@ fn live_run_d64_over_port64() {
     println!("Image mounted and machine reset; the 1541 loads from here (~60s for this disk)");
 }
 
+// ── Firmware 3.15 API (auto-skips on older firmware) ────────────────────────
+
+/// Read the device's firmware and build the capability gate from it. Returns
+/// `None` (and prints why) when the device predates 3.15, so these tests are
+/// safe to run against any host in the fleet.
+fn caps_or_skip(host: &str) -> Option<crate::device_caps::DeviceCaps> {
+    let conn = connect(host, test_password());
+    let info = on_device(&conn, |d| d.info()).expect("info() failed");
+    let caps = crate::device_caps::DeviceCaps::from_firmware(Some(&info.firmware_version));
+    if !caps.has_315_api() {
+        eprintln!(
+            "SKIP: {} runs firmware {} — the 3.15 API needs 3.15 or newer",
+            info.product, info.firmware_version
+        );
+        return None;
+    }
+    println!("{} on firmware {}", info.product, info.firmware_version);
+    Some(caps)
+}
+
+#[test]
+#[ignore = "requires an Ultimate on firmware 3.15+; set U64_TEST_HOST=<ip>"]
+fn live_315_heap_stats() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    let h = block_on(crate::api_315::heap_stats(
+        &host,
+        test_password().as_deref(),
+    ))
+    .expect("heap_stats failed");
+    println!(
+        "heap: free {} / total {} ({:.0}% used), min ever free {}",
+        h.free,
+        h.total,
+        h.used_fraction() * 100.0,
+        h.min_ever_free
+    );
+    assert!(h.total > 0, "a device must report a heap total");
+    assert!(h.free <= h.total, "free cannot exceed total");
+    assert!(
+        h.min_ever_free <= h.free,
+        "low water mark cannot exceed current free"
+    );
+}
+
+/// The menu screen is 2000 bytes when the menu is open, and a 404 (mapped to
+/// `None`) when it is not — both are correct answers, so this asserts the
+/// shape of whichever one comes back rather than forcing the menu open.
+#[test]
+#[ignore = "requires an Ultimate on firmware 3.15+; set U64_TEST_HOST=<ip>"]
+fn live_315_menu_screen() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    match block_on(crate::api_315::menu_screen(
+        &host,
+        test_password().as_deref(),
+    ))
+    .expect("menu_screen failed")
+    {
+        Some(screen) => {
+            assert_eq!(screen.codes.len(), crate::api_315::MENU_CELLS);
+            assert_eq!(screen.colors.len(), crate::api_315::MENU_CELLS);
+            let decode = |row: &[u8]| -> String {
+                row.iter()
+                    .map(|&c| match c {
+                        1..=26 => (b'A' + c - 1) as char,
+                        32..=63 => c as char,
+                        _ => '.',
+                    })
+                    .collect()
+            };
+            println!("menu is open; row 0: {:?}", decode(screen.row(0)));
+            assert!(
+                screen.codes.iter().any(|&c| c != 0x20),
+                "an open menu cannot be entirely blank"
+            );
+        }
+        None => println!("menu is not on screen (404) — the documented way to ask"),
+    }
+}
+
+#[test]
+#[ignore = "requires an Ultimate on firmware 3.15+; set U64_TEST_HOST=<ip>"]
+fn live_315_file_info_reports_missing_files_as_none() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    let missing = block_on(crate::api_315::file_info(
+        &host,
+        test_password().as_deref(),
+        "/Temp/definitely-not-here-9f3a.d64",
+    ))
+    .expect("a missing file is not an error");
+    assert_eq!(missing, None, "404 must map to None, not an Err");
+    println!("missing file correctly reported as None");
+}
+
+/// Formats a real image on the device, then reads it back through `files:info`
+/// to prove the bytes actually landed.
+#[test]
+#[ignore = "DESTRUCTIVE: writes a disk image to the device. Set U64_TEST_DESTRUCTIVE=1"]
+fn live_315_create_disk_image_roundtrip() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    let dir = std::env::var("U64_TEST_DISK_DIR").unwrap_or_else(|_| "Temp".to_string());
+    let path = format!("{}/u64mgr-selftest.d64", dir.trim_matches('/'));
+    let pw = test_password();
+
+    // The firmware refuses to overwrite and there is no REST delete, so a
+    // repeat run legitimately finds the image already there. Treat that as the
+    // same outcome rather than leaving a test that only passes once.
+    match block_on(crate::api_315::create_disk_image(
+        &host,
+        pw.as_deref(),
+        &path,
+        crate::api_315::DiskKind::D64 { tracks: None },
+        Some("SELFTEST"),
+    )) {
+        Ok(written) => {
+            println!("created {} ({} bytes written)", path, written);
+            assert_eq!(written, 174_848, "a 35-track D64 is 174848 bytes");
+        }
+        Err(e) if e.to_uppercase().contains("EXISTS") => {
+            println!(
+                "{} already existed from an earlier run — verifying it",
+                path
+            );
+        }
+        Err(e) => panic!("create_disk_image failed: {e}"),
+    }
+
+    let info = block_on(crate::api_315::file_info(&host, pw.as_deref(), &path))
+        .expect("file_info failed")
+        .expect("the image we just created must exist");
+    println!("files:info -> {:?}", info);
+    assert_eq!(info.size, 174_848, "a 35-track D64 is 174848 bytes on disk");
+    assert_eq!(info.extension.to_uppercase(), "D64");
+}
+
+/// Cartridges answer 501 to `machine:input` — the firmware registers the call
+/// but the hardware cannot drive keyboard or joystick lines. Callers rely on
+/// that being `Unsupported` (so they fall back) rather than a hard failure,
+/// so pin the behaviour on whichever product is under test.
+#[test]
+#[ignore = "requires an Ultimate on firmware 3.15+; set U64_TEST_HOST=<ip>"]
+fn live_315_input_reports_hardware_support_honestly() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    // Releasing everything is the safest probe: it presses nothing.
+    let events = [crate::api_315::InputEvent::ReleaseAll];
+    match block_on(crate::api_315::send_input(
+        &host,
+        test_password().as_deref(),
+        &events,
+    )) {
+        Ok(()) => println!("machine:input is supported on this hardware"),
+        Err(crate::device_caps::CapError::Unsupported(why)) => {
+            println!("machine:input unsupported here (expected on a cartridge): {why}");
+        }
+        Err(other) => panic!("unexpected failure from machine:input: {other}"),
+    }
+}
+
 #[test]
 #[ignore = "DESTRUCTIVE: resets drive A. Set U64_TEST_DESTRUCTIVE=1"]
 fn live_drive_reset() {
