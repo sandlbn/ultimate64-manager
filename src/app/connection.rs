@@ -146,6 +146,13 @@ impl Ultimate64Browser {
                     );
                 }
                 self.consecutive_status_failures = 0;
+                // Hand the firmware version to the streaming tab so its
+                // 3.15-only joystick control can gate itself without repeating
+                // the /v1/info round-trip.
+                self.video_streaming
+                    .set_device_firmware(status.firmware.clone());
+                self.remote_browser
+                    .set_device_firmware(status.firmware.clone());
                 // Show connected message when first connecting
                 if !self.status.connected && status.connected {
                     self.user_message = Some(UserMessage::Info(format!(

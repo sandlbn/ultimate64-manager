@@ -8,6 +8,9 @@ use crate::{Message, Ultimate64Browser, UserMessage};
 
 impl Ultimate64Browser {
     pub(crate) fn handle_reset_machine(&mut self) -> Task<Message> {
+        // The device drops every held key/joystick input on reset; keep our
+        // idea of what is held from drifting out of step with it.
+        self.video_streaming.forget_held_inputs();
         if let Some(conn) = &self.connection {
             let conn = conn.clone();
             Task::perform(
@@ -38,6 +41,9 @@ impl Ultimate64Browser {
     }
 
     pub(crate) fn handle_reboot_machine(&mut self) -> Task<Message> {
+        // The device drops every held key/joystick input on reset; keep our
+        // idea of what is held from drifting out of step with it.
+        self.video_streaming.forget_held_inputs();
         if let Some(host) = &self.host_url {
             let url = format!("{}/v1/machine:reboot", host);
             Task::perform(
