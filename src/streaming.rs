@@ -507,6 +507,15 @@ pub struct VideoStreaming {
     input_ctl: crate::input_315::InputController,
     /// Last failure from `machine:input`, shown once rather than per tick.
     input_error: Option<String>,
+    /// The batch currently on the wire, with the state it establishes. The
+    /// device's HTTP server handles one connection at a time, so a second
+    /// request while this is set would stall both.
+    input_in_flight: Option<crate::input_315::PortState>,
+    /// Consecutive failed sends, for backing off rather than giving up at one.
+    input_failures: u32,
+    /// When the joystick strip was last summoned. It auto-hides a few seconds
+    /// later so it stops covering the picture while playing.
+    strip_shown_at: Option<std::time::Instant>,
     /// Set once the device answers 501: it has the call but not the hardware.
     /// Latched so the UI stops offering injection instead of failing per click.
     input_unsupported: Option<String>,
@@ -586,6 +595,9 @@ impl VideoStreaming {
             gamepad_status: crate::gamepad::GamepadSnapshot::default(),
             input_ctl: crate::input_315::InputController::new(),
             input_error: None,
+            input_in_flight: None,
+            input_failures: 0,
+            strip_shown_at: None,
             input_unsupported: None,
             show_menu_screen: false,
             menu_screen: None,
@@ -816,6 +828,36 @@ impl VideoStreaming {
         )
     }
 
+    /// How long the joystick strip stays up before getting out of the way.
+    const STRIP_AUTOHIDE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Whether the joystick strip should be on screen.
+    ///
+    /// It is a setup aid, not a HUD: useful while choosing a port and checking
+    /// the pad is read, then just something covering the picture. So it shows
+    /// itself when summoned and stands down shortly after.
+    ///
+    /// Two states override the timer, because in both the strip is the only
+    /// thing explaining why nothing is happening: a failed call, and no pad
+    /// detected.
+    fn strip_visible_at(&self, now: std::time::Instant) -> bool {
+        if self.input_error.is_some() {
+            return true;
+        }
+        if !self.joystick_enabled {
+            return false;
+        }
+        if !self.gamepad_status.is_connected() {
+            return true;
+        }
+        self.strip_shown_at
+            .is_some_and(|t| now.duration_since(t) < Self::STRIP_AUTOHIDE)
+    }
+
+    fn strip_visible(&self) -> bool {
+        self.strip_visible_at(std::time::Instant::now())
+    }
+
     /// Forget everything the joystick is holding, without telling the device.
     ///
     /// Ultimate 64 firmware releases every held key and joystick direction as
@@ -828,7 +870,7 @@ impl VideoStreaming {
     /// Sending a release here would be wrong as well as pointless: the machine
     /// is mid-reset and there is nothing to release.
     pub fn forget_held_inputs(&mut self) {
-        self.input_ctl = crate::input_315::InputController::new();
+        self.input_ctl.forget();
     }
 
     /// Send one PETSCII character as a key press.
@@ -843,10 +885,12 @@ impl VideoStreaming {
         connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
         code: u8,
     ) -> Task<StreamingMessage> {
-        if self.supports_input_api() {
+        if self.can_inject() {
             if let Some(host) = self.ultimate_host.clone() {
-                let ch = crate::petscii::byte_to_char(code);
-                let events = crate::input_315::type_text_events(&ch.to_string());
+                // Must NOT go through petscii::byte_to_char here: that is a
+                // display helper which folds every control code to a space, so
+                // RETURN arrived as SPACE and the cursor stepped right.
+                let events = crate::input_315::events_for_petscii(code);
                 if !events.is_empty() {
                     let password = self.api_password.clone();
                     return Task::perform(
@@ -863,10 +907,47 @@ impl VideoStreaming {
         send_petscii(connection, code)
     }
 
-    /// Send a batch of input events, if there are any.
+    /// How many consecutive failed sends before giving up and saying so.
     ///
-    /// Empty batches are the normal case while a direction is simply held, so
-    /// this returns without touching the network for them.
+    /// A single timeout is routine while the device is busy running a game; a
+    /// run of them means it is genuinely not listening. Stopping at the first
+    /// one killed the joystick mid-game.
+    const INPUT_FAILURE_LIMIT: u32 = 10;
+
+    /// Send the outstanding difference, if any, and only if nothing is already
+    /// on the wire.
+    ///
+    /// At most one request is in flight at a time: the Ultimate's HTTP server
+    /// handles a single connection, so overlapping requests stall it and time
+    /// out. Because the batch is recomputed from the confirmed state on each
+    /// call, movement during an in-flight request collapses into one follow-up
+    /// rather than a queue of stale ones.
+    fn pump_input(&mut self) -> Task<StreamingMessage> {
+        if self.input_in_flight.is_some() || !self.joystick_enabled {
+            return Task::none();
+        }
+        let Some(pending) = self.input_ctl.pending() else {
+            return Task::none();
+        };
+        let Some(host) = self.ultimate_host.clone() else {
+            return Task::none();
+        };
+        self.input_in_flight = Some(pending.establishes);
+        let password = self.api_password.clone();
+        let events = pending.events;
+        Task::perform(
+            async move {
+                crate::api_315::send_input(&host, password.as_deref(), &events)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            StreamingMessage::InputSent,
+        )
+    }
+
+    /// Send a one-off batch that is not part of the pad's tracked state — a
+    /// release-all, or a named key from the menu pad. Not subject to the
+    /// in-flight guard: these are user-initiated and rare.
     fn flush_input(&self, events: Vec<crate::api_315::InputEvent>) -> Task<StreamingMessage> {
         if events.is_empty() {
             return Task::none();
@@ -1350,8 +1431,17 @@ impl VideoStreaming {
             }
 
             StreamingMessage::ToggleJoystick => {
+                // While enabled but hidden, the button brings the strip back
+                // rather than switching off. Otherwise the only way to change
+                // port would be to disable and re-enable, and it would be far
+                // too easy to kill the joystick mid-game by reaching for it.
+                if self.joystick_enabled && !self.strip_visible() {
+                    self.strip_shown_at = Some(std::time::Instant::now());
+                    return Task::none();
+                }
                 self.joystick_enabled = !self.joystick_enabled;
                 self.input_error = None;
+                self.strip_shown_at = self.joystick_enabled.then(std::time::Instant::now);
                 if self.joystick_enabled {
                     // Start the reader lazily — no thread for users who never
                     // switch this on.
@@ -1368,6 +1458,7 @@ impl VideoStreaming {
             }
 
             StreamingMessage::JoystickPort(port) => {
+                self.strip_shown_at = Some(std::time::Instant::now());
                 if port != self.joystick_port {
                     // Release on the old port before moving, or it keeps
                     // whatever was held at the moment of the switch.
@@ -1385,9 +1476,138 @@ impl VideoStreaming {
                 self.gamepad_status = reader.snapshot();
                 let desired = self.gamepad_status.pad.to_inputs();
                 let port = self.joystick_port;
-                let events = self.input_ctl.set_joystick(port, desired);
-                // The common case is "nothing changed", which costs no request.
-                self.flush_input(events)
+                self.input_ctl.set_desired(port, desired);
+                // The common case is "already up to date", which costs nothing.
+                self.pump_input()
+            }
+
+            StreamingMessage::InputSent(result) => {
+                let establishes = self.input_in_flight.take();
+                match result {
+                    Ok(()) => {
+                        // Only now is it true that the device holds this.
+                        if let Some(state) = establishes {
+                            self.input_ctl.commit(state);
+                        }
+                        self.input_failures = 0;
+                        self.input_error = None;
+                    }
+                    Err(e) => {
+                        // Not committing means the next poll recomputes the same
+                        // difference and tries again, so a dropped request heals
+                        // itself rather than leaving a dead direction.
+                        if e.contains("Ultimate 64-class hardware") {
+                            // A verdict about the hardware, not a blip: stop.
+                            log::warn!("machine:input unsupported: {}", e);
+                            self.input_unsupported = Some(e.clone());
+                            self.input_error = Some(e);
+                            self.joystick_enabled = false;
+                            self.input_failures = 0;
+                        } else {
+                            self.input_failures = self.input_failures.saturating_add(1);
+                            log::debug!(
+                                "machine:input attempt {} failed: {}",
+                                self.input_failures,
+                                e
+                            );
+                            if self.input_failures >= Self::INPUT_FAILURE_LIMIT {
+                                // Persistently failing: stop driving and say so,
+                                // rather than hammering an unreachable device.
+                                log::warn!(
+                                    "machine:input giving up after {} failures",
+                                    self.input_failures
+                                );
+                                self.input_error = Some(e);
+                                self.joystick_enabled = false;
+                                self.strip_shown_at = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                }
+                // Something may have changed while that request was out.
+                self.pump_input()
+            }
+
+            StreamingMessage::ToggleMenuScreen => {
+                self.show_menu_screen = !self.show_menu_screen;
+                self.menu_error = None;
+                if !self.show_menu_screen {
+                    self.menu_screen = None;
+                    return Task::none();
+                }
+                self.poll_menu_screen()
+            }
+
+            StreamingMessage::MenuScreenPoll => self.poll_menu_screen(),
+
+            StreamingMessage::SendKeyCombo(keys) => self.send_key_combo(keys),
+
+            StreamingMessage::MenuScreenLoaded(result) => {
+                match result {
+                    // `None` is the documented answer for "the menu is not on
+                    // screen", not a failure.
+                    Ok(screen) => {
+                        self.menu_screen = screen;
+                        self.menu_error = None;
+                    }
+                    Err(e) => {
+                        log::warn!("menu_screen poll failed: {}", e);
+                        self.menu_error = Some(e);
+                        self.menu_screen = None;
+                    }
+                }
+                Task::none()
+            }
+
+            StreamingMessage::ToggleJoystick => {
+                // While enabled but hidden, the button brings the strip back
+                // rather than switching off. Otherwise the only way to change
+                // port would be to disable and re-enable, and it would be far
+                // too easy to kill the joystick mid-game by reaching for it.
+                if self.joystick_enabled && !self.strip_visible() {
+                    self.strip_shown_at = Some(std::time::Instant::now());
+                    return Task::none();
+                }
+                self.joystick_enabled = !self.joystick_enabled;
+                self.input_error = None;
+                self.strip_shown_at = self.joystick_enabled.then(std::time::Instant::now);
+                if self.joystick_enabled {
+                    // Start the reader lazily — no thread for users who never
+                    // switch this on.
+                    if self.gamepad.is_none() {
+                        self.gamepad = Some(crate::gamepad::GamepadReader::start());
+                    }
+                } else {
+                    // Hand control back cleanly: a direction still held on the
+                    // device would otherwise stick with nothing to release it.
+                    let events = self.input_ctl.release_all();
+                    return self.flush_input(events);
+                }
+                Task::none()
+            }
+
+            StreamingMessage::JoystickPort(port) => {
+                self.strip_shown_at = Some(std::time::Instant::now());
+                if port != self.joystick_port {
+                    // Release on the old port before moving, or it keeps
+                    // whatever was held at the moment of the switch.
+                    let events = self.input_ctl.release_all();
+                    self.joystick_port = port;
+                    return self.flush_input(events);
+                }
+                Task::none()
+            }
+
+            StreamingMessage::GamepadPoll => {
+                let Some(reader) = self.gamepad.as_ref() else {
+                    return Task::none();
+                };
+                self.gamepad_status = reader.snapshot();
+                let desired = self.gamepad_status.pad.to_inputs();
+                let port = self.joystick_port;
+                self.input_ctl.set_desired(port, desired);
+                // The common case is "already up to date", which costs nothing.
+                self.pump_input()
             }
 
             StreamingMessage::InputSent(result) => {
@@ -1548,10 +1768,14 @@ impl VideoStreaming {
             "🕹",
             joy_supported.then_some(StreamingMessage::ToggleJoystick),
             self.joystick_enabled,
-            if joy_supported {
-                "Drive a C64 joystick from a USB gamepad"
-            } else {
+            if !joy_supported {
                 "Needs Ultimate firmware 3.15 or newer"
+            } else if !self.joystick_enabled {
+                "Drive a C64 joystick from a USB gamepad"
+            } else if self.strip_visible() {
+                "Turn the gamepad joystick off"
+            } else {
+                "Show gamepad settings (press again to turn off)"
             },
             fs,
         );
@@ -1764,7 +1988,7 @@ impl VideoStreaming {
         if self.show_menu_screen {
             overlay_col = overlay_col.push(self.menu_screen_view(&fs));
         }
-        if self.joystick_enabled || self.input_error.is_some() {
+        if self.strip_visible() {
             overlay_col = overlay_col.push(self.joystick_strip(&fs));
         }
         if self.show_virtual_keyboard {
@@ -3080,7 +3304,12 @@ mod joystick_gate_tests {
 
         let held: std::collections::BTreeSet<JoyInput> =
             [JoyInput::Left, JoyInput::Fire].into_iter().collect();
-        assert!(!vs.input_ctl.set_joystick(2, held).is_empty());
+        vs.input_ctl.set_desired(2, held);
+        let p = vs
+            .input_ctl
+            .pending()
+            .expect("a new direction must be sent");
+        vs.input_ctl.commit(p.establishes);
         assert!(!vs.input_ctl.held(2).is_empty());
 
         let _ = vs.update_impl(StreamingMessage::ToggleJoystick, None);
@@ -3097,21 +3326,67 @@ mod joystick_gate_tests {
         let mut vs = VideoStreaming::new();
         vs.set_device_firmware(Some("3.15".into()));
         let held: std::collections::BTreeSet<JoyInput> = [JoyInput::Up].into_iter().collect();
-        vs.input_ctl.set_joystick(2, held);
+        vs.input_ctl.set_desired(2, held);
+        if let Some(p) = vs.input_ctl.pending() {
+            vs.input_ctl.commit(p.establishes);
+        }
 
         let _ = vs.update_impl(StreamingMessage::JoystickPort(1), None);
         assert_eq!(vs.joystick_port, 1);
         assert!(vs.input_ctl.held(2).is_empty(), "old port must be released");
     }
 
-    /// A failing device call stops the loop rather than retrying every tick.
+    /// A single timeout must NOT stop the joystick. The device is busy running
+    /// a game; one slow reply is routine, and killing control over it is what
+    /// made the joystick die mid-game.
     #[test]
-    fn an_input_failure_stops_driving_and_surfaces_once() {
+    fn one_transient_failure_keeps_the_joystick_running() {
         let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
         vs.joystick_enabled = true;
-        let _ = vs.update_impl(StreamingMessage::InputSent(Err("boom".to_string())), None);
-        assert!(!vs.joystick_enabled, "should stop after a failure");
-        assert_eq!(vs.input_error.as_deref(), Some("boom"));
+        let _ = vs.update_impl(
+            StreamingMessage::InputSent(Err("operation timed out".to_string())),
+            None,
+        );
+        assert!(vs.joystick_enabled, "one timeout must not stop play");
+        assert_eq!(vs.input_failures, 1);
+    }
+
+    /// Persistent failure does stop it, rather than hammering a device that is
+    /// plainly not listening.
+    #[test]
+    fn persistent_failure_gives_up_and_says_so() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        vs.joystick_enabled = true;
+        for _ in 0..VideoStreaming::INPUT_FAILURE_LIMIT {
+            let _ = vs.update_impl(
+                StreamingMessage::InputSent(Err("operation timed out".to_string())),
+                None,
+            );
+        }
+        assert!(!vs.joystick_enabled, "should give up eventually");
+        assert!(vs.input_error.is_some(), "and explain why");
+        assert!(vs.strip_visible(), "the explanation must be on screen");
+    }
+
+    /// A success in between clears the count, so occasional blips never
+    /// accumulate into a shutdown.
+    #[test]
+    fn a_success_resets_the_failure_count() {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        vs.joystick_enabled = true;
+        for _ in 0..(VideoStreaming::INPUT_FAILURE_LIMIT - 1) {
+            let _ = vs.update_impl(
+                StreamingMessage::InputSent(Err("timed out".to_string())),
+                None,
+            );
+        }
+        let _ = vs.update_impl(StreamingMessage::InputSent(Ok(())), None);
+        assert_eq!(vs.input_failures, 0);
+        assert!(vs.joystick_enabled);
+        assert!(vs.input_error.is_none());
     }
 }
 
@@ -3157,16 +3432,20 @@ mod reset_desync_tests {
         let right: BTreeSet<JoyInput> = [JoyInput::Right].into_iter().collect();
 
         // Stick pushed right, device now holding it.
-        assert!(!vs.input_ctl.set_joystick(2, right.clone()).is_empty());
+        vs.input_ctl.set_desired(2, right.clone());
+        let p = vs.input_ctl.pending().expect("first press");
+        vs.input_ctl.commit(p.establishes);
         // Same position again: nothing to send, as designed.
-        assert!(vs.input_ctl.set_joystick(2, right.clone()).is_empty());
+        vs.input_ctl.set_desired(2, right.clone());
+        assert!(vs.input_ctl.pending().is_none());
 
         // Reset — the firmware releases everything on its own.
         vs.forget_held_inputs();
 
         // The stick is still pushed right, and that must now be re-pressed.
+        vs.input_ctl.set_desired(2, right);
         assert!(
-            !vs.input_ctl.set_joystick(2, right).is_empty(),
+            vs.input_ctl.pending().is_some(),
             "after a reset the held direction must be sent again"
         );
     }
@@ -3175,9 +3454,12 @@ mod reset_desync_tests {
     fn forgetting_held_inputs_clears_every_port() {
         let mut vs = VideoStreaming::new();
         vs.input_ctl
-            .set_joystick(1, [JoyInput::Up].into_iter().collect());
+            .set_desired(1, [JoyInput::Up].into_iter().collect());
         vs.input_ctl
-            .set_joystick(2, [JoyInput::Fire].into_iter().collect());
+            .set_desired(2, [JoyInput::Fire].into_iter().collect());
+        if let Some(p) = vs.input_ctl.pending() {
+            vs.input_ctl.commit(p.establishes);
+        }
         vs.forget_held_inputs();
         assert!(vs.input_ctl.held(1).is_empty());
         assert!(vs.input_ctl.held(2).is_empty());
@@ -3334,5 +3616,95 @@ mod menu_navigation_tests {
         let vs = VideoStreaming::new(); // no firmware -> gate closed
         assert!(!vs.can_inject());
         let _ = vs.send_key_combo(menu_keys::UP);
+    }
+}
+
+#[cfg(test)]
+mod joystick_strip_visibility_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn enabled_with_pad() -> VideoStreaming {
+        let mut vs = VideoStreaming::new();
+        vs.set_device_firmware(Some("3.15".into()));
+        vs.joystick_enabled = true;
+        vs.gamepad_status = crate::gamepad::GamepadSnapshot {
+            name: Some("Test Pad".into()),
+            ..Default::default()
+        };
+        vs.strip_shown_at = Some(Instant::now());
+        vs
+    }
+
+    #[test]
+    fn the_strip_hides_itself_once_the_timer_runs_out() {
+        let vs = enabled_with_pad();
+        let t0 = vs.strip_shown_at.unwrap();
+        assert!(vs.strip_visible_at(t0), "visible when summoned");
+        assert!(
+            vs.strip_visible_at(t0 + Duration::from_secs(1)),
+            "still visible shortly after"
+        );
+        assert!(
+            !vs.strip_visible_at(t0 + VideoStreaming::STRIP_AUTOHIDE + Duration::from_millis(1)),
+            "must get out of the way while playing"
+        );
+    }
+
+    /// With no pad attached the strip is the only thing explaining why nothing
+    /// happens, so it must not hide.
+    #[test]
+    fn a_missing_gamepad_keeps_the_strip_up() {
+        let mut vs = enabled_with_pad();
+        vs.gamepad_status = crate::gamepad::GamepadSnapshot::default();
+        let t = vs.strip_shown_at.unwrap() + Duration::from_secs(3600);
+        assert!(vs.strip_visible_at(t));
+    }
+
+    #[test]
+    fn an_error_keeps_the_strip_up_even_when_disabled() {
+        let mut vs = VideoStreaming::new();
+        vs.input_error = Some("boom".into());
+        assert!(!vs.joystick_enabled);
+        assert!(vs.strip_visible_at(Instant::now()), "failures must be seen");
+    }
+
+    #[test]
+    fn nothing_is_shown_while_the_joystick_is_off() {
+        let vs = VideoStreaming::new();
+        assert!(!vs.strip_visible_at(Instant::now()));
+    }
+
+    /// The button reveals before it disables: pressing it while the strip is
+    /// hidden brings it back and leaves the joystick running. Reaching for the
+    /// icon mid-game must not kill the joystick.
+    #[test]
+    fn pressing_the_button_while_hidden_reveals_instead_of_disabling() {
+        let mut vs = enabled_with_pad();
+        // Age it past the timeout so it is hidden.
+        vs.strip_shown_at = Some(Instant::now() - VideoStreaming::STRIP_AUTOHIDE * 2);
+        assert!(!vs.strip_visible());
+
+        let _ = vs.update_impl(StreamingMessage::ToggleJoystick, None);
+        assert!(vs.joystick_enabled, "must stay enabled");
+        assert!(vs.strip_visible(), "and come back into view");
+    }
+
+    /// A second press, now that it is visible, does switch off.
+    #[test]
+    fn pressing_again_while_visible_switches_off() {
+        let mut vs = enabled_with_pad();
+        assert!(vs.strip_visible());
+        let _ = vs.update_impl(StreamingMessage::ToggleJoystick, None);
+        assert!(!vs.joystick_enabled, "visible + press = off");
+    }
+
+    #[test]
+    fn changing_port_keeps_the_strip_up_while_adjusting() {
+        let mut vs = enabled_with_pad();
+        vs.strip_shown_at = Some(Instant::now() - VideoStreaming::STRIP_AUTOHIDE * 2);
+        let _ = vs.update_impl(StreamingMessage::JoystickPort(1), None);
+        assert_eq!(vs.joystick_port, 1);
+        assert!(vs.strip_visible(), "stay up while the user is adjusting");
     }
 }

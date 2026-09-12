@@ -14,7 +14,9 @@
 //! Verified live against an Ultimate II+L on firmware 3.15.
 
 use crate::device_caps::CapError;
-use crate::net_utils::{build_device_client, with_password, REST_TIMEOUT_SECS};
+use crate::net_utils::{
+    build_device_client, build_device_client_ms, with_password, REST_TIMEOUT_SECS,
+};
 use serde::{Deserialize, Serialize};
 
 /// Formatting a disk image writes the whole thing, so give it room — a DNP can
@@ -364,6 +366,14 @@ struct InputBatch<'a> {
     events: &'a [InputEvent],
 }
 
+/// Budget for one input batch.
+///
+/// Deliberately short. This is interactive control: an event that has not
+/// landed in this long is already stale, and the caller re-sends the current
+/// stick position rather than replaying the old one. A long timeout here froze
+/// the joystick for seconds whenever the device was briefly busy.
+pub const INPUT_TIMEOUT_MS: u64 = 500;
+
 /// Largest batch the firmware accepts.
 pub const MAX_INPUT_EVENTS: usize = 64;
 
@@ -389,7 +399,7 @@ pub async fn send_input(
         )));
     }
     let url = format!("http://{}/v1/machine:input", host);
-    let client = build_device_client(REST_TIMEOUT_SECS).map_err(CapError::Unsupported)?;
+    let client = build_device_client_ms(INPUT_TIMEOUT_MS).map_err(CapError::Unsupported)?;
     let req = with_password(client.post(&url), password).json(&InputBatch { events });
     let resp = req
         .send()

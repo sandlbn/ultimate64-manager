@@ -93,6 +93,23 @@ pub fn build_device_client(timeout_secs: u64) -> Result<reqwest::Client, String>
         .map_err(|e| format!("HTTP client error: {}", e))
 }
 
+/// Like [`build_device_client`], but with a sub-second budget.
+///
+/// For interactive input there is no point waiting seconds: a joystick event
+/// that has not landed within a few hundred milliseconds is already stale — the
+/// stick has moved on — and the caller will re-send the *current* position
+/// anyway. A short cap keeps one slow request from freezing control.
+pub fn build_device_client_ms(timeout_ms: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .connect_timeout(std::time::Duration::from_millis(timeout_ms))
+        .pool_max_idle_per_host(0)
+        .tcp_keepalive(None)
+        .http1_only()
+        .build()
+        .map_err(|e| format!("HTTP client error: {}", e))
+}
+
 /// Build a reqwest client configured for external API calls (GitHub, etc).
 pub fn build_external_client(
     user_agent: &str,
