@@ -19,6 +19,26 @@ pub enum ImageKind {
     D81,
 }
 
+impl ImageKind {
+    /// Track that holds the BAM and directory. A file's first block is never
+    /// here, which is what makes it a reliable test for a decorative entry.
+    pub fn dir_track(self) -> u8 {
+        match self {
+            ImageKind::D64 | ImageKind::D71 => 18,
+            ImageKind::D81 => 40,
+        }
+    }
+
+    /// Highest track number on this format.
+    pub fn track_count(self) -> u8 {
+        match self {
+            ImageKind::D64 => 35,
+            ImageKind::D71 => 70,
+            ImageKind::D81 => 80,
+        }
+    }
+}
+
 impl std::fmt::Display for ImageKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -484,11 +504,13 @@ pub fn extract_single_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
 pub fn extract_first_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
     let kind = detect_kind(data.len())?;
     let entries = read_directory(data, kind).ok()?;
-    // The first real (closed, non-scratched) directory entry is what LOAD"*"
-    // targets. Only DMA-boot it if it is a PRG.
-    let first = entries
-        .iter()
-        .find(|e| e.file_type != FileType::Del && e.first_track != 0)?;
+    // The first *loadable* entry is what LOAD"*" targets. "Loadable" has to be
+    // checked rather than assumed: demo disks routinely fill the directory with
+    // decorative entries whose names are graphics characters and whose start
+    // pointers aim at the directory track itself. Taking the literal first entry
+    // there DMA-loads the directory as if it were code, and a real drive asked
+    // to LOAD it simply hangs. See [`is_loadable`].
+    let first = entries.iter().find(|e| is_loadable(e, kind))?;
     if first.file_type != FileType::Prg {
         return None;
     }
@@ -497,6 +519,79 @@ pub fn extract_first_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
         return None;
     }
     Some((first.name.trim().to_string(), bytes))
+}
+
+/// Whether a directory entry points at something that could really be a file.
+///
+/// Rejects scratched entries and the decorative ones demo disks use for
+/// directory art, identified by a start pointer that cannot hold file data: the
+/// directory track itself, track 0, or a track beyond the disk.
+fn is_loadable(e: &DirEntry, kind: ImageKind) -> bool {
+    if e.file_type == FileType::Del || e.first_track == 0 {
+        return false;
+    }
+    // The directory lives here; a file's first block never does.
+    if e.first_track == kind.dir_track() {
+        return false;
+    }
+    e.first_track <= kind.track_count()
+}
+
+/// Whether the disk has any entry that could actually be loaded.
+///
+/// * `Some(true)`  — there is a real file to boot.
+/// * `Some(false)` — the directory was read and holds nothing loadable. Side-B
+///   disks of multi-part demos look like this: every entry is decoration. Typing
+///   `LOAD"*",8,1` at such a disk makes the drive hand back the BAM as a program
+///   at `$0042`, which overwrites zero page and the stack and hangs the machine,
+///   so the caller should decline rather than fall back to the keyboard.
+/// * `None` — the image could not be parsed at all (GCR, damaged). The keyboard
+///   path is still the right fallback there, since the directory is simply
+///   unknown rather than known-empty.
+pub fn has_loadable_entry(data: &[u8]) -> Option<bool> {
+    let kind = detect_kind(data.len())?;
+    let entries = read_directory(data, kind).ok()?;
+    Some(entries.iter().any(|e| is_loadable(e, kind)))
+}
+
+/// Start of BASIC ROM. A program whose bytes run past here cannot be started by
+/// BASIC's `RUN`, however valid its stub looks.
+pub const BASIC_ROM_START: u32 = 0xA000;
+
+/// Whether this PRG is too large for BASIC to `RUN`, and so must be entered by
+/// jumping to its `SYS` address instead.
+///
+/// `prg` includes the two-byte load address. This is not hypothetical: a 43 KB
+/// demo loading at `$0801` ends at `$B2BA`, and every attempt to `RUN` it
+/// returned silently to `READY.`
+pub fn needs_direct_jump(prg: &[u8]) -> bool {
+    if prg.len() < 3 {
+        return false;
+    }
+    let load = u16::from_le_bytes([prg[0], prg[1]]) as u32;
+    load + (prg.len() as u32 - 2) > BASIC_ROM_START
+}
+
+/// Parse the `SYS <address>` of a BASIC stub, the convention machine-code
+/// programs use to start themselves.
+///
+/// Needed because "load it and RUN" is not always enough: a stub whose payload
+/// runs past the start of BASIC ROM cannot be started by BASIC's RUN at all, so
+/// the entry point has to be jumped to directly. `prg` includes the two-byte
+/// load address.
+pub fn basic_stub_sys_address(prg: &[u8]) -> Option<u16> {
+    // 2-byte load address, then: next-line link (2), line number (2), token.
+    let body = prg.get(2..)?;
+    // 0x9E is the SYS token.
+    let sys_at = body.iter().take(16).position(|&b| b == 0x9E)?;
+    let digits: String = body
+        .get(sys_at + 1..)?
+        .iter()
+        .skip_while(|&&b| b == b' ')
+        .take_while(|&&b| b.is_ascii_digit())
+        .map(|&b| b as char)
+        .collect();
+    digits.parse::<u16>().ok()
 }
 
 // ─── Disk image creation ──────────────────────────────────────────────────────
@@ -847,6 +942,71 @@ mod tests {
         assert_eq!(bytes, payload);
     }
 
+    /// A payload that runs past the start of BASIC ROM cannot be started by
+    /// `RUN` — the case that left a 43 KB demo sitting at `READY.` forever.
+    #[test]
+    fn oversized_programs_are_flagged_for_a_direct_jump() {
+        // $0801 + 43449 bytes ends at $B2BA, well past $A000.
+        let mut big = vec![0x01, 0x08];
+        big.extend(std::iter::repeat(0u8).take(43_449));
+        assert!(needs_direct_jump(&big));
+
+        // An ordinary program is fine for RUN.
+        let mut small = vec![0x01, 0x08];
+        small.extend(std::iter::repeat(0u8).take(4_000));
+        assert!(!needs_direct_jump(&small));
+
+        assert!(!needs_direct_jump(&[0x01]), "runt input must not panic");
+    }
+
+    #[test]
+    fn basic_stub_sys_address_is_parsed() {
+        // 10 SYS 2064
+        let prg = [
+            0x01, 0x08, 0x0b, 0x08, 0x3e, 0x0c, 0x9e, b'2', b'0', b'6', b'4', 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(basic_stub_sys_address(&prg), Some(2064));
+        // No SYS token -> nothing to jump to.
+        assert_eq!(basic_stub_sys_address(&[0x01, 0x08, 0, 0, 0, 0, 0]), None);
+    }
+
+    /// Decorative directory entries point at the directory track, so a LOAD
+    /// takes the BAM as a program (load address `$0042`) and hangs the machine.
+    /// They must never be chosen.
+    #[test]
+    fn directory_art_entries_are_not_loadable() {
+        let art = DirEntry {
+            name: "ART".into(),
+            raw_name: vec![0xA0; 16],
+            file_type: FileType::Prg,
+            size_blocks: 0,
+            locked: true,
+            closed: true,
+            first_track: 18, // the directory track itself
+            first_sector: 0,
+        };
+        assert!(!is_loadable(&art, ImageKind::D64));
+
+        let real = DirEntry {
+            first_track: 19,
+            ..art.clone()
+        };
+        assert!(is_loadable(&real, ImageKind::D64));
+
+        let off_disk = DirEntry {
+            first_track: 200,
+            ..art.clone()
+        };
+        assert!(!is_loadable(&off_disk, ImageKind::D64));
+
+        let scratched = DirEntry {
+            first_track: 19,
+            file_type: FileType::Del,
+            ..art.clone()
+        };
+        assert!(!is_loadable(&scratched, ImageKind::D64));
+    }
+
     #[test]
     fn test_extract_first_prg_picks_first_when_prg() {
         // First dir entry is a PRG (points at a data sector), second is a SEQ.
@@ -914,5 +1074,58 @@ mod tests {
         assert_eq!(FileType::from_byte(0x02), FileType::Prg);
         assert_eq!(FileType::from_byte(0x82), FileType::Prg); // With closed bit
         assert_eq!(FileType::from_byte(0xC2), FileType::Prg); // With closed and locked
+    }
+}
+
+#[cfg(test)]
+mod real_image_inspection {
+    use super::*;
+
+    /// Print what the boot logic decides for a real image. Diagnostic, not an
+    /// assertion: point it at a disk with `U64_TEST_D64=<path>`.
+    #[test]
+    #[ignore = "diagnostic: set U64_TEST_D64=<path to a .d64>"]
+    fn inspect_real_d64() {
+        let Ok(path) = std::env::var("U64_TEST_D64") else {
+            eprintln!("SKIP: set U64_TEST_D64");
+            return;
+        };
+        let data = std::fs::read(&path).expect("read image");
+        let kind = detect_kind(data.len());
+        println!("{path}\n  kind={kind:?} len={}", data.len());
+        match read_directory(&data, kind.expect("kind")) {
+            Ok(entries) => {
+                for (i, e) in entries.iter().take(10).enumerate() {
+                    println!(
+                        "  [{i}] {:?} t/s={}/{} blocks={} loadable={} {:?}",
+                        e.file_type,
+                        e.first_track,
+                        e.first_sector,
+                        e.size_blocks,
+                        is_loadable(e, kind.unwrap()),
+                        e.name
+                    );
+                }
+            }
+            Err(e) => println!("  directory unreadable: {e}"),
+        }
+        match extract_first_prg(&data) {
+            Some((name, prg)) => {
+                let load = u16::from_le_bytes([prg[0], prg[1]]);
+                println!(
+                    "  -> chosen {:?}: {} bytes, load ${:04X}, end ${:04X}",
+                    name,
+                    prg.len() - 2,
+                    load,
+                    load as u32 + prg.len() as u32 - 2
+                );
+                println!(
+                    "  -> needs_direct_jump={} sys={:?}",
+                    needs_direct_jump(&prg),
+                    basic_stub_sys_address(&prg)
+                );
+            }
+            None => println!("  -> extract_first_prg: None (keyboard LOAD fallback)"),
+        }
     }
 }

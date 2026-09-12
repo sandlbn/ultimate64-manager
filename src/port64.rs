@@ -673,19 +673,23 @@ pub async fn write_dma(
         .map_err(|e| e.to_string())
 }
 
-/// Fire-and-forget `CMD_RUN_IMG` — upload a disk image and have the *firmware*
-/// mount it and run `*` from drive A. This is the device's own "run disk"
-/// (no client-side `LOAD"*"`/keyboard/DMA), so it's the most reliable boot for
-/// `.d64` images. The firmware always stores the payload as `tcpimage.d64`, so
-/// this is d64-only — callers use the REST mount+boot fallback for other formats
-/// and when port 64 (the Ultimate DMA service) is unavailable.
-pub async fn run_disk_image(
+/// Upload and **mount** a disk image over port 64 (`CMD_MOUNT_IMG`).
+///
+/// Mount only — it does not reset or boot. Booting is the caller's job, via
+/// [`crate::run_ops::boot_mounted_disk`].
+///
+/// This deliberately does *not* use `CMD_RUN_IMG`, whose name promises more
+/// than it delivers: measured on hardware, that command uploads the image,
+/// mounts it and resets the machine, then leaves the C64 sitting at the BASIC
+/// banner indefinitely — 90 s with no attempt to load. Preferring it meant
+/// every `.d64` silently failed to start while the app reported success.
+pub async fn mount_disk_image(
     host: String,
     password: Option<String>,
     image: Vec<u8>,
 ) -> Result<(), String> {
     Port64Client::new(host, password)
-        .run_image(&image)
+        .mount_image(&image)
         .await
         .map_err(|e| e.to_string())
 }

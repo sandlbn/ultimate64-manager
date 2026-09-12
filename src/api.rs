@@ -106,13 +106,96 @@ pub async fn mount_disk(
     Ok(format!("Mounted: {}", filename))
 }
 
-/// Run a disk image on the device.
+/// Boot a disk that is already mounted.
 ///
-/// Preferred for `.d64` on drive A: the native port-64 `CMD_RUN_IMG` — the
-/// firmware mounts and boots the disk itself (no client-side `LOAD"*"`). Falls
-/// back to REST mount + [`crate::run_ops::boot_mounted_disk`] (DMA-load the
-/// first PRG, else keyboard) for other formats, drive B, or when port 64 is
-/// unavailable.
+/// Normally this is [`crate::run_ops::boot_mounted_disk`] — DMA-load the disk's
+/// first PRG and let BASIC `RUN` it, else type `LOAD"*",8,1`.
+///
+/// Some disks defeat that, and demo disks especially. Two things go wrong:
+///
+/// * **The directory lies.** Decorative entries point at the directory track
+///   itself, so `LOAD"*"` takes the BAM as a program — load address `$0042` —
+///   and writes over zero page and the stack until the machine hangs. A real
+///   C64 hangs the same way; the disk was never launchable that way.
+///   [`extract_first_prg`](crate::disk_image::extract_first_prg) skips entries
+///   that cannot hold file data, which is only possible because we parse the
+///   image ourselves rather than asking the drive.
+/// * **The program is too big for `RUN`.** A payload loading at `$0801` and
+///   running past `$A000` sits under BASIC ROM; `RUN` returns silently to
+///   `READY.` Entering at the stub's `SYS` address instead is the only way in,
+///   which is what `dma_jump` does.
+///
+/// The jump path is used *only* when BASIC could not have run the program
+/// anyway, so ordinary disks keep the behaviour they already had.
+async fn boot_mounted(
+    host: &str,
+    password: Option<String>,
+    device_num: &str,
+    image: Option<Vec<u8>>,
+    filename: &str,
+    connection: Option<Arc<Mutex<dyn RemoteDevice>>>,
+) -> Result<String, String> {
+    if let Some(bytes) = image.as_deref() {
+        if let Some((name, prg)) = crate::disk_image::extract_first_prg(bytes) {
+            if crate::disk_image::needs_direct_jump(&prg) {
+                if let Some(sys) = crate::disk_image::basic_stub_sys_address(&prg) {
+                    log::info!(
+                        "boot: {:?} is {} bytes past BASIC ROM — jumping to SYS {}",
+                        name,
+                        prg.len(),
+                        sys
+                    );
+                    if crate::port64::write_dma_jump(host.to_string(), password.clone(), sys, prg)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok(format!("Loading {} — watch the C64", filename));
+                    }
+                    log::info!("boot: port-64 jump unavailable — falling back");
+                }
+            }
+        }
+    }
+
+    // A disk whose directory is readable but holds nothing loadable has nothing
+    // to boot — the side-B disk of a two-part demo is the usual case. Falling
+    // through to the keyboard `LOAD"*"` would make the drive hand back the BAM
+    // as a program at $0042 and hang the C64, so decline instead. The disk stays
+    // mounted, which is what is wanted when the other side asks you to flip.
+    if let Some(bytes) = image.as_deref() {
+        if crate::disk_image::has_loadable_entry(bytes) == Some(false) {
+            log::info!("boot: {} has no loadable entry — mounted only", filename);
+            return Ok(format!(
+                "Mounted {} — no bootable program on this disk",
+                filename
+            ));
+        }
+    }
+
+    let Some(conn) = connection else {
+        return Ok(format!(
+            "Mounted: {} (no connection for auto-run)",
+            filename
+        ));
+    };
+    let device = device_num.to_string();
+    let name = filename.to_string();
+    run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
+        let c = conn.lock().unwrap();
+        crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
+        Ok(format!("Loading {} — watch the C64", name))
+    })
+    .await
+}
+
+/// Mount a disk image and boot it.
+///
+/// Mounting uses the port-64 `CMD_MOUNT_IMG` for `.d64` on drive A (fast), or
+/// REST otherwise. Booting is always [`crate::run_ops::boot_mounted_disk`] —
+/// DMA-load the disk's first PRG, else type `LOAD"*",8,1` + `RUN`.
+///
+/// Note the firmware's `CMD_RUN_IMG` is deliberately *not* used: it mounts and
+/// resets but never loads, leaving the machine at the BASIC banner.
 pub async fn run_disk(
     host: &str,
     file_path: &str,
@@ -150,48 +233,36 @@ pub async fn run_disk(
     .ok()
     .map(|(_, bytes)| bytes);
 
-    // Preferred: native firmware mount+run for .d64 on drive A. `host` is the
-    // device IP (no scheme), which is exactly what the port-64 socket needs.
+    // Mount over port 64 when possible — it uploads a 175 KB image in about a
+    // tenth of a second — but *only* to mount. The firmware's `CMD_RUN_IMG`
+    // reads as if it would do the whole job, and this code used to prefer it,
+    // but measured on hardware it mounts, resets, and then leaves the C64 at
+    // the BASIC banner indefinitely (90 s observed) without ever loading.
+    // Every `.d64` silently failed to start while the app reported success.
+    // Booting is done below, by the path that actually works.
+    let mut mounted = false;
     if drive == "a" && ext == "d64" {
         if let Some(bytes) = &image {
-            if crate::port64::run_disk_image(host.to_string(), password.clone(), bytes.clone())
+            if crate::port64::mount_disk_image(host.to_string(), password.clone(), bytes.clone())
                 .await
                 .is_ok()
             {
-                log::info!("run_disk: mounted+started via port-64 CMD_RUN_IMG");
-                // CMD_RUN_IMG returns as soon as the image is mounted and the
-                // machine reset — the C64 then loads from the emulated 1541 at
-                // authentic speed, which measured ~60s for a real game disk.
-                // Saying "Running" here reads as a failure while the drive is
-                // still working, so report what is actually true.
-                return Ok(format!("Loading {} — watch the C64", filename));
+                log::info!("run_disk: mounted via port-64 CMD_MOUNT_IMG");
+                mounted = true;
+            } else {
+                log::info!("run_disk: port-64 unavailable — mounting over REST");
             }
-            log::info!("run_disk: port-64 unavailable — REST mount + boot");
         }
     }
-
-    // Fallback: REST mount, then boot (DMA first PRG, else keyboard LOAD).
-    mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
-    if let Some(conn) = connection {
-        let device = device_num.to_string();
-        run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
-            let c = conn.lock().unwrap();
-            crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok(format!("Loading {} — watch the C64", filename))
-        })
-        .await
-    } else {
-        // No connection available - just mount (reset requires connection or separate HTTP call)
-        Ok(format!(
-            "Mounted: {} (no connection for auto-run)",
-            filename
-        ))
+    if !mounted {
+        mount_disk(host, file_path, drive, "readonly", password.clone()).await?;
     }
+    boot_mounted(host, password, device_num, image, &filename, connection).await
 }
 
 /// Run a *local* disk image — the local-file equivalent of [`run_disk`]. Used by
-/// Game Mode. Prefers the native port-64 `CMD_RUN_IMG` for `.d64` on drive A,
-/// falling back to REST upload+mount + boot. `host` is the device IP (no scheme).
+/// Game Mode. Uploads and mounts over port 64 for `.d64` on drive A, else over
+/// REST, then boots. `host` is the device IP (no scheme).
 pub async fn run_local_disk_async(
     host: &str,
     local_path: &Path,
@@ -214,12 +285,13 @@ pub async fn run_local_disk_async(
     // fallback uses them as the DMA source.
     let image = tokio::fs::read(local_path).await.ok();
 
-    // Preferred: native firmware mount+run for .d64 on drive A (no client-side
-    // LOAD"*"/keyboard). The firmware boots the disk itself. `host` is the
-    // device IP — exactly what the port-64 socket needs.
+    // Mount over port 64 when possible (fast), then boot below. See `run_disk`:
+    // `CMD_RUN_IMG` mounts and resets but never boots, so it must not be used
+    // as the launch mechanism.
+    let mut mounted = false;
     if drive == "a" && ext == "d64" {
         if let Some(bytes) = &image {
-            if crate::port64::run_disk_image(
+            if crate::port64::mount_disk_image(
                 host.to_string(),
                 password.map(str::to_string),
                 bytes.clone(),
@@ -227,39 +299,35 @@ pub async fn run_local_disk_async(
             .await
             .is_ok()
             {
-                log::info!("run_local_disk: mounted+started via port-64 CMD_RUN_IMG");
-                return Ok(format!("Loading {} — watch the C64", filename));
+                log::info!("run_local_disk: mounted via port-64 CMD_MOUNT_IMG");
+                mounted = true;
+            } else {
+                log::info!("run_local_disk: port-64 unavailable — uploading over REST");
             }
-            log::info!("run_local_disk: port-64 unavailable — REST upload+mount+boot");
         }
     }
-
-    // Fallback: REST upload+mount, then boot (DMA first PRG, else keyboard LOAD).
-    // The REST client needs the scheme; the device IP is `host`.
-    upload_mount_disk_async(
-        &format!("http://{}", host),
-        local_path,
-        drive,
-        "readonly",
-        password,
-    )
-    .await?;
+    if !mounted {
+        // The REST client needs the scheme; the device IP is `host`.
+        upload_mount_disk_async(
+            &format!("http://{}", host),
+            local_path,
+            drive,
+            "readonly",
+            password,
+        )
+        .await?;
+    }
 
     let device_num = if drive == "a" { "8" } else { "9" };
-    if let Some(conn) = connection {
-        let device = device_num.to_string();
-        run_blocking(REST_RUN_TIMEOUT_SECS, "Disk boot", move || {
-            let c = conn.lock().unwrap();
-            crate::run_ops::boot_mounted_disk(&*c, &device, image.as_deref())?;
-            Ok(format!("Loading {} — watch the C64", filename))
-        })
-        .await
-    } else {
-        Ok(format!(
-            "Mounted: {} (no connection for auto-run)",
-            filename
-        ))
-    }
+    boot_mounted(
+        host,
+        password.map(str::to_string),
+        device_num,
+        image,
+        &filename,
+        connection,
+    )
+    .await
 }
 
 // ─────────────────────────────────────────────────────────────────

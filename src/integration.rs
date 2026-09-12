@@ -475,7 +475,7 @@ fn live_run_prg_completes_within_the_run_timeout() {
 /// Needs a d64: set `U64_TEST_D64=/path/to/image.d64`.
 #[test]
 #[ignore = "DESTRUCTIVE: mounts and boots a disk. Set U64_TEST_DESTRUCTIVE=1 + U64_TEST_D64=<path>"]
-fn live_run_d64_over_port64() {
+fn live_315_mount_d64_over_port64() {
     let host = host_or_skip!();
     let _serial = device_lock();
     require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
@@ -488,14 +488,14 @@ fn live_run_d64_over_port64() {
     println!("Booting {} ({} bytes) on {}", path, image.len(), host);
 
     let started = std::time::Instant::now();
-    block_on(crate::port64::run_disk_image(
+    block_on(crate::port64::mount_disk_image(
         host.clone(),
         test_password(),
         image,
     ))
-    .expect("port-64 CMD_RUN_IMG failed");
+    .expect("port-64 CMD_MOUNT_IMG failed");
     println!(
-        "CMD_RUN_IMG accepted in {:.2}s",
+        "CMD_MOUNT_IMG accepted in {:.2}s",
         started.elapsed().as_secs_f32()
     );
 
@@ -687,6 +687,77 @@ fn live_315_create_disk_image_roundtrip() {
     println!("files:info -> {:?}", info);
     assert_eq!(info.size, 174_848, "a 35-track D64 is 174848 bytes on disk");
     assert_eq!(info.extension.to_uppercase(), "D64");
+}
+
+/// The regression guard for the bug this suite missed: a disk that mounts but
+/// never boots.
+///
+/// The earlier version of the mount test asserted only that the image was
+/// mounted and the machine had reset — both of which `CMD_RUN_IMG` does — so it
+/// passed while every `.d64` sat at the BASIC banner forever. What actually
+/// matters is that the machine *leaves* the banner.
+///
+/// Requires hardware where DMA `run_prg` reaches the machine. A cartridge
+/// stacked inside an Ultimate 64 does not qualify: DMA never reaches the host
+/// there, so this is opt-in via `U64_TEST_DISK_BOOT=1` rather than failing on
+/// a rig that cannot pass it.
+#[test]
+#[ignore = "DESTRUCTIVE: boots a disk. Set U64_TEST_DESTRUCTIVE=1 U64_TEST_DISK_BOOT=1 U64_TEST_D64=<path>"]
+fn live_disk_actually_boots_after_mount() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+    require_flag!(
+        "U64_TEST_DISK_BOOT",
+        "the disk-boot check (needs working DMA)"
+    );
+
+    let Some(path) = std::env::var("U64_TEST_D64").ok().filter(|s| !s.is_empty()) else {
+        eprintln!("SKIP: set U64_TEST_D64=<path to a .d64>");
+        return;
+    };
+    let conn = connect(&host, test_password());
+    let pw = test_password();
+
+    block_on(crate::api::run_local_disk_async(
+        &host,
+        std::path::Path::new(&path),
+        "a",
+        pw.as_deref(),
+        Some(conn.clone()),
+    ))
+    .expect("run_local_disk_async failed");
+
+    // "COMMODORE 64 BASIC" in screen codes. Leaving this behind is the only
+    // evidence the disk actually started.
+    const BANNER: &[u8] = &[
+        0x03, 0x0f, 0x0d, 0x0d, 0x0f, 0x04, 0x0f, 0x12, 0x05, 0x20, 0x36, 0x34, 0x20, 0x02, 0x01,
+        0x13, 0x09, 0x03,
+    ];
+    // Where the VIC is actually fetching characters from. Reading $0400 alone is
+    // not enough: a demo that relocates the screen leaves the stale BASIC banner
+    // sitting there, so a fixed-address check reports "never booted" while the
+    // demo is plainly running somewhere else.
+    let screen_addr = |c: &Arc<Mutex<dyn RemoteDevice>>| -> u16 {
+        let d018 = read_mem(c, 0xD018, 1).map(|v| v[0]).unwrap_or(0x15);
+        let dd00 = read_mem(c, 0xDD00, 1).map(|v| v[0]).unwrap_or(0x97);
+        let bank = (!dd00 & 3) as u16 * 16384;
+        bank + ((d018 >> 4) & 0x0F) as u16 * 1024
+    };
+
+    for i in 1..=20 {
+        std::thread::sleep(Duration::from_secs(2));
+        let addr = screen_addr(&conn);
+        let screen = read_mem(&conn, addr, 1000).expect("screen read failed");
+        let at_banner = screen.windows(BANNER.len()).any(|w| w == BANNER);
+        let blank = screen.iter().all(|&b| b == 0x20);
+        // A relocated screen is itself proof something took the machine over.
+        if addr != 0x0400 || (!at_banner && !blank) {
+            println!("disk booted after ~{}s (screen at ${:04X})", i * 2, addr);
+            return;
+        }
+    }
+    panic!("disk never left the BASIC banner after 40s — it mounted but did not boot");
 }
 
 /// Cartridges answer 501 to `machine:input` — the firmware registers the call
