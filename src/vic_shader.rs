@@ -23,6 +23,48 @@ use crate::streaming::{ScaleMode, StreamingMessage};
 const TEX_W: u32 = crate::streaming::VIC_WIDTH;
 const TEX_H: u32 = crate::streaming::VIC_HEIGHT;
 
+/// Place the frame inside `bw` × `bh` **device pixels**: an integer scale,
+/// snapped to whole pixels, returned as the NDC rect `(x0, y0_top, x1,
+/// y1_bottom)` plus the output size in pixels.
+///
+/// Two separate things have to be whole numbers here, and missing either one
+/// shows up as distorted characters under nearest sampling:
+///
+/// * the **scale**, so each source texel covers a whole number of device
+///   pixels; and
+/// * the **offset**, so the quad starts on a pixel boundary. Centring the quad
+///   exactly puts its edges on a half-pixel whenever `bw - dw` is odd, and the
+///   sampling grid is then offset by half a pixel — some texels take one device
+///   pixel more than their neighbours, which reads as uneven character stems.
+///   Rounding the offset down costs at most one pixel of centring.
+///
+/// When the frame cannot fit even at 1× the quad is clamped to the bounds and
+/// the picture is squashed, which is the best available answer for a pane
+/// smaller than the C64's own frame.
+fn fit_quad(bw: f32, bh: f32) -> ([f32; 4], [f32; 2]) {
+    if bw <= 0.0 || bh <= 0.0 {
+        return ([-1.0, 1.0, 1.0, -1.0], [TEX_W as f32, TEX_H as f32]);
+    }
+
+    let scale = (bw / TEX_W as f32)
+        .floor()
+        .min((bh / TEX_H as f32).floor())
+        .max(1.0);
+    let dw = TEX_W as f32 * scale;
+    let dh = TEX_H as f32 * scale;
+
+    let ox = ((bw - dw) * 0.5).floor().max(0.0);
+    let oy = ((bh - dh) * 0.5).floor().max(0.0);
+
+    // Pixel offsets to NDC; y is flipped because NDC +1 is the top.
+    let x0 = ((ox / bw) * 2.0 - 1.0).max(-1.0);
+    let x1 = (((ox + dw) / bw) * 2.0 - 1.0).min(1.0);
+    let y0 = (1.0 - (oy / bh) * 2.0).min(1.0);
+    let y1 = (1.0 - ((oy + dh) / bh) * 2.0).max(-1.0);
+
+    ([x0, y0, x1, y1], [dw, dh])
+}
+
 /// The video display element backed by the wgpu shader widget.
 pub fn vic_video<'a>(
     frame: Arc<Vec<u8>>,
@@ -116,22 +158,10 @@ impl Primitive for VicPrimitive {
         // is computed in *physical* pixels so each source texel is a whole number
         // of device pixels (crisp).
         let sf = viewport.scale_factor() as f32;
-        let bw = bounds.width * sf;
-        let bh = bounds.height * sf;
-
-        let scale = (bw / TEX_W as f32)
-            .floor()
-            .min((bh / TEX_H as f32).floor())
-            .max(1.0);
-        let dw = TEX_W as f32 * scale;
-        let dh = TEX_H as f32 * scale;
-
-        let half_x = (dw / bw).min(1.0);
-        let half_y = (dh / bh).min(1.0);
-        // rect = (x0, y0_top, x1, y1_bottom)
+        let (rect, out_size) = fit_quad(bounds.width * sf, bounds.height * sf);
         let uniforms = Uniforms {
-            rect: [-half_x, half_y, half_x, -half_y],
-            out_size: [dw, dh],
+            rect,
+            out_size,
             effect: self.effect,
             _pad: 0,
         };
@@ -487,3 +517,85 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(color, 1.0);
 }
 "#;
+
+#[cfg(test)]
+mod fit_quad_tests {
+    use super::*;
+
+    /// Device-pixel edges of the quad, recovered from its NDC rect.
+    fn edges(bw: f32, bh: f32) -> (f32, f32, f32, f32) {
+        let (rect, size) = fit_quad(bw, bh);
+        let x0 = (rect[0] + 1.0) * 0.5 * bw;
+        let y0 = (1.0 - rect[1]) * 0.5 * bh;
+        (x0, y0, size[0], size[1])
+    }
+
+    #[test]
+    fn an_exact_fit_spans_the_whole_surface() {
+        let (rect, size) = fit_quad(TEX_W as f32, TEX_H as f32);
+        assert_eq!(size, [TEX_W as f32, TEX_H as f32]);
+        assert_eq!(rect, [-1.0, 1.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn the_scale_is_a_whole_number() {
+        // 3.9x available -> 3x used, so every texel is 3 device pixels.
+        let (_, size) = fit_quad(TEX_W as f32 * 3.9, TEX_H as f32 * 3.9);
+        assert_eq!(size[0] / TEX_W as f32, 3.0);
+        assert_eq!(size[1] / TEX_H as f32, 3.0);
+    }
+
+    /// The bug this guards: with an odd amount of leftover space, centring the
+    /// quad exactly lands its edges on a half pixel. Under nearest sampling the
+    /// grid then shifts by half a pixel and some texels take one device pixel
+    /// more than their neighbours — uneven character stems.
+    #[test]
+    fn the_quad_starts_on_a_whole_device_pixel_with_odd_leftover_space() {
+        // 1 device pixel of slack horizontally: an exact centring would put the
+        // left edge at 0.5.
+        let (x0, _, dw, _) = edges(TEX_W as f32 + 1.0, TEX_H as f32);
+        assert_eq!(dw, TEX_W as f32, "still 1x");
+        assert!(
+            (x0 - x0.round()).abs() < 1e-3,
+            "left edge must land on a pixel, got {x0}"
+        );
+    }
+
+    #[test]
+    fn both_axes_snap_across_a_range_of_awkward_sizes() {
+        for w in 0..40 {
+            for h in 0..40 {
+                let bw = TEX_W as f32 * 2.0 + w as f32;
+                let bh = TEX_H as f32 * 2.0 + h as f32;
+                let (x0, y0, dw, dh) = edges(bw, bh);
+                assert!(
+                    (x0 - x0.round()).abs() < 1e-3,
+                    "x0 {x0} not whole for bw {bw}"
+                );
+                assert!(
+                    (y0 - y0.round()).abs() < 1e-3,
+                    "y0 {y0} not whole for bh {bh}"
+                );
+                // And the size stays an exact multiple of the native frame.
+                assert_eq!(dw % TEX_W as f32, 0.0);
+                assert_eq!(dh % TEX_H as f32, 0.0);
+            }
+        }
+    }
+
+    /// A pane smaller than the frame cannot be pixel-perfect; clamp to the
+    /// bounds rather than letting the quad spill outside them.
+    #[test]
+    fn a_pane_smaller_than_the_frame_clamps_to_the_bounds() {
+        let (rect, _) = fit_quad(TEX_W as f32 / 2.0, TEX_H as f32 / 2.0);
+        assert!(rect[0] >= -1.0 && rect[2] <= 1.0);
+        assert!(rect[1] <= 1.0 && rect[3] >= -1.0);
+    }
+
+    #[test]
+    fn degenerate_bounds_do_not_divide_by_zero() {
+        let (rect, size) = fit_quad(0.0, 0.0);
+        assert!(rect.iter().all(|v| v.is_finite()));
+        assert!(size.iter().all(|v| v.is_finite()));
+    }
+}
