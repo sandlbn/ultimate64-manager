@@ -239,10 +239,12 @@ mod live_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
             let snap = r.snapshot();
-            let events = ctl.set_joystick(2, snap.pad.to_inputs());
-            if !events.is_empty() {
+            ctl.set_desired(2, snap.pad.to_inputs());
+            if let Some(p) = ctl.pending() {
                 sent += 1;
-                println!("  -> {events:?}");
+                println!("  -> {:?}", p.events);
+                // Stand in for the device accepting it.
+                ctl.commit(p.establishes);
             }
             std::thread::sleep(std::time::Duration::from_millis(16));
         }

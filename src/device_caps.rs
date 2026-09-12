@@ -214,6 +214,36 @@ mod tests {
         assert!(v("3.15d").at_least(FW_315));
     }
 
+    /// 3.15a is a real released build. A letter-suffixed patch level must pass
+    /// the gate: it is 3.15 with a revision letter, not something before it.
+    #[test]
+    fn the_released_letter_suffixed_builds_gate_correctly() {
+        for (v, expected) in [
+            ("3.15", true),
+            ("3.15a", true), // released
+            ("3.15d", true),
+            ("3.16a", true),
+            ("3.14", false),
+            ("3.14d", false), // Ultimate 64 Elite's own published format
+            ("3.9", false),
+            ("3.9z", false),
+            ("1.1.0", false),
+        ] {
+            let parsed = FirmwareVersion::parse(v).unwrap_or_else(|| panic!("{v} must parse"));
+            assert_eq!(
+                parsed.at_least(FW_315),
+                expected,
+                "{v} -> parts {:?}",
+                parsed.parts
+            );
+            assert_eq!(
+                DeviceCaps::from_firmware(Some(v)).has_315_api(),
+                expected,
+                "{v} through DeviceCaps"
+            );
+        }
+    }
+
     #[test]
     fn unparseable_or_absent_version_is_treated_as_old() {
         assert!(FirmwareVersion::parse("").is_none());

@@ -186,6 +186,80 @@ fn shifted_symbol(c: char) -> Option<(&'static str, bool)> {
     Some((key, true))
 }
 
+/// The key combo that produces PETSCII `code`, for the keys that have no
+/// printable character.
+///
+/// This exists because [`crate::petscii::byte_to_char`] must not be used for
+/// this job: it is a *display* helper that folds every control code in
+/// `0x00..=0x1F` to a space. Routing the keyboard through it turned RETURN
+/// (13) into SPACE, so pressing Enter printed a space and the cursor moved one
+/// to the right — the key appeared to work while doing something else entirely.
+///
+/// C64 layout notes: the second bank of function keys and the up/left cursor
+/// directions are shifted forms, not keys of their own.
+pub fn keys_for_petscii(code: u8) -> Option<&'static [&'static str]> {
+    const RETURN: &[&str] = &["return"];
+    const DEL: &[&str] = &["inst_del"];
+    const INST: &[&str] = &["left_shift", "inst_del"];
+    const HOME: &[&str] = &["clr_home"];
+    const CLR: &[&str] = &["left_shift", "clr_home"];
+    const DOWN: &[&str] = &["cursor_up_down"];
+    const UP: &[&str] = &["left_shift", "cursor_up_down"];
+    const RIGHT: &[&str] = &["cursor_left_right"];
+    const LEFT: &[&str] = &["left_shift", "cursor_left_right"];
+    const RUN_STOP: &[&str] = &["run_stop"];
+    const F1: &[&str] = &["f1"];
+    const F3: &[&str] = &["f3"];
+    const F5: &[&str] = &["f5"];
+    const F7: &[&str] = &["f7"];
+    const F2: &[&str] = &["left_shift", "f1"];
+    const F4: &[&str] = &["left_shift", "f3"];
+    const F6: &[&str] = &["left_shift", "f5"];
+    const F8: &[&str] = &["left_shift", "f7"];
+
+    Some(match code {
+        3 => RUN_STOP,
+        13 | 141 => RETURN, // 141 is shift+RETURN
+        17 => DOWN,
+        19 => HOME,
+        20 => DEL,
+        29 => RIGHT,
+        133 => F1,
+        134 => F3,
+        135 => F5,
+        136 => F7,
+        137 => F2,
+        138 => F4,
+        139 => F6,
+        140 => F8,
+        145 => UP,
+        147 => CLR,
+        148 => INST,
+        157 => LEFT,
+        _ => return None,
+    })
+}
+
+/// The events that reproduce one PETSCII byte on the C64 keyboard.
+///
+/// Control codes are mapped by [`keys_for_petscii`]; everything else goes
+/// through the printable-character table. An unmappable byte yields no events
+/// rather than a wrong key.
+pub fn events_for_petscii(code: u8) -> Vec<InputEvent> {
+    if let Some(keys) = keys_for_petscii(code) {
+        return vec![InputEvent::Keyboard {
+            inputs: keys.iter().map(|k| k.to_string()).collect(),
+            transition: Transition::Tap,
+        }];
+    }
+    // Printable range only — never fold a control code to a space.
+    let ch = match code {
+        0x20..=0x7e => code as char,
+        _ => return Vec::new(),
+    };
+    type_text_events(&ch.to_string())
+}
+
 /// Turn text into tap events, one per character.
 ///
 /// Characters with no C64 key are skipped rather than failing the batch — the
@@ -260,10 +334,31 @@ impl PadState {
     }
 }
 
-/// Tracks what is currently held so only changes are sent.
+/// What the device has been asked to hold, per port.
+pub type PortState = Vec<(u8, BTreeSet<JoyInput>)>;
+
+/// A batch waiting to go out, plus the state it establishes once accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingInput {
+    pub events: Vec<InputEvent>,
+    /// Commit this with [`InputController::commit`] *after* the device accepts
+    /// the batch — never before.
+    pub establishes: PortState,
+}
+
+/// Tracks what the pad wants versus what the device has confirmed, so only
+/// changes are sent and a failed send corrects itself.
+///
+/// The split matters. Recording a press the moment it is sent means a request
+/// that times out leaves this side believing the device holds something it
+/// does not, and nothing ever corrects it — the direction stays dead until it
+/// is moved away and back. Holding `confirmed` until the device answers makes
+/// the next poll re-send the same difference, so a dropped request heals on its
+/// own within a frame.
 #[derive(Debug, Default)]
 pub struct InputController {
-    joy: HashMap<u8, BTreeSet<JoyInput>>,
+    desired: HashMap<u8, BTreeSet<JoyInput>>,
+    confirmed: HashMap<u8, BTreeSet<JoyInput>>,
 }
 
 impl InputController {
@@ -271,56 +366,97 @@ impl InputController {
         Self::default()
     }
 
-    /// What is currently held on `port`.
+    /// What the device is believed to be holding — what the UI should show.
     pub fn held(&self, port: u8) -> BTreeSet<JoyInput> {
-        self.joy.get(&port).cloned().unwrap_or_default()
+        self.confirmed.get(&port).cloned().unwrap_or_default()
     }
 
-    /// Whether anything at all is held.
+    /// Whether nothing is held or wanted.
     pub fn is_idle(&self) -> bool {
-        self.joy.values().all(|h| h.is_empty())
+        self.desired.values().all(|h| h.is_empty()) && self.confirmed.values().all(|h| h.is_empty())
     }
 
-    /// Move `port` to `desired`, returning only the events needed to get there.
+    /// Record where the pad is now. Cheap and lossless: call it every frame.
+    pub fn set_desired(&mut self, port: u8, inputs: BTreeSet<JoyInput>) {
+        self.desired.insert(port, inputs);
+    }
+
+    /// The difference the device still needs, or `None` when it is up to date.
     ///
-    /// An unchanged position returns an empty vec, which callers should treat
-    /// as "send nothing" — that is what keeps a held direction free.
-    pub fn set_joystick(&mut self, port: u8, desired: BTreeSet<JoyInput>) -> Vec<InputEvent> {
-        let held = self.joy.entry(port).or_default();
-        let to_press: Vec<JoyInput> = desired.difference(held).copied().collect();
-        let to_release: Vec<JoyInput> = held.difference(&desired).copied().collect();
-
+    /// Only the difference is sent, so a steady direction costs nothing at all;
+    /// and because this is recomputed from `confirmed` each time, a burst of
+    /// movement during an in-flight request collapses into one batch rather
+    /// than a queue of stale ones.
+    pub fn pending(&self) -> Option<PendingInput> {
         let mut events = Vec::new();
-        if !to_release.is_empty() {
-            events.push(InputEvent::Joystick {
-                port,
-                inputs: to_release,
-                transition: Transition::Release,
-            });
+        let mut establishes = Vec::new();
+
+        let mut ports: Vec<u8> = self.desired.keys().copied().collect();
+        ports.sort_unstable();
+        for port in ports {
+            let want = self.desired.get(&port).cloned().unwrap_or_default();
+            let have = self.held(port);
+            if want == have {
+                continue;
+            }
+            let to_release: Vec<JoyInput> = have.difference(&want).copied().collect();
+            let to_press: Vec<JoyInput> = want.difference(&have).copied().collect();
+            // Release first: pressing the opposite direction before letting the
+            // old one go would briefly show both.
+            if !to_release.is_empty() {
+                events.push(InputEvent::Joystick {
+                    port,
+                    inputs: to_release,
+                    transition: Transition::Release,
+                });
+            }
+            if !to_press.is_empty() {
+                events.push(InputEvent::Joystick {
+                    port,
+                    inputs: to_press,
+                    transition: Transition::Press,
+                });
+            }
+            establishes.push((port, want));
         }
-        if !to_press.is_empty() {
-            events.push(InputEvent::Joystick {
-                port,
-                inputs: to_press,
-                transition: Transition::Press,
-            });
+
+        if events.is_empty() {
+            None
+        } else {
+            Some(PendingInput {
+                events,
+                establishes,
+            })
         }
-        *held = desired;
-        events
     }
 
-    /// Drop everything held, locally and on the device.
+    /// Accept a batch the device confirmed.
+    pub fn commit(&mut self, establishes: PortState) {
+        for (port, state) in establishes {
+            self.confirmed.insert(port, state);
+        }
+    }
+
+    /// Drop everything, locally and on the device.
     ///
     /// Worth sending whenever control is handed back — closing the panel,
     /// losing the pad, leaving the tab — or a held direction stays stuck on the
     /// device with nothing left to release it.
     pub fn release_all(&mut self) -> Vec<InputEvent> {
-        if self.is_idle() {
-            self.joy.clear();
-            return Vec::new();
+        let had_any = !self.is_idle();
+        self.desired.clear();
+        self.confirmed.clear();
+        if had_any {
+            vec![InputEvent::ReleaseAll]
+        } else {
+            Vec::new()
         }
-        self.joy.clear();
-        vec![InputEvent::ReleaseAll]
+    }
+
+    /// Forget what the device was holding without sending anything — for when
+    /// it has already dropped everything itself, as it does on reset.
+    pub fn forget(&mut self) {
+        self.confirmed.clear();
     }
 }
 
@@ -419,27 +555,35 @@ mod tests {
         assert!(left.contains(&JoyInput::Left) && !left.contains(&JoyInput::Right));
     }
 
+    fn commit_all(c: &mut InputController) {
+        if let Some(p) = c.pending() {
+            c.commit(p.establishes);
+        }
+    }
+
     #[test]
     fn first_press_emits_press_only() {
         let mut c = InputController::new();
-        let evs = c.set_joystick(2, set(&[JoyInput::Up]));
-        assert_eq!(evs.len(), 1);
+        c.set_desired(2, set(&[JoyInput::Up]));
+        let p = c.pending().expect("a new direction must be sent");
+        assert_eq!(p.events.len(), 1);
         assert!(matches!(
-            &evs[0],
+            &p.events[0],
             InputEvent::Joystick { port: 2, transition: Transition::Press, inputs } if inputs == &vec![JoyInput::Up]
         ));
     }
 
     /// The property that makes this playable: holding a direction costs no
-    /// further requests.
+    /// further requests once the device has confirmed it.
     #[test]
-    fn an_unchanged_position_emits_nothing() {
+    fn an_unchanged_position_emits_nothing_once_confirmed() {
         let mut c = InputController::new();
-        c.set_joystick(2, set(&[JoyInput::Up, JoyInput::Fire]));
+        c.set_desired(2, set(&[JoyInput::Up, JoyInput::Fire]));
+        commit_all(&mut c);
         for _ in 0..100 {
+            c.set_desired(2, set(&[JoyInput::Up, JoyInput::Fire]));
             assert!(
-                c.set_joystick(2, set(&[JoyInput::Up, JoyInput::Fire]))
-                    .is_empty(),
+                c.pending().is_none(),
                 "a steady stick must not generate traffic"
             );
         }
@@ -448,57 +592,211 @@ mod tests {
     #[test]
     fn a_change_emits_release_then_press_for_only_the_difference() {
         let mut c = InputController::new();
-        c.set_joystick(2, set(&[JoyInput::Up, JoyInput::Fire]));
-        let evs = c.set_joystick(2, set(&[JoyInput::Down, JoyInput::Fire]));
-        assert_eq!(evs.len(), 2, "one release and one press");
-        // Release must precede press, or the device briefly sees both.
+        c.set_desired(2, set(&[JoyInput::Up, JoyInput::Fire]));
+        commit_all(&mut c);
+        c.set_desired(2, set(&[JoyInput::Down, JoyInput::Fire]));
+        let p = c.pending().expect("the change must be sent");
+        assert_eq!(p.events.len(), 2, "one release and one press");
         assert!(matches!(
-            &evs[0],
+            &p.events[0],
             InputEvent::Joystick { transition: Transition::Release, inputs, .. } if inputs == &vec![JoyInput::Up]
         ));
         assert!(matches!(
-            &evs[1],
+            &p.events[1],
             InputEvent::Joystick { transition: Transition::Press, inputs, .. } if inputs == &vec![JoyInput::Down]
+        ));
+    }
+
+    /// Nothing is believed held until the device says so. A send that is never
+    /// committed (it timed out) must leave the difference outstanding.
+    #[test]
+    fn state_is_only_believed_after_the_device_confirms_it() {
+        let mut c = InputController::new();
+        c.set_desired(2, set(&[JoyInput::Left]));
+        assert!(c.pending().is_some());
+        assert!(c.held(2).is_empty(), "nothing is held until confirmed");
+
+        // Pretend the request failed: no commit.
+        assert!(c.pending().is_some(), "the difference is still outstanding");
+
+        let p = c.pending().unwrap();
+        c.commit(p.establishes);
+        assert_eq!(c.held(2), set(&[JoyInput::Left]));
+        assert!(c.pending().is_none());
+    }
+
+    /// A failed send must not be replayed. In a game the stick has already
+    /// moved on, so the retry has to carry the *current* position.
+    #[test]
+    fn a_retry_sends_the_newest_position_not_the_stale_one() {
+        let mut c = InputController::new();
+        c.set_desired(2, set(&[JoyInput::Left]));
+        let stale = c.pending().expect("first batch");
+        // That request fails — never committed. Meanwhile the stick moves.
+        c.set_desired(2, set(&[JoyInput::Right]));
+
+        let fresh = c.pending().expect("retry");
+        assert_ne!(fresh.events, stale.events, "must not replay the old batch");
+        assert!(
+            matches!(
+                &fresh.events[0],
+                InputEvent::Joystick { transition: Transition::Press, inputs, .. }
+                    if inputs == &vec![JoyInput::Right]
+            ),
+            "retry must carry the current direction, got {:?}",
+            fresh.events
+        );
+    }
+
+    /// Several changes during one in-flight request collapse into a single
+    /// follow-up rather than a queue of stale batches.
+    #[test]
+    fn rapid_movement_collapses_into_one_batch() {
+        let mut c = InputController::new();
+        for dir in [
+            JoyInput::Up,
+            JoyInput::Down,
+            JoyInput::Left,
+            JoyInput::Right,
+        ] {
+            c.set_desired(2, set(&[dir]));
+        }
+        let p = c.pending().expect("one batch");
+        assert_eq!(p.events.len(), 1, "only the final position matters");
+        assert!(matches!(
+            &p.events[0],
+            InputEvent::Joystick { inputs, .. } if inputs == &vec![JoyInput::Right]
         ));
     }
 
     #[test]
     fn releasing_everything_on_a_port_emits_a_release_for_it() {
         let mut c = InputController::new();
-        c.set_joystick(1, set(&[JoyInput::Left]));
-        let evs = c.set_joystick(1, BTreeSet::new());
-        assert_eq!(evs.len(), 1);
+        c.set_desired(1, set(&[JoyInput::Left]));
+        commit_all(&mut c);
+        c.set_desired(1, BTreeSet::new());
+        let p = c.pending().expect("the release must be sent");
         assert!(matches!(
-            &evs[0],
+            &p.events[0],
             InputEvent::Joystick {
                 transition: Transition::Release,
                 ..
             }
         ));
+        c.commit(p.establishes);
         assert!(c.held(1).is_empty());
     }
 
     #[test]
     fn ports_are_tracked_independently() {
         let mut c = InputController::new();
-        c.set_joystick(1, set(&[JoyInput::Left]));
-        c.set_joystick(2, set(&[JoyInput::Right]));
+        c.set_desired(1, set(&[JoyInput::Left]));
+        c.set_desired(2, set(&[JoyInput::Right]));
+        commit_all(&mut c);
         assert_eq!(c.held(1), set(&[JoyInput::Left]));
         assert_eq!(c.held(2), set(&[JoyInput::Right]));
-        // Changing one must not disturb the other.
-        c.set_joystick(1, BTreeSet::new());
-        assert_eq!(c.held(2), set(&[JoyInput::Right]));
+        c.set_desired(1, BTreeSet::new());
+        commit_all(&mut c);
+        assert_eq!(
+            c.held(2),
+            set(&[JoyInput::Right]),
+            "the other port is untouched"
+        );
     }
 
     #[test]
     fn release_all_clears_state_and_is_a_no_op_when_idle() {
         let mut c = InputController::new();
         assert!(c.release_all().is_empty(), "nothing held, nothing to send");
-        c.set_joystick(2, set(&[JoyInput::Fire]));
+        c.set_desired(2, set(&[JoyInput::Fire]));
         let evs = c.release_all();
         assert_eq!(evs.len(), 1);
         assert!(matches!(&evs[0], InputEvent::ReleaseAll));
         assert!(c.is_idle());
         assert!(c.release_all().is_empty(), "already released");
+    }
+}
+
+#[cfg(test)]
+mod petscii_key_tests {
+    use super::*;
+
+    fn keys_of(evs: &[InputEvent]) -> Vec<String> {
+        match evs.first() {
+            Some(InputEvent::Keyboard { inputs, .. }) => inputs.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The regression this fixes: Enter is PETSCII 13, which the display
+    /// helper folded to a space. The C64 then printed a space and the cursor
+    /// stepped one to the right — the key looked like it worked.
+    #[test]
+    fn enter_sends_return_and_never_space() {
+        let evs = events_for_petscii(13);
+        assert_eq!(keys_of(&evs), vec!["return".to_string()]);
+        assert!(
+            !keys_of(&evs).contains(&"space".to_string()),
+            "RETURN must not degrade to SPACE"
+        );
+    }
+
+    /// Every control code must map to its own key, not collapse to space.
+    /// `byte_to_char` returns ' ' for all of 0x00..=0x1F, which is why these
+    /// are listed out explicitly.
+    #[test]
+    fn control_codes_map_to_their_own_keys() {
+        for (code, expected) in [
+            (3u8, vec!["run_stop"]),
+            (13, vec!["return"]),
+            (17, vec!["cursor_up_down"]),
+            (19, vec!["clr_home"]),
+            (20, vec!["inst_del"]),
+            (29, vec!["cursor_left_right"]),
+            (145, vec!["left_shift", "cursor_up_down"]),
+            (147, vec!["left_shift", "clr_home"]),
+            (148, vec!["left_shift", "inst_del"]),
+            (157, vec!["left_shift", "cursor_left_right"]),
+        ] {
+            assert_eq!(keys_of(&events_for_petscii(code)), expected, "code {code}");
+        }
+    }
+
+    /// F2/F4/F6/F8 are shifted forms of F1/F3/F5/F7 on a C64.
+    #[test]
+    fn function_keys_use_shift_for_the_second_bank() {
+        assert_eq!(keys_of(&events_for_petscii(133)), vec!["f1"]);
+        assert_eq!(keys_of(&events_for_petscii(134)), vec!["f3"]);
+        assert_eq!(keys_of(&events_for_petscii(135)), vec!["f5"]);
+        assert_eq!(keys_of(&events_for_petscii(136)), vec!["f7"]);
+        assert_eq!(keys_of(&events_for_petscii(137)), vec!["left_shift", "f1"]);
+        assert_eq!(keys_of(&events_for_petscii(140)), vec!["left_shift", "f7"]);
+    }
+
+    #[test]
+    fn printable_characters_still_work() {
+        assert_eq!(keys_of(&events_for_petscii(b'a')), vec!["a"]);
+        assert_eq!(keys_of(&events_for_petscii(b' ')), vec!["space"]);
+        assert_eq!(keys_of(&events_for_petscii(b'1')), vec!["1"]);
+        assert_eq!(keys_of(&events_for_petscii(b'!')), vec!["left_shift", "1"]);
+    }
+
+    /// Every combo must name keys the firmware accepts, or it rejects the whole
+    /// batch and the keypress silently vanishes.
+    #[test]
+    fn every_petscii_mapping_names_valid_keys() {
+        for code in 0u8..=255 {
+            for k in keys_of(&events_for_petscii(code)) {
+                assert!(is_valid_key(&k), "code {code} produced invalid key {k:?}");
+            }
+        }
+    }
+
+    /// An unmappable control code must produce nothing rather than a wrong key.
+    #[test]
+    fn unmapped_control_codes_send_nothing() {
+        // 5 is "white text" — a colour code, not a key.
+        assert!(events_for_petscii(5).is_empty());
+        assert!(events_for_petscii(18).is_empty()); // RVS ON
     }
 }
