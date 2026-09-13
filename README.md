@@ -22,7 +22,9 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Remote Directory Browser** – Browse the Ultimate filesystem without mounting disks
 - **Disk Image Viewer** – Display **D64/D71 directory contents** (C64-style listing)
 - **Disk Management** – Mount D64, D71, D81, G64, G71, G81 images to Drive A/B
+  - Create empty D64/D71/D81 images — formatted on the device itself on firmware 3.15+, otherwise built locally and uploaded
 - **Run Programs** – Direct load and run for PRG, CRT, and SID files (PRG files also offer **Load** without running)
+  - Disk images launch the program the disk actually boots with, including multi-part demos whose first directory entry is artwork or a data part
 - **Game Mode** – A full-screen list for browsing and running game collections
   - Reads game folders on the device (FTP) or on local disk, configured in Settings (or add the current device folder with **🎮+**)
   - Handles common collection layouts: flat files, letter buckets, one-folder-per-game, and nested folders
@@ -43,6 +45,8 @@ https://github.com/sandlbn/ultimate64-manager/releases
   - Fullscreen mode (double-click or Opt+F / Alt+F)
   - Screenshot capture to Pictures folder
   - Unicast and multicast support
+  - **Gamepad → C64 joystick** – play with a USB/Bluetooth controller, port 1 or 2 selectable (firmware 3.15+, Ultimate 64-class hardware)
+  - **Ultimate menu viewer** – see the device's own menu in the app and drive it with cursor keys, RETURN and F-keys (firmware 3.15+)
 - **Audio Streaming** – SID audio output via UDP
 - **Memory Editor** – Read and write C64 memory in real-time
   - Quick access to common locations (Screen, VIC-II, SID, CIA, Zero Page, etc.)
@@ -54,7 +58,7 @@ https://github.com/sandlbn/ultimate64-manager/releases
 - **Device Discovery** – Automatic network discovery of Ultimate devices
 - **Backup & Restore** – Full configuration backup and restore
 - **Machine Control** – Pause, Resume, Reset, Reboot, Power Off
-- **Remote Keyboard Input** – For BASIC only
+- **Remote Keyboard Input** – Type into the C64 from the app. On firmware 3.15+ (Ultimate 64-class hardware) keys go through the firmware's input API, so RETURN, cursor keys, DEL and the function keys behave as real keypresses; on older firmware it writes to the KERNAL keyboard buffer, which suits BASIC but not games that scan the matrix directly
 - **Device tab** – Low-level device capabilities in one place
   - Live drive-type switching (1541 / 1571 / 1581), drive power on/off, and drive reset for Drive A/B
   - Keyboard/text injection – feeds text into the KERNAL keyboard buffer (`$0277`) and presses RETURN. Works at the BASIC prompt and programs that read via the KERNAL (GETIN/CHRIN); **not** games that scan the keyboard matrix (`$DC00`) directly
