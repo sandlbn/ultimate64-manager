@@ -137,22 +137,22 @@ async fn boot_mounted(
 ) -> Result<String, String> {
     if let Some(bytes) = image.as_deref() {
         if let Some((name, prg)) = crate::disk_image::extract_first_prg(bytes) {
-            if crate::disk_image::needs_direct_jump(&prg) {
-                if let Some(sys) = crate::disk_image::basic_stub_sys_address(&prg) {
-                    log::info!(
-                        "boot: {:?} is {} bytes past BASIC ROM — jumping to SYS {}",
-                        name,
-                        prg.len(),
-                        sys
-                    );
-                    if crate::port64::write_dma_jump(host.to_string(), password.clone(), sys, prg)
-                        .await
-                        .is_ok()
-                    {
-                        return Ok(format!("Loading {} — watch the C64", filename));
-                    }
-                    log::info!("boot: port-64 jump unavailable — falling back");
+            if let Some(entry) = crate::disk_image::entry_point(&prg) {
+                log::info!(
+                    "boot: {:?} loads at ${:04X} ({} bytes) — BASIC RUN cannot start it, \
+                     jumping to ${:04X}",
+                    name,
+                    u16::from_le_bytes([prg[0], prg[1]]),
+                    prg.len() - 2,
+                    entry
+                );
+                if crate::port64::write_dma_jump(host.to_string(), password.clone(), entry, prg)
+                    .await
+                    .is_ok()
+                {
+                    return Ok(format!("Loading {} — watch the C64", filename));
                 }
+                log::info!("boot: port-64 jump unavailable — falling back");
             }
         }
     }

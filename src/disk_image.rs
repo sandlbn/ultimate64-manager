@@ -510,15 +510,45 @@ pub fn extract_first_prg(data: &[u8]) -> Option<(String, Vec<u8>)> {
     // pointers aim at the directory track itself. Taking the literal first entry
     // there DMA-loads the directory as if it were code, and a real drive asked
     // to LOAD it simply hangs. See [`is_loadable`].
-    let first = entries.iter().find(|e| is_loadable(e, kind))?;
-    if first.file_type != FileType::Prg {
-        return None;
-    }
-    let bytes = follow_file_chain(data, kind, first.first_track, first.first_sector)?;
+    let candidates: Vec<&DirEntry> = entries
+        .iter()
+        .filter(|e| is_loadable(e, kind) && e.file_type == FileType::Prg)
+        .collect();
+
+    // Prefer a file BASIC could actually start: loads at $0801 behind a SYS
+    // stub. That is the convention for "this is the launcher", and on disks
+    // holding a program plus its data parts it is the only entry that is one.
+    //
+    // Without this the first directory entry wins, which on a multi-part demo
+    // is part one of the payload — it loads at $1000 or $3000, BASIC `RUN`
+    // does nothing with it, and the disk looks broken. `LOAD"*",8,1` picks that
+    // same wrong file, which is why such disks are launched by choosing the
+    // program from the directory rather than by running the disk.
+    let chosen = candidates
+        .iter()
+        .find(|e| {
+            follow_file_chain(data, kind, e.first_track, e.first_sector)
+                .as_deref()
+                .and_then(looks_like_basic_launcher)
+                .unwrap_or(false)
+        })
+        .or_else(|| candidates.first())?;
+
+    let bytes = follow_file_chain(data, kind, chosen.first_track, chosen.first_sector)?;
     if bytes.len() < 3 {
         return None;
     }
-    Some((first.name.trim().to_string(), bytes))
+    Some((chosen.name.trim().to_string(), bytes))
+}
+
+/// Whether a PRG is a BASIC launcher: loads at `$0801` and carries a `SYS`
+/// stub. `prg` includes the two-byte load address.
+fn looks_like_basic_launcher(prg: &[u8]) -> Option<bool> {
+    if prg.len() < 8 {
+        return Some(false);
+    }
+    let load = u16::from_le_bytes([prg[0], prg[1]]);
+    Some(load == BASIC_START && basic_stub_sys_address(prg).is_some())
 }
 
 /// Whether a directory entry points at something that could really be a file.
@@ -554,22 +584,40 @@ pub fn has_loadable_entry(data: &[u8]) -> Option<bool> {
     Some(entries.iter().any(|e| is_loadable(e, kind)))
 }
 
+/// Where a BASIC program must load for `RUN` to find it.
+pub const BASIC_START: u16 = 0x0801;
+
 /// Start of BASIC ROM. A program whose bytes run past here cannot be started by
 /// BASIC's `RUN`, however valid its stub looks.
 pub const BASIC_ROM_START: u32 = 0xA000;
 
-/// Whether this PRG is too large for BASIC to `RUN`, and so must be entered by
-/// jumping to its `SYS` address instead.
+/// The address to jump to in order to start `prg`, or `None` when BASIC's `RUN`
+/// can start it unaided.
 ///
-/// `prg` includes the two-byte load address. This is not hypothetical: a 43 KB
-/// demo loading at `$0801` ends at `$B2BA`, and every attempt to `RUN` it
-/// returned silently to `READY.`
-pub fn needs_direct_jump(prg: &[u8]) -> bool {
+/// `prg` includes the two-byte load address. Three cases, all met on real disks:
+///
+/// * **Loads somewhere other than `$0801`** — it is machine code, not a BASIC
+///   program. `RUN` would execute whatever happens to be at `$0801` (usually
+///   nothing), so the file "loads and then does nothing". Its own load address
+///   is the entry point by convention.
+/// * **Loads at `$0801` but runs past BASIC ROM** — a stub with a large payload
+///   behind it. `RUN` cannot handle a program that big and returns silently to
+///   `READY.`, so enter at the stub's `SYS` address instead.
+/// * **Ordinary BASIC program** — `None`; let `RUN` do its job, which is the
+///   proven path for the great majority of disks.
+pub fn entry_point(prg: &[u8]) -> Option<u16> {
     if prg.len() < 3 {
-        return false;
+        return None;
     }
-    let load = u16::from_le_bytes([prg[0], prg[1]]) as u32;
-    load + (prg.len() as u32 - 2) > BASIC_ROM_START
+    let load = u16::from_le_bytes([prg[0], prg[1]]);
+    if load != BASIC_START {
+        return Some(load);
+    }
+    let end = load as u32 + prg.len() as u32 - 2;
+    if end > BASIC_ROM_START {
+        return basic_stub_sys_address(prg);
+    }
+    None
 }
 
 /// Parse the `SYS <address>` of a BASIC stub, the convention machine-code
@@ -942,21 +990,27 @@ mod tests {
         assert_eq!(bytes, payload);
     }
 
-    /// A payload that runs past the start of BASIC ROM cannot be started by
-    /// `RUN` — the case that left a 43 KB demo sitting at `READY.` forever.
+    /// The three boot cases seen on real disks.
     #[test]
-    fn oversized_programs_are_flagged_for_a_direct_jump() {
-        // $0801 + 43449 bytes ends at $B2BA, well past $A000.
-        let mut big = vec![0x01, 0x08];
+    fn entry_point_covers_the_three_real_cases() {
+        // Ordinary BASIC program at $0801 that fits: RUN handles it.
+        let mut ordinary = vec![0x01, 0x08];
+        ordinary.extend(std::iter::repeat(0u8).take(4_000));
+        assert_eq!(entry_point(&ordinary), None, "RUN is fine here");
+
+        // Machine code loading elsewhere: RUN would execute an empty $0801, so
+        // the file "loads and does nothing". Enter at its load address.
+        let mut ml = vec![0x00, 0x10]; // $1000
+        ml.extend(std::iter::repeat(0u8).take(2_592));
+        assert_eq!(entry_point(&ml), Some(0x1000));
+
+        // $0801 stub with a payload past BASIC ROM: RUN returns to READY.
+        let mut big = vec![0x01, 0x08, 0x0b, 0x08, 0x3e, 0x0c, 0x9e];
+        big.extend(b"2064");
         big.extend(std::iter::repeat(0u8).take(43_449));
-        assert!(needs_direct_jump(&big));
+        assert_eq!(entry_point(&big), Some(2064));
 
-        // An ordinary program is fine for RUN.
-        let mut small = vec![0x01, 0x08];
-        small.extend(std::iter::repeat(0u8).take(4_000));
-        assert!(!needs_direct_jump(&small));
-
-        assert!(!needs_direct_jump(&[0x01]), "runt input must not panic");
+        assert_eq!(entry_point(&[0x01]), None, "runt input must not panic");
     }
 
     #[test]
@@ -1120,8 +1174,8 @@ mod real_image_inspection {
                     load as u32 + prg.len() as u32 - 2
                 );
                 println!(
-                    "  -> needs_direct_jump={} sys={:?}",
-                    needs_direct_jump(&prg),
+                    "  -> entry_point={:?} (None = BASIC RUN) sys={:?}",
+                    entry_point(&prg),
                     basic_stub_sys_address(&prg)
                 );
             }
