@@ -5580,7 +5580,7 @@ dependencies = [
 
 [[package]]
 name = "ultimate64-manager"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "anyhow",
  "bytemuck",
