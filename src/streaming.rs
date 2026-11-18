@@ -32,6 +32,15 @@ const MULTICAST_AUDIO: Ipv4Addr = Ipv4Addr::new(239, 0, 1, 65);
 const MULTICAST_IFACE: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
 
 // Video frame dimensions
+/// Lowest gamepad sample rate offered. Below this a direction change is
+/// visibly late even on a good link.
+pub const GAMEPAD_HZ_MIN: u32 = 5;
+/// Highest gamepad sample rate offered. Past this the device's single-connection
+/// HTTP server is the bottleneck, not the pad.
+pub const GAMEPAD_HZ_MAX: u32 = 250;
+/// Default rate; matches the fixed 16 ms tick this replaced.
+pub const GAMEPAD_HZ_DEFAULT: u32 = 60;
+
 pub const VIC_WIDTH: u32 = 384;
 pub const VIC_HEIGHT: u32 = 272;
 // const FRAME_SIZE: usize = (VIC_WIDTH * VIC_HEIGHT) as usize; // 104448 bytes
@@ -142,6 +151,10 @@ pub enum StreamingMessage {
     ToggleJoystick,
     /// Choose which C64 control port the pad drives (1 or 2).
     JoystickPort(u8),
+    /// Change how often the pad is sampled and pushed to the device.
+    GamepadHz(u32),
+    /// Emitted after a rate change so the host can persist it to settings.
+    GamepadHzPersist(u32),
     /// Timer tick: sample the pad and send any change to the device.
     GamepadPoll,
     /// Result of a `machine:input` batch.
@@ -493,7 +506,7 @@ pub struct VideoStreaming {
     pub stream_control_method: StreamControlMethod, // Stream control method for communicating with Ultimate64
     // ── Gamepad → C64 joystick (firmware 3.15 `machine:input`) ──
     /// Firmware the connected device reports, for the 3.15 gate.
-    pub device_firmware: Option<String>,
+    pub device_caps: crate::device_caps::DeviceCaps,
     /// Whether pad-to-joystick control is active.
     pub joystick_enabled: bool,
     /// C64 control port the pad drives. Port 2 is where most games look.
@@ -513,6 +526,10 @@ pub struct VideoStreaming {
     input_in_flight: Option<crate::input_315::PortState>,
     /// Consecutive failed sends, for backing off rather than giving up at one.
     input_failures: u32,
+    /// Gamepad sample rate in hertz, from settings.
+    gamepad_hz: u32,
+    /// Which interface the connection runs over; video needs the wired one.
+    link: crate::link_kind::LinkKind,
     /// When the joystick strip was last summoned. It auto-hides a few seconds
     /// later so it stops covering the picture while playing.
     strip_shown_at: Option<std::time::Instant>,
@@ -588,7 +605,7 @@ impl VideoStreaming {
             last_key_time: None,
             ultimate_host: None,
             api_password: None,
-            device_firmware: None,
+            device_caps: crate::device_caps::DeviceCaps::default(),
             joystick_enabled: false,
             joystick_port: 2,
             gamepad: None,
@@ -597,6 +614,8 @@ impl VideoStreaming {
             input_error: None,
             input_in_flight: None,
             input_failures: 0,
+            gamepad_hz: GAMEPAD_HZ_DEFAULT,
+            link: crate::link_kind::LinkKind::Unknown,
             strip_shown_at: None,
             input_unsupported: None,
             show_menu_screen: false,
@@ -659,12 +678,28 @@ impl VideoStreaming {
                 })
         };
 
+        let hz_btn = |hz: u32| {
+            button(text(format!("{}Hz", hz)).size(fs.tiny))
+                .on_press(StreamingMessage::GamepadHz(hz))
+                .padding([2, 5])
+                .style(if self.gamepad_hz == hz {
+                    iced::widget::button::primary
+                } else {
+                    iced::widget::button::text
+                })
+        };
+        let mut rates = row![].spacing(2).align_y(iced::Alignment::Center);
+        for hz in Self::GAMEPAD_HZ_CHOICES {
+            rates = rates.push(hz_btn(hz));
+        }
+
         container(
             row![
                 text("🕹").size(fs.small),
                 status,
                 port_btn(1),
                 port_btn(2),
+                rates,
                 text(held_label).size(fs.tiny).color(dim),
             ]
             .spacing(8)
@@ -907,6 +942,59 @@ impl VideoStreaming {
         send_petscii(connection, code)
     }
 
+    /// Sample rates offered for the gamepad, in hertz.
+    ///
+    /// Presets rather than a free slider: the useful range is narrow, and the
+    /// choice is "is my link keeping up?" rather than a value to dial in.
+    pub const GAMEPAD_HZ_CHOICES: [u32; 4] = [15, 30, 60, 120];
+
+    /// A note shown when the connection cannot carry video.
+    ///
+    /// Over Wi-Fi the device accepts `streams/video:start` and answers 200, then
+    /// sends nothing — so without this the user watches "waiting for frames"
+    /// with no indication that the address they are connected to can never
+    /// deliver any. Only shown for a link positively identified as Wi-Fi; an
+    /// unidentified link says nothing rather than guessing.
+    fn link_warning(&self, fs: &crate::styles::FontSizes) -> Option<Element<'_, StreamingMessage>> {
+        if !self.link.blocks_video_stream() {
+            return None;
+        }
+        Some(
+            container(
+                text(
+                    "Connected over Wi-Fi — the video stream only works on the device's wired port. \
+                     Connect to its Ethernet address to see video.",
+                )
+                .size(fs.tiny)
+                .color(iced::Color::from_rgb(0.98, 0.78, 0.35)),
+            )
+            .padding(6)
+            .into(),
+        )
+    }
+
+    /// Record which interface the connection runs over.
+    pub fn set_link_kind(&mut self, link: crate::link_kind::LinkKind) {
+        self.link = link;
+    }
+
+    /// Set the gamepad sample rate, clamped to something sane. A zero or wild
+    /// value out of a hand-edited settings file must not divide by zero or
+    /// spin the device.
+    pub fn set_gamepad_hz(&mut self, hz: u32) {
+        self.gamepad_hz = hz.clamp(GAMEPAD_HZ_MIN, GAMEPAD_HZ_MAX);
+    }
+
+    /// Current gamepad sample rate.
+    pub fn gamepad_hz(&self) -> u32 {
+        self.gamepad_hz
+    }
+
+    /// The tick interval for the configured rate.
+    fn gamepad_interval(&self) -> Duration {
+        Duration::from_millis((1000 / self.gamepad_hz.max(1)).max(1) as u64)
+    }
+
     /// How many consecutive failed sends before giving up and saying so.
     ///
     /// A single timeout is routine while the device is busy running a game; a
@@ -971,15 +1059,28 @@ impl VideoStreaming {
         self.ultimate_host = host;
     }
 
-    /// Record the firmware the device reports, so the 3.15-only joystick
-    /// control can gate itself.
-    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
-        self.device_firmware = firmware;
+    /// Record what the connected device supports, so the joystick and
+    /// keyboard controls can gate themselves.
+    ///
+    /// Takes resolved capabilities rather than a version string on purpose:
+    /// the version cannot tell whether a C64 Ultimate has `machine:input`, and
+    /// re-deriving the answer from it here is what once hid these controls on
+    /// a device that supports them.
+    pub fn set_device_caps(&mut self, caps: crate::device_caps::DeviceCaps) {
+        self.device_caps = caps;
     }
 
-    /// Whether this device exposes the 3.15 `machine:input` call.
+    /// Test shorthand for a device whose version alone decides the matter.
+    #[cfg(test)]
+    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
+        self.set_device_caps(crate::device_caps::DeviceCaps::from_firmware(
+            firmware.as_deref(),
+        ));
+    }
+
+    /// Whether this device exposes the `machine:input` call.
     pub fn supports_input_api(&self) -> bool {
-        crate::device_caps::DeviceCaps::from_firmware(self.device_firmware.as_deref()).has_315_api()
+        self.device_caps.has_315_api()
     }
 
     /// Whether keys and joystick moves can actually be injected.
@@ -1457,6 +1558,15 @@ impl VideoStreaming {
                 Task::none()
             }
 
+            StreamingMessage::GamepadHz(hz) => {
+                self.set_gamepad_hz(hz);
+                // Persisted by the host so the choice survives a restart; the
+                // right rate is a property of the user's network, not a mood.
+                Task::done(StreamingMessage::GamepadHzPersist(self.gamepad_hz))
+            }
+
+            StreamingMessage::GamepadHzPersist(_) => Task::none(),
+
             StreamingMessage::JoystickPort(port) => {
                 self.strip_shown_at = Some(std::time::Instant::now());
                 if port != self.joystick_port {
@@ -1526,108 +1636,6 @@ impl VideoStreaming {
                 }
                 // Something may have changed while that request was out.
                 self.pump_input()
-            }
-
-            StreamingMessage::ToggleMenuScreen => {
-                self.show_menu_screen = !self.show_menu_screen;
-                self.menu_error = None;
-                if !self.show_menu_screen {
-                    self.menu_screen = None;
-                    return Task::none();
-                }
-                self.poll_menu_screen()
-            }
-
-            StreamingMessage::MenuScreenPoll => self.poll_menu_screen(),
-
-            StreamingMessage::SendKeyCombo(keys) => self.send_key_combo(keys),
-
-            StreamingMessage::MenuScreenLoaded(result) => {
-                match result {
-                    // `None` is the documented answer for "the menu is not on
-                    // screen", not a failure.
-                    Ok(screen) => {
-                        self.menu_screen = screen;
-                        self.menu_error = None;
-                    }
-                    Err(e) => {
-                        log::warn!("menu_screen poll failed: {}", e);
-                        self.menu_error = Some(e);
-                        self.menu_screen = None;
-                    }
-                }
-                Task::none()
-            }
-
-            StreamingMessage::ToggleJoystick => {
-                // While enabled but hidden, the button brings the strip back
-                // rather than switching off. Otherwise the only way to change
-                // port would be to disable and re-enable, and it would be far
-                // too easy to kill the joystick mid-game by reaching for it.
-                if self.joystick_enabled && !self.strip_visible() {
-                    self.strip_shown_at = Some(std::time::Instant::now());
-                    return Task::none();
-                }
-                self.joystick_enabled = !self.joystick_enabled;
-                self.input_error = None;
-                self.strip_shown_at = self.joystick_enabled.then(std::time::Instant::now);
-                if self.joystick_enabled {
-                    // Start the reader lazily — no thread for users who never
-                    // switch this on.
-                    if self.gamepad.is_none() {
-                        self.gamepad = Some(crate::gamepad::GamepadReader::start());
-                    }
-                } else {
-                    // Hand control back cleanly: a direction still held on the
-                    // device would otherwise stick with nothing to release it.
-                    let events = self.input_ctl.release_all();
-                    return self.flush_input(events);
-                }
-                Task::none()
-            }
-
-            StreamingMessage::JoystickPort(port) => {
-                self.strip_shown_at = Some(std::time::Instant::now());
-                if port != self.joystick_port {
-                    // Release on the old port before moving, or it keeps
-                    // whatever was held at the moment of the switch.
-                    let events = self.input_ctl.release_all();
-                    self.joystick_port = port;
-                    return self.flush_input(events);
-                }
-                Task::none()
-            }
-
-            StreamingMessage::GamepadPoll => {
-                let Some(reader) = self.gamepad.as_ref() else {
-                    return Task::none();
-                };
-                self.gamepad_status = reader.snapshot();
-                let desired = self.gamepad_status.pad.to_inputs();
-                let port = self.joystick_port;
-                self.input_ctl.set_desired(port, desired);
-                // The common case is "already up to date", which costs nothing.
-                self.pump_input()
-            }
-
-            StreamingMessage::InputSent(result) => {
-                match result {
-                    Ok(()) => self.input_error = None,
-                    Err(e) => {
-                        // Report once and stop driving, rather than retrying a
-                        // failing call every tick.
-                        log::warn!("machine:input failed: {}", e);
-                        // The firmware's own wording for a device that has the
-                        // call but not the hardware. Latching it retires the
-                        // controls instead of letting every click fail.
-                        if e.contains("Ultimate 64-class hardware") {
-                            self.input_unsupported = Some(e.clone());
-                        }
-                        self.input_error = Some(e);
-                        self.joystick_enabled = false;
-                    }
-                }
-                Task::none()
             }
 
             StreamingMessage::ToggleVirtualKeyboard => {
@@ -1985,6 +1993,9 @@ impl VideoStreaming {
         // Bottom overlay stack on the video: the on-screen keyboard (if shown)
         // sits just above the media-player control bar, both floating on the video.
         let mut overlay_col = column![].spacing(6).align_x(iced::Alignment::Center);
+        if let Some(note) = self.link_warning(&fs) {
+            overlay_col = overlay_col.push(note);
+        }
         if self.show_menu_screen {
             overlay_col = overlay_col.push(self.menu_screen_view(&fs));
         }
@@ -2201,7 +2212,7 @@ impl VideoStreaming {
         // controller only emits events when the position actually changes.
         if self.joystick_enabled {
             subscriptions.push(
-                iced::time::every(Duration::from_millis(16)).map(|_| StreamingMessage::GamepadPoll),
+                iced::time::every(self.gamepad_interval()).map(|_| StreamingMessage::GamepadPoll),
             );
         }
 
@@ -3282,16 +3293,36 @@ mod joystick_gate_tests {
         vs.set_device_firmware(Some("3.14".into()));
         assert!(!vs.supports_input_api(), "3.14 predates machine:input");
 
-        // The Commodore-fork C64 Ultimate numbers itself separately and 404s
-        // on this call today.
+        // The Commodore line's numbers say nothing either way, so with no
+        // answer from the device yet the controls stay hidden.
         vs.set_device_firmware(Some("1.1.0".into()));
         assert!(!vs.supports_input_api());
 
         vs.set_device_firmware(None);
         assert!(
             !vs.supports_input_api(),
-            "unknown firmware is treated as old"
+            "unknown firmware stays closed until the device is asked"
         );
+    }
+
+    /// The regression on the C64 Ultimate: firmware 1.2.1 has `machine:input`
+    /// and real joystick lines, but the controls were hidden because the gate
+    /// read "1.2.1 < 3.15". Once the device has answered the probe, injection
+    /// must be on offer regardless of the number it reports.
+    #[test]
+    fn joystick_and_keys_are_offered_once_the_device_confirms_the_api() {
+        use crate::device_caps::DeviceCaps;
+        let mut vs = VideoStreaming::new();
+
+        vs.set_device_caps(DeviceCaps::from_firmware(Some("1.2.1")));
+        assert!(!vs.can_inject(), "not offered before the device answers");
+
+        vs.set_device_caps(DeviceCaps::from_firmware(Some("1.2.1")).with_probe_result(true));
+        assert!(vs.supports_input_api());
+        assert!(vs.can_inject());
+
+        vs.set_device_caps(DeviceCaps::from_firmware(Some("1.1.0")).with_probe_result(false));
+        assert!(!vs.can_inject(), "a device that 404s the probe stays gated");
     }
 
     /// Turning the feature off must release whatever the pad was holding, or a
@@ -3706,5 +3737,59 @@ mod joystick_strip_visibility_tests {
         let _ = vs.update_impl(StreamingMessage::JoystickPort(1), None);
         assert_eq!(vs.joystick_port, 1);
         assert!(vs.strip_visible(), "stay up while the user is adjusting");
+    }
+}
+
+#[cfg(test)]
+mod gamepad_rate_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_matches_the_fixed_rate_it_replaced() {
+        let vs = VideoStreaming::new();
+        assert_eq!(vs.gamepad_hz(), GAMEPAD_HZ_DEFAULT);
+        // The old hard-coded tick was 16 ms.
+        assert_eq!(vs.gamepad_interval(), Duration::from_millis(16));
+    }
+
+    #[test]
+    fn a_lower_rate_produces_a_longer_interval() {
+        let mut vs = VideoStreaming::new();
+        vs.set_gamepad_hz(15);
+        assert_eq!(vs.gamepad_interval(), Duration::from_millis(66));
+        vs.set_gamepad_hz(120);
+        assert_eq!(vs.gamepad_interval(), Duration::from_millis(8));
+    }
+
+    /// A hand-edited settings file must not be able to divide by zero or ask
+    /// the device for an impossible rate.
+    #[test]
+    fn absurd_rates_are_clamped_rather_than_trusted() {
+        let mut vs = VideoStreaming::new();
+        vs.set_gamepad_hz(0);
+        assert_eq!(vs.gamepad_hz(), GAMEPAD_HZ_MIN);
+        assert!(vs.gamepad_interval() > Duration::ZERO, "must never be zero");
+
+        vs.set_gamepad_hz(100_000);
+        assert_eq!(vs.gamepad_hz(), GAMEPAD_HZ_MAX);
+        assert!(vs.gamepad_interval() >= Duration::from_millis(1));
+    }
+
+    #[test]
+    fn every_offered_choice_survives_clamping() {
+        for hz in VideoStreaming::GAMEPAD_HZ_CHOICES {
+            let mut vs = VideoStreaming::new();
+            vs.set_gamepad_hz(hz);
+            assert_eq!(vs.gamepad_hz(), hz, "{hz}Hz must be selectable as offered");
+        }
+    }
+
+    /// Changing the rate asks the host to persist exactly what is in use, so a
+    /// clamped value cannot be written back as the raw request.
+    #[test]
+    fn a_rate_change_reports_the_clamped_value_for_persistence() {
+        let mut vs = VideoStreaming::new();
+        let _ = vs.update_impl(StreamingMessage::GamepadHz(0), None);
+        assert_eq!(vs.gamepad_hz(), GAMEPAD_HZ_MIN);
     }
 }

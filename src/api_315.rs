@@ -1,17 +1,20 @@
-//! REST calls added in Ultimate firmware 3.15.
+//! REST calls that older Ultimate firmware does not have.
 //!
-//! Kept apart from [`crate::api`] so the version gate is impossible to miss:
-//! everything here 404s on older firmware. Callers check
+//! The 3.x line gained them in 3.15, hence the module name; the Commodore C64
+//! Ultimate has them under its own, unrelated version numbers. Kept apart from
+//! [`crate::api`] so the gate is impossible to miss: everything here 404s on
+//! firmware without it. Callers check
 //! [`crate::device_caps::DeviceCaps::has_315_api`] first; the calls themselves
 //! also classify a 404/501 answer rather than reporting a generic HTTP error,
 //! because on this API those two codes carry distinct, actionable meanings:
 //!
-//! * **404** — the firmware predates the call.
+//! * **404** — the firmware does not have the call.
 //! * **501** — the firmware has it, but this hardware cannot do it. A cartridge
 //!   answers 501 to `machine:input`, since driving keyboard and joystick lines
 //!   needs Ultimate 64-class hardware.
 //!
-//! Verified live against an Ultimate II+L on firmware 3.15.
+//! Verified live against an Ultimate II+L on firmware 3.15 and a C64 Ultimate
+//! on firmware 1.2.1.
 
 use crate::device_caps::CapError;
 use crate::net_utils::{
@@ -65,6 +68,43 @@ fn classify(status: u16, body: &str) -> CapError {
 struct ErrorResponse {
     #[serde(default)]
     errors: Vec<String>,
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Capability probe  (GET /v1/machine:heap)
+// ─────────────────────────────────────────────────────────────────
+
+/// What a status code from the probe says about the device.
+///
+/// `None` means "no answer": a 403 is about the password and a 5xx about the
+/// device's state, and neither says whether the calls exist. Reporting those
+/// as "absent" would cache a wrong answer for the whole connection.
+fn probe_verdict(status: u16) -> Option<bool> {
+    match status {
+        200..=299 => Some(true),
+        404 => Some(false),
+        _ => None,
+    }
+}
+
+/// Ask the device whether it has the calls in this module.
+///
+/// Needed because the firmware version cannot say: the two product lines
+/// number themselves independently (see [`crate::device_caps`]).
+///
+/// `machine:heap` is the probe because it reads counters and changes nothing,
+/// and because its 404 is unambiguous. `machine:menu_screen` would be the
+/// wrong choice — it also answers 404 when the call exists but the menu is
+/// closed, so a perfectly capable device would look old.
+///
+/// `Err` means the question is still open and should be asked again.
+pub async fn probe_api(host: &str, password: Option<&str>) -> Result<bool, String> {
+    let url = format!("http://{}/v1/machine:heap", host);
+    let client = build_device_client(REST_TIMEOUT_SECS)?;
+    let req = with_password(client.get(&url), password);
+    let status = req.send().await.map_err(|e| e.to_string())?.status();
+    probe_verdict(status.as_u16())
+        .ok_or_else(|| format!("capability probe answered HTTP {}", status.as_u16()))
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -358,6 +398,11 @@ pub enum InputEvent {
     },
     /// Drop everything currently held. Worth sending when a mapping session
     /// ends, so a held direction doesn't stick on the device.
+    ///
+    /// Named explicitly: the enum-wide lowercase rule would send
+    /// `releaseall`, which the firmware rejects with a 400 — leaving whatever
+    /// was held stuck down, the one outcome this event exists to prevent.
+    #[serde(rename = "release_all")]
     ReleaseAll,
 }
 
@@ -517,7 +562,18 @@ mod tests {
 
         let r: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&InputEvent::ReleaseAll).unwrap()).unwrap();
-        assert_eq!(r["kind"], "releaseall");
+        assert_eq!(r["kind"], "release_all");
+    }
+
+    /// Only a clear yes or no may be cached for the connection. A wrong
+    /// password or a busy device says nothing about whether the calls exist.
+    #[test]
+    fn the_probe_only_concludes_from_an_unambiguous_answer() {
+        assert_eq!(probe_verdict(200), Some(true));
+        assert_eq!(probe_verdict(404), Some(false));
+        for inconclusive in [401, 403, 500, 501, 503] {
+            assert_eq!(probe_verdict(inconclusive), None, "HTTP {inconclusive}");
+        }
     }
 
     /// 501 means "this hardware can't", which callers fall back on; anything

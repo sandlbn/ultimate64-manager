@@ -170,7 +170,7 @@ pub struct RemoteBrowser {
     pub is_connected: bool,
     pub host_address: Option<String>,
     /// Firmware the device reports, for the 3.15 feature gate.
-    pub device_firmware: Option<String>,
+    pub device_caps: crate::device_caps::DeviceCaps,
     pub password: Option<String>,
     pub filter: String,
     // Checked files for batch operations
@@ -244,7 +244,7 @@ impl Default for RemoteBrowser {
             is_loading: false,
             is_connected: false,
             host_address: None,
-            device_firmware: None,
+            device_caps: crate::device_caps::DeviceCaps::default(),
             password: None,
             filter: String::new(),
             checked_files: HashSet::new(),
@@ -283,14 +283,24 @@ impl RemoteBrowser {
         Self::default()
     }
 
-    /// Record the firmware the device reports, so 3.15-only calls can gate.
-    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
-        self.device_firmware = firmware;
+    /// Record what the connected device supports. Resolved capabilities, not
+    /// a version string — see [`crate::device_caps`] for why the number alone
+    /// cannot gate.
+    pub fn set_device_caps(&mut self, caps: crate::device_caps::DeviceCaps) {
+        self.device_caps = caps;
     }
 
-    /// Whether the device can format disk images itself (firmware 3.15+).
+    /// Test shorthand for a device whose version alone decides the matter.
+    #[cfg(test)]
+    pub fn set_device_firmware(&mut self, firmware: Option<String>) {
+        self.set_device_caps(crate::device_caps::DeviceCaps::from_firmware(
+            firmware.as_deref(),
+        ));
+    }
+
+    /// Whether the device can format disk images itself.
     pub fn supports_native_disk_create(&self) -> bool {
-        crate::device_caps::DeviceCaps::from_firmware(self.device_firmware.as_deref()).has_315_api()
+        self.device_caps.has_315_api()
     }
 
     pub fn set_host(&mut self, host: Option<String>, password: Option<String>) {
@@ -2980,5 +2990,17 @@ mod disk_create_gate_tests {
             !rb.supports_native_disk_create(),
             "unknown firmware falls back to FTP"
         );
+    }
+
+    /// A C64 Ultimate reports a version below 3.15 and still formats disk
+    /// images itself; what counts is the device's own answer.
+    #[test]
+    fn native_disk_creation_follows_the_probe_where_the_version_cannot_say() {
+        use crate::device_caps::DeviceCaps;
+        let mut rb = RemoteBrowser::new();
+        rb.set_device_caps(DeviceCaps::from_firmware(Some("1.2.1")).with_probe_result(true));
+        assert!(rb.supports_native_disk_create());
+        rb.set_device_caps(DeviceCaps::from_firmware(Some("1.2.1")).with_probe_result(false));
+        assert!(!rb.supports_native_disk_create());
     }
 }

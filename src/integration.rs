@@ -143,6 +143,87 @@ fn on_device<T: Send + 'static>(
     })
 }
 
+/// A status poll as the app makes it on a brand-new connection: nothing known
+/// about the device's capabilities yet.
+fn fetch_status_fresh(host: &str, conn: &Arc<Mutex<dyn RemoteDevice>>) -> crate::StatusInfo {
+    fetch_status_knowing(host, conn, crate::device_caps::DeviceCaps::default())
+}
+
+/// A status poll carrying what an earlier poll on this connection learned.
+fn fetch_status_knowing(
+    host: &str,
+    conn: &Arc<Mutex<dyn RemoteDevice>>,
+    known: crate::device_caps::DeviceCaps,
+) -> crate::StatusInfo {
+    let ctx = crate::CapsContext {
+        host: host.to_string(),
+        password: test_password(),
+        known,
+    };
+    retry(|| block_on(crate::fetch_status(conn.clone(), ctx.clone())).map_err(|e| e.to_string()))
+        .expect("fetch_status failed — reachable? password correct?")
+}
+
+/// Where the VIC is currently reading its text screen from.
+///
+/// Not simply `$0400`: a program can move the screen within the VIC bank
+/// (`$D018` bits 4-7) and move the bank itself (`$DD00` bits 0-1, inverted).
+/// A check that reads `$0400` regardless passes or fails on whatever happens
+/// to be lying there, not on what is displayed.
+fn screen_base(conn: &Arc<Mutex<dyn RemoteDevice>>) -> u16 {
+    let d018 = read_mem(conn, 0xD018, 1).expect("read $D018 failed")[0];
+    let dd00 = read_mem(conn, 0xDD00, 1).expect("read $DD00 failed")[0];
+    screen_base_from(d018, dd00)
+}
+
+fn screen_base_from(d018: u8, dd00: u8) -> u16 {
+    let bank = u16::from(3 - (dd00 & 0x03)) * 0x4000;
+    bank + u16::from(d018 >> 4) * 0x0400
+}
+
+/// The power-on values must resolve to the familiar `$0400`, and a relocated
+/// screen must not — otherwise the helper is just an expensive constant.
+#[test]
+fn screen_base_follows_the_vic_bank_and_screen_pointer() {
+    assert_eq!(screen_base_from(0x15, 0x97), 0x0400, "power-on defaults");
+    assert_eq!(
+        screen_base_from(0x35, 0x97),
+        0x0C00,
+        "screen moved in bank 0"
+    );
+    assert_eq!(screen_base_from(0x15, 0x94), 0xC400, "bank 3 selected");
+}
+
+/// The 1000 screen codes the VIC is displaying right now.
+fn read_screen(conn: &Arc<Mutex<dyn RemoteDevice>>) -> Vec<u8> {
+    let base = screen_base(conn);
+    read_mem(conn, base, 1000).expect("screen read failed")
+}
+
+fn contains_run(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Poll the displayed screen until `pred` holds, or give up after `timeout`.
+/// Returns the last screen read either way, so a failure can show it.
+fn wait_for_screen(
+    conn: &Arc<Mutex<dyn RemoteDevice>>,
+    timeout: Duration,
+    pred: impl Fn(&[u8]) -> bool,
+) -> (bool, Vec<u8>) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let screen = read_screen(conn);
+        if pred(&screen) {
+            return (true, screen);
+        }
+        if std::time::Instant::now() >= deadline {
+            return (false, screen);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 macro_rules! host_or_skip {
     () => {
         match test_host() {
@@ -172,8 +253,7 @@ fn live_fetch_status() {
     let host = host_or_skip!();
     let _serial = device_lock();
     let conn = connect(&host, test_password());
-    let status = retry(|| block_on(crate::fetch_status(conn.clone())).map_err(|e| e.to_string()))
-        .expect("fetch_status failed — reachable? password correct?");
+    let status = fetch_status_fresh(&host, &conn);
     assert!(status.connected, "device reported not connected");
     let info = status.device_info.expect("no device info returned");
     println!("Connected to: {}", info);
@@ -344,12 +424,18 @@ fn live_config_item_details() {
 fn live_debugreg_read() {
     let host = host_or_skip!();
     let _serial = device_lock();
-    // U64-only endpoint; on a U2+ it legitimately errors, so this is lenient.
+    // Only Ultimate 64-class hardware has the register, so a device refusing
+    // the call is a legitimate answer. A device that answers and is then
+    // misread is not: that is this app failing to parse the documented body,
+    // which is exactly how the read was broken before.
     match block_on(crate::api::read_debugreg_async(
         &host_url(&host),
         test_password().as_deref(),
     )) {
         Ok(v) => println!("debug register $D7FF = ${:02X}", v),
+        Err(e) if e.contains("could not parse") => {
+            panic!("the device answered but the value was not understood: {e}")
+        }
         Err(e) => println!("debugreg not available (expected on non-U64): {}", e),
     }
 }
@@ -538,22 +624,83 @@ fn live_315_mount_d64_over_port64() {
 
 // ── Firmware 3.15 API (auto-skips on older firmware) ────────────────────────
 
-/// Read the device's firmware and build the capability gate from it. Returns
-/// `None` (and prints why) when the device predates 3.15, so these tests are
+/// Resolve the device's capabilities the way the app does — through the status
+/// poll, which asks the device when its version number cannot say. Returns
+/// `None` (and prints why) when the device lacks the API, so these tests are
 /// safe to run against any host in the fleet.
 fn caps_or_skip(host: &str) -> Option<crate::device_caps::DeviceCaps> {
     let conn = connect(host, test_password());
-    let info = on_device(&conn, |d| d.info()).expect("info() failed");
-    let caps = crate::device_caps::DeviceCaps::from_firmware(Some(&info.firmware_version));
-    if !caps.has_315_api() {
-        eprintln!(
-            "SKIP: {} runs firmware {} — the 3.15 API needs 3.15 or newer",
-            info.product, info.firmware_version
-        );
+    let status = fetch_status_fresh(host, &conn);
+    let device = status.device_info.unwrap_or_default();
+    if !status.caps.has_315_api() {
+        eprintln!("SKIP: {device} does not provide the extended REST API");
         return None;
     }
-    println!("{} on firmware {}", info.product, info.firmware_version);
-    Some(caps)
+    println!("{device}: extended REST API present");
+    Some(status.caps)
+}
+
+/// The regression guard for the C64 Ultimate: its firmware numbers itself
+/// below 3.15 yet answers every gated call, so the gate has to come from
+/// asking the device. Whatever the version says, the gate must agree with
+/// what the device actually does — in both directions.
+#[test]
+#[ignore = "requires a real Ultimate; set U64_TEST_HOST=<ip>"]
+fn live_capability_gate_agrees_with_what_the_device_answers() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    let conn = connect(&host, test_password());
+
+    let status = fetch_status_fresh(&host, &conn);
+    let firmware = status.firmware.clone().unwrap_or_default();
+    let by_version_alone =
+        crate::device_caps::DeviceCaps::from_firmware(Some(&firmware)).has_315_api();
+    let gate = status.caps.has_315_api();
+    println!(
+        "{}: version compare alone says {}, resolved gate says {}",
+        status.device_info.clone().unwrap_or_default(),
+        by_version_alone,
+        gate
+    );
+    assert!(
+        !status.caps.needs_probe(),
+        "a successful poll must leave the question settled"
+    );
+
+    // Independent evidence, from calls other than the one used as the probe.
+    let file_info = block_on(crate::api_315::file_info(
+        &host,
+        test_password().as_deref(),
+        "/Temp",
+    ));
+    let input_state = block_on(async {
+        let client = crate::net_utils::build_device_client(5).unwrap();
+        let req = crate::net_utils::with_password(
+            client.get(format!("http://{}/v1/machine:input", host)),
+            test_password().as_deref(),
+        );
+        req.send().await.map(|r| r.status().as_u16())
+    })
+    .expect("machine:input request failed");
+    println!("files/Temp:info -> {file_info:?}");
+    println!("GET machine:input -> HTTP {input_state}");
+
+    if gate {
+        assert!(
+            matches!(file_info, Ok(Some(_))),
+            "gate is open but files:info did not answer: {file_info:?}"
+        );
+        assert_ne!(input_state, 404, "gate is open but machine:input is absent");
+    } else {
+        assert_eq!(
+            input_state, 404,
+            "gate is closed but the device has machine:input — features are being hidden"
+        );
+    }
+
+    // The answer must ride along to the next poll instead of being re-asked.
+    let again = fetch_status_knowing(&host, &conn, status.caps.clone());
+    assert_eq!(again.caps, status.caps, "a second poll changed the answer");
 }
 
 #[test]
@@ -895,4 +1042,259 @@ fn live_315_named_key_injection_is_classified_correctly() {
         }
         Err(other) => panic!("unexpected failure: {other}"),
     }
+}
+
+/// Proves an injected joystick press is seen by the C64 itself, not merely
+/// accepted by the REST layer: fire on port 2 must pull bit 4 of CIA 1 port A
+/// (`$DC00`) low, and releasing must let it go high again.
+///
+/// The release goes through `ReleaseAll` on purpose. That event used to be
+/// serialised as `releaseall`, which the firmware rejects — so a stick held
+/// when the app let go stayed held on the device.
+#[test]
+#[ignore = "DESTRUCTIVE: presses fire on joystick port 2. Needs Ultimate 64-class hardware. Set U64_TEST_DESTRUCTIVE=1"]
+fn live_315_injected_joystick_press_reaches_the_cia_port() {
+    use crate::api_315::{InputEvent, JoyInput, Transition};
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    let conn = connect(&host, test_password());
+    let pw = test_password();
+    const FIRE: u8 = 0x10;
+    let port_a = || read_mem(&conn, 0xDC00, 1).expect("read $DC00 failed")[0];
+
+    let before = port_a();
+    let press = [InputEvent::Joystick {
+        port: 2,
+        inputs: vec![JoyInput::Fire],
+        transition: Transition::Press,
+    }];
+    match block_on(crate::api_315::send_input(&host, pw.as_deref(), &press)) {
+        Ok(()) => {}
+        Err(crate::device_caps::CapError::Unsupported(why)) => {
+            eprintln!("SKIP: this hardware cannot inject input: {why}");
+            return;
+        }
+        Err(other) => panic!("joystick press was refused: {other}"),
+    }
+    let held = port_a();
+
+    // Release before asserting anything, so a failed assertion cannot leave
+    // fire held down on the user's machine.
+    let released = block_on(crate::api_315::send_input(
+        &host,
+        pw.as_deref(),
+        &[InputEvent::ReleaseAll],
+    ));
+    let after = port_a();
+    println!("$DC00 before ${before:02X}, fire held ${held:02X}, after release ${after:02X}");
+
+    released.expect("release_all was refused — a held input would stay stuck");
+    assert_ne!(before & FIRE, 0, "fire was already down before the test");
+    assert_eq!(held & FIRE, 0, "fire press did not reach $DC00");
+    assert_ne!(after & FIRE, 0, "fire is still down after release_all");
+}
+
+/// Proves injected keys reach the running machine: after a reset to BASIC,
+/// text typed through the app's own event builder must appear on the screen
+/// the VIC is displaying, and injected DEL presses must remove it again.
+///
+/// The screen is located through `$D018`/`$DD00` rather than assumed at
+/// `$0400`, and the reset is what makes the outcome deterministic — typing
+/// into whatever program happened to be running proves nothing either way.
+#[test]
+#[ignore = "DESTRUCTIVE: resets the C64 and types at the BASIC prompt. Needs Ultimate 64-class hardware. Set U64_TEST_DESTRUCTIVE=1"]
+fn live_315_injected_keys_appear_on_the_displayed_screen() {
+    use crate::api_315::{InputEvent, Transition};
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+    if caps_or_skip(&host).is_none() {
+        return;
+    }
+    let conn = connect(&host, test_password());
+    let pw = test_password();
+
+    block_on(crate::api::reset_machine_async(
+        &host_url(&host),
+        pw.as_deref(),
+    ))
+    .expect("reset failed");
+    // "READY." in screen codes.
+    const READY: &[u8] = &[0x12, 0x05, 0x01, 0x04, 0x19, 0x2E];
+    // A reset does not clear RAM, so the prompt from *before* the reset is
+    // still in screen memory until the KERNAL wipes it. Waiting for READY
+    // alone matches that stale text at once, and keys sent then are lost in
+    // the boot — observed: typing straight after the first match typed
+    // nothing. So wait for the old prompt to go, then for the new one.
+    wait_for_screen(&conn, Duration::from_secs(3), |s| !contains_run(s, READY));
+    let (ready, _) = wait_for_screen(&conn, Duration::from_secs(15), |s| contains_run(s, READY));
+    assert!(ready, "machine did not reach the BASIC prompt after reset");
+    // READY. is printed just before BASIC starts reading the keyboard.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // A run of characters BASIC's banner never contains.
+    const TYPED: &str = "zxq7";
+    const TYPED_CODES: &[u8] = &[0x1A, 0x18, 0x11, 0x37];
+    let (_, clean) = wait_for_screen(&conn, Duration::ZERO, |_| true);
+    assert!(
+        !contains_run(&clean, TYPED_CODES),
+        "marker text is on screen before anything was typed"
+    );
+
+    let events = crate::input_315::type_text_events(TYPED);
+    assert_eq!(
+        events.len(),
+        TYPED.len(),
+        "every marker character has a key"
+    );
+    match block_on(crate::api_315::send_input(&host, pw.as_deref(), &events)) {
+        Ok(()) => {}
+        Err(crate::device_caps::CapError::Unsupported(why)) => {
+            eprintln!("SKIP: this hardware cannot inject input: {why}");
+            return;
+        }
+        Err(other) => panic!("typing was refused: {other}"),
+    }
+    let (typed, _) = wait_for_screen(&conn, Duration::from_secs(5), |s| {
+        contains_run(s, TYPED_CODES)
+    });
+    println!(
+        "screen at ${:04X}; typed text {}",
+        screen_base(&conn),
+        if typed { "appeared" } else { "did NOT appear" }
+    );
+    assert!(
+        typed,
+        "injected keys never showed up on the displayed screen"
+    );
+
+    // Tidy up through a named, non-printing key — the kind the old
+    // keyboard-buffer poke could not express.
+    let deletes: Vec<InputEvent> = (0..TYPED.len())
+        .map(|_| InputEvent::Keyboard {
+            inputs: vec!["inst_del".to_string()],
+            transition: Transition::Tap,
+        })
+        .collect();
+    block_on(crate::api_315::send_input(&host, pw.as_deref(), &deletes))
+        .expect("DEL taps were refused");
+    let (gone, _) = wait_for_screen(&conn, Duration::from_secs(5), |s| {
+        !contains_run(s, TYPED_CODES)
+    });
+    assert!(gone, "injected DEL did not remove the typed text");
+    println!("injected DEL removed the typed text");
+}
+
+/// Drives the app's own stream-control path over the documented REST routes
+/// only (no port-64 fallback to mask a failure) and checks the stream by its
+/// effect: video packets arrive after `start`, and stop arriving after `stop`.
+///
+/// "The device answered 200" is not the assertion — a 200 with no packets
+/// would be exactly the failure a user sees as a black stream window.
+#[test]
+#[ignore = "DESTRUCTIVE: redirects, then stops, the device's video stream. Needs Ultimate 64-class hardware. Set U64_TEST_DESTRUCTIVE=1"]
+fn live_rest_stream_start_delivers_video_and_stop_silences_it() {
+    use crate::settings::StreamControlMethod::RestOnly;
+    use std::net::UdpSocket;
+    const VIDEO: u8 = 0x20;
+
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    require_flag!("U64_TEST_DESTRUCTIVE", "state-changing tests");
+    let pw = test_password();
+
+    let my_ip = crate::net_utils::get_local_ip().expect("no local IP to receive the stream on");
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("bind UDP");
+    let port = socket.local_addr().unwrap().port();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    // Datagrams seen within `window`, counting only those from the device.
+    let count_packets = |window: Duration| {
+        let deadline = std::time::Instant::now() + window;
+        let mut buf = [0u8; 2048];
+        let mut seen = 0u32;
+        let mut last_len = 0;
+        while std::time::Instant::now() < deadline {
+            if let Ok((len, from)) = socket.recv_from(&mut buf) {
+                if from.ip().to_string() == host {
+                    seen += 1;
+                    last_len = len;
+                }
+            }
+        }
+        (seen, last_len)
+    };
+
+    let (idle, _) = count_packets(Duration::from_millis(500));
+    assert_eq!(idle, 0, "packets arriving before the stream was started");
+
+    crate::stream_control::send_stream_command(&host, &my_ip, port, VIDEO, pw.as_deref(), RestOnly)
+        .expect("REST streams/video:start was refused");
+    let (streaming, len) = count_packets(Duration::from_secs(1));
+
+    // Stop before asserting, so a failure cannot leave the device streaming.
+    let stopped = crate::stream_control::send_stop_command(&host, VIDEO, pw.as_deref(), RestOnly);
+    // Let datagrams already in flight drain before judging silence.
+    count_packets(Duration::from_millis(500));
+    let (after_stop, _) = count_packets(Duration::from_secs(1));
+    println!(
+        "to {my_ip}:{port}: {streaming} video packets in 1s ({len} bytes each), {after_stop} in the 1s after stop"
+    );
+
+    stopped.expect("REST streams/video:stop was refused");
+    assert!(streaming > 100, "start was accepted but no video arrived");
+    assert_eq!(after_stop, 0, "stop was accepted but video kept arriving");
+
+    // Documented as safe to call unconditionally; the app relies on it by
+    // sending a stop before every start.
+    crate::stream_control::send_stop_command(&host, VIDEO, pw.as_deref(), RestOnly)
+        .expect("stopping an already-stopped stream must not be an error");
+}
+
+/// The link classifier against the real device: the same unit answers on two
+/// addresses, one per interface, and only the wired one carries video.
+#[test]
+#[ignore = "requires the device on the local segment; set U64_TEST_HOST=<ip>"]
+fn live_link_kind_matches_the_interface_in_use() {
+    let host = host_or_skip!();
+    let _serial = device_lock();
+    let conn = connect(&host, test_password());
+    let info = on_device(&conn, |d| d.info()).expect("info() failed");
+
+    // The crate's DeviceInfo predates these fields, so read them from the raw
+    // endpoint rather than adding a dependency on a newer crate shape.
+    let url = format!("{}/v1/info", host_url(&host));
+    let body = block_on(async move {
+        reqwest::get(&url)
+            .await
+            .expect("info")
+            .text()
+            .await
+            .expect("body")
+    });
+    let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+    let eth = json["ethernet_mac"].as_str();
+    let wifi = json["wifi_mac"].as_str();
+
+    let peer = crate::link_kind::arp_lookup(&host);
+    let kind = crate::link_kind::classify(peer, eth, wifi);
+    println!(
+        "{} on {} -> {:?} (eth {:?}, wifi {:?})",
+        info.product, host, kind, eth, wifi
+    );
+
+    if eth.is_none() && wifi.is_none() {
+        assert_eq!(kind, crate::link_kind::LinkKind::Unknown);
+        return;
+    }
+    assert_ne!(
+        kind,
+        crate::link_kind::LinkKind::Unknown,
+        "a device on the local segment reporting MACs should classify"
+    );
 }

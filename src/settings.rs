@@ -84,6 +84,17 @@ pub struct Preferences {
     /// can turn it off.
     #[serde(default = "default_true")]
     pub use_gpu_video_shader: bool,
+    /// How often the gamepad is sampled and any change pushed to the device,
+    /// in hertz.
+    ///
+    /// Tunable because the right value depends on the network rather than on
+    /// the app: each change costs one HTTP request, and the device's server
+    /// handles a single connection at a time. A high rate gives the lowest
+    /// input latency but is the first thing to suffer on a congested or
+    /// wireless link; dropping it trades responsiveness for a stream of
+    /// requests the device can keep up with.
+    #[serde(default = "default_gamepad_poll_hz")]
+    pub gamepad_poll_hz: u32,
     /// Device folders (SD/USB FTP paths) whose subfolders are treated as
     /// games in Game Mode. Each subfolder under a root is one game; its
     /// smart-picked cover is its box art. `#[serde(default)]` keeps older
@@ -98,6 +109,11 @@ fn default_true() -> bool {
 
 fn default_font_size() -> u32 {
     12
+}
+
+/// Matches the old fixed 16 ms tick, so existing users see no change.
+fn default_gamepad_poll_hz() -> u32 {
+    60
 }
 
 fn default_song_duration() -> u32 {
@@ -127,6 +143,7 @@ impl Default for AppSettings {
                 font_size: 12,
                 last_active_tab: None,
                 use_gpu_video_shader: true,
+                gamepad_poll_hz: default_gamepad_poll_hz(),
                 game_library_roots: Vec::new(),
             },
         }

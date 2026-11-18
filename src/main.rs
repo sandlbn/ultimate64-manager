@@ -138,6 +138,7 @@ mod gamepad;
 mod input_315;
 #[cfg(test)]
 mod integration;
+mod link_kind;
 mod memory_editor;
 mod mod_info;
 mod music_ops;
@@ -617,6 +618,14 @@ pub struct StatusInfo {
     /// [`crate::device_caps`]). The display string flattens it into prose and
     /// can't be parsed back reliably.
     pub firmware: Option<String>,
+    /// What the device can do, including its own answer to the capability
+    /// probe. Kept on the status so the answer rides along to the next poll
+    /// and the device is asked once per connection, not once per poll.
+    pub caps: crate::device_caps::DeviceCaps,
+    /// Which of the device's interfaces this connection runs over. The video
+    /// stream only works on the wired one, and nothing in a stream response
+    /// says so, so the app has to work it out and say it itself.
+    pub link: crate::link_kind::LinkKind,
     pub mounted_disks: Vec<(String, String)>,
     /// Live per-drive state (name, power, type) from `drive_list`, so the drive
     /// control strip can reflect what's actually set on the device.
@@ -770,6 +779,7 @@ impl Ultimate64Browser {
         // without a device when U64_AUTO_TEST_PATTERN is set.
         let mut video_streaming = VideoStreaming::new();
         video_streaming.use_gpu_shader = settings.preferences.use_gpu_video_shader;
+        video_streaming.set_gamepad_hz(settings.preferences.gamepad_poll_hz);
         if std::env::var("U64_AUTO_TEST_PATTERN").is_ok() {
             video_streaming.preload_test_pattern();
         }
@@ -827,6 +837,8 @@ impl Ultimate64Browser {
                 connected: false,
                 device_info: None,
                 firmware: None,
+                caps: crate::device_caps::DeviceCaps::default(),
+                link: crate::link_kind::LinkKind::Unknown,
                 mounted_disks: Vec::new(),
                 drives: Vec::new(),
             },
@@ -1674,6 +1686,14 @@ impl Ultimate64Browser {
                     self.settings.preferences.use_gpu_video_shader = on;
                     if let Err(e) = self.settings.save() {
                         log::warn!("Failed to save renderer preference: {}", e);
+                    }
+                }
+                // Persist the gamepad sample rate. The tab has already clamped
+                // it, so what arrives here is what it actually uses.
+                if let StreamingMessage::GamepadHzPersist(hz) = msg {
+                    self.settings.preferences.gamepad_poll_hz = hz;
+                    if let Err(e) = self.settings.save() {
+                        log::warn!("Failed to save gamepad rate: {}", e);
                     }
                 }
                 // Handle screenshot result for user message
@@ -2651,6 +2671,7 @@ impl Ultimate64Browser {
         self.status.device_info = None;
         self.status.mounted_disks.clear();
         self.status.drives.clear();
+        self.forget_device_caps();
 
         if self.settings.connection.host.is_empty() {
             log::error!("Host IP is empty");
@@ -2797,7 +2818,51 @@ async fn execute_template_commands(
     Ok(())
 }
 
-async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<StatusInfo, DeviceError> {
+/// What [`fetch_status`] needs to settle the device's capabilities: where to
+/// ask, and what this connection already learned.
+#[derive(Debug, Clone)]
+pub struct CapsContext {
+    /// Bare host, as the user entered it.
+    pub host: String,
+    pub password: Option<String>,
+    /// Capabilities from the previous poll, so an answered probe is reused.
+    pub known: crate::device_caps::DeviceCaps,
+}
+
+/// Work out what the device supports, asking it only when the version number
+/// cannot say and nothing has been learned yet.
+///
+/// Runs inside the status poll, after its other requests, because the
+/// device's HTTP server takes one connection at a time — a probe fired
+/// alongside the poll would be competing with it. A probe that fails for any
+/// reason other than a clear yes/no leaves the question open, so the next
+/// poll asks again instead of caching a network blip as "unsupported".
+async fn resolve_caps(firmware: Option<&str>, ctx: &CapsContext) -> crate::device_caps::DeviceCaps {
+    let caps =
+        crate::device_caps::DeviceCaps::from_firmware(firmware).inheriting_probe_from(&ctx.known);
+    if !caps.needs_probe() {
+        return caps;
+    }
+    match crate::api_315::probe_api(&ctx.host, ctx.password.as_deref()).await {
+        Ok(has_api) => {
+            log::info!(
+                "Capability probe: firmware {:?} {} the extended REST API",
+                firmware,
+                if has_api { "has" } else { "lacks" }
+            );
+            caps.with_probe_result(has_api)
+        }
+        Err(e) => {
+            log::debug!("Capability probe inconclusive, will retry: {}", e);
+            caps
+        }
+    }
+}
+
+async fn fetch_status(
+    connection: Arc<Mutex<dyn RemoteDevice>>,
+    caps_ctx: CapsContext,
+) -> Result<StatusInfo, DeviceError> {
     // Use spawn_blocking to avoid runtime conflicts with ultimate64 crate
     // Wrap in timeout to prevent hangs when device is offline
     let result = tokio::time::timeout(
@@ -2839,6 +2904,10 @@ async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<Status
                 connected: true,
                 device_info,
                 firmware,
+                caps: crate::device_caps::DeviceCaps::default(),
+                // Both resolved after the blocking section, where async calls
+                // and the host address are available.
+                link: crate::link_kind::LinkKind::Unknown,
                 mounted_disks,
                 drives,
             })
@@ -2846,11 +2915,34 @@ async fn fetch_status(connection: Arc<Mutex<dyn RemoteDevice>>) -> Result<Status
     )
     .await;
 
-    match result {
-        Ok(Ok(status)) => status,
-        Ok(Err(e)) => Err(DeviceError::Network(format!("task join error: {}", e))),
-        Err(_) => Err(DeviceError::Timeout),
-    }
+    let mut status = match result {
+        Ok(Ok(status)) => status?,
+        Ok(Err(e)) => return Err(DeviceError::Network(format!("task join error: {}", e))),
+        Err(_) => return Err(DeviceError::Timeout),
+    };
+    status.caps = resolve_caps(status.firmware.as_deref(), &caps_ctx).await;
+    status.link = resolve_link(&caps_ctx).await;
+    Ok(status)
+}
+
+/// Work out which interface this connection runs over.
+///
+/// The ARP lookup shells out, so it runs on the blocking pool; it is cheap and
+/// only happens once per poll. An address that is routed rather than on the
+/// local segment resolves to the gateway and so reads as `Unknown`, which is
+/// the honest answer.
+async fn resolve_link(ctx: &CapsContext) -> crate::link_kind::LinkKind {
+    let host = ctx.host.clone();
+    let password = ctx.password.clone();
+    let macs = crate::api::device_macs(&host, password.as_deref()).await;
+    let Some((eth, wifi)) = macs else {
+        return crate::link_kind::LinkKind::Unknown;
+    };
+    let peer = tokio::task::spawn_blocking(move || crate::link_kind::arp_lookup(&host))
+        .await
+        .ok()
+        .flatten();
+    crate::link_kind::classify(peer, eth.as_deref(), wifi.as_deref())
 }
 
 /// Best-effort classification of an `ultimate64` crate error string into a
