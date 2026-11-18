@@ -754,8 +754,8 @@ pub async fn load_prg_async(
     Ok(format!("Loaded: {}", filename))
 }
 
-/// Read the debug register ($D7FF, U64 only).
-/// GET /v1/machine:debugreg  → body is the value (hex or decimal text).
+/// Read the debug register ($D7FF, Ultimate 64-class hardware only).
+/// GET /v1/machine:debugreg → `{"value": "1F", "errors": []}`.
 pub async fn read_debugreg_async(host: &str, password: Option<&str>) -> Result<u8, String> {
     let url = format!("{}/v1/machine:debugreg", host);
     let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS)?;
@@ -791,10 +791,24 @@ pub async fn write_debugreg_async(
     Ok(format!("Debug register = ${:02X}", value))
 }
 
-/// Parse a debug-register value returned by the device. Accepts a bare
-/// number, an optional `0x`/`$` hex prefix, or a JSON-ish `{"value": N}`
-/// fragment — returns the low byte.
+/// The documented answer to `GET /v1/machine:debugreg`.
+#[derive(serde::Deserialize)]
+struct DebugRegisterResponse {
+    value: String,
+}
+
+/// Parse a debug-register value returned by the device.
+///
+/// The documented shape is tried first and read as **hexadecimal**: the API
+/// returns the register as two hex digits in a JSON string, so `"10"` is 16,
+/// not ten. The older heuristic below guessed at the format before the API was
+/// documented; it reads bare numbers as decimal and cannot find the value in
+/// the real multi-field response at all, so it is kept only as a fallback for
+/// bodies that are not the documented JSON.
 fn parse_debugreg_value(body: &str) -> Option<u8> {
+    if let Ok(doc) = serde_json::from_str::<DebugRegisterResponse>(body) {
+        return u8::from_str_radix(doc.value.trim(), 16).ok();
+    }
     let mut s = body.trim();
     // Pull a value out of a trivial `"value": 123` shape if present.
     if let Some(pos) = s.find(':') {
@@ -834,6 +848,30 @@ mod tests {
     #[test]
     fn parse_debugreg_json_fragment() {
         assert_eq!(parse_debugreg_value("{\"value\": 42}"), Some(42));
+    }
+
+    /// The body exactly as a C64 Ultimate on firmware 1.2.1 sends it. The
+    /// value sits ahead of an `errors` array, which the old heuristic could
+    /// not see past — every real read failed to parse.
+    #[test]
+    fn parse_debugreg_reads_the_response_the_device_actually_sends() {
+        let body = "{ \n  \"value\" : \"00\",\n  \"errors\" : [  ]\n}";
+        assert_eq!(parse_debugreg_value(body), Some(0x00));
+    }
+
+    /// The documented value is two hex digits. Digits-only values are the
+    /// trap: "10" must be $10, not ten.
+    #[test]
+    fn parse_debugreg_reads_the_documented_value_as_hex() {
+        assert_eq!(
+            parse_debugreg_value(r#"{"value":"10","errors":[]}"#),
+            Some(0x10)
+        );
+        assert_eq!(
+            parse_debugreg_value(r#"{"value":"1F","errors":[]}"#),
+            Some(0x1f)
+        );
+        assert_eq!(parse_debugreg_value(r#"{"value":"zz","errors":[]}"#), None);
     }
 
     #[test]
@@ -889,4 +927,31 @@ mod tests {
             Arc::new(Mutex::new(MockDevice::failing()));
         assert!(read_memory_async(conn, 0, 16).await.is_err());
     }
+}
+
+/// Read the device's interface MAC addresses from `/v1/info`.
+///
+/// Returns `None` when the firmware predates these fields, so callers can tell
+/// "this device cannot answer" apart from "this device has no Wi-Fi".
+pub async fn device_macs(
+    host: &str,
+    password: Option<&str>,
+) -> Option<(Option<String>, Option<String>)> {
+    let url = format!("http://{}/v1/info", host);
+    let client = crate::net_utils::build_device_client(REST_TIMEOUT_SECS).ok()?;
+    let req = crate::net_utils::with_password(client.get(&url), password);
+    let body = req.send().await.ok()?.text().await.ok()?;
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let eth = json
+        .get("ethernet_mac")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let wifi = json
+        .get("wifi_mac")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    if eth.is_none() && wifi.is_none() {
+        return None;
+    }
+    Some((eth, wifi))
 }

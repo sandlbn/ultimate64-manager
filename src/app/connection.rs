@@ -66,6 +66,7 @@ impl Ultimate64Browser {
         self.status.device_info = None;
         self.status.mounted_disks.clear();
         self.status.drives.clear();
+        self.forget_device_caps();
         self.consecutive_status_failures = 0;
         self.remote_browser.set_host(None, None);
         // Clear telnet host for video streaming control
@@ -74,6 +75,18 @@ impl Ultimate64Browser {
             "Disconnected from Ultimate64".to_string(),
         ));
         Task::none()
+    }
+
+    /// Drop what was learned about the device's capabilities.
+    ///
+    /// The probe answer is cached per connection. The next device may report
+    /// the very same version string and still differ, so the answer must not
+    /// outlive the connection it was obtained on.
+    pub(crate) fn forget_device_caps(&mut self) {
+        let unknown = crate::device_caps::DeviceCaps::default();
+        self.status.caps = unknown.clone();
+        self.video_streaming.set_device_caps(unknown.clone());
+        self.remote_browser.set_device_caps(unknown);
     }
 
     pub(crate) fn handle_stream_control_method_changed(
@@ -95,8 +108,9 @@ impl Ultimate64Browser {
     pub(crate) fn handle_refresh_status(&mut self) -> Task<Message> {
         if let Some(conn) = &self.connection {
             let conn = conn.clone();
+            let caps_ctx = self.caps_context();
             Task::perform(
-                async move { fetch_status(conn).await },
+                async move { fetch_status(conn, caps_ctx).await },
                 Message::StatusUpdated,
             )
         } else {
@@ -104,12 +118,23 @@ impl Ultimate64Browser {
         }
     }
 
+    /// Where the status poll should ask about capabilities, and what this
+    /// connection has already learned.
+    fn caps_context(&self) -> crate::CapsContext {
+        crate::CapsContext {
+            host: self.settings.connection.host.clone(),
+            password: self.settings.connection.password.clone(),
+            known: self.status.caps.clone(),
+        }
+    }
+
     pub(crate) fn handle_refresh_after_connect(&mut self, ctx: TabContext) -> Task<Message> {
         // Refresh both status and remote browser after connection
         let status_cmd = if let Some(conn) = &self.connection {
             let conn = conn.clone();
+            let caps_ctx = self.caps_context();
             Task::perform(
-                async move { fetch_status(conn).await },
+                async move { fetch_status(conn, caps_ctx).await },
                 Message::StatusUpdated,
             )
         } else {
@@ -146,13 +171,12 @@ impl Ultimate64Browser {
                     );
                 }
                 self.consecutive_status_failures = 0;
-                // Hand the firmware version to the streaming tab so its
-                // 3.15-only joystick control can gate itself without repeating
-                // the /v1/info round-trip.
-                self.video_streaming
-                    .set_device_firmware(status.firmware.clone());
-                self.remote_browser
-                    .set_device_firmware(status.firmware.clone());
+                // Hand the resolved capabilities to the tabs that gate on
+                // them, so none of them repeats the round-trips or — worse —
+                // re-derives the answer from the version number alone.
+                self.video_streaming.set_device_caps(status.caps.clone());
+                self.video_streaming.set_link_kind(status.link);
+                self.remote_browser.set_device_caps(status.caps.clone());
                 // Show connected message when first connecting
                 if !self.status.connected && status.connected {
                     self.user_message = Some(UserMessage::Info(format!(

@@ -1,24 +1,31 @@
-//! Firmware-version gating for calls that only exist on newer Ultimate builds.
+//! Capability gating for calls that only exist on newer Ultimate builds.
 //!
-//! Ultimate firmware 3.15 added a batch of REST calls (native disk-image
-//! creation, the menu screen, heap statistics, file info, keyboard/joystick
-//! injection). Calling them on older firmware gets a 404, so every new call in
-//! this app is guarded by [`DeviceCaps`].
+//! A batch of REST calls (native disk-image creation, the menu screen, heap
+//! statistics, file info, keyboard/joystick injection) is absent from older
+//! firmware, which answers them with a 404. Every such call in this app is
+//! guarded by [`DeviceCaps`].
 //!
-//! # Why a version compare is enough, and where it isn't
+//! # Why the gate detects instead of comparing versions
 //!
-//! The 3.x line is Gideon's board (Ultimate II / II+ / II+L and the Ultimate 64
-//! II), so a numeric `>= 3.15` cleanly separates old from new across that whole
-//! family. The Commodore-branded C64 Ultimate fork numbers itself separately
-//! (it reports `1.1.0`) and genuinely lacks these calls — verified: it answers
-//! 404 on every one of them — so falling below the cut is the correct outcome
-//! there rather than an accident of string comparison.
+//! A version number identifies a firmware *line*, not a feature set. Gideon's
+//! line (Ultimate II / II+ / II+L, Ultimate 64) is at 3.x and gained these
+//! calls in 3.15. The Commodore-branded C64 Ultimate numbers itself
+//! independently: it reported `1.1.0` when it lacked the calls and reports
+//! `1.2.1` now that it has them. A `>= 3.15` compare therefore switched the
+//! whole feature set off on a device that answers every one of these calls.
 //!
-//! What a version compare *cannot* express is that a call can exist in the
-//! firmware and still be unavailable on the hardware in front of you.
-//! `machine:input` is registered on 3.15 but answers **501** on a cartridge,
-//! because driving keyboard and joystick lines needs Ultimate 64-class
-//! hardware that a cartridge does not have. So callers must treat
+//! So the version is only a fast path. `>= 3.15` is trusted as "has the API"
+//! without a round-trip; anything else is settled by asking the device once
+//! (see [`crate::api_315::probe_api`]) and remembering the answer for the
+//! connection. Until that answer is in, the gate stays closed, so a device
+//! that has not been asked keeps the paths that already worked.
+//!
+//! # What the gate still cannot express
+//!
+//! A call can exist in the firmware and be unavailable on the hardware in
+//! front of you. `machine:input` answers **501** on a cartridge, because
+//! driving keyboard and joystick lines needs Ultimate 64-class hardware. That
+//! is a per-call answer, not a property of the firmware, so callers must treat
 //! [`CapError::Unsupported`] as a normal outcome and fall back, not as a bug.
 
 /// A firmware version, parsed into comparable numeric components.
@@ -81,27 +88,68 @@ impl FirmwareVersion {
 pub const FW_315: &[u32] = &[3, 15];
 
 /// What the connected device supports.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceCaps {
     firmware: Option<FirmwareVersion>,
+    /// What the device itself said when asked whether it has the API.
+    /// `None` until it has been asked — which is not the same as "no".
+    probed: Option<bool>,
 }
 
 impl DeviceCaps {
-    /// Read the capabilities implied by a reported firmware version. An
-    /// unparseable or absent version is treated as old, so a device that
-    /// reports something unexpected keeps the paths that already worked.
+    /// The capabilities a reported firmware version implies on its own.
+    ///
+    /// Only `>= 3.15` is conclusive. Everything else — an older 3.x, the
+    /// Commodore line, an unparseable or absent version — is left closed but
+    /// undecided: see [`Self::needs_probe`].
     pub fn from_firmware(raw: Option<&str>) -> Self {
         Self {
             firmware: raw.and_then(FirmwareVersion::parse),
+            probed: None,
         }
     }
 
-    /// Whether the 3.15 REST additions are present.
-    pub fn has_315_api(&self) -> bool {
+    /// Whether the version number alone proves the API is there.
+    fn version_implies_api(&self) -> bool {
         self.firmware.as_ref().is_some_and(|v| v.at_least(FW_315))
     }
 
-    /// Guard helper: `Err(CapError::TooOld)` when the firmware predates 3.15.
+    /// Whether the device still has to be asked.
+    ///
+    /// False once the version settles it or an answer has been recorded, so
+    /// the probe costs one request per connection rather than one per poll.
+    pub fn needs_probe(&self) -> bool {
+        !self.version_implies_api() && self.probed.is_none()
+    }
+
+    /// Record the device's own answer to the capability probe.
+    pub fn with_probe_result(mut self, has_api: bool) -> Self {
+        self.probed = Some(has_api);
+        self
+    }
+
+    /// Carry over an answer already obtained on this connection.
+    ///
+    /// Only when the firmware string is unchanged: a firmware update happens
+    /// without the app reconnecting, and the answer belongs to the build that
+    /// gave it.
+    pub fn inheriting_probe_from(mut self, earlier: &DeviceCaps) -> Self {
+        if self.firmware == earlier.firmware {
+            self.probed = earlier.probed;
+        }
+        self
+    }
+
+    /// Whether the REST additions are present — proven by the version on the
+    /// 3.x line, or by the device's own answer everywhere else.
+    ///
+    /// The name records where the calls first appeared (firmware 3.15), not a
+    /// requirement that the device report that number.
+    pub fn has_315_api(&self) -> bool {
+        self.version_implies_api() || self.probed == Some(true)
+    }
+
+    /// Guard helper: `Err(CapError::TooOld)` when the device lacks the calls.
     pub fn require_315(&self) -> Result<(), CapError> {
         if self.has_315_api() {
             Ok(())
@@ -120,7 +168,7 @@ impl DeviceCaps {
 /// Why a version-gated call could not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CapError {
-    /// The firmware is older than the release that added the call.
+    /// The firmware does not have the call.
     TooOld { found: String },
     /// The firmware has the call, but this hardware cannot perform it (HTTP
     /// 501). A cartridge answering `machine:input` is the standard case.
@@ -140,7 +188,7 @@ impl std::fmt::Display for CapError {
         match self {
             CapError::TooOld { found } => write!(
                 f,
-                "needs Ultimate firmware 3.15 or newer (device reports {})",
+                "not available on this firmware (device reports {}; the Ultimate 3.x line gained it in 3.15)",
                 found
             ),
             CapError::Unsupported(why) => f.write_str(why),
@@ -183,12 +231,72 @@ mod tests {
         assert!(!v("3.9").at_least(FW_315), "3.9 is older than 3.15");
     }
 
-    /// The Commodore-fork C64 Ultimate numbers itself on a separate line and
-    /// does not have these calls (verified: 404 on all of them), so it must
-    /// fall below the cut.
+    /// The Commodore line numbers itself independently of the 3.x line, so
+    /// its versions land below the cut whether or not the build has the calls
+    /// (1.1.0 did not, 1.2.1 does). The compare must not be read as an answer
+    /// there — it only says the fast path does not apply.
     #[test]
-    fn the_commodore_fork_version_line_falls_below_the_cut() {
-        assert!(!v("1.1.0").at_least(FW_315));
+    fn the_commodore_version_line_is_undecided_by_the_number_alone() {
+        for fw in ["1.1.0", "1.2.1"] {
+            assert!(!v(fw).at_least(FW_315));
+            let caps = DeviceCaps::from_firmware(Some(fw));
+            assert!(caps.needs_probe(), "{fw} must be asked, not assumed old");
+            assert!(!caps.has_315_api(), "{fw} stays closed until it answers");
+        }
+    }
+
+    /// The regression this module exists to prevent: a C64 Ultimate on 1.2.1
+    /// answers every gated call, and a version compare switched them all off.
+    #[test]
+    fn a_device_that_answers_the_probe_has_the_api_whatever_it_calls_itself() {
+        let caps = DeviceCaps::from_firmware(Some("1.2.1")).with_probe_result(true);
+        assert!(caps.has_315_api());
+        assert!(!caps.needs_probe(), "one answer per connection is enough");
+        assert!(caps.require_315().is_ok());
+    }
+
+    #[test]
+    fn a_device_that_refuses_the_probe_stays_gated_and_is_not_asked_again() {
+        let caps = DeviceCaps::from_firmware(Some("1.1.0")).with_probe_result(false);
+        assert!(!caps.has_315_api());
+        assert!(!caps.needs_probe());
+    }
+
+    /// The 3.x fast path: no round-trip, and nothing a probe says can take the
+    /// API away from a version that is known to have it.
+    #[test]
+    fn firmware_315_is_trusted_without_a_probe() {
+        let caps = DeviceCaps::from_firmware(Some("3.15"));
+        assert!(caps.has_315_api());
+        assert!(!caps.needs_probe());
+        assert!(caps.with_probe_result(false).has_315_api());
+    }
+
+    /// A device whose version cannot be read used to be written off as old.
+    /// It is now asked like any other, and stays closed until it answers.
+    #[test]
+    fn an_unreadable_version_is_asked_rather_than_assumed_old() {
+        for raw in [None, Some("unknown")] {
+            let caps = DeviceCaps::from_firmware(raw);
+            assert!(caps.needs_probe());
+            assert!(!caps.has_315_api());
+            assert!(caps.with_probe_result(true).has_315_api());
+        }
+    }
+
+    /// The answer is cached across status polls, but it belongs to the build
+    /// that gave it: after a firmware update the device must be asked again.
+    #[test]
+    fn a_cached_answer_survives_a_poll_but_not_a_firmware_change() {
+        let earlier = DeviceCaps::from_firmware(Some("1.2.1")).with_probe_result(true);
+
+        let same = DeviceCaps::from_firmware(Some("1.2.1")).inheriting_probe_from(&earlier);
+        assert!(same.has_315_api());
+        assert!(!same.needs_probe());
+
+        let updated = DeviceCaps::from_firmware(Some("1.3.0")).inheriting_probe_from(&earlier);
+        assert!(updated.needs_probe());
+        assert!(!updated.has_315_api());
     }
 
     #[test]
@@ -245,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_or_absent_version_is_treated_as_old() {
+    fn unparseable_or_absent_version_is_closed_until_probed() {
         assert!(FirmwareVersion::parse("").is_none());
         assert!(FirmwareVersion::parse("unknown").is_none());
         assert!(!DeviceCaps::from_firmware(Some("unknown")).has_315_api());
@@ -253,11 +361,17 @@ mod tests {
     }
 
     #[test]
-    fn caps_gate_matches_the_two_live_devices() {
-        // Ultimate II+L on 3.15 — has the new calls.
+    fn caps_gate_matches_the_live_devices() {
+        // Ultimate II+L on 3.15 — has the calls; the version proves it.
         assert!(DeviceCaps::from_firmware(Some("3.15")).has_315_api());
-        // C64 Ultimate on 1.1.0 — does not.
-        assert!(!DeviceCaps::from_firmware(Some("1.1.0")).has_315_api());
+        // C64 Ultimate on 1.1.0 — answered 404 to all of them.
+        assert!(!DeviceCaps::from_firmware(Some("1.1.0"))
+            .with_probe_result(false)
+            .has_315_api());
+        // The same product on 1.2.1 — answers them.
+        assert!(DeviceCaps::from_firmware(Some("1.2.1"))
+            .with_probe_result(true)
+            .has_315_api());
     }
 
     #[test]
